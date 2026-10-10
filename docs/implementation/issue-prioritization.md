@@ -73,14 +73,14 @@ dedicated read-only gateway with these boundaries:
 
 ## Ownership and staged delivery
 
-H1-H3 own dedicated issue retrieval, normalization and ranking modules plus
-their tests and this document. They do not edit the Store, runner, shared web
-shell, package files or CI.
+Lane H is done. H1-H3 owned dedicated issue retrieval, normalization and
+ranking modules plus their tests and this document. They did not edit the
+Store, runner, shared web shell, package files or CI.
 
 **Schedule change (2026-09-25, approved by the product owner).** H4 was planned
-to wait for G4 to release the shared web files. G cannot start until E4 merges,
-and E4 waits for D5, so the web files had no active owner. H4 therefore takes
-them now, split in two:
+to wait for G4 to release the shared web files. G could not start until E4
+merged, and E4 waited for D5, so the web files had no active owner. H4
+therefore took them, split in two:
 
 - **H4a (#55): the Issues screen.** It owned `web/server.ts`,
   `web/public/*`, a new `web/issues.ts`, the demo fixture
