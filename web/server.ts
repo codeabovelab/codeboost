@@ -575,7 +575,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
-    const json = (status: number, value: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
+    // A reply sent while the request body is still unread (a refusal before the body is read) closes the connection
+    // (#157). Node discards only an unread body that fits its socket buffers; a larger one held the connection until
+    // the keep-alive timeout, which delayed shutdown by about 6 s.
+    const head = (status: number, contentType: string) => {
+      if (!req.complete) res.setHeader('Connection', 'close');
+      res.writeHead(status, { 'Content-Type': contentType });
+    };
+    const json = (status: number, value: unknown) => { head(status, 'application/json'); res.end(JSON.stringify(value)); };
     try {
       if (req.headers.host !== `127.0.0.1:${actualPort}` || (req.headers.origin && req.headers.origin !== origin)) { json(403, { error: 'Local origin required.' }); return; }
       const path = new URL(req.url ?? '/', origin).pathname;
@@ -602,11 +609,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const chunks: Buffer[] = []; let size = 0;
         const limit = path === '/api/plan/import' ? MAX_IMPORT_REQUEST_BYTES : MAX_REQUEST_BYTES;
         activeRequest.readingBody=true;
-        // Past the limit, the rest of the body is read and discarded, and the 413 goes out once it ends (#157). A reply
-        // while the client is still sending leaves the connection half read: it is held until the keep-alive timeout,
-        // delaying shutdown, and the client can be reset before it reads the reply. Shutdown still destroys a request
-        // that is discarding its body (readingBody stays set), as it does any request still reading one.
-        try { for await (const chunk of req) { size += chunk.length; if (size <= limit) chunks.push(chunk); } }
+        // Past the limit, the rest of the body is read and discarded, and the 413 goes out once it ends (#157). Closing
+        // the connection instead (as `head` does for a refusal before the body is read) can reset a client still sending
+        // before it reads the reply. Shutdown still destroys a request that is discarding its body (readingBody stays
+        // set), as it does any request still reading one.
+        try { for await (const chunk of req) { size += chunk.length; if (size <= limit) chunks.push(chunk); else chunks.length = 0; } }
         finally { activeRequest.readingBody=false; }
         if (size > limit) { json(413, { error: 'Request too large.' }); return; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
@@ -700,11 +707,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
       const file = files[path];
-      if (file) { res.writeHead(200, { 'Content-Type': `${file[1]}; charset=utf-8` }); res.end(readFileSync(new URL(file[0], publicRoot))); return; }
+      if (file) { head(200, `${file[1]}; charset=utf-8`); res.end(readFileSync(new URL(file[0], publicRoot))); return; }
       const font = /^\/fonts\/(ibm-plex-(?:sans|mono)-latin-(?:400|500|600)-normal\.woff2)$/.exec(path);
       if (font) {
         const family = font[1]!.startsWith('ibm-plex-sans') ? 'ibm-plex-sans' : 'ibm-plex-mono';
-        res.writeHead(200, { 'Content-Type': 'font/woff2' }); res.end(readFileSync(fileURLToPath(new URL(`../node_modules/@fontsource/${family}/files/${font[1]}`, import.meta.url)))); return;
+        head(200, 'font/woff2'); res.end(readFileSync(fileURLToPath(new URL(`../node_modules/@fontsource/${family}/files/${font[1]}`, import.meta.url)))); return;
       }
       json(404, { error: 'Not found.' });
     } catch (error) {

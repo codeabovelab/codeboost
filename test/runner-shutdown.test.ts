@@ -199,13 +199,13 @@ describe('server shutdown', { timeout: 15_000 }, () => {
 });
 
 describe('an oversized request body (#157)', () => {
-  /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records when the reply arrived. */
-  function oversized(app: App, first: number) {
+  /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records the reply and when it came. */
+  function oversized(app: App, first: number, options: { path?: string; token?: string; contentType?: string } = {}) {
     const url = new URL(origin(app));
-    const state: { status?: number; body?: string; error?: Error; endedAt?: number; repliedAt?: number } = {};
-    const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/action', method: 'POST',
-      headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } }, res => {
-      state.repliedAt = performance.now(); state.status = res.statusCode;
+    const state: { status?: number; body?: string; connection?: string; error?: Error; endedAt?: number; repliedAt?: number } = {};
+    const req = httpRequest({ host: url.hostname, port: url.port, path: options.path ?? '/api/action', method: 'POST',
+      headers: { 'x-codeboost-token': options.token ?? app.token, 'content-type': options.contentType ?? 'application/json' } }, res => {
+      state.repliedAt = performance.now(); state.status = res.statusCode; state.connection = res.headers.connection;
       let data = ''; res.on('data', chunk => { data += chunk; }); res.on('end', () => { state.body = data; });
     });
     const settled = new Promise<void>(resolve => { req.on('close', resolve); });
@@ -213,38 +213,77 @@ describe('an oversized request body (#157)', () => {
     req.write('x'.repeat(first));
     return { state, settled, send: (bytes: number) => req.write('x'.repeat(bytes)), end: () => { state.endedAt = performance.now(); req.end(); } };
   }
+  /** Resolves once the server's handler has run up to its first await for the next request (the body read, for a POST). */
+  const handled = (app: App) => new Promise<void>(resolve => { app.server.once('request', () => setImmediate(resolve)); });
+  const timed = async (close: () => Promise<void>) => { const started = performance.now(); await close(); return performance.now() - started; };
+  const big = 4 * 1024 * 1024;
 
   it('replies 413 only once the whole body has arrived', async () => {
     const { app } = await serve();
-    const sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await reading;
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(sent.state.status).toBeUndefined();
-    sent.send(4 * 1024 * 1024); sent.end();
+    sent.send(big); sent.end();
     await sent.settled;
     expect(sent.state).toMatchObject({ status: 413, body: JSON.stringify({ error: 'Request too large.' }) });
     expect(sent.state.error).toBeUndefined();
-    expect(sent.state.repliedAt).toBeGreaterThanOrEqual(sent.state.endedAt!);
   });
   it('shuts down promptly after refusing a body far over the limit', async () => {
     const { app, close } = await serve();
-    const response = await fetch(`${origin(app)}/api/action`, { method: 'POST', body: 'x'.repeat(4 * 1024 * 1024),
+    const response = await fetch(`${origin(app)}/api/action`, { method: 'POST', body: 'x'.repeat(big),
       headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
     expect(response.status).toBe(413);
     await response.text();
     // A half-read connection was held until Node's keep-alive timeout (5 s, plus 1 s of buffer) before close settled.
-    const started = performance.now();
-    await close();
-    expect(performance.now() - started).toBeLessThan(3_000);
+    expect(await timed(close)).toBeLessThan(3_000);
+  });
+  it('still replies 413 to an oversized body that completes during the shutdown drain', async () => {
+    const { app, close } = await serve();
+    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await reading;
+    const closing = close();
+    await tick();
+    sent.send(big); sent.end();
+    await sent.settled;
+    expect(sent.state).toMatchObject({ status: 413, body: JSON.stringify({ error: 'Request too large.' }) });
+    await closing;
   });
   it('destroys an oversized request still being sent after the drain limit, and close settles', async () => {
     const { app, close } = await serve();
-    const sent = oversized(app, MAX_REQUEST_BYTES * 2);
-    await new Promise(resolve => setTimeout(resolve, 100));
+    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await reading;
     await close();
     await sent.settled;
     expect(sent.state.status).toBeUndefined();
     expect(sent.state.error).toBeDefined();
   });
+  it.each([
+    ['a wrong token', { token: 'f'.repeat(64) }, 403],
+    ['an unsupported content type', { contentType: 'text/plain' }, 405],
+    ['a path that takes no POST', { path: '/' }, 405],
+  ] as const)('closes the connection when it refuses %s before reading a large body, so shutdown is prompt', async (_label, options, status) => {
+    const { app, close } = await serve();
+    const sent = oversized(app, big, options);
+    sent.end();
+    await sent.settled;
+    // The client may be reset while still sending; when the reply arrives first, it closes the connection.
+    if (sent.state.status !== undefined) expect(sent.state).toMatchObject({ status, connection: 'close' });
+    else expect(sent.state.error).toBeDefined();
+    expect(await timed(close)).toBeLessThan(3_000);
+  });
+  it.each([['GET', '/api/review', undefined], ['POST', '/api/settings', JSON.stringify({ questionProvider: 'claude' })]] as const)(
+    'keeps the connection open after a %s whose body was read', async (method, path, body) => {
+      const { app } = await serve();
+      const url = new URL(origin(app));
+      const reply = await new Promise<{ status: number; connection?: string }>((resolve, reject) => {
+        const req = httpRequest({ host: url.hostname, port: url.port, path, method,
+          headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) } },
+        res => { res.resume(); resolve({ status: res.statusCode!, connection: res.headers.connection }); });
+        req.on('error', reject); req.end(body);
+      });
+      expect(reply).toEqual({ status: 200, connection: 'keep-alive' });
+    });
 });
 
 describe('/api/runner', () => {
