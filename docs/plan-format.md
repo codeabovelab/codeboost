@@ -109,7 +109,7 @@ Every consumer of a current plan (execution, review, fixes, and conflict resolut
 
 ## Checks after import
 
-The schema checks the shape. codeboost then checks the meaning. A **failure** blocks approval. A **warning** shows on the item, and you can approve anyway. (The Plans screen does not show warnings or have an approval step yet: an import or an applied draft or suggestion creates the next revision directly. #155 tracks both.)
+The schema checks the shape. codeboost then checks the meaning. A **failure** blocks approval. A **warning** shows on the item, and you can approve anyway.
 
 | Check | Result if it fails |
 |---|---|
@@ -126,7 +126,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | The item has at least one `cmd`. | Warning: "No test command" |
 | Each `cmd` is parsed as one executable and literal arguments, with the entire argv matched element-for-element against a repo-approved argv entry. Prefix matches, appended flags, extra arguments, and argument substitution are not allowed. An unlisted argv needs the person's explicit approval as a new exact allowlist entry; plan approval alone does not grant execution permission. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
 | A completed agent invocation changes a dependency or a script codeboost will run. | Before its own installation or script invocation, codeboost stops in "needs approval". This post-invocation gate cannot prevent an agent from executing a changed script during its invocation; container and network restrictions must already contain that execution. |
-| `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway. (The Plans screen lists them read-only. It has no answer or approve control yet: #155.) |
+| `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
 
 **Submodules in version 1.** Gitlinks are review-only metadata leaves: the linking engine can display and attribute externally produced pointer changes, but v1 plans cannot author, add, delete, or rename a gitlink. Reject declarations targeting an existing gitlink and reject agent-produced gitlinks. Authoring them requires a future typed target-commit field and runner-controlled operation. Do not initialize or update nested submodule worktrees. Before each invocation that can write the task filesystem (an execute or fix agent, and a check that runs an item's `cmd` there), reject an initialized/populated gitlink directory and bind an empty read-only mount at every existing gitlink path; refuse the invocation if that protection cannot be enforced. A read-only invocation (planning, questions, review, and a check that runs as review) needs neither: its task filesystem is a fresh non-recursive clone, so every gitlink directory is empty, and it is mounted read-only, so nothing can fill one. Every directory above a gitlink is pinned for the invocation too (mounted again at its own path, so it cannot be renamed), so the gitlink's mount cannot be moved aside and its path refilled. Before tests and before committing, inspect gitlink locations without following links and reject nested content, including content under newly introduced gitlinks. A top-level Git diff is not enough. Reviewing submodule pointers reads the Git entry only; the agent never receives an editable nested checkout. Tests must attempt writes beneath a gitlink and provide a pre-populated nested checkout, and both must be refused.
 
@@ -149,10 +149,18 @@ Issue text and agent-produced plan fields remain untrusted. The prompt builder s
 | Source | What happens |
 |---|---|
 | **Claude drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
-| **You import a file** | In the Plans screen's Import plan section, pick a `.yaml`, `.yml`, or `.json` file and choose **Import next revision**. (Pasting a plan is not built yet: #155.) codeboost reads it, runs the schema and the checks after import, and saves it as the next revision. The file's `revision` is replaced by the next free number. |
-| **You edit on the Plans screen** | *Not built yet (#155).* Each change is checked as you type. Approving saves the revision. |
+| **You import a file** | On the Plans screen, choose "Import plan" and pick a `.yaml`, `.yml`, or `.json` file, or paste one. codeboost reads it, runs the schema and the checks after import, and saves it as the next draft revision. The file's `revision` is replaced by the next free number. |
+| **You edit on the Plans screen** | Each change is checked as you type. Approving saves the revision. |
 
 codeboost keeps the master copy in its own database. The copy in the PR description is written from that master and is never read back.
+
+### What the shipped Plans screen does today
+
+This guide and the v1 contract describe the full design. The Plans screen built in lane G (#145) differs from it in these ways:
+
+- **Not built yet (#155):** pasting a plan, editing on the Plans screen, showing check warnings, answering open questions, and a whole-plan approval step. Today an import, or an applied agent draft or suggestion, creates the next revision directly.
+- **Does not yet conform to the v1 suggestion-card contract (#159):** after one card is applied, the other cards lose their Apply control instead of showing it disabled. One **Dismiss suggestions** control discards the whole response; cards have no Dismiss of their own.
+- **Control names:** the import button is **Import next revision**. A suggestion card's button is **Apply this edit**, and a draft's is **Apply draft**.
 
 ## Suggested edits (plan assistant)
 
@@ -160,7 +168,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 
 - `reply`: its answer to you, in plain words;
 - `base_revision`: the revision it read. codeboost refuses edits made against an older revision;
-- `edits`: 0 to 10 suggested edits. Each one becomes a card with **Apply this edit**. **Dismiss suggestions** discards the whole response. Nothing changes until you click Apply. Applying one card creates the next revision and makes all remaining cards from that response stale, including independent edits.
+- `edits`: 0 to 10 suggested edits. Each one becomes a card with **Apply** and **Dismiss**. Nothing changes until you click Apply. Applying one card creates the next revision and makes all remaining cards from that response stale, including independent edits.
 
 | `op` | Fields it uses | What it does |
 |---|---|---|
@@ -174,7 +182,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 | `remove_check` | `item`, `check_index` | Removes an acceptance entry by position, starting at 0. |
 | `set_depends` | `item`, `depends_on` | Replaces the item's `depends_on` list. |
 
-**One card per revision.** Version 1 applies one selected card in one transaction, validates the complete resulting plan, increments the revision, and consumes that suggestion ID. In the same transaction, invalidate every other outstanding suggestion against the old revision. Remaining cards stay visible without Apply. Below them, one "Plan changed — refresh suggestions" line has a **Refresh suggestions** action. Refresh sends the unapplied requested changes and the new current plan to the assistant under a new server-bound request, returning new IDs/revision; the person reviews the new cards before applying another. Never silently bump base_revision or replay old operations (especially positional check indexes). Dismiss does not mutate the plan or revision. Concurrent Apply requests use compare-and-swap: exactly one wins, the other returns stale with no mutation; retrying a consumed ID cannot create another revision. The two edits in the example are alternatives available at revision 3, not two sequentially applicable cards from that same response. Test first Apply, sibling cards without Apply, refresh, second Apply, and concurrent/replayed requests.
+**One card per revision.** Version 1 applies one selected card in one transaction, validates the complete resulting plan, increments the revision, and consumes that suggestion ID. In the same transaction, invalidate every other outstanding suggestion against the old revision. Remaining cards show "Plan changed — refresh suggestions" with Apply disabled and a **Refresh suggestions** action. Refresh sends the unapplied requested changes and the new current plan to the assistant under a new server-bound request, returning new IDs/revision; the person reviews the new cards before applying another. Never silently bump base_revision or replay old operations (especially positional check indexes). Dismiss does not mutate the plan or revision. Concurrent Apply requests use compare-and-swap: exactly one wins, the other returns stale with no mutation; retrying a consumed ID cannot create another revision. The two edits in the example are alternatives available at revision 3, not two sequentially applicable cards from that same response. Test first Apply, disabled sibling Apply, refresh, second Apply, and concurrent/replayed requests.
 
 **Request identity binding.** `base_revision` is local to one plan, not a globally unique identity. Before an assistant request starts, the server persists an opaque request ID bound to the stable repository/task/plan IDs, schema version, and base revision. Store its response/suggestion IDs under that captured context only; never attach a late result to the currently selected UI plan. Apply accepts a server-issued suggestion ID, loads its bound context, and atomically verifies the target plan identity and revision before mutation. Reject unknown, canceled, cross-plan, or stale requests. A matching revision and item IDs on another plan are insufficient. The assistant response need not echo trusted IDs, and any identity claims in free text are ignored. Test two plans at revision 3 with P1 while a delayed response for A arrives with B selected: B must remain unchanged.
 
