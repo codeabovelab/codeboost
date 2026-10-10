@@ -199,8 +199,8 @@ describe('server shutdown', { timeout: 15_000 }, () => {
 });
 
 describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
-  // The drain limit is above Node's keep-alive timeout (5 s, plus 1 s of buffer), so a connection held until that
-  // timeout shows as a slow close instead of being cut at the drain limit.
+  // The drain limit is long, so a connection held open after the reply (until the client or Node's keep-alive timeout
+  // drops it, about 4–6 s) shows as a slow close instead of being cut at the drain limit.
   const drainMs = 10_000, prompt = 3_000, big = 4 * 1024 * 1024;
   const serveLong = () => serve(undefined, undefined, drainMs);
   /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records the reply and when it came. */
@@ -239,7 +239,7 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
   });
   it('shuts down promptly after refusing a body far over the limit', async () => {
     const { app, close } = await serveLong();
-    // fetch keeps the connection for reuse, as the browser does; Node's http client would drop it after the reply.
+    // fetch keeps the connection for reuse after the reply, as the browser does.
     const response = await fetch(`${origin(app)}/api/action`, { method: 'POST', body: 'x'.repeat(big),
       headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
     expect({ status: response.status, body: await response.text() }).toEqual({ status: 413, body: refused });
