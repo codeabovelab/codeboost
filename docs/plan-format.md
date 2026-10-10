@@ -160,7 +160,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 
 - `reply`: its answer to you, in plain words;
 - `base_revision`: the revision it read. codeboost refuses edits made against an older revision;
-- `edits`: 0 to 10 suggested edits. Each one becomes a card with **Apply** and **Dismiss**. Nothing changes until you click Apply. Applying one card creates the next revision and makes all remaining cards from that response stale, including independent edits.
+- `edits`: 0 to 10 suggested edits. Each one becomes a card with **Apply**. **Dismiss suggestions** discards the whole response. Nothing changes until you click Apply. Applying one card creates the next revision and makes all remaining cards from that response stale, including independent edits.
 
 | `op` | Fields it uses | What it does |
 |---|---|---|
