@@ -73,22 +73,25 @@ dedicated read-only gateway with these boundaries:
 
 ## Ownership and staged delivery
 
-H1-H3 own dedicated issue retrieval, normalization and ranking modules plus
-their tests and this document. They do not edit the Store, runner, shared web
-shell, package files or CI.
+Lane H is done. H1-H3 owned dedicated issue retrieval, normalization and
+ranking modules plus their tests and this document. They did not edit the
+Store, runner, shared web shell, package files or CI.
 
 **Schedule change (2026-09-25, approved by the product owner).** H4 was planned
-to wait for G4 to release the shared web files. G cannot start until E4 merges,
-and E4 waits for D5, so the web files had no active owner. H4 therefore takes
-them now, split in two:
+to wait for G4 to release the shared web files. G could not start until E4
+merged, and E4 waited for D5, so the web files had no active owner. H4
+therefore took them, split in two:
 
-- **H4a (this change): the Issues screen.** It owns `web/server.ts`,
+- **H4a (#55): the Issues screen.** It owned `web/server.ts`,
   `web/public/*`, a new `web/issues.ts`, the demo fixture
-  `scripts/demo-issues.ts` and their tests. It does not edit `runner/store.ts`.
-  It hands the web files to G when G1 starts.
-- **H4b: the "trust this issue" action.** It records trust decisions through
-  the storage owner (F) after F1's Store changes land, so the two lanes do not
-  both bump the schema version.
+  `scripts/demo-issues.ts` and their tests. It did not edit `runner/store.ts`.
+  Its plan was to hand the web files to G when G1 started. Lane G has since
+  finished and released its shared screen files (see
+  `docs/implementation/planning-screen.md`); `web/server.ts` is lane F's
+  server contract.
+- **H4b (#108, PR #139): the "trust this issue" action.** It was planned to
+  record trust decisions through the storage owner (F) after F1's Store changes
+  landed, so the two lanes would not both bump the schema version.
 
 H1 is complete when this policy and access inspection are committed. H2/H3 are
 complete when dedicated tests prove normalized retrieval, deterministic reasons,

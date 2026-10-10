@@ -156,6 +156,14 @@ Issue text and agent-produced plan fields remain untrusted. The prompt builder s
 
 codeboost keeps the master copy in its own database. The copy in the PR description is written from that master and is never read back.
 
+### What the shipped Plans screen does today
+
+This guide and the v1 contract describe the full design. The Plans screen built in lane G (#145) differs from it in these ways:
+
+- **Not built yet (#155):** pasting a plan, editing on the Plans screen, showing check warnings, answering open questions, a whole-plan approval step, and the amendment-proposal flow (the runner does not save a plan-change proposal, and the Plans screen cannot show or edit one; see "When the plan is wrong" in the design doc). Today an import, or an applied agent draft or suggestion, creates the next revision directly.
+- **Does not yet conform to the v1 suggestion-card contract (#159):** after one card is applied, the other cards lose their Apply control instead of showing it disabled. One **Dismiss suggestions** control discards the whole response; cards have no Dismiss of their own.
+- **Control names:** the import button is **Import next revision**. A suggestion card's button is **Apply this edit**, and a draft's is **Apply draft**.
+
 ## Suggested edits (plan assistant)
 
 When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json):
