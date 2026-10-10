@@ -1345,3 +1345,49 @@ it('leaves a running preparation in charge when a push settlement is requested m
   expect(fixture.branchReads()).toBe(0);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('pushes nothing when the task is reassigned while the push authorization is read', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 2) return; // validations: 1 rebase, 2 push authorization read
+    const identity = service.config.identity;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.pushes).toEqual([]);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('keeps the process-settlement reserve inside a settlement read\'s time limit', async () => {
+  // Reserve plus 2 s left: the read may run for at most about 2 s, leaving the reserve for Git to settle.
+  let startedAt = 0, failedAt = 0, pushedAt = 0;
+  const fixture = await rebaseFixture('feature\n', undefined, { branchReadHangs: true,
+    // Just after the preparation started, so `leaveOfDeadline` measures from (almost) its own start.
+    duringRebase() { startedAt = performance.now(); },
+    pushFailure() {
+    leaveOfDeadline(startedAt, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 2_000);
+    pushedAt = Date.now();
+    return new Error('connection reset');
+  } });
+  failedAt = Date.now();
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset' });
+  expect(fixture.branchReads()).toBe(1);
+  expect(failedAt - pushedAt).toBeLessThan(8_000);
+  expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('starts no settlement read when less than the process-settlement reserve is left', async () => {
+  let startedAt = 0;
+  const fixture = await rebaseFixture('feature\n', undefined, { branchReadHangs: true,
+    duringRebase() { startedAt = performance.now(); },
+    pushFailure() {
+    leaveOfDeadline(startedAt, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS - 1_000);
+    return new Error('connection reset');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset' });
+  expect(fixture.branchReads()).toBe(0);
+  expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});

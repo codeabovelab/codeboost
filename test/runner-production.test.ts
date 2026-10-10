@@ -135,7 +135,11 @@ describe('runner startup', () => {
       await coordinator.remote.push({ branch: 'codeboost/task-1', from, to, beforePush });
       expect(push).toHaveBeenCalledWith(service.config.identity,
         expect.objectContaining({ head: to, branch: 'codeboost/task-1', expected: from }), undefined);
-      push.mock.calls[0]![1].beforePush!();
+      // The boundary only hands back the guard; the pusher runs it as its finalizer, synchronously, as Git starts.
+      const finalize = await push.mock.calls[0]![1].beforePush!();
+      expect(beforePush).not.toHaveBeenCalled();
+      expect(finalize).toBeTypeOf('function');
+      (finalize as () => void)();
       expect(beforePush).toHaveBeenCalledOnce();
       await expect(coordinator.remote.readBranch('codeboost/task-1')).resolves.toBeNull();
       expect(read).toHaveBeenCalledWith(service.config.identity, 'codeboost/task-1', undefined);

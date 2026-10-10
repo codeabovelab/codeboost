@@ -334,8 +334,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       inspect,
       fetch: (pair, signal) => pusher.fetchCommits([pair.base, pair.head], signal),
       // Leased to exactly the inspected head the rebase rewrote; the coordinator's durable marker brackets the write.
+      // The guard is returned as the boundary's finalizer, which the pusher runs synchronously as Git starts: nothing can
+      // land between the last check and the write.
       push: (input, signal) => pusher.push(identity, { head: input.to, branch: input.branch, expected: input.from,
-        beforePush: () => { input.beforePush(); } }, signal),
+        beforePush: async () => input.beforePush }, signal),
       readBranch: (branch, signal) => pusher.readBranch(identity, branch, signal),
     }, undefined, o.capability, authorize);
   };

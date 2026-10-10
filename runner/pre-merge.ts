@@ -197,9 +197,15 @@ export class PreMergeCoordinator {
     this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(identity).planKey, marker.attemptId));
     return { before, after: this.service.store.getTask(identity).stateVersion };
   }
+  /**
+   * One branch read, all of it, Git's settlement after an abort included, within `limitMs` (at most
+   * PUSH_SETTLEMENT_TIMEOUT_MS): the read is aborted the process-settlement reserve before that, and does not start
+   * when less than the reserve is left.
+   */
   async #settlePush(marker: PushMarker, limitMs = PUSH_SETTLEMENT_TIMEOUT_MS): Promise<{ outcome: PushOutcome; before: number; after: number }> {
-    const read = await this.remote.readBranch(marker.branch,
-      AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(Math.max(1, Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs)))]));
+    const readMs = Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs) - this.processSettlementReserveMs;
+    if (readMs < 1) throw Object.assign(new Error('Too little time is left to read the branch and settle Git.'), { code: 'ETIMEDOUT' });
+    const read = await this.remote.readBranch(marker.branch, AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(readMs)]));
     const outcome: PushOutcome = read === marker.to ? 'pushed' : read === marker.from ? 'not-pushed' : 'moved';
     return { outcome, ...this.#finishPush(marker) };
   }
@@ -291,9 +297,12 @@ export class PreMergeCoordinator {
     if (!remote.branch) throw new GuardRefusal('The pull request was not published by the runner, so its rewritten head cannot be pushed.');
     const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
       reviewVersion: view.expected.reviewVersion! };
+    // Captured before the asynchronous authorization read: any task write that lands during it (a reassignment, a
+    // referenced-code change) must refuse the claim, not be adopted by it.
+    const admitted = this.service.store.getTask(identity).stateVersion;
     const authorization = await authorize();
     signal.throwIfAborted();
-    const marker = this.service.store.beginPrePush(identity, reviewed, this.service.store.getTask(identity).stateVersion,
+    const marker = this.service.store.beginPrePush(identity, reviewed, admitted,
       { branch: remote.branch, from: remote.head, to: view.snapshot.head });
     const binding = this.service.store.getTask(identity).stateVersion;
     // The task state this push left, for binding a later failure: the version clearing the marker produced when nothing
