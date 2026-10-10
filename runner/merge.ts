@@ -162,8 +162,11 @@ export class MergeCoordinator {
     return (await this.#status(view, fresh, signal)).status;
   }
 
-  /** Fresh exact base/head pair for pre-merge preparation, using the same task-PR resolution as merge admission. */
-  async remotePair(signal?: AbortSignal): Promise<{ base: string; head: string }> {
+  /**
+   * Fresh exact base/head pair for pre-merge preparation, using the same task-PR resolution as merge admission. `branch`
+   * is the task PR's head branch when the runner published it; only then may preparation push a rewritten head.
+   */
+  async remotePair(signal?: AbortSignal): Promise<{ base: string; head: string; branch?: string }> {
     const resolved = this.#resolve(this.#attempt());
     const remote = await this.gateway.inspect({ fresh: true, timeoutMs: 6_000, signal,
       ...(resolved.target ? { target: resolved.target } : {}) });
@@ -178,7 +181,7 @@ export class MergeCoordinator {
       const blockers = this.#publishedBlockers(remote, resolved);
       if (blockers.length) throw new GuardRefusal(blockers[0]!.message);
     }
-    return { base: remote.base, head: remote.head };
+    return { base: remote.base, head: remote.head, ...(resolved.headBranch !== undefined ? { branch: resolved.headBranch } : {}) };
   }
 
   async #status(view: ReviewView, fresh: boolean, signal?: AbortSignal): Promise<{ status: MergeStatus; resolved: ResolvedTarget }> {
@@ -198,7 +201,9 @@ export class MergeCoordinator {
     if (this.service.store && this.service.config) {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
-      if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
+      if (task.pushInProgress) blockers.push({ code: 'preparation',
+        message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' });
+      else if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
         && !this.service.store.preMergeReady(this.service.config.identity, {
           stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
           snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,

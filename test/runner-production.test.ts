@@ -17,6 +17,7 @@ import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 import type { GitRebaser } from '../runner/rebase.ts';
+import { GitBranchPusher } from '../runner/branch-push.ts';
 
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
 const issueReads: number[] = [];
@@ -120,6 +121,29 @@ describe('runner startup', () => {
     expect(existsSync(join(root, 'runner', 'diagnostics'))).toBe(false);
     expect(await assembly.sources.vendor(service.config.identity)).toBe('claude');
     expect(() => assembly.sources.planContext({ ...service.config.identity, planId: 'other' })).toThrow(/only its configured plan/);
+  });
+  it('pushes a prepared rewrite only under an exact lease on the PR head it rewrote', async () => {
+    const { root, service } = fixture(), calls: string[] = [];
+    const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'sha256:x', recovery: () => recovery(calls) });
+    const push = vi.spyOn(GitBranchPusher.prototype, 'push').mockResolvedValue();
+    const read = vi.spyOn(GitBranchPusher.prototype, 'readBranch').mockResolvedValue(null);
+    try {
+      const coordinator = assembly.preMerge!({} as RunnerCoordinator, async () => ({ base: 'a'.repeat(40), head: 'a'.repeat(40) }),
+        async () => ({ refresh: async () => undefined, validate: () => undefined }));
+      const beforePush = vi.fn(), from = 'c'.repeat(40), to = 'd'.repeat(40);
+      await coordinator.remote.push({ branch: 'codeboost/task-1', from, to, beforePush });
+      expect(push).toHaveBeenCalledWith(service.config.identity,
+        expect.objectContaining({ head: to, branch: 'codeboost/task-1', expected: from }), undefined);
+      // The boundary only hands back the guard; the pusher runs it as its finalizer, synchronously, as Git starts.
+      const finalize = await push.mock.calls[0]![1].beforePush!();
+      expect(beforePush).not.toHaveBeenCalled();
+      expect(finalize).toBeTypeOf('function');
+      (finalize as () => void)();
+      expect(beforePush).toHaveBeenCalledOnce();
+      await expect(coordinator.remote.readBranch('codeboost/task-1')).resolves.toBeNull();
+      expect(read).toHaveBeenCalledWith(service.config.identity, 'codeboost/task-1', undefined);
+    } finally { push.mockRestore(); read.mockRestore(); }
   });
   it('reads the issue once for a run of items, and again once the reuse window has passed', async () => {
     const { root, service } = fixture();

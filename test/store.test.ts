@@ -121,7 +121,7 @@ it('scopes issue trust to repository and current author, supports revoke, and mi
   legacy.exec('DROP TABLE issue_trust; ALTER TABLE attempts DROP COLUMN prompt_comments; PRAGMA user_version=16;'); legacy.close();
   const migrated = open(path), db = new DatabaseSync(path);
   try {
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='issue_trust'").get()).toEqual({ name: 'issue_trust' });
     expect(db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments')).toBe(true);
     expect(migrated.issueTrust('owner/a', 5)).toBeNull();

@@ -105,7 +105,7 @@ describe('schema v12 review ordering', () => {
     migrated.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: migratedVersion },
       [{ item: 'P1', fingerprint: 'approved-after-upgrade' }], []);
     expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
 });
 
@@ -783,7 +783,7 @@ describe('runner commits and preparation groups (#87)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN preparation_identity; PRAGMA user_version=15;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, preparationIdentity: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
 });
 
@@ -917,7 +917,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
 
   it('adds the durable owed marker to a version 12 database', () => {
@@ -927,7 +927,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_owed; PRAGMA user_version=12;'); db.close();
     const reopened = open(path);
     expect(reopened.owedSafetyFindings()).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
 
   it('restores and clears an escalation owed behind a human gate across real store reopens', () => {
@@ -967,7 +967,7 @@ describe('allocation baseline (#91)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
 });
 describe('publish outcomes (#103)', () => {
@@ -983,7 +983,7 @@ describe('publish outcomes (#103)', () => {
     reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
     expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
     expect(reopened.getTask(identity)).toEqual(before);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
   });
   it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
     const { store } = queued(), version = store.getTask(identity).stateVersion;
@@ -1000,5 +1000,89 @@ describe('publish outcomes (#103)', () => {
     db.exec('DROP TABLE publish_outcomes; PRAGMA user_version=9;'); db.close();
     expect(open(path).lastPublish(identity)).toMatchObject({ outcome: 'not published', draft: false, stateVersion: version,
       message: expect.stringMatching(/Use the publish action/) });
+  });
+});
+
+describe('pre-merge push marker (F6a of #22)', () => {
+  const BRANCH = 'codeboost/task-1';
+  /** The fixture's head oid(2) rewritten to oid(12) on a moved base oid(10). */
+  function rewritten() {
+    const f = fixture();
+    const reviewed = () => ({ revision: 1, snapshotId: f.store.getSnapshot(identity).id, reviewVersion: f.store.reviewVersion(identity) });
+    f.store.recordHistory(identity, reviewed(), oid(1), oid(2), [{ sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }]);
+    f.store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+    return { ...f, reviewed };
+  }
+  const begin = (f: ReturnType<typeof rewritten>, input: Partial<{ branch: string; from: string; to: string }> = {}) =>
+    f.store.beginPrePush(identity, f.reviewed(), f.store.getTask(identity).stateVersion,
+      { branch: BRANCH, from: oid(2), to: oid(12), ...input });
+
+  it('migrates a v17 store and reopens it unchanged', () => {
+    const { store, path } = fixture();
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const legacy = new DatabaseSync(path);
+    legacy.exec('ALTER TABLE tasks DROP COLUMN push_in_progress; PRAGMA user_version=17;'); legacy.close();
+    expect(open(path).getTask(identity).pushInProgress).toBeNull();
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
+  });
+
+  it('claims only a push of the current head over a durable rewrite predecessor', () => {
+    const f = rewritten();
+    expect(() => begin(f, { from: oid(5) })).toThrow(/not a rewrite predecessor/);
+    expect(() => begin(f, { to: oid(2), from: oid(12) })).toThrow(/reviewed head changed/);
+    expect(() => begin(f, { branch: 'main' })).toThrow(/codeboost\/ task branch/);
+    const version = f.store.getTask(identity).stateVersion;
+    const marker = begin(f);
+    expect(f.store.getTask(identity)).toMatchObject({ stateVersion: version + 1,
+      pushInProgress: { attemptId: marker.attemptId, branch: BRANCH, from: oid(2), to: oid(12), snapshotId: f.store.getSnapshot(identity).id } });
+    expect(() => begin(f)).toThrow(/Stale task state|push of the rewritten head is in progress/);
+  });
+
+  it('refuses a push claim for a task that is not mergeable, is being cancelled, or has an attempt or merge in flight', () => {
+    const queuedTask = rewritten();
+    queuedTask.store.transitionTask(identity, queuedTask.store.getTask(identity).stateVersion, 'queued');
+    expect(() => begin(queuedTask)).toThrow(/The task is queued; push it from review/);
+
+    const attempting = rewritten();
+    admit(attempting.store, { kind: 'check' });
+    expect(() => begin(attempting)).toThrow(/attempt is still active/);
+
+    const cancelling = rewritten();
+    admit(cancelling.store, { kind: 'check' });
+    expect(cancelling.store.cancelTask(identity, cancelling.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+    expect(() => begin(cancelling)).toThrow(/being cancelled/);
+
+    const merging = rewritten();
+    merging.store.beginMergeAttempt(identity, merging.reviewed(), oid(12), null, 'direct', randomUUID(), merging.store.getTask(identity).stateVersion);
+    expect(() => begin(merging)).toThrow(/merge is in progress/);
+  });
+
+  it('blocks every other task write, rebase and merge until the push settles, and survives a restart', () => {
+    const f = rewritten(), marker = begin(f), version = () => f.store.getTask(identity).stateVersion;
+    expect(() => f.store.transitionTask(identity, version(), 'queued')).toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.beginMergeAttempt(identity, f.reviewed(), oid(12), null, 'direct', randomUUID(), version()))
+      .toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.beginRebase(identity, f.reviewed(), version(), { oldBase: oid(10), oldHead: oid(12), onto: oid(20), oldHistory: [oid(12)] }))
+      .toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.recordRebase(identity, f.reviewed(), oid(20), oid(22), [{ oldSha: oid(12), newSha: oid(22) }]))
+      .toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.admitAttempt(identity, { expectedStateVersion: version(), kind: 'check', item: 'P1',
+      expectedContext: f.store.currentContext(identity), deadline: later() })).toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.setAssignment(identity, version(), 'someone', 'b'.repeat(40))).toThrow(/push of the rewritten head is in progress/);
+    f.store.close(); stores.splice(stores.indexOf(f.store), 1);
+    const reopened = open(f.path);
+    expect(reopened.pushesInProgress()).toEqual([{ planKey: reopened.getTask(identity).planKey, marker }]);
+    expect(reopened.finishPrePush(reopened.getTask(identity).planKey, randomUUID())).toBe(false);
+    expect(reopened.finishPrePush(reopened.getTask(identity).planKey, marker.attemptId)).toBe(true);
+    expect(reopened.getTask(identity).pushInProgress).toBeNull();
+    expect(reopened.pushesInProgress()).toEqual([]);
+  });
+
+  it('defers a cancel requested during the push until its outcome is read, then closes the task', () => {
+    const f = rewritten(), marker = begin(f), actionId = randomUUID();
+    expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, actionId)).toBe('stopping');
+    expect(f.store.getTask(identity).status).toBe('in review');
+    expect(f.store.finishPrePush(f.store.getTask(identity).planKey, marker.attemptId)).toBe(true);
+    expect(f.store.getTask(identity).status).toBe('cancelled');
   });
 });

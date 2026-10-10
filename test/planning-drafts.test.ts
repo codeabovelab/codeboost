@@ -170,7 +170,7 @@ it.each([9, 10])('migrates a v%i database to the current schema, reading its exi
   const migrated = open();
   expect(migrated.getSuggestions(identity, id)).toMatchObject({ mode: 'suggest', state: 'pending' });
   const db = new DatabaseSync(path);
-  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 }); } finally { db.close(); }
+  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 }); } finally { db.close(); }
 });
 it('adds checkpoint bindings to v14 planning requests without losing their state', () => {
   const { store, path, open } = fixture(), id = store.beginSuggestions(identity, state(store), 'draft');
@@ -181,7 +181,7 @@ it('adds checkpoint bindings to v14 planning requests without losing their state
   expect(migrated.getDraft(identity, id).state).toBe('pending');
   const db = new DatabaseSync(path);
   try {
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 18 });
     expect(db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'continuation')).toBe(true);
   } finally { db.close(); }
 });
