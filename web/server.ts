@@ -602,8 +602,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const chunks: Buffer[] = []; let size = 0;
         const limit = path === '/api/plan/import' ? MAX_IMPORT_REQUEST_BYTES : MAX_REQUEST_BYTES;
         activeRequest.readingBody=true;
-        try { for await (const chunk of req) { size += chunk.length; if (size > limit) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
+        // Past the limit, the rest of the body is read and discarded, and the 413 goes out once it ends (#157). A reply
+        // while the client is still sending leaves the connection half read: it is held until the keep-alive timeout,
+        // delaying shutdown, and the client can be reset before it reads the reply. Shutdown still destroys a request
+        // that is discarding its body (readingBody stays set), as it does any request still reading one.
+        try { for await (const chunk of req) { size += chunk.length; if (size <= limit) chunks.push(chunk); } }
         finally { activeRequest.readingBody=false; }
+        if (size > limit) { json(413, { error: 'Request too large.' }); return; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
         // Admitted requests drain normally (AGENTS.md); only the irreversible merge boundary rechecks the flag.

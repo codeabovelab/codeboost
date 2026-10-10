@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
-import { RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
+import { MAX_REQUEST_BYTES, RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
@@ -195,6 +195,55 @@ describe('server shutdown', { timeout: 15_000 }, () => {
     app.service.store.closeWrites();
     const response = await api(app, 'GET', '/api/review');
     expect(response).toEqual({ status: 503, body: { error: 'The review server is shutting down.' } });
+  });
+});
+
+describe('an oversized request body (#157)', () => {
+  /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records when the reply arrived. */
+  function oversized(app: App, first: number) {
+    const url = new URL(origin(app));
+    const state: { status?: number; body?: string; error?: Error; endedAt?: number; repliedAt?: number } = {};
+    const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/action', method: 'POST',
+      headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } }, res => {
+      state.repliedAt = performance.now(); state.status = res.statusCode;
+      let data = ''; res.on('data', chunk => { data += chunk; }); res.on('end', () => { state.body = data; });
+    });
+    const settled = new Promise<void>(resolve => { req.on('close', resolve); });
+    req.on('error', error => { state.error = error; });
+    req.write('x'.repeat(first));
+    return { state, settled, send: (bytes: number) => req.write('x'.repeat(bytes)), end: () => { state.endedAt = performance.now(); req.end(); } };
+  }
+
+  it('replies 413 only once the whole body has arrived', async () => {
+    const { app } = await serve();
+    const sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(sent.state.status).toBeUndefined();
+    sent.send(4 * 1024 * 1024); sent.end();
+    await sent.settled;
+    expect(sent.state).toMatchObject({ status: 413, body: JSON.stringify({ error: 'Request too large.' }) });
+    expect(sent.state.error).toBeUndefined();
+    expect(sent.state.repliedAt).toBeGreaterThanOrEqual(sent.state.endedAt!);
+  });
+  it('shuts down promptly after refusing a body far over the limit', async () => {
+    const { app, close } = await serve();
+    const response = await fetch(`${origin(app)}/api/action`, { method: 'POST', body: 'x'.repeat(4 * 1024 * 1024),
+      headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
+    expect(response.status).toBe(413);
+    await response.text();
+    // A half-read connection was held until Node's keep-alive timeout (5 s, plus 1 s of buffer) before close settled.
+    const started = performance.now();
+    await close();
+    expect(performance.now() - started).toBeLessThan(3_000);
+  });
+  it('destroys an oversized request still being sent after the drain limit, and close settles', async () => {
+    const { app, close } = await serve();
+    const sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await close();
+    await sent.settled;
+    expect(sent.state.status).toBeUndefined();
+    expect(sent.state.error).toBeDefined();
   });
 });
 
