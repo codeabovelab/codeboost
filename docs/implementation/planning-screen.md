@@ -42,4 +42,4 @@ G1–G4 have merged as PRs #148, #150, #151 and #152, which completes lane G (#1
 
 Three related issues remain open. #146: `POST /api/plan/import` refuses request bodies over 16 KiB, but some schema-valid plans are larger. The fix is to raise the server's request limit, or to tighten the schema or import bound so the two agree. The screen needs no change. The #145 progress notes record #146 as lane F's work, because `web/server.ts` is an F-owned server contract.
 
-#155: `docs/plan-format.md` and the design doc describe paste import, in-screen plan editing and a view of the runner's amendment proposal, which were not built. #156: the runner-lifecycle decision to revisit E3's early `cancelled` write at G4 was not recorded.
+#155: `docs/plan-format.md` and the design doc describe Plans screen features that were not built: paste import, in-screen plan editing, a view of the runner's amendment proposal, check warnings and answering open questions. #156: the runner-lifecycle decision to revisit E3's early `cancelled` write at G4 was not recorded.
