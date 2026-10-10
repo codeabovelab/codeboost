@@ -323,7 +323,9 @@ export class PreMergeCoordinator {
     } catch (error) {
       if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
       // Shutdown: no new GitHub read may start; startup settles the marker. Otherwise one read, within what is left of
-      // the preparation's deadline (its settlement reserve included), settles it. A cancel does not stop that read.
+      // the preparation's deadline with Git's settlement reserve kept inside it, settles it; a cancel does not stop that
+      // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
+      // the marker stays, as for an unreadable branch.
       let settled = binding;
       const left = Math.floor(deadline - performance.now());
       if (!this.#closing && left >= 1) {

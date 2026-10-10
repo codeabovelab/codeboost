@@ -1215,14 +1215,18 @@ it('ends the wait for the pushed head when the preparation deadline, not the vis
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
-it('bounds the settlement read after a failed push by what is left of the preparation deadline', async () => {
-  const startedAt = performance.now();
-  const fixture = await rebaseFixture('feature\n', undefined, { branchReadHangs: true, pushFailure() {
-    leaveOfDeadline(startedAt, 1_000);
-    return new Error('connection reset');
-  } });
-  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset' });
-  // The read was cut off by the deadline, so the outcome is still unknown and the marker stays.
+it('leaves the push marker without a branch read when the preparation deadline ends the push', async () => {
+  let startedAt = 0;
+  const fixture = await rebaseFixture('feature\n', undefined, { branchReadHangs: true,
+    duringRebase() { startedAt = performance.now(); },
+    pushFailure() {
+      // The preparation's timer aborts its work the settlement reserve before the deadline; so does this push.
+      leaveOfDeadline(startedAt, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS - 50);
+      return Object.assign(new Error('Pre-merge preparation deadline exceeded.'), { code: 'ETIMEDOUT' });
+    } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+  // Less than Git's settlement reserve is left, so no read starts: the outcome stays unknown and the marker stays.
+  expect(fixture.branchReads()).toBe(0);
   expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
