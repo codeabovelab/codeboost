@@ -6,7 +6,7 @@ Repo: codeabovelab/codeboost
 Status: APPROVED
 Mode: Builder (open source / research)
 Writing standard: plain language, ISO 24495-1:2023
-Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes"). For the current state of each lane, see the lane table in `docs/architecture.md`.
+Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes"). The summary and build-step status were updated later as lanes merged. For the current state of each lane, see the lane table in `docs/architecture.md`.
 
 ## About this document
 
@@ -27,7 +27,7 @@ Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel bui
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
 - **How it stays safe.** Agents run inside a container that holds only the task's code and the credential for that phase, so your other files and credentials are not there. Ask, code-writing runs, and conflict resolution use provider-specific containers; exact-head `cmd:` checks use a credential-free read-only profile. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **Where the build is.** Built: the plan and linking library, SQLite store, review screen with Ask and change requests, guarded merge gate with merge-queue support, agent isolation boundary, Planning screen (lane G, #145), opt-in code-writing runner and publishing, durable local rebase/conflict resolution, and pre-merge base/head refresh with exact-head `cmd:` checks. Still deferred: pushing the rewritten head, waiting for its required checks, handing that exact pair to guarded merge, and the Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
+- **Where the build is.** Built: the plan and linking library, SQLite store, review screen with Ask and change requests, guarded merge gate with merge-queue support, agent isolation boundary, Plans screen (lane G, #145), opt-in code-writing runner and publishing, durable local rebase/conflict resolution, and pre-merge base/head refresh with exact-head `cmd:` checks. Still deferred: pushing the rewritten head, waiting for its required checks, handing that exact pair to guarded merge, and the Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 

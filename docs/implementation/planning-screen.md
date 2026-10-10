@@ -38,6 +38,6 @@ Suggestion replies render as plain text followed by one line-separated row per t
 
 ## Handoff
 
-G1–G4 have merged as PRs #148, #150, #151 and #152, which completes lane G (#145). Lane G no longer owns `web/public/index.html`, `web/public/app.js`, `web/public/style.css`, `test/browser/plans.spec.ts`, `test/browser/plans-authoring.spec.ts`, `test/browser/plans-production.spec.ts` or this document. The next change to those files takes ownership under the usual rules: check open PRs and worktrees first.
+G1–G4 have merged as PRs #148, #150, #151 and #152, which completes lane G (#145). Lane G no longer owns `web/public/index.html`, `web/public/app.js`, `web/public/style.css`, `test/browser/plans.spec.ts`, `test/browser/plans-authoring.spec.ts`, `test/browser/plans-production.spec.ts` or this document. G3 also edited `web/server.ts` and `test/planning-drafts-api.test.ts`; those stay with lane F, which owns the server contract. Before the next change to any of these files, follow "Task resumption and ownership" in `AGENTS.md`: check open PRs, branches and worktrees first.
 
 One related issue remains open. #146: `POST /api/plan/import` refuses request bodies over 16 KiB, but some schema-valid plans are larger. Lane F owns it, because the fix is in the server's request limit, not in the screen.
