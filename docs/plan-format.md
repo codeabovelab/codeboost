@@ -158,7 +158,7 @@ codeboost keeps the master copy in its own database. The copy in the PR descript
 
 This guide and the v1 contract describe the full design. The Plans screen built in lane G (#145) differs from it in these ways:
 
-- **Not built yet (#155):** pasting a plan, editing on the Plans screen, showing check warnings, answering open questions, and a whole-plan approval step. Today an import, or an applied agent draft or suggestion, creates the next revision directly.
+- **Not built yet (#155):** pasting a plan, editing on the Plans screen, showing check warnings, answering open questions, a whole-plan approval step, and the amendment-proposal flow (the runner does not save a plan-change proposal, and the Plans screen cannot show or edit one; see "When the plan is wrong" in the design doc). Today an import, or an applied agent draft or suggestion, creates the next revision directly.
 - **Does not yet conform to the v1 suggestion-card contract (#159):** after one card is applied, the other cards lose their Apply control instead of showing it disabled. One **Dismiss suggestions** control discards the whole response; cards have no Dismiss of their own.
 - **Import size (#146):** the server refuses import requests over 16 KiB, so some schema-valid plans cannot be imported yet.
 - **Control names:** the import button is **Import next revision**. A suggestion card's button is **Apply this edit**, and a draft's is **Apply draft**.
