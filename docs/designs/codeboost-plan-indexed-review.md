@@ -2165,7 +2165,7 @@ None proposed. Every fix is in the plan and in the tasks below.
 
 Built from this review's decisions. Tick each one as you ship it.
 
-**Status (checked against `main` on 2026-09-26).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
+**Status (checked against `main` on 2026-09-26; Plans entries updated after G4, PR #152).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
 - Built: two-tab composer and "n pending changes" tags (part of DT4); the notice below 1280px (part of DT13); the `?` shortcut help (part of DT12); a blocker list from the guarded merge gate (part of DT7).
 - Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 7 to 9; Issues became a link in #55 and Plans in G1, #148); the approved Plans mockup's expandable row editing (not built, #155) and bottom-drawer plan assistant (the built screen puts the assistant in a side panel); Lessons inbox and Learning screen (DT14, DT15, build step 9).
 - Not yet audited against their Verify lines: DT2, DT3, DT5, DT6, DT9, DT10, DT11.
