@@ -20,6 +20,7 @@ import { IssueBoard } from './issues.ts';
 import { SuggestionCoordinator, type PlanningMode, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
+import { MAX_SOURCE_BYTES } from '../core/parse-v1.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
 export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & {
   repo: { name: string; baseRef: string };
@@ -44,6 +45,15 @@ export const PLANNING_SHUTDOWN_GRACE_MS = 20_000;
 /** Production planning is built after the Store opens, from the review it serves (see web/cli.ts). */
 export type PlanningSetup = (service: ReviewService) => PlanningDeps;
 const publicRoot = new URL('./public/', import.meta.url);
+/** The largest body of a POST request other than plan import, in bytes. */
+export const MAX_REQUEST_BYTES = 16 * 1024;
+/**
+ * The largest body of `POST /api/plan/import`, in bytes (#146). The body carries the plan source as one JSON string.
+ * Any JSON encoding writes each UTF-8 byte of that source as at most 6 bytes (`\u0001` for a control character, which
+ * YAML accepts in a scalar). So the limit admits every source within the parser's limit, inside any envelope that
+ * fits MAX_REQUEST_BYTES with an empty source. A larger source then gets the parser's refusal, not a transport one.
+ */
+export const MAX_IMPORT_REQUEST_BYTES = 6 * MAX_SOURCE_BYTES + MAX_REQUEST_BYTES;
 /** The longest shutdown waits for admitted requests to finish before aborting them; below the 15 s request timeout. */
 export const MAX_SHUTDOWN_DRAIN_MS = 14_500;
 /**
@@ -589,8 +599,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const planningPath = path === '/api/plan/import' || PLANNING_REQUEST.test(path);
         if (req.method !== 'POST' || !(['/api/action','/api/settings','/api/issues','/api/runner'].includes(path) || planningPath) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
+        const limit = path === '/api/plan/import' ? MAX_IMPORT_REQUEST_BYTES : MAX_REQUEST_BYTES;
         activeRequest.readingBody=true;
-        try { for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
+        try { for await (const chunk of req) { size += chunk.length; if (size > limit) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
         finally { activeRequest.readingBody=false; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
