@@ -109,7 +109,7 @@ Every consumer of a current plan (execution, review, fixes, and conflict resolut
 
 ## Checks after import
 
-The schema checks the shape. codeboost then checks the meaning. A **failure** blocks approval. A **warning** shows on the item, and you can approve anyway.
+The schema checks the shape. codeboost then checks the meaning. A **failure** blocks approval. A **warning** shows on the item, and you can approve anyway. (The Plans screen does not show warnings yet: #155.)
 
 | Check | Result if it fails |
 |---|---|
@@ -126,7 +126,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | The item has at least one `cmd`. | Warning: "No test command" |
 | Each `cmd` is parsed as one executable and literal arguments, with the entire argv matched element-for-element against a repo-approved argv entry. Prefix matches, appended flags, extra arguments, and argument substitution are not allowed. An unlisted argv needs the person's explicit approval as a new exact allowlist entry; plan approval alone does not grant execution permission. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
 | A completed agent invocation changes a dependency or a script codeboost will run. | Before its own installation or script invocation, codeboost stops in "needs approval". This post-invocation gate cannot prevent an agent from executing a changed script during its invocation; container and network restrictions must already contain that execution. |
-| `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
+| `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway. (The Plans screen lists them read-only; answering is not built yet: #155.) |
 
 **Submodules in version 1.** Gitlinks are review-only metadata leaves: the linking engine can display and attribute externally produced pointer changes, but v1 plans cannot author, add, delete, or rename a gitlink. Reject declarations targeting an existing gitlink and reject agent-produced gitlinks. Authoring them requires a future typed target-commit field and runner-controlled operation. Do not initialize or update nested submodule worktrees. Before each invocation that can write the task filesystem (an execute or fix agent, and a check that runs an item's `cmd` there), reject an initialized/populated gitlink directory and bind an empty read-only mount at every existing gitlink path; refuse the invocation if that protection cannot be enforced. A read-only invocation (planning, questions, review, and a check that runs as review) needs neither: its task filesystem is a fresh non-recursive clone, so every gitlink directory is empty, and it is mounted read-only, so nothing can fill one. Every directory above a gitlink is pinned for the invocation too (mounted again at its own path, so it cannot be renamed), so the gitlink's mount cannot be moved aside and its path refilled. Before tests and before committing, inspect gitlink locations without following links and reject nested content, including content under newly introduced gitlinks. A top-level Git diff is not enough. Reviewing submodule pointers reads the Git entry only; the agent never receives an editable nested checkout. Tests must attempt writes beneath a gitlink and provide a pre-populated nested checkout, and both must be refused.
 
