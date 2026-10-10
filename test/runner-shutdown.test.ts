@@ -28,9 +28,9 @@ afterEach(async () => {
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 function demo() { const root = mkdtempSync(join(tmpdir(), 'codeboost-shutdown-')); roots.push(root); return createDemo(join(root, 'demo')); }
 type App = Awaited<ReturnType<typeof startServer>>;
-async function serve(deps?: RunnerDeps, agent: QuestionAgent = async () => 'answer') {
+async function serve(deps?: RunnerDeps, agent: QuestionAgent = async () => 'answer', drainMs = 2_000) {
   const config = demo();
-  const app = await startServer(config, 0, agent, undefined, 2_000, undefined, deps);
+  const app = await startServer(config, 0, agent, undefined, drainMs, undefined, deps);
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await app.close(); } };
   cleanups.push(close);
@@ -199,6 +199,10 @@ describe('server shutdown', { timeout: 15_000 }, () => {
 });
 
 describe('an oversized request body (#157)', () => {
+  // The drain limit is above Node's keep-alive timeout (5 s, plus 1 s of buffer), so a connection held until that
+  // timeout shows as a slow close instead of being cut at the drain limit.
+  const drainMs = 10_000, prompt = 3_000, big = 4 * 1024 * 1024;
+  const serveLong = () => serve(undefined, undefined, drainMs);
   /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records the reply and when it came. */
   function oversized(app: App, first: number, options: { path?: string; token?: string; contentType?: string } = {}) {
     const url = new URL(origin(app));
@@ -213,46 +217,50 @@ describe('an oversized request body (#157)', () => {
     req.write('x'.repeat(first));
     return { state, settled, send: (bytes: number) => req.write('x'.repeat(bytes)), end: () => { state.endedAt = performance.now(); req.end(); } };
   }
-  /** Resolves once the server's handler has run up to its first await for the next request (the body read, for a POST). */
-  const handled = (app: App) => new Promise<void>(resolve => { app.server.once('request', () => setImmediate(resolve)); });
+  /** Resolves once the server has taken `bytes` off the next connection, so the handler has the body past that point. */
+  const serverRead = (app: App, bytes: number) => new Promise<void>(resolve => {
+    app.server.once('connection', socket => {
+      const check = setInterval(() => { if (socket.bytesRead >= bytes || socket.destroyed) { clearInterval(check); setImmediate(resolve); } }, 10);
+    });
+  });
   const timed = async (close: () => Promise<void>) => { const started = performance.now(); await close(); return performance.now() - started; };
-  const big = 4 * 1024 * 1024;
+  const refused = JSON.stringify({ error: 'Request too large.' });
 
   it('replies 413 only once the whole body has arrived', async () => {
-    const { app } = await serve();
-    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
-    await reading;
+    const { app } = await serveLong();
+    const read = serverRead(app, MAX_REQUEST_BYTES * 2), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await read;
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(sent.state.status).toBeUndefined();
     sent.send(big); sent.end();
     await sent.settled;
-    expect(sent.state).toMatchObject({ status: 413, body: JSON.stringify({ error: 'Request too large.' }) });
+    expect(sent.state).toMatchObject({ status: 413, body: refused });
     expect(sent.state.error).toBeUndefined();
   });
   it('shuts down promptly after refusing a body far over the limit', async () => {
-    const { app, close } = await serve();
+    const { app, close } = await serveLong();
+    // fetch keeps the connection for reuse, as the browser does; Node's http client would drop it after the reply.
     const response = await fetch(`${origin(app)}/api/action`, { method: 'POST', body: 'x'.repeat(big),
       headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
-    expect(response.status).toBe(413);
-    await response.text();
-    // A half-read connection was held until Node's keep-alive timeout (5 s, plus 1 s of buffer) before close settled.
-    expect(await timed(close)).toBeLessThan(3_000);
+    expect({ status: response.status, body: await response.text() }).toEqual({ status: 413, body: refused });
+    expect(await timed(close)).toBeLessThan(prompt);
   });
-  it('still replies 413 to an oversized body that completes during the shutdown drain', async () => {
-    const { app, close } = await serve();
-    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
-    await reading;
+  it('still replies 413, after the body ends, to an oversized body that completes during the shutdown drain', async () => {
+    const { app, close } = await serveLong();
+    const read = serverRead(app, MAX_REQUEST_BYTES * 2), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await read;
     const closing = close();
     await tick();
-    sent.send(big); sent.end();
+    sent.send(MAX_REQUEST_BYTES * 4); sent.end();
     await sent.settled;
-    expect(sent.state).toMatchObject({ status: 413, body: JSON.stringify({ error: 'Request too large.' }) });
+    expect(sent.state).toMatchObject({ status: 413, body: refused });
+    expect(sent.state.repliedAt).toBeGreaterThanOrEqual(sent.state.endedAt!);
     await closing;
   });
   it('destroys an oversized request still being sent after the drain limit, and close settles', async () => {
     const { app, close } = await serve();
-    const reading = handled(app), sent = oversized(app, MAX_REQUEST_BYTES * 2);
-    await reading;
+    const read = serverRead(app, MAX_REQUEST_BYTES * 2), sent = oversized(app, MAX_REQUEST_BYTES * 2);
+    await read;
     await close();
     await sent.settled;
     expect(sent.state.status).toBeUndefined();
@@ -263,27 +271,32 @@ describe('an oversized request body (#157)', () => {
     ['an unsupported content type', { contentType: 'text/plain' }, 405],
     ['a path that takes no POST', { path: '/' }, 405],
   ] as const)('closes the connection when it refuses %s before reading a large body, so shutdown is prompt', async (_label, options, status) => {
-    const { app, close } = await serve();
+    const { app, close } = await serveLong();
     const sent = oversized(app, big, options);
     sent.end();
     await sent.settled;
     // The client may be reset while still sending; when the reply arrives first, it closes the connection.
     if (sent.state.status !== undefined) expect(sent.state).toMatchObject({ status, connection: 'close' });
     else expect(sent.state.error).toBeDefined();
-    expect(await timed(close)).toBeLessThan(3_000);
+    expect(await timed(close)).toBeLessThan(prompt);
   });
-  it.each([['GET', '/api/review', undefined], ['POST', '/api/settings', JSON.stringify({ questionProvider: 'claude' })]] as const)(
-    'keeps the connection open after a %s whose body was read', async (method, path, body) => {
-      const { app } = await serve();
-      const url = new URL(origin(app));
-      const reply = await new Promise<{ status: number; connection?: string }>((resolve, reject) => {
-        const req = httpRequest({ host: url.hostname, port: url.port, path, method,
-          headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) } },
-        res => { res.resume(); resolve({ status: res.statusCode!, connection: res.headers.connection }); });
-        req.on('error', reject); req.end(body);
-      });
-      expect(reply).toEqual({ status: 200, connection: 'keep-alive' });
+  it.each([
+    ['a static file', 'GET', '/', undefined, 200],
+    ['an API read answered without waiting', 'GET', '/api/settings', undefined, 200],
+    ['an API read answered after waiting', 'GET', '/api/review', undefined, 200],
+    ['an unknown path', 'GET', '/missing', undefined, 404],
+    ['a POST whose body was read', 'POST', '/api/settings', JSON.stringify({ questionProvider: 'claude' }), 200],
+  ] as const)('keeps the connection open after %s', async (_label, method, path, body, status) => {
+    const { app } = await serve();
+    const url = new URL(origin(app));
+    const reply = await new Promise<{ status: number; connection?: string }>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path, method,
+        headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) } },
+      res => { res.resume(); resolve({ status: res.statusCode!, connection: res.headers.connection }); });
+      req.on('error', reject); req.end(body);
     });
+    expect(reply).toEqual({ status, connection: 'keep-alive' });
+  });
 });
 
 describe('/api/runner', () => {

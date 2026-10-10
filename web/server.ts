@@ -577,9 +577,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     // A reply sent while the request body is still unread (a refusal before the body is read) closes the connection
     // (#157). Node discards only an unread body that fits its socket buffers; a larger one held the connection until
-    // the keep-alive timeout, which delayed shutdown by about 6 s.
+    // the keep-alive timeout, which delayed shutdown by about 6 s. `req.complete` cannot tell: it is still false while
+    // the handler starts, even for a request with no body.
+    const declaresBody = req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] ?? 0) > 0;
     const head = (status: number, contentType: string) => {
-      if (!req.complete) res.setHeader('Connection', 'close');
+      if (declaresBody && !req.readableEnded) res.setHeader('Connection', 'close');
       res.writeHead(status, { 'Content-Type': contentType });
     };
     const json = (status: number, value: unknown) => { head(status, 'application/json'); res.end(JSON.stringify(value)); };
