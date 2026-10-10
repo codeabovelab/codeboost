@@ -653,8 +653,8 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## What to do next
 
-1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1) and the Issues screen (H4a).
-2. Finish the open lane PRs listed in "Lane status", then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1), the Issues screen (H4a), planning acceptance (E4) and the Plans screen (G1–G4, #145).
+2. Finish the open lane work listed in the lane table in `docs/architecture.md`, then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
 3. Optionally run the non-blocking human validation tracked in #19.
 4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
 5. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
@@ -2167,7 +2167,7 @@ Built from this review's decisions. Tick each one as you ship it.
 
 **Status (checked against `main` on 2026-09-26).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
 - Built: two-tab composer and "n pending changes" tags (part of DT4); the notice below 1280px (part of DT13); the `?` shortcut help (part of DT12); a blocker list from the guarded merge gate (part of DT7).
-- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Plans, Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 6 to 9; Issues became a link in #55); Lessons inbox and Learning screen (DT14, DT15, build step 9).
+- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 7 to 9; Issues became a link in #55 and Plans in G1, #148); Lessons inbox and Learning screen (DT14, DT15, build step 9).
 - Not yet audited against their Verify lines: DT2, DT3, DT5, DT6, DT9, DT10, DT11.
 - File paths in the DTs (`web/review`, `web/shell` and others) are proposed names. Today all UI code is in `web/public/`.
 
