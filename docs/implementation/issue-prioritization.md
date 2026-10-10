@@ -82,13 +82,12 @@ to wait for G4 to release the shared web files. G cannot start until E4 merges,
 and E4 waits for D5, so the web files had no active owner. H4 therefore takes
 them now, split in two:
 
-- **H4a (this change): the Issues screen.** It owns `web/server.ts`,
+- **H4a (#55): the Issues screen.** It owned `web/server.ts`,
   `web/public/*`, a new `web/issues.ts`, the demo fixture
-  `scripts/demo-issues.ts` and their tests. It does not edit `runner/store.ts`.
-  When G1 started, it handed `web/public/*` to G. #145 treated `web/server.ts`
-  as F's server contract; G3 still changed it once (PR #151). G released its
-  files after G4 (see
-  `docs/implementation/planning-screen.md`).
+  `scripts/demo-issues.ts` and their tests. It did not edit `runner/store.ts`.
+  When G1 started, H4a handed `web/public/*` to G, and `web/server.ts` passed
+  to F as the server contract (#145); G3 changed it once (PR #151). G released
+  its files after G4 (see `docs/implementation/planning-screen.md`).
 - **H4b: the "trust this issue" action.** It records trust decisions through
   the storage owner (F) after F1's Store changes land, so the two lanes do not
   both bump the schema version.
