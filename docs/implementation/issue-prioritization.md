@@ -85,8 +85,9 @@ them now, split in two:
 - **H4a (this change): the Issues screen.** It owns `web/server.ts`,
   `web/public/*`, a new `web/issues.ts`, the demo fixture
   `scripts/demo-issues.ts` and their tests. It does not edit `runner/store.ts`.
-  When G1 started, it handed `web/public/*` to G; #145 kept server-contract
-  changes in `web/server.ts` with F. G released its files after G4 (see
+  When G1 started, it handed `web/public/*` to G. #145 treated `web/server.ts`
+  as F's server contract; G3 still changed it once (PR #151). G released its
+  files after G4 (see
   `docs/implementation/planning-screen.md`).
 - **H4b: the "trust this issue" action.** It records trust decisions through
   the storage owner (F) after F1's Store changes land, so the two lanes do not
