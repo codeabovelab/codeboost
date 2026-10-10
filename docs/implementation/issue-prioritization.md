@@ -89,9 +89,9 @@ therefore took them, split in two:
   finished and released its shared screen files (see
   `docs/implementation/planning-screen.md`); `web/server.ts` is lane F's
   server contract.
-- **H4b: the "trust this issue" action.** It records trust decisions through
-  the storage owner (F) after F1's Store changes land, so the two lanes do not
-  both bump the schema version.
+- **H4b (#108, PR #139): the "trust this issue" action.** It recorded trust
+  decisions through the storage owner (F) after F1's Store changes landed, so
+  the two lanes did not both bump the schema version.
 
 H1 is complete when this policy and access inspection are committed. H2/H3 are
 complete when dedicated tests prove normalized retrieval, deterministic reasons,
