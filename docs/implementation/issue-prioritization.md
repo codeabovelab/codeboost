@@ -85,8 +85,9 @@ them now, split in two:
 - **H4a (#55): the Issues screen.** It owned `web/server.ts`,
   `web/public/*`, a new `web/issues.ts`, the demo fixture
   `scripts/demo-issues.ts` and their tests. It did not edit `runner/store.ts`.
-  When G1 started, H4a handed `web/public/*` to G. G released those files
-  after G4 (see `docs/implementation/planning-screen.md`).
+  Its plan was to hand the web files to G when G1 started. Lane G has since
+  finished and released its shared screen files (see
+  `docs/implementation/planning-screen.md`).
 - **H4b: the "trust this issue" action.** It records trust decisions through
   the storage owner (F) after F1's Store changes land, so the two lanes do not
   both bump the schema version.
