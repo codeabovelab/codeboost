@@ -198,7 +198,7 @@ describe('server shutdown', { timeout: 15_000 }, () => {
   });
 });
 
-describe('an oversized request body (#157)', () => {
+describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
   // The drain limit is above Node's keep-alive timeout (5 s, plus 1 s of buffer), so a connection held until that
   // timeout shows as a slow close instead of being cut at the drain limit.
   const drainMs = 10_000, prompt = 3_000, big = 4 * 1024 * 1024;
@@ -249,13 +249,14 @@ describe('an oversized request body (#157)', () => {
     const { app, close } = await serveLong();
     const read = serverRead(app, MAX_REQUEST_BYTES * 2), sent = oversized(app, MAX_REQUEST_BYTES * 2);
     await read;
-    const closing = close();
+    const started = performance.now(), closing = close();
     await tick();
     sent.send(MAX_REQUEST_BYTES * 4); sent.end();
     await sent.settled;
     expect(sent.state).toMatchObject({ status: 413, body: refused });
     expect(sent.state.repliedAt).toBeGreaterThanOrEqual(sent.state.endedAt!);
     await closing;
+    expect(performance.now() - started).toBeLessThan(prompt);
   });
   it('destroys an oversized request still being sent after the drain limit, and close settles', async () => {
     const { app, close } = await serve();
