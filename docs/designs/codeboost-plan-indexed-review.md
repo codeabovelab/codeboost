@@ -1892,7 +1892,7 @@ Critical gaps (no test, no handling, and silent): 0.
 
 **Scheduling decision (2026-09-24).** Run up to three implementation tasks concurrently in separate feature branches and worktrees. The foundation and review screen are the baseline, not new assignments. Recheck current main, open PRs, and existing implementations before taking a lane; unchecked historical T-items are not proof that their code is missing. These lanes authorize a development schedule, not simultaneous task execution in the shipped runner.
 
-**Current state.** The lane plans below record the original schedule. Lanes C, D, E, G, H and K are done, so their rows and handoff steps describe past work, not current owners or blockers. For the current state of each lane, see the lane table in `docs/architecture.md`. Before editing a shared file, follow "Task resumption and ownership" in `AGENTS.md`.
+**Current state.** The lane plans below record the original schedule. B0 and lanes C, D, E, G, H and K are done, so their rows and handoff steps describe past work, not current owners or blockers. For the current state of each lane, see the lane table in `docs/architecture.md`. Before editing a shared file, follow "Task resumption and ownership" in `AGENTS.md`.
 
 #### Lane status (checked 2026-09-26, after #55)
 
