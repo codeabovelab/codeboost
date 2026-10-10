@@ -87,7 +87,8 @@ them now, split in two:
   `scripts/demo-issues.ts` and their tests. It did not edit `runner/store.ts`.
   Its plan was to hand the web files to G when G1 started. Lane G has since
   finished and released its shared screen files (see
-  `docs/implementation/planning-screen.md`).
+  `docs/implementation/planning-screen.md`); `web/server.ts` is lane F's
+  server contract.
 - **H4b: the "trust this issue" action.** It records trust decisions through
   the storage owner (F) after F1's Store changes land, so the two lanes do not
   both bump the schema version.
