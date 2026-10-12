@@ -35,13 +35,14 @@ Without a runner, **Merge PR** works as before.
 | Wait for checks | The job inspects the pull request (fresh) at once, then again after 10 s, with the wait doubling up to 60 s. | every required check succeeds, or the required set was read and is empty, and nothing else blocks | a required check fails, or 30 minutes pass (job: `blocked`); the pull request moved, or another blocker appears (job: `failed`) |
 | Merge | The job calls the guarded merge with the current review token. Its inspections rerun the already-fixed check. | GitHub merged or queued the head (job: `merged` or `queued`) | GitHub refused (job: `blocked`), validation refused (job: `failed`), or the outcome is unknown (job: `submitted`; the merge attempt reconciles as before) |
 
-While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. No inspection starts after the 30 minutes, and one still running when they end is stopped, so only checks seen passing within the limit count. The guarded merge that follows inspects again and may ask GitHub to merge shortly after the limit; it refuses anything no longer clear. Unreadable branch rules never pass. Another blocker outranks a failing check: checks that fail on a head a collaborator pushed say nothing about this review, so the job ends `failed` and the task stays in review.
+While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. No inspection starts after the 30 minutes, and one still running when they end is stopped, so only checks seen passing within the limit count. The guarded merge that follows inspects again and may ask GitHub to merge shortly after the limit; it refuses anything no longer clear. Unreadable branch rules never pass. Another blocker outranks a failing check: checks that fail on a head a collaborator pushed say nothing about this review, so the job ends `failed` and the task's status is unchanged.
 
 ## Outcomes
 
 | Job state | Task status afterwards | What the person does |
 |---|---|---|
-| `merged`, `queued` | merged, or in review while queued | nothing |
+| `merged` | merged | nothing |
+| `queued` | unchanged (in review, or approved, merge blocked on a retry) while GitHub's queue holds it | nothing |
 | `submitted` | unchanged | refresh; the merge attempt settles from GitHub |
 | `blocked` | approved, merge blocked | fix the check or GitHub's reason, then **Retry merge**. To change the task's code, use the scope-amendment flow, as from review: it accepts a blocked task. |
 | `review-required` | unchanged | review the refreshed pull request, then merge again |
