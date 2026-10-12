@@ -16,7 +16,7 @@ import { PullRequestPublisher } from '../runner/publish.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { baseBranch } from '../runner/production.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
-import type { MergeGateway } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
 import { OWED_REFUSAL } from '../runner/publishing.ts';
 import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
@@ -24,7 +24,7 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
-import type { MergeJobTiming } from '../runner/merge-job.ts';
+import { MergeJobCoordinator, type MergeJobTiming } from '../runner/merge-job.ts';
 import type { RemoteMergeState, RequiredCheck } from '../github/merge.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
@@ -1912,6 +1912,38 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(Date.now() - closing).toBeLessThan(10_000);
     const reopened = new Store(database);
     try { expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'running', step: 'checks' }); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('awaits a merge job that settles after the shutdown abort before the store closes', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, merging: AbortSignal | null = null;
+    const base = gateway(() => storeRef!, () => []);
+    // GitHub was asked to merge; after the abort it answers, a little later, with a refusal.
+    const gh: MergeGateway = { inspect: base.inspect, merge: (_head, options) => new Promise((_resolve, reject) => {
+      merging = options!.signal!;
+      merging.addEventListener('abort', () => setTimeout(() => reject(new MergeSubmissionError('Base branch was modified.', 'refused')), 300), { once: true });
+    }) };
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(() => expect(merging).not.toBeNull(), { timeout: 10_000 });
+    const database = served.app.service.config.database, order: string[] = [];
+    const jobClose = MergeJobCoordinator.prototype.close, storeClose = Store.prototype.close;
+    const jobs = vi.spyOn(MergeJobCoordinator.prototype, 'close').mockImplementation(async function (this: MergeJobCoordinator) {
+      await jobClose.call(this); order.push('job settled');
+    });
+    const stores = vi.spyOn(Store.prototype, 'close').mockImplementation(function (this: Store) { order.push('store closed'); return storeClose.call(this); });
+    try { await served.close(); } finally { jobs.mockRestore(); stores.mockRestore(); }
+    // Shutdown awaited the job before the store closed, so its last write landed: it ended as its merge attempt records it.
+    expect(order[0]).toBe('job settled');
+    expect(order).toContain('store closed');
+    const reopened = new Store(database);
+    try {
+      expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+      expect(reopened.getTask(served.identity).status).toBe('approved but merge blocked');
+    } finally { reopened.close(); }
   }, 60_000);
 
   it('stops a waiting merge job when the task is cancelled, and closes the task\'s pull requests', async () => {
