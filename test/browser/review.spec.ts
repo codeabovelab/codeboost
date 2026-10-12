@@ -629,6 +629,27 @@ test('hides Retry until a timed-out invocation has actually settled',async({page
  settle('Late answer');
  await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible({timeout:10000});
 });
+test('keeps focus on the Merge button when a merge-job click is refused (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let mergeClicks=0;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}mergeClicks++;
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Issue #1 is not trusted for its current author.'})});});
+ // A runner server reports merging as a job (its merge status carries `job`).
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ const button=page.locator('#merge');
+ await button.focus();await button.press('Enter');
+ await expect(page.locator('#banner')).toHaveText(/^Merge blocked\. Issue #1 is not trusted/);
+ // The refusal leaves the control marked, not disabled, and focused (AGENTS.md, Async review UI).
+ await expect(button).toHaveAttribute('aria-disabled','true');
+ await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
+ // Activating it again starts nothing: the merge is not ready.
+ await button.press('Enter');
+ expect(mergeClicks).toBe(1);
+});
 test('follows a one-click merge job from preparation through the required-check wait to merged (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
