@@ -7,7 +7,7 @@ import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESER
   type PreMergeAuthorization, type PreMergeResult } from '../runner/pre-merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import { MergeJobCoordinator } from '../runner/merge-job.ts';
-import type { MergeGateway } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
@@ -1436,7 +1436,7 @@ it('starts no settlement read when less than the process-settlement reserve is l
 });
 
 // F6b of #22: the acceptance cases, run through the one-click merge job with real preparation.
-async function mergeJob(rebasedText: string, commandExit?: number, options: Parameters<typeof rebaseFixture>[2] = {}) {
+async function mergeJob(rebasedText: string, commandExit?: number, options: Parameters<typeof rebaseFixture>[2] = {}, refuse: () => boolean = () => false) {
   const fixture = await rebaseFixture(rebasedText, commandExit, { ...options, deferStart: true, published: true });
   const merged: string[] = [];
   // As production builds it with a runner: the task's published PR, which requires durable preparation readiness.
@@ -1448,7 +1448,11 @@ async function mergeJob(rebasedText: string, commandExit?: number, options: Para
         published: { headBranch: request!.target!.headBranch!, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr.openingId),
           branchOpen: [{ number: 7, base: 'main' }] } };
     },
-    merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/7' }; },
+    merge: async head => {
+      merged.push(head);
+      if (refuse()) throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
+      return { url: 'https://github.com/acme/app/pull/7' };
+    },
   };
   const merges = new MergeCoordinator(fixture.service, gateway, undefined, undefined,
     { repository: 'acme/app', baseBranch: 'main', requiresPreparation: true });
@@ -1456,7 +1460,7 @@ async function mergeJob(rebasedText: string, commandExit?: number, options: Para
   const start = () => jobs.start(fixture.service.load().token, randomUUID());
   const settled = async () => { await jobs.current; return jobs.latest()!; };
   const close = async () => { await jobs.close(); await fixture.coordinator.close(); await fixture.runner.close(); };
-  return { ...fixture, merged, jobs, start, settled, close };
+  return { ...fixture, merged, merges, jobs, start, settled, close };
 }
 
 it('merges through the job when a moved base leaves approvals valid, pushing and checking the rewritten head', async () => {
@@ -1496,6 +1500,31 @@ it('stops the job for review when a collaborator pushed to the pull request', as
   expect(f.merged).toEqual([]);
   await f.close();
 });
+
+it('stops a retry for review when its preparation rebases after GitHub refused the merge', async () => {
+  let refuse = true;
+  const f = await mergeJob('feature\n', 0, {
+    // The retry's rebase replays the already-rebased head onto the moved base, keeping its content.
+    rebaseResult: (service, input, run) => run < 2 ? undefined : fixtureGit(service.config.repository, 'commit-tree',
+      fixtureGit(service.config.repository, 'rev-parse', `${input.oldHead}^{tree}`), '-p', input.onto, '-m', 'feature, rebased again'),
+  }, () => refuse);
+  f.start();
+  expect(await f.settled()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+  expect(f.service.store.getTask(f.service.config.identity).status).toBe('approved but merge blocked');
+  // The base moves again before the person retries: the retry's preparation rebases, making a new snapshot.
+  refuse = false;
+  const repository = f.service.config.repository, base = f.remote().base;
+  const moved = fixtureGit(repository, 'commit-tree', fixtureGit(repository, 'rev-parse', `${base}^{tree}`), '-p', base, '-m', 'base moved after the refusal');
+  f.moveRemote({ base: moved, head: f.remote().head });
+  f.start();
+  // After a merge attempt, a replacement snapshot needs every item approved again (#24): the retry stops for review.
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
+  expect(f.service.load().items.every(item => item.state === 'stale')).toBe(true);
+  expect((await f.merges.status()).blockers).toEqual(expect.arrayContaining([
+    expect.objectContaining({ code: 'queue-head', message: expect.stringMatching(/Approve every item again for the replacement snapshot/) })]));
+  expect(f.merged).toHaveLength(1);
+  await f.close();
+}, 60_000);
 
 it('ends the job cancelled when the task is cancelled while a command check runs', async () => {
   const f = await mergeJob('feature\n', 0, { commandWaitsForCancellation: true });
