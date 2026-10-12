@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS, PreMergeCoordinator,
-  type PreMergeAuthorization } from '../runner/pre-merge.ts';
+  type PreMergeAuthorization, type PreMergeResult } from '../runner/pre-merge.ts';
+import { MergeCoordinator } from '../runner/merge.ts';
+import { MergeJobCoordinator } from '../runner/merge-job.ts';
+import type { MergeGateway } from '../github/merge.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -72,6 +75,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   rebaseResult?: (service: ReviewService, input: { oldHead: string; onto: string }, run: number) => string | undefined;
   /** Branch reads never answer; only their abort signal ends them. */
   branchReadHangs?: boolean;
+  /** Set up everything but start no preparation; `result` is then null. */
+  deferStart?: boolean;
   /** Remote fetches fail once codeboost has pushed. */
   fetchFailsAfterPush?: boolean;
   /** A collaborator pushes this commit to the branch just before codeboost's push, which is then refused. */
@@ -244,7 +249,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     }) as RunnerCoordinator['start'];
   }
   const task = service.store.getTask(identity);
-  const result = await coordinator.start({ stateVersion: task.stateVersion,
+  const result = options.deferStart ? null as unknown as PreMergeResult : await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
     branchReads: () => branchReads,
@@ -1394,4 +1399,73 @@ it('starts no settlement read when less than the process-settlement reserve is l
   expect(fixture.branchReads()).toBe(0);
   expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
   await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+// F6b of #22: the acceptance cases, run through the one-click merge job with real preparation.
+async function mergeJob(rebasedText: string, commandExit?: number, options: Parameters<typeof rebaseFixture>[2] = {}) {
+  const fixture = await rebaseFixture(rebasedText, commandExit, { ...options, deferStart: true });
+  const merged: string[] = [];
+  const gateway: MergeGateway = {
+    inspect: async () => ({ base: fixture.remote().base, head: fixture.remote().head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
+      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false }),
+    merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/7' }; },
+  };
+  const merges = new MergeCoordinator(fixture.service, gateway);
+  const jobs = new MergeJobCoordinator(fixture.service, fixture.coordinator, merges, undefined, { checkWaitMs: 2_000, firstDelayMs: 5, maxDelayMs: 20 });
+  const start = () => jobs.start(fixture.service.load().token, randomUUID());
+  const settled = async () => { await jobs.current; return jobs.latest()!; };
+  const close = async () => { await jobs.close(); await fixture.coordinator.close(); await fixture.runner.close(); };
+  return { ...fixture, merged, jobs, start, settled, close };
+}
+
+it('merges through the job when a moved base leaves approvals valid, pushing and checking the rewritten head', async () => {
+  const f = await mergeJob('feature\n', 0);
+  f.start();
+  expect(await f.settled()).toMatchObject({ state: 'merged' });
+  expect(f.pushes).toHaveLength(1);
+  expect(f.checkedHeads).toEqual([f.rebased]);
+  expect(f.merged).toEqual([f.rebased]);
+  await f.close();
+});
+
+it('stops the job for review when the rebase makes an approval stale, and merges nothing', async () => {
+  const f = await mergeJob('changed by rebase\n');
+  f.start();
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('fails the job when a command check breaks on the rewritten head', async () => {
+  const f = await mergeJob('feature\n', 1);
+  f.start();
+  expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('stops the job for review when a collaborator pushed to the pull request', async () => {
+  const f = await mergeJob('feature\n');
+  const repository = f.service.config.repository;
+  writeFileSync(join(repository, 'late.txt'), 'collaborator\n'); fixtureGit(repository, 'add', 'late.txt'); fixtureGit(repository, 'commit', '-qm', 'collaborator');
+  f.moveRemote({ base: f.remote().base, head: fixtureGit(repository, 'rev-parse', 'HEAD') });
+  f.start();
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/head moved/) });
+  expect(f.pushes).toEqual([]);
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('ends the job cancelled when the task is cancelled while a command check runs', async () => {
+  const f = await mergeJob('feature\n', 0, { commandWaitsForCancellation: true });
+  f.start();
+  await vi.waitFor(() => expect(f.runner.isActive(f.service.config.identity)).toBe(true));
+  const identity = f.service.config.identity;
+  f.jobs.cancel();
+  f.coordinator.cancelTask(f.service.store.getTask(identity).stateVersion, randomUUID());
+  expect(await f.settled()).toMatchObject({ state: 'cancelled' });
+  expect(new Set(f.cancelReasons)).toEqual(new Set(['cancelled']));
+  expect(f.merged).toEqual([]);
+  await vi.waitFor(() => expect(f.service.store.getTask(identity).status).toBe('cancelled'));
+  await f.close();
 });

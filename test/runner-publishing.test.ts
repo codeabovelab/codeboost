@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -24,6 +24,8 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
+import type { MergeJobTiming } from '../runner/merge-job.ts';
+import type { RemoteMergeState, RequiredCheck } from '../github/merge.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -232,13 +234,16 @@ function world(): World {
  * earlier process would have left it.
  */
 async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource;
-  issueGateway?: IssueTrustGateway; preMerge?: (service: ReviewService) => PreMergeCoordinator } = {}) {
+  issueGateway?: IssueTrustGateway; preMerge?: (service: ReviewService) => PreMergeCoordinator; mergeGateway?: MergeGateway; mergeJobTiming?: MergeJobTiming;
+  /** A runner block and no github.pullRequest: merging targets the PR the runner published, after preparation. */
+  runnerPublished?: boolean } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
   let findings: SafetyFindings | undefined;
-  const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1, baseBranch: 'main' } } : {}) };
-  app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
+  const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3,
+    ...(options.runnerPublished ? {} : { pullRequest: 1 }), baseBranch: 'main' } } : {}), ...(options.runnerPublished ? { runner: {} } : {}) };
+  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, options.issueGateway, undefined, undefined, async service => {
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
       const review = service.load();
@@ -284,7 +289,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     return { deps, sources, findings, publisher, ...(options.preMerge ? { preMerge: () => options.preMerge!(service) } : {}),
       ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
-  });
+  }, options.mergeJobTiming ? { mergeJobTiming: options.mergeJobTiming } : {});
   cleanups.push(close);
   // As the CLI does once it has verified the lock.
   if (options.startup !== false) app.publishOwed(() => undefined);
@@ -1722,4 +1727,98 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(await act(app, 'close-pull-requests')).toMatchObject({ status: 409, body: { error: 'The task has no pull request to close.' } });
     expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: 'The task is cancelled; its pull requests are closed, not published.' } });
   });
+});
+
+describe('the one-click merge job (F6b of #22)', () => {
+  const issueGateway: IssueTrustGateway = {
+    repository: REPO,
+    async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+    async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
+    async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+  };
+  /** Preparation as F5/F6a end it: readiness recorded exactly on its own action. */
+  const preparation = (service: ReviewService) => ({
+    get active() { return false; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
+    cancelTask: () => 'closed' as const, close: async () => undefined,
+    start: async (expected: { actionId: string }) => {
+      const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
+      const readiness = { stateVersion: service.store.getTask(identity).stateVersion, reviewVersion: service.store.reviewVersion(identity),
+        snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: service.commandPolicyDigest() };
+      return service.store.settlePreMergeAction(identity, expected.actionId,
+        { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
+    },
+  } as unknown as PreMergeCoordinator);
+  /** GitHub showing the task's published PR at the reviewed pair; `checks()` gives its required checks now. */
+  const gateway = (store: () => Store, checks: () => RequiredCheck[]): MergeGateway & { merged: string[] } => {
+    const merged: string[] = [];
+    return { merged,
+      inspect: async request => {
+        const identity = createIdentity(), pr = store().taskPullRequests(identity).find(row => row.number === request?.target?.pullRequest);
+        const snapshot = store().getSnapshot(identity);
+        return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
+          mergeQueue: false, requiredChecks: checks(), alreadyFixed: 'clear', pullRequest: request!.target!.pullRequest, draft: false,
+          published: { headBranch: request!.target!.headBranch!, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr!.openingId),
+            branchOpen: [{ number: request!.target!.pullRequest, base: 'main' }] } } as RemoteMergeState;
+      },
+      merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/100' }; } };
+  };
+  let createIdentity: () => PlanIdentity = () => { throw new Error('not set'); };
+  /** A review a person could merge: the demo's out-of-scope mode change undone, its unplanned changes accepted, all approved. */
+  const mergeable = (w: World) => {
+    chmodSync(join(w.demo.repository, 'run.sh'), 0o644); git(w.demo.repository, 'commit', '-qam', 'Restore declared scope');
+  };
+  const acceptAndApprove = (service: ReviewService) => {
+    let view = service.load();
+    for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+      view = service.act({ action: 'accept', key: segment.key, token: view.token });
+    for (const item of view.items) if (item.state !== 'approved')
+      view = service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  };
+  const review = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/review`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
+  const merge = async (app: App, token: string, actionId = randomUUID()) => {
+    const response = await fetch(`${new URL(app.url).origin}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'merge', token, actionId }) });
+    return { status: response.status, body: await response.json() as Record<string, any> };
+  };
+  const mergeState = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/merge`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
+
+  it('offers Merge PR while only blockers the job resolves remain, then waits for checks and merges, refusing prepare-merge meanwhile', async () => {
+    const w = world(); mergeable(w);
+    let checks: RequiredCheck[] = [{ context: 'ci', appId: null, state: 'pending' }], storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => checks);
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const before = await review(served.app);
+    // Not prepared yet, and a required check pends: both are the job's to resolve.
+    expect(before.merge.blockers.map((blocker: { code: string }) => blocker.code)).toEqual(expect.arrayContaining(['preparation', 'check']));
+    expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
+    const started = await merge(served.app, before.token);
+    expect(started.status).toBe(200);
+    expect(started.body.job).toMatchObject({ state: 'running' });
+    expect(started.body.merge).toMatchObject({ ready: false, job: { state: 'running' } });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }), { timeout: 10_000 });
+    expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/merge is running/) } });
+    checks = [{ context: 'ci', appId: null, state: 'success' }];
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+    expect(gh.merged).toEqual([served.store.getSnapshot(served.identity).head]);
+    expect(served.store.getTask(served.identity).status).toBe('merged');
+   }, 60_000);
+
+  it('stops a waiting merge job when the task is cancelled, and closes the task\'s pull requests', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks' }), { timeout: 10_000 });
+    expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'closed' });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 10_000 });
+    await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
+    expect(gh.merged).toEqual([]);
+   }, 60_000);
 });

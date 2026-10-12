@@ -129,6 +129,23 @@ export interface PushMarker {
 }
 /** What a read of the branch showed after a push: `to`, still `from`, or anything else. */
 export type PushOutcome = 'pushed' | 'not-pushed' | 'moved';
+/** A one-click merge job (F6b of #22; docs/implementation/merge-handoff.md). */
+export type MergeJobState = 'running' | 'merged' | 'queued' | 'submitted' | 'blocked' | 'review-required' | 'failed' | 'cancelled';
+export type MergeJobStep = 'preparing' | 'checks' | 'merging';
+export interface MergeJob {
+  /** The click's action ID. */
+  id: string;
+  /** The review token the click was made with; a resend must carry the same one. */
+  token: string;
+  state: MergeJobState;
+  step: MergeJobStep | null;
+  reason: string | null;
+  /** Required checks that have not succeeded yet, as the last inspection read them. */
+  checks: { context: string; state: string }[];
+  url: string | null;
+  startedAt: string;
+  updatedAt: string;
+}
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
   firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
@@ -206,8 +223,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 18) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 19) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -328,6 +345,13 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'push_in_progress'))
             this.#db.exec('ALTER TABLE tasks ADD COLUMN push_in_progress TEXT');
           this.#db.exec('PRAGMA user_version=18');
+        }
+        // One-click merge jobs (F6b of #22). Kept apart from tasks, so a job's progress never changes the task state version.
+        if (version < 19) {
+          this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (
+            id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS merge_jobs_plan ON merge_jobs(plan_key);`);
+          this.#db.exec('PRAGMA user_version=19');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -2081,6 +2105,72 @@ export class Store {
     return saved.ok === true && saved.value?.outcome === 'ready' && stable(saved.preMergeReadiness) === stable(readiness);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
+  /**
+   * Admit a merge job for this click. A resend of the same click returns its job; another click while a job runs, or a
+   * reused action ID with another token, is refused. Never touches the task.
+   */
+  beginMergeJob(identity: PlanIdentity, input: { actionId: string; token: string; now?: string }): { job: MergeJob; resent: boolean } {
+    assertUuidV4(input.actionId, 'Action ID');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      const existing = this.#get('SELECT data FROM merge_jobs WHERE id=?', input.actionId);
+      if (existing) {
+        const job = decode<MergeJob>(existing.data);
+        if (job.token !== input.token || this.#get('SELECT plan_key FROM merge_jobs WHERE id=?', input.actionId)!.plan_key !== key)
+          throw new ActionIdReused('Action ID already used for a different request.');
+        return { job, resent: true };
+      }
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
+      if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
+      const now = input.now ?? new Date().toISOString();
+      const job: MergeJob = { id: input.actionId, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
+        url: null, startedAt: now, updatedAt: now };
+      this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
+      return { job, resent: false };
+    });
+  }
+  /** Move a running job to another step or record what it waits for. A job no longer running is left unchanged. */
+  updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[] }): MergeJob | null {
+    return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, ...patch } : null);
+  }
+  /** End a running job. Returns false when it had already ended. */
+  finishMergeJob(identity: PlanIdentity, id: string, outcome: { state: Exclude<MergeJobState, 'running'>; reason?: string | null; url?: string | null }): boolean {
+    return this.#changeMergeJob(identity, id, job => job.state === 'running'
+      ? { ...job, state: outcome.state, step: null, reason: outcome.reason ?? null, url: outcome.url ?? job.url } : null) !== null;
+  }
+  #changeMergeJob(identity: PlanIdentity, id: string, change: (job: MergeJob) => MergeJob | null): MergeJob | null {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const row = this.#get('SELECT data FROM merge_jobs WHERE id=? AND plan_key=?', id, key);
+      if (!row) throw new Error('Unknown merge job.');
+      const next = change(decode<MergeJob>(row.data));
+      if (!next) return null;
+      const job = { ...next, updatedAt: new Date().toISOString() };
+      this.#run('UPDATE merge_jobs SET data=? WHERE id=?', encode(job), id);
+      return job;
+    });
+  }
+  getMergeJob(identity: PlanIdentity, id: string): MergeJob | null {
+    const row = this.#get('SELECT data FROM merge_jobs WHERE id=? AND plan_key=?', id, identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  latestMergeJob(identity: PlanIdentity): MergeJob | null {
+    const row = this.#get('SELECT data FROM merge_jobs WHERE plan_key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  runningMergeJob(identity: PlanIdentity): MergeJob | null {
+    const row = this.#get(`SELECT data FROM merge_jobs WHERE plan_key=? AND json_extract(data,'$.state')='running' ORDER BY rowid DESC LIMIT 1`,
+      identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  /** At startup: a job the server stopped running cannot continue; it fails, and the person merges again. */
+  settleInterruptedMergeJobs(identity: PlanIdentity): void {
+    const running = this.runningMergeJob(identity);
+    if (running) this.finishMergeJob(identity, running.id, { state: 'failed',
+      reason: 'The server restarted before the merge finished. Merge again.' });
+  }
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {
     const snapshot = this.getSnapshot(identity);
     const result: PreMergeActionResult = { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [],

@@ -159,6 +159,15 @@ function renderMerge() {
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
   $("merge").disabled = !merge.ready;
+  const job = merge.job;
+  if (job?.state === "running") {
+    $("merge").disabled = true;
+    $("merge").textContent = { preparing: "Preparing…", checks: "Waiting for checks…", merging: "Merging…" }[job.step] ?? "Merging…";
+    $("merge-details").hidden = false;
+    $("merge-details").textContent = "Merge status";
+    scheduleMergePoll();
+    return;
+  }
   $("merge").textContent = merge.action === "retry"
     ? "Retry merge"
     : merge.queue?.state === "submitting"
@@ -177,8 +186,9 @@ function scheduleMergePoll() {
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
   const queue = data?.merge?.queue;
-  const state = queue?.state;
-  if (queue?.kind === "queue" && ["submitting", "queued"].includes(state)) {
+  const job = data?.merge?.job;
+  const state = job?.state === "running" ? `job:${job.step}` : queue?.state;
+  if (job?.state === "running" || (queue?.kind === "queue" && ["submitting", "queued"].includes(state))) {
     if (state !== mergePollState) {
       mergePollState = state;
       mergePollDelay = 2000;
@@ -197,6 +207,21 @@ async function pollMergeQueue(generation) {
   try {
     const update = await api("/api/merge");
     if (generation !== mergeGeneration || !data?.merge?.available) return;
+    if (data.merge.job?.state === "running") {
+      // A merge job (F6b): follow its step; once it ends, reload the review, which shows the outcome.
+      const job = update.job;
+      if (job?.state === "running") {
+        const changed = job.step !== data.merge.job.step || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
+        data = { ...data, merge: { ...data.merge, job } };
+        $("banner").textContent = mergeJobText(job);
+        if (!changed) backOffMergePoll();
+        renderMerge();
+        return;
+      }
+      await refresh();
+      if (job) $("banner").textContent = mergeJobText(job);
+      return;
+    }
     const queue = update.queue;
     mergeObservationGeneration++;
     data = withMergeQueue(data, queue);
@@ -209,6 +234,18 @@ async function pollMergeQueue(generation) {
     backOffMergePoll();
     scheduleMergePoll();
   }
+}
+function mergeJobText(job) {
+  if (job.state === "running") return job.step === "checks"
+    ? `Waiting for required checks${job.checks.length ? `: ${job.checks.map(check => `${check.context} is ${check.state}`).join(", ")}` : ""}.`
+    : job.step === "merging" ? "Merging the reviewed head." : "Preparing the merge: refresh, rebase, push and command checks.";
+  return {
+    merged: "Merged.", queued: "Merge queued. Waiting for GitHub to confirm the outcome.",
+    submitted: `Merge submitted; GitHub's outcome is not confirmed yet. ${job.reason ?? ""}`.trim(),
+    blocked: `Approved, merge blocked. ${job.reason ?? ""} Fix it, then Retry merge.`.trim(),
+    "review-required": `Review needed before merging. ${job.reason ?? ""}`.trim(),
+    failed: `Merge stopped. ${job.reason ?? ""} Merge again when ready.`.trim(), cancelled: "Merge cancelled.",
+  }[job.state] ?? job.state;
 }
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge"]);
 function withMergeQueue(view, queue) {
@@ -522,7 +559,12 @@ $("approve").onclick = () => {
 $("reload").onclick = refresh;
 $("merge-details").onclick = () => {
   if (!data?.merge?.available) return;
-  const queue = data.merge.queue;
+  const queue = data.merge.queue, job = data.merge.job;
+  if (job?.state === "running") {
+    showDialog(`<h2>Merge status</h2><p><strong>${esc(job.step ?? job.state)}</strong></p><p>${esc(mergeJobText(job))}</p>${job.checks.length
+      ? `<ul>${job.checks.map(check => `<li>${esc(check.context)}: ${esc(check.state)}</li>`).join("")}</ul>` : ""}`);
+    return;
+  }
   showDialog(
     `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
@@ -541,6 +583,13 @@ $("merge").onclick = async () => {
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
     mergeAction = null;
+    if (updated.job) {
+      // A merge job runs in the background (F6b); the page follows it.
+      data = { ...updated, merge: { ...updated.merge, job: updated.job } };
+      render();
+      $("banner").textContent = mergeJobText(updated.job);
+      return;
+    }
     const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";
     const blocker = { code: queued ? "queue-active" : "merge-submitted", message: queued ? "The reviewed head is queued. Waiting for GitHub to confirm the outcome." : "Merge was submitted. Refresh to confirm GitHub state." };
     data = updated.mergeRefreshRequired
