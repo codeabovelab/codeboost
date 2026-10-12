@@ -47,7 +47,8 @@ export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
 /**
  * Git and GitHub subprocesses abort before the advertised operation deadline, leaving their stop/drain time. That time
  * is bounded except in two cases, which are waited for, fail-closed: a process that stays in a subprocess's group after
- * it exits, and, for Git calls that change something (fetch, push), a process that left the group but holds its output.
+ * it exits, and, for Git calls that change something (fetch, update-ref, push), a process that left the group but holds
+ * its output (reads, ls-remote and cat-file, fail instead after the pipe drain).
  */
 export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
 /** Keep a full process-settlement window between live rebase expiry and its separately budgeted durable cleanup. */

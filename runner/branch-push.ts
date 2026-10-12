@@ -116,7 +116,7 @@ export class GitBranchPusher implements BranchPusher {
     const unique = [...new Set(commits)];
     await this.#git(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--', this.#url, ...unique], signal, true);
     const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false,
-      Buffer.from(`${unique.join('\n')}\n`));
+      Buffer.from(`${unique.join('\n')}\n`), true);
     const records = found.split('\n');
     if (records.length !== unique.length || records.some((record, index) => record !== `${unique[index]} commit`))
       throw new Error('The refreshed remote base or head is not a commit in the runner repository.');
@@ -134,7 +134,7 @@ export class GitBranchPusher implements BranchPusher {
     if (input.expected !== undefined && !COMMIT_ID.test(input.expected)) throw new Error('A full commit ID is required.');
     const ref = this.#ref(input.branch);
     // Git answers "<id> missing" for an absent object; any other failure (no repository, permissions) keeps Git's error.
-    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`));
+    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`), true);
     if (found === `${input.head} missing`) throw new Error(`The runner repository has no commit ${input.head}.`);
     if (found !== `${input.head} commit`) throw new Error(`${input.head} is not a commit in the runner repository.`);
     const remote = await this.#read(ref, signal);
@@ -190,6 +190,10 @@ export class GitBranchPusher implements BranchPusher {
     return matches[0]?.[0] ?? null;
   }
 
+  /**
+   * `readOnly` (ls-remote, cat-file: commands that change nothing) bounds the wait for a process that left Git's group
+   * but holds its output: the call fails after the pipe drain instead. Members of Git's group are always waited for.
+   */
   async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer, readOnly = false): Promise<string> {
     const protocol = this.#url.startsWith('/') ? 'file' : 'https';
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',

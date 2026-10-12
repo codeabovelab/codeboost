@@ -1,6 +1,6 @@
 # Pre-merge rebase and sandboxed conflict boundary
 
-**Issue and lane:** #22, lanes F3-F4. This is the trusted local rewrite, recovery, and sandboxed conflict engine boundary. The `rebase-fix` child adapter is assembled inside the production rebaser through lane D with durable resource ownership and bounded exact-path copy-in/copy-out. No production request starts that rebaser yet: F5-F6 must own admission plus the current base/head refresh before invoking it, then push the rewritten head, run plan `cmd:` checks, wait for GitHub checks, and hand the validated pair to the merge coordinator. Exposing the raw rebaser earlier would bypass those required guards.
+**Issue and lane:** #22, lanes F3-F4. This is the trusted local rewrite, recovery, and sandboxed conflict engine boundary. The `rebase-fix` child adapter is assembled inside the production rebaser through lane D with durable resource ownership and bounded exact-path copy-in/copy-out. `prepare-merge` starts it after admission and the current base/head refresh (F5); the rewritten head is then pushed (F6a) and plan `cmd:` checks run. Waiting for GitHub's checks and handing the validated pair to the merge coordinator follow in F6b. Exposing the raw rebaser earlier would bypass those required guards.
 
 ## Ownership and lifecycle
 
