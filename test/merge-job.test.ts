@@ -231,6 +231,24 @@ it('replays a resent click, refuses a second click while a job runs, and replays
   expect(f.prep.calls).toHaveLength(1);
 });
 
+it('resolves close only once the job has settled, so shutdown can await its last write', async () => {
+  const f = setup();
+  // Preparation that finishes its own work after the shutdown abort (as a push or command check settling does).
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const prepared = f.prep.fake.start.bind(f.prep.fake);
+  (f.prep.fake as unknown as { start: typeof prepared }).start = async expected => { await held; return prepared(expected); };
+  f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.coordinator.latest()).toMatchObject({ state: 'running', step: 'preparing' }));
+  let closed = false;
+  const closing = f.coordinator.close().then(() => { closed = true; });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  expect(closed).toBe(false);
+  release(); await closing;
+  expect(f.coordinator.active).toBe(false);
+  expect(f.gh.merged).toEqual([]);
+});
+
 it('leaves a job running on shutdown, and startup ends it as failed', async () => {
   const f = setup({ checks: () => [pending()] });
   f.coordinator.start('review-token', randomUUID());

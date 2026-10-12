@@ -1914,7 +1914,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'running', step: 'checks' }); } finally { reopened.close(); }
   }, 60_000);
 
-  it('awaits a merge job that settles after the shutdown abort before the store closes', async () => {
+  it('closes the merge job before the store, so a job settling after the shutdown abort records its outcome', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, merging: AbortSignal | null = null;
     const base = gateway(() => storeRef!, () => []);
@@ -1936,7 +1936,8 @@ describe('the one-click merge job (F6b of #22)', () => {
     });
     const stores = vi.spyOn(Store.prototype, 'close').mockImplementation(function (this: Store) { order.push('store closed'); return storeClose.call(this); });
     try { await served.close(); } finally { jobs.mockRestore(); stores.mockRestore(); }
-    // Shutdown awaited the job before the store closed, so its last write landed: it ended as its merge attempt records it.
+    // Shutdown closed the job before the store (close awaiting the job is shown in merge-job.test.ts), and the job's last
+    // write landed: it ended as its merge attempt records it.
     expect(order[0]).toBe('job settled');
     expect(order).toContain('store closed');
     const reopened = new Store(database);
