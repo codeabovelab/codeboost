@@ -120,8 +120,9 @@ export class MergeCoordinator {
    * The already-fixed scan of a runner-published PR (F6b of #22). It must cover every base commit after the task's
    * original base (its first snapshot's), since a rebase can bring any of them under the PR. The pre-PR check of the
    * task's first opening into the current base branch scanned that branch from its snapshot's base to its tip and found
-   * nothing; when that base is the task's original base, the scan starts at that tip, and every later rebase onto the
-   * branch brought in only commits after it, whichever of the task's openings the merge follows. An opening into another
+   * nothing; when that base is the task's original base, the scan starts at that tip: commits a later rebase onto the
+   * branch brings in up to that tip were scanned by that check, and later ones are in this scan, whichever of the
+   * task's openings the merge follows. An opening into another
    * base branch says nothing about this one. A first opening recorded before schema v19 has no check: the task's oldest
    * clear check stands in. Otherwise (no such check, or one that scanned from a rebased base), the scan starts at the
    * task's original base. The task's own commits are excluded.
