@@ -577,8 +577,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     // A reply sent before the request's body is read (a refusal) closes the connection (#157). Node then discards the
     // body, and the connection stays busy while it does: shutdown's idle-connection close skips it, and nothing closes
-    // it once it goes idle, so a large body held it until the client or the keep-alive timeout dropped it.
-    // `req.complete` cannot tell whether a body is unread: it is still false while the handler starts, even with none.
+    // it once it goes idle, so a large body held it until the client or the keep-alive timeout dropped it. Accepted
+    // cost: a client still sending can be reset before it reads the refusal. The UI keeps an import's action ID for a
+    // resend. `req.complete` cannot tell whether a body is unread: it is still false while the handler starts.
     const declaresBody = req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] ?? 0) > 0;
     const head = (status: number, contentType: string) => {
       if (declaresBody && !req.readableEnded) res.setHeader('Connection', 'close');
@@ -612,10 +613,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const limit = path === '/api/plan/import' ? MAX_IMPORT_REQUEST_BYTES : MAX_REQUEST_BYTES;
         activeRequest.readingBody=true;
         // Past the limit, the rest of the body is read and discarded, and the 413 goes out once it ends (#157). Node does
-        // not discard the rest of a body the handler has started reading, so a reply mid-body left the connection half
-        // read until the keep-alive timeout (about 6 s). Closing the connection instead (as `head` does for a refusal
-        // before the body is read) can reset a client still sending before it reads the reply. Shutdown still destroys a request that is discarding its body (readingBody stays
-        // set), as it does any request still reading one.
+        // not discard the rest of a body the handler has started reading, so a reply mid-body either held the connection
+        // half read until the keep-alive timeout (about 6 s) or reset the client. Closing the connection instead (as
+        // `head` does for a refusal before the body is read) can also reset a client still sending before it reads the
+        // reply. Shutdown still destroys a request that is discarding its body (readingBody stays set), as it does any
+        // request still reading one.
         try { for await (const chunk of req) { size += chunk.length; if (size <= limit) chunks.push(chunk); else chunks.length = 0; } }
         finally { activeRequest.readingBody=false; }
         if (size > limit) { json(413, { error: 'Request too large.' }); return; }
