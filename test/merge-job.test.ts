@@ -240,6 +240,16 @@ it('ends queued when the merge queue accepted the head', async () => {
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it('leaves the task approved, merge blocked when a retried job is queued', async () => {
+  const f = setup({ queue: true, checks: n => (n === 1 ? [{ context: 'build', appId: null, state: 'failure' }] : []) });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked' });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'queued' });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
 it('refuses a click while the runner or publisher is busy, and replays that refusal once it is idle', () => {
   const f = setup(), id = randomUUID();
   expect(() => f.coordinator.start('review-token', id, () => 'The runner is busy.')).toThrow('The runner is busy.');
