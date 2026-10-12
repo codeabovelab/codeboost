@@ -1814,6 +1814,40 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(served.store.getTask(served.identity).status).toBe('merged');
    }, 60_000);
 
+  it('admits issue trust before a merge job starts: an untrusted click is refused and replayed, a failed read saves nothing', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, access: 'untrusted' | 'unreadable' | 'trusted' = 'trusted', reads = 0, prepared = 0;
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, async issueAccess(number) {
+      reads++;
+      if (access === 'unreadable') throw new Error('GitHub returned HTTP 502');
+      return access === 'trusted' ? { number, authorLogin: 'member', collaborator: true } : { number, authorLogin: 'outside', collaborator: false };
+    } };
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway: gate, mergeGateway: gh, runnerPublished: true,
+      preMerge: service => { const real = preparation(service); return { ...real, get active() { return false; }, get last() { return null; },
+        start: (expected: { actionId: string }) => { prepared++; return (real.start as (value: unknown) => unknown)(expected); } } as unknown as PreMergeCoordinator; } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // A failed read decides nothing: nothing is saved, so the same click may be sent again.
+    access = 'unreadable';
+    expect((await merge(served.app, token, id)).status).toBe(502);
+    expect(served.store.getMergeJob(served.identity, id)).toBeNull();
+    access = 'untrusted';
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: expect.stringMatching(/not trusted/) } });
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ refused: true });
+    // The resend replays the refusal without another read, even once the issue is trusted.
+    access = 'trusted'; const before = reads;
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: expect.stringMatching(/not trusted/) } });
+    expect(reads).toBe(before);
+    expect(prepared).toBe(0);
+    expect((await mergeState(served.app)).job).toBeNull();
+    // A new click on a trusted issue starts the job.
+    expect((await merge(served.app, token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+    expect(prepared).toBe(1);
+  }, 60_000);
+
   it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;

@@ -50,6 +50,8 @@ export class MergeJobCoordinator {
   get active(): boolean { return this.#active !== null; }
   /** The running job's settlement, for the server's after-work hooks; null when none runs. */
   get current(): Promise<void> | null { return this.#active; }
+  /** Whether this click already has a saved job or refusal, which a resend replays without new admission reads. */
+  saved(actionId: string): boolean { return this.service.store.getMergeJob(this.service.config.identity, actionId) !== null; }
   latest(): MergeJobView | null {
     const job = this.service.store.latestMergeJob(this.service.config.identity);
     return job ? mergeJobView(job) : null;

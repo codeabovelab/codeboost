@@ -679,8 +679,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           // With a runner, one click starts the whole merge job (F6b of #22) and returns at once; the browser follows it
           // through GET /api/merge.
           if(mergeJobs) {
-            const job=mergeJobs.start(input.token,input.actionId,()=>runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
-              ?'The runner or publisher is busy; the merge cannot start yet.':null);
+            // Trust is admitted before the job starts, as for prepare-merge: an untrusted issue's click is refused, and the
+            // refusal saved. A failed read decides nothing: it saves nothing, and the same click may be sent again.
+            let untrusted: string|null=null;
+            if(config.github&&!mergeJobs.saved(input.actionId)) {
+              if(stopping||runner?.closing)throw new ShuttingDownError();
+              const access=await readIssueAccess(requestAbort.signal);
+              try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
+            }
+            const job=mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
+              ?'The runner or publisher is busy; the merge cannot start yet.':null));
             const running=mergeJobs.current;
             if(running)void running.finally(()=>{ if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); });
             json(200,{...(await load(requestAbort.signal)),job});return;
