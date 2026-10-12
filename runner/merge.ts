@@ -112,23 +112,23 @@ export class MergeCoordinator {
     if (!latest || latest.number === null) throw new MergeTargetUnavailable(`The task has no published pull request into ${published.baseBranch}.`);
     if (published.configured !== undefined && published.configured !== latest.number)
       throw new MergeTargetUnavailable(`github.pullRequest is #${published.configured}, but the task's pull request is #${latest.number}. Remove github.pullRequest from the review configuration.`);
-    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange(latest.checkId) },
+    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange() },
       openingId: latest.openingId, marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
   }
 
   /**
-   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the PR's own pre-PR check
-   * scanned through, so base commits any pre-merge rebase brought under the PR are covered, even after a re-publish
-   * recorded a newer check from a rebased base. The task's own commits are excluded. An opening recorded before schema
-   * v19 uses the task's oldest clear check, the only start provably continuous with what was scanned before.
+   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the task's first clear
+   * pre-PR check scanned through. That check scanned the task's base up to that tip and found nothing; every base commit
+   * a later rebase can bring under the PR landed after it, so the scan covers them whichever opening the merge follows
+   * (a new opening after a rebase included). The task's own commits are excluded.
    */
-  #alreadyFixedRange(openingCheck: string | null): { alreadyFixedSince?: string; ownCommits: string[] } {
+  #alreadyFixedRange(): { alreadyFixedSince?: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
-    const check = (openingCheck ? store.getAlreadyFixed(identity, openingCheck) : null) ?? store.oldestClearAlreadyFixed(identity);
+    const check = store.oldestClearAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
     if (!check || check.result.outcome !== 'clear') return { ownCommits };
     // That check scanned its snapshot's base up to the base branch's tip then (`baseHead`) and found nothing, so the merge
-    // scans only what landed after that tip: every base commit a rebase can bring in, and no more.
+    // scans only what landed after that tip.
     return { alreadyFixedSince: check.result.baseHead, ownCommits };
   }
 
