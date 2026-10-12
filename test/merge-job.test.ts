@@ -67,12 +67,13 @@ function preparation(store: Store, result: (call: number) => PreMergeResult['sta
 }
 /** GitHub showing PR 7 as published; `checks(n)` gives the required checks of the n-th inspection. */
 function github(store: Store, options: { checks?: (n: number) => RequiredCheck[]; change?: (n: number) => Partial<RemoteMergeState>;
-  merge?: (signal?: AbortSignal) => Promise<{ url: string }>; queue?: boolean } = {}) {
+  merge?: (signal?: AbortSignal) => Promise<{ url: string }>; queue?: boolean; unreadable?: (n: number) => boolean } = {}) {
   let inspections = 0;
   const merged: string[] = [];
   const client: MergeGateway = {
     inspect: vi.fn(async request => {
       inspections++;
+      if (options.unreadable?.(inspections)) throw new Error('GitHub returned HTTP 502');
       const record = store.taskPullRequests(identity).find(pr => pr.number === 7)!;
       const snapshot = store.getSnapshot(identity);
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
@@ -139,6 +140,15 @@ it('stops at once when a required check fails, without waiting for the time limi
   expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked', reason: 'Required check failed: build.' });
   expect(f.gh.inspections()).toBe(1);
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
+it('ends failed, without merging, when GitHub cannot be read while waiting for checks', async () => {
+  const f = setup({ checks: () => [pending()], unreadable: n => n === 2 });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/HTTP 502/) });
+  expect(f.gh.inspections()).toBe(2);
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('in review');
 });
 
 it('waits while GitHub is still computing mergeability', async () => {
@@ -354,6 +364,7 @@ it('settles a job a crash left in its merge step from its merge attempt at start
   for (const [settle, expected, status] of [
     [() => undefined, 'submitted', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged'],
+    [(store: Store, id: string) => store.queueMergeAttempt(identity, id, 'https://github.com/owner/repo/pull/7'), 'queued', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked'],
   ] as const) {
     // GitHub never answers: the job is in its merge step when the process "crashes".
