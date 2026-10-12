@@ -279,7 +279,15 @@ export class MergeCoordinator {
       ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
       : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' };
     if (attempt?.state === 'merged') return { code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' };
-    if (attempt && !this.#freshReviewComplete(attempt)) return { code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+    if (attempt && !this.#freshReviewComplete(attempt)) {
+      // A new snapshot or plan revision after an attempt (a rebase, for example) needs every item approved again for it;
+      // the attempt's own reason (often GitHub's refusal) would not say so.
+      const { store, config } = this.service;
+      const replaced = store.getSnapshot(config.identity).id !== attempt.snapshotId || store.getPlan(config.identity).revision !== attempt.revision;
+      return { code: 'queue-head', message: replaced
+        ? `The pull request changed after the last merge attempt${attempt.reason ? ` (${attempt.reason})` : ''}. Approve every item again for the replacement snapshot, then merge.`
+        : attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+    }
     return null;
   }
 

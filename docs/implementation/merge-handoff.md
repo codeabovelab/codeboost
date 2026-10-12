@@ -44,7 +44,7 @@ While waiting, an unknown mergeability (GitHub is still computing it) and a pend
 | `merged` | merged | nothing |
 | `queued` | unchanged (in review, or approved, merge blocked on a retry) while GitHub's queue holds it | nothing |
 | `submitted` | unchanged | refresh; the merge attempt settles from GitHub |
-| `blocked` | approved, merge blocked | fix the check or GitHub's reason, then **Retry merge**. To change the task's code, use the scope-amendment flow, as from review: it accepts a blocked task. |
+| `blocked` | approved, merge blocked | fix the check or GitHub's reason, then **Retry merge**. After GitHub refused a merge, a retry whose preparation rebases makes a new snapshot, and that needs every item approved again (the replacement-snapshot rule of `merge-queue.md`); the retry then ends `failed` and says so. To change the task's code, use the scope-amendment flow, as from review: it accepts a blocked task. |
 | `review-required` | unchanged | review the refreshed pull request, then merge again |
 | `failed` | unchanged | read the reason, then merge again |
 | `cancelled` | cancelled | nothing |

@@ -502,6 +502,48 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
 });
 
+it('ends a retry whose preparation rebased after a refused merge as failed, asking for the replacement snapshot\'s review', async () => {
+  let storeRef: Store | null = null;
+  const f = setup({ merge: async () => { throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused'); },
+    prepare: call => {
+      // The retry's preparation rebases: a new snapshot, whose approvals carry over but were given for the old one.
+      if (call === 2) {
+        const store = storeRef!, snapshot = store.getSnapshot(identity);
+        store.recordRebase(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+      }
+      return 'ready';
+    } });
+  storeRef = f.store;
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked' });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+  f.coordinator.start('review-token', randomUUID());
+  // A refused attempt followed by a new snapshot needs every item approved again (#24): the job says so, not GitHub's old text.
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/Approve every item again for the replacement snapshot/) });
+  expect(f.gh.merged).toHaveLength(1);
+});
+
+it('refuses, saves and replays a click on a task that is not mergeable or is being cancelled', () => {
+  const f = setup(), queued = randomUUID();
+  f.store.transitionTask(identity, f.store.getTask(identity).stateVersion, 'queued');
+  expect(() => f.coordinator.start('review-token', queued)).toThrow('The task is queued; merge it from review.');
+  expect(f.store.getMergeJob(identity, queued)).toMatchObject({ refused: true });
+  f.store.transitionTask(identity, f.store.getTask(identity).stateVersion, 'in review');
+  // A resend replays the refusal, even though the task is in review again.
+  expect(() => f.coordinator.start('review-token', queued)).toThrow('The task is queued; merge it from review.');
+  // A cancel that waits for a push of the rewritten head to settle keeps the task in review, cancel requested.
+  const snapshot = f.store.getSnapshot(identity), reviewed = { revision: 1, snapshotId: snapshot.id, reviewVersion: f.store.reviewVersion(identity) };
+  f.store.recordRebase(identity, reviewed, oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+  const after = f.store.getSnapshot(identity);
+  f.store.beginPrePush(identity, { revision: 1, snapshotId: after.id, reviewVersion: f.store.reviewVersion(identity) }, f.store.getTask(identity).stateVersion,
+    { branch: BRANCH, from: oid(2), to: oid(12) });
+  expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  const cancelling = randomUUID();
+  expect(() => f.coordinator.start('review-token', cancelling)).toThrow('The task is being cancelled.');
+  expect(f.store.getMergeJob(identity, cancelling)).toMatchObject({ refused: true });
+  expect(f.prep.calls).toEqual([]);
+});
+
 it('answers a preparation stopping for shutdown as not applied, saving nothing', () => {
   const f = setup(), id = randomUUID();
   (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('The server is shutting down.'); };
