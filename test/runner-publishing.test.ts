@@ -1872,7 +1872,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
   }, 60_000);
 
-  it('answers 503 when shutdown stops the reload after a merge job was saved, and the resent click replays it', async () => {
+  it('answers 503 when shutdown stops the reload after a merge job was saved, keeping the saved job for a resend', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, hanging = false;
     // From the click on, GitHub does not answer; only the caller's abort ends each read.
@@ -1888,7 +1888,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     const closed = served.close();
     expect(await clicked).toMatchObject({ status: 503 });
     await closed;
-    // The job was saved: a resend after restart replays it rather than starting another.
+    // The job was saved under the click's action ID, which a resend replays (merge-job.test.ts covers the replay).
     const reopened = new Store(database);
     try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
   }, 60_000);
