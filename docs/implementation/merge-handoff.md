@@ -52,7 +52,7 @@ Moving the task to **approved, merge blocked** advances its state version, so th
 
 ## The already-fixed range
 
-A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base of the snapshot on which the pull request's own pre-PR check ran (recorded with the opening, schema v19) to the base branch's tip, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the latest clear check, whatever later checks found. The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
+A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base-branch tip the pull request's own pre-PR check scanned through (that check is recorded with the opening, schema v19) to the base branch's tip now, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the latest clear check, whatever later checks found. The check reads at most 250 base commits: if more landed since the pre-PR check, its answer is unknown and merging stays blocked, as for a pull request never rebased. There is no person override yet (the Continue action of `pull-request-opening.md` is a later slice). The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
 
 ## Cancel, shutdown and restart
 
@@ -72,7 +72,7 @@ Schema v19 adds `merge_jobs`: one row per job (`action_id`, task key, `state`, `
 
 - `POST /api/action` with `merge` returns `{ job }` at once when a runner is configured.
 - `GET /api/merge` returns `{ queue, job }`.
-- Merge PR is offered while the only blockers left are ones the job resolves: preparation, a moved base (with a merge conflict it causes), `cmd:` checks, pending required checks, and mergeability GitHub is still computing.
+- Merge PR is offered while the only blockers left are ones the job resolves or reports: preparation, a moved base (with a merge conflict it causes), `cmd:` checks, required checks (the job waits for pending ones and ends `blocked` on failing ones, so a person can retry after re-running CI), and mergeability GitHub is still computing.
 - The browser polls `GET /api/merge` with the existing 2 s to 30 s backoff while a job runs, shows its step in the merge banner, lists waiting checks in the blocker dialog, and offers **Retry merge** when the job is `blocked`. The design's full step list and a Cancel button come later.
 
 ## Tests

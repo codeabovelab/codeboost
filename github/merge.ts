@@ -61,7 +61,7 @@ export interface MergeTarget {
   /** The task branch of a published target (#121). The inspection then also reads `RemoteMergeState.published`. */
   headBranch?: string;
   /**
-   * Where the already-fixed commit scan starts: the base the PR's own pre-PR check scanned from. A rebase moves the
+   * Where the already-fixed commit scan starts: the base-branch tip the PR's own pre-PR check scanned through. A rebase moves the
    * PR's base past base commits that check never saw (F6b of #22). Default: the PR's base commit.
    */
   alreadyFixedSince?: string;

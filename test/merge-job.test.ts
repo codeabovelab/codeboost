@@ -341,7 +341,10 @@ it('settles a job a crash left in its merge step from its merge attempt at start
 it('blocks the job and the task in one write, leaving a task that moved meanwhile as it is', () => {
   const store = publishedTask(), first = randomUUID(), second = randomUUID();
   store.beginMergeJob(identity, { actionId: first, token: 'review-token' });
+  const before = store.getTask(identity).stateVersion;
   expect(store.blockMergeJob(identity, first, 'Required check failed: ci.')).toBe(true);
+  // The status change advances the task state version, so the next merge prepares again from the start.
+  expect(store.getTask(identity).stateVersion).toBe(before + 1);
   expect(store.getMergeJob(identity, first)).toMatchObject({ state: 'blocked', reason: 'Required check failed: ci.' });
   expect(store.getTask(identity).status).toBe('approved but merge blocked');
   store.beginMergeJob(identity, { actionId: second, token: 'review-token' });
@@ -368,4 +371,12 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   f.store.updateMergeJob(identity, crashed, { step: 'merging', mergeActionId: randomUUID() });
   f.store.settleInterruptedMergeJobs(identity);
   expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
+});
+
+it('refuses a click while a preparation is already running, saving nothing', () => {
+  const f = setup();
+  (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('Pre-merge preparation is already running.'); };
+  expect(() => f.coordinator.start('review-token', randomUUID())).toThrow('Pre-merge preparation is already running.');
+  expect(f.coordinator.latest()).toBeNull();
+  expect(f.prep.calls).toEqual([]);
 });

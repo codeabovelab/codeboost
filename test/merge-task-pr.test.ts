@@ -253,7 +253,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
     const status = await merges.status();
     expect(status.blockers).toEqual([]);
-    expect(gh.targets[0]).toEqual({ pullRequest: 7, ownPullRequests: [7], headBranch: BRANCH, alreadyFixedSince: oid(1), ownCommits: [oid(2)] });
+    expect(gh.targets[0]).toEqual({ pullRequest: 7, ownPullRequests: [7], headBranch: BRANCH, alreadyFixedSince: oid(9), ownCommits: [oid(2)] });
     await merges.merge('review-token');
     expect(gh.merged).toEqual([7]);
     expect(store.getMergeAttempt(identity)).toMatchObject({ pullRequest: 7, state: 'merged' });
@@ -340,7 +340,7 @@ describe('the merge gate with a runner block (#121)', () => {
     store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
     await merges.status(undefined, true);
-    expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 7, alreadyFixedSince: oid(1) });
+    expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 7, alreadyFixedSince: oid(9) });
     expect([...gh.targets.at(-1)!.ownCommits!].sort()).toEqual([oid(12), oid(2)].sort());
   });
 
@@ -353,12 +353,13 @@ describe('the merge gate with a runner block (#121)', () => {
     const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
     store.markRunning(identity, attempt.id);
     store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
-    expect(clear(store).snapshotId).toBe(store.getSnapshot(identity).id);
+    expect(store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id,
+      reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(19) } }).snapshotId).toBe(store.getSnapshot(identity).id);
     expect(store.getSnapshot(identity).base).toBe(oid(10));
     toReview(store);
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
     await merges.status(undefined, true);
-    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(1) });
+    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(9) });
   });
 
   it('scans from the latest clear check for a PR opened before schema v19, even when a later check was not clear', async () => {
@@ -382,7 +383,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(reopened);
     const merges = new MergeCoordinator(service(reopened), gh.client, undefined, undefined, PUBLISHED);
     await merges.status(undefined, true);
-    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(1) });
+    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(9) });
   });
 
   it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
@@ -411,7 +412,7 @@ describe('the merge gate with a runner block (#121)', () => {
     toReview(store);
     const gh = github(store);
     await new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED).status();
-    expect(gh.targets[0]).toEqual({ pullRequest: 8, ownPullRequests: [7, 8], headBranch: BRANCH, alreadyFixedSince: oid(1), ownCommits: [oid(2)] });
+    expect(gh.targets[0]).toEqual({ pullRequest: 8, ownPullRequests: [7, 8], headBranch: BRANCH, alreadyFixedSince: oid(9), ownCommits: [oid(2)] });
   });
 
   it('refuses when the task\'s PR changes between the validation passes', async () => {

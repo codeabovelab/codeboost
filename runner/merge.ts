@@ -117,16 +117,19 @@ export class MergeCoordinator {
   }
 
   /**
-   * The already-fixed scan of a runner-published PR (F6b of #22): from the base the PR's own pre-PR check scanned, so base
-   * commits any pre-merge rebase brought under the PR are covered, even after a re-publish recorded a newer check from a
-   * rebased base. The task's own commits are excluded. An opening recorded before schema v19 uses the latest clear check.
+   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the PR's own pre-PR check
+   * scanned through, so base commits any pre-merge rebase brought under the PR are covered, even after a re-publish
+   * recorded a newer check from a rebased base. The task's own commits are excluded. An opening recorded before schema
+   * v19 uses the latest clear check.
    */
   #alreadyFixedRange(openingCheck: string | null): { alreadyFixedSince?: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
     const check = (openingCheck ? store.getAlreadyFixed(identity, openingCheck) : null) ?? store.latestClearAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
     if (!check || check.result.outcome !== 'clear') return { ownCommits };
-    return { alreadyFixedSince: store.getSnapshot(identity, check.snapshotId).base, ownCommits };
+    // That check scanned its snapshot's base up to the base branch's tip then (`baseHead`) and found nothing, so the merge
+    // scans only what landed after that tip: every base commit a rebase can bring in, and no more.
+    return { alreadyFixedSince: check.result.baseHead, ownCommits };
   }
 
   /** Whether GitHub shows the task's published PR where it was opened, as the only open PR from its branch. */
