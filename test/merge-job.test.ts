@@ -337,3 +337,35 @@ it('settles a job a crash left in its merge step from its merge attempt at start
     expect(f.store.getTask(identity).status).toBe(status);
   }
 });
+
+it('blocks the job and the task in one write, leaving a task that moved meanwhile as it is', () => {
+  const store = publishedTask(), first = randomUUID(), second = randomUUID();
+  store.beginMergeJob(identity, { actionId: first, token: 'review-token' });
+  expect(store.blockMergeJob(identity, first, 'Required check failed: ci.')).toBe(true);
+  expect(store.getMergeJob(identity, first)).toMatchObject({ state: 'blocked', reason: 'Required check failed: ci.' });
+  expect(store.getTask(identity).status).toBe('approved but merge blocked');
+  store.beginMergeJob(identity, { actionId: second, token: 'review-token' });
+  expect(store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
+  expect(store.blockMergeJob(identity, second, 'late')).toBe(true);
+  expect(store.getTask(identity).status).toBe('cancelled');
+});
+
+it('decides a retried job only from its own merge attempt, never from an earlier refused one', async () => {
+  // The first job's merge is refused: its attempt stays on record as failed.
+  let refuse = true, conflictFrom = Number.POSITIVE_INFINITY;
+  const f = setup({ merge: async () => { if (refuse) throw new MergeSubmissionError('Base branch was modified.', 'refused'); return { url: 'u' }; },
+    change: n => (n >= conflictFrom ? { mergeable: 'CONFLICTING' } : {}) });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked' });
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed' });
+  // Retry: the guarded merge's second validation pass now sees a conflict, so it refuses before asking GitHub.
+  refuse = false; conflictFrom = f.gh.inspections() + 3;
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/merge conflicts/) });
+  // At startup too: a job that saved its merge action ID but never got an attempt fails, whatever older attempts say.
+  const crashed = randomUUID();
+  f.store.beginMergeJob(identity, { actionId: crashed, token: 'review-token' });
+  f.store.updateMergeJob(identity, crashed, { step: 'merging', mergeActionId: randomUUID() });
+  f.store.settleInterruptedMergeJobs(identity);
+  expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
+});

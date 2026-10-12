@@ -158,16 +158,10 @@ export class MergeJobCoordinator {
       this.#finish(job.id, 'cancelled', 'Task cancelled.');
   }
 
-  /** Approved, merge blocked: the task's next merge prepares again from the start. */
+  /** Approved, merge blocked: the task's next merge prepares again from the start. One Store transaction. */
   #block(job: MergeJob, reason: string): void {
-    const { store, config } = this.service, identity = config.identity;
-    try {
-      this.settle(() => {
-        const task = store.getTask(identity);
-        if (task.status === 'in review') store.transitionTask(identity, task.stateVersion, 'approved but merge blocked');
-      });
-    } catch { /* The task moved meanwhile (for example, cancelled); the job still ends blocked. */ }
-    this.#finish(job.id, 'blocked', reason);
+    try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason)); }
+    catch { /* Startup settles a job that could not be ended now. */ }
   }
 
   async #awaitChecks(job: MergeJob, signal: AbortSignal): Promise<CheckVerdict> {

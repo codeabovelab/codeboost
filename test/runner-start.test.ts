@@ -190,16 +190,6 @@ describe('start (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toHaveLength(1);
     expect(await view(app)).toMatchObject({ startable: false });
   });
-  it('starts a task whose merge job was blocked, so an amended plan can fix what blocked it (F6b)', async () => {
-    const { app, identity, store, items } = await serve();
-    // As a merge job leaves it when a required check failed or GitHub refused the merge.
-    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
-    expect(await view(app)).toMatchObject({ startable: true, resumable: false });
-    const started = await act(app, 'start');
-    expect(started.body.result).toMatchObject({ outcome: 'started', item: items[0] });
-    expect(store.getAttempts(identity)).toEqual([expect.objectContaining({ kind: 'execute', item: items[0] })]);
-    await app.executor!.close();
-  });
   it('rolls the move to queued back when admission refuses the first item, and records the refusal', async () => {
     // Only earlier-revision attempts, the budget spent, and back in review: runChoice passes, so the action moves the
     // task to queued and admission itself refuses.

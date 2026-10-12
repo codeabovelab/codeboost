@@ -2142,6 +2142,22 @@ export class Store {
     mergeActionId?: string }): MergeJob | null {
     return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, ...patch } : null);
   }
+  /**
+   * End a running job `blocked` and, in the same transaction, move a task still in review to approved, merge blocked,
+   * so the job and the task cannot disagree after a crash. A task that moved meanwhile keeps its status.
+   */
+  blockMergeJob(identity: PlanIdentity, id: string, reason: string): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
+        && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
+        this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);
+        this.#touch(key);
+      }
+      return this.finishMergeJob(identity, id, { state: 'blocked', reason });
+    });
+  }
   /** End a running job. Returns false when it had already ended. */
   finishMergeJob(identity: PlanIdentity, id: string, outcome: { state: Exclude<MergeJobState, 'running'>; reason?: string | null; url?: string | null }): boolean {
     return this.#changeMergeJob(identity, id, job => job.state === 'running'
@@ -2194,12 +2210,7 @@ export class Store {
         reason: 'The server restarted while GitHub\'s merge outcome was unknown; it reconciles from GitHub.' });
       return;
     }
-    const task = this.getTask(identity);
-    if (task.status === 'in review') {
-      try { this.transitionTask(identity, task.stateVersion, 'approved but merge blocked'); }
-      catch (error) { if (!(error instanceof GuardRefusal)) throw error; }
-    }
-    this.finishMergeJob(identity, running.id, { state: 'blocked', reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}` });
+    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {
