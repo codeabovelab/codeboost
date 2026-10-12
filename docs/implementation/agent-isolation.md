@@ -89,10 +89,15 @@ Use only these entry points to run an agent:
    - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory
      and passes its exact text to Claude as `--json-schema`. The container profile refuses the command if that text
      differs from the file it mounts. The result's `stdout` is Claude's `structured_output` object as JSON text, with
-     no prose or Markdown around it. A Claude run that fails its own schema check settles with a nonzero exit code.
-     Questions answer in plain text and carry no schema flag. The schema file must be a regular file with one link,
-     at most 64 KiB of UTF-8, and a JSON object with `"type": "object"`; otherwise the start call throws. Leave out a
-     draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan format](../plan-format.md)).
+     no prose or Markdown around it. It is the exact text of that member, cut from the CLI's envelope and never
+     re-encoded here, so the plan parser sees any duplicate key or inexact integer the envelope holds and refuses it
+     (#166). The Claude API and CLI may resolve those before writing the envelope; that is not verified, because the
+     only real-CLI probes need credentials and do not run in CI. A planning envelope that repeats a top-level key is
+     refused as malformed, whatever it reports. A Claude run that fails its own schema check settles with a nonzero
+     exit code. Questions answer in plain text and carry no schema flag. The schema file must be a regular file with
+     one link, at most 64 KiB of UTF-8, and a JSON object with `"type": "object"`; otherwise the start call throws.
+     Leave out a draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan
+     format](../plan-format.md)).
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before

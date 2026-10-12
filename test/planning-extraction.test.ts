@@ -66,6 +66,7 @@ it.each([
   expect(extract(raw)).toMatchObject({ providerFailed: true });
 });
 
+// `structured` writes its envelope with JSON.stringify, so the exact text of the answer is JSON.stringify(answer).
 it('returns structured_output as JSON text and ignores Claude\'s prose result', () => {
   const answer = reply();
   expect(extract(structured(answer))).toEqual({ text: JSON.stringify(answer), providerFailed: false });
