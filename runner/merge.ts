@@ -122,9 +122,8 @@ export class MergeCoordinator {
    * task's first opening into the current base branch scanned that branch from its snapshot's base to its tip and found
    * nothing; when that base is the task's original base, the scan starts at that tip: commits a later rebase onto the
    * branch brings in up to that tip were scanned by that check, and later ones are in this scan, whichever of the
-   * task's openings the merge follows. An opening into another
-   * base branch says nothing about this one. A first opening recorded before schema v19 has no check: the task's oldest
-   * clear check stands in. Otherwise (no such check, or one that scanned from a rebased base), the scan starts at the
+   * task's openings the merge follows. An opening into another base branch says nothing about this one. A first
+   * opening recorded before schema v19 has no check: the task's oldest clear check stands in. Otherwise (no such check, or one that scanned from a rebased base), the scan starts at the
    * task's original base. The task's own commits are excluded.
    */
   #alreadyFixedRange(here: TaskPullRequest[], base: string): { alreadyFixedSince: string; ownCommits: string[] } {
