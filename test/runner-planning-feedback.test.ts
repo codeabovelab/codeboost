@@ -7,7 +7,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { choiceKeys } from '../core/approvals.ts';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
-import { startServer, type PlanningDeps } from '../web/server.ts';
+import { MAX_IMPORT_REQUEST_BYTES, MAX_REQUEST_BYTES, startServer, type PlanningDeps } from '../web/server.ts';
+import { MAX_SOURCE_BYTES } from '../core/parse-v1.ts';
 import { Store } from '../runner/store.ts';
 import { ReviewService } from '../runner/review.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -143,6 +144,76 @@ describe('planning API for lane G', () => {
     expect((await api(app, 'POST', '/api/plan/import', request)).body.result).toEqual(first.body.result);
     expect((await review(app)).plan.revision).toBe(view.plan.revision + 1);
     expect((await api(app, 'POST', '/api/plan/import', { ...request, actionId: randomUUID() })).status).toBe(409);
+  });
+  describe('import request size (#146)', () => {
+    /** The plan with items added up to `count` items. Each new item adds files whose change text is `change`. */
+    const grown = (plan: Record<string, any>, count: number, change: string, files = 40) => ({ ...plan, items: [...plan.items,
+      ...Array.from({ length: count - plan.items.length }, (_, i) => {
+        const id = `P${plan.items.length + i + 1}`;
+        return { id, title: `Item ${id}`, intent: 'Fill the plan.', depends_on: [], acceptance: [{ type: 'check', text: 'Covered.' }],
+          files: Array.from({ length: files }, (_, k) => ({ path: `import-limit/${id}/f${k}.txt`, kind: 'add', renamed_from: null, change })) };
+      })] });
+    const post = async (app: App, body: string) => {
+      const response = await fetch(`${new URL(app.url).origin}/api/plan/import`, { method: 'POST', body,
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    const envelope = (source: string, revision: number) => JSON.stringify({ source, format: 'json', expectedRevision: revision, actionId: randomUUID() });
+
+    it('imports a schema-valid plan whose request is larger than the 16 KiB other requests get', async () => {
+      const { app } = await serve();
+      const view = await review(app);
+      const body = envelope(JSON.stringify(grown(view.plan, 10, 'Write the generated file.')), view.plan.revision);
+      expect(Buffer.byteLength(body)).toBeGreaterThan(MAX_REQUEST_BYTES);
+      expect(await post(app, body)).toEqual({ status: 200, body: { result: { revision: view.plan.revision + 1 } } });
+      expect((await review(app)).plan.items).toHaveLength(10);
+    });
+    it('imports a 1 MiB YAML source that escapes to almost six times its size, the most JSON can expand it', async () => {
+      const { app } = await serve();
+      const view = await review(app);
+      // YAML takes a raw control character in a quoted scalar; JSON writes each one as \u0001.
+      const yaml = (plan: unknown) => `%YAML 1.2\n---\n${JSON.stringify(plan).replaceAll('\\u0001', '\u0001')}\n`;
+      let files = 1;
+      while (Buffer.byteLength(yaml(grown(view.plan, 30, '\u0001'.repeat(1200), files + 1))) < MAX_SOURCE_BYTES) files++;
+      const unpadded = yaml(grown(view.plan, 30, '\u0001'.repeat(1200), files));
+      const source = `${unpadded}#${'x'.repeat(MAX_SOURCE_BYTES - Buffer.byteLength(unpadded) - 1)}`;
+      expect(Buffer.byteLength(source)).toBe(MAX_SOURCE_BYTES);
+      const body = JSON.stringify({ source, format: 'yaml', expectedRevision: view.plan.revision, actionId: randomUUID() });
+      expect(Buffer.byteLength(body)).toBeGreaterThan(5.5 * MAX_SOURCE_BYTES);
+      expect(Buffer.byteLength(body)).toBeLessThanOrEqual(MAX_IMPORT_REQUEST_BYTES);
+      expect(await post(app, body)).toEqual({ status: 200, body: { result: { revision: view.plan.revision + 1 } } });
+      expect((await review(app)).plan.items[29].files[0].change).toBe('\u0001'.repeat(1200));
+    });
+    it('passes a request at the limit to the parser, which refuses a source over 1 MiB', async () => {
+      const { app } = await serve();
+      const view = await review(app), empty = Buffer.byteLength(envelope('', view.plan.revision));
+      const body = envelope('x'.repeat(MAX_IMPORT_REQUEST_BYTES - empty), view.plan.revision);
+      expect(Buffer.byteLength(body)).toBe(MAX_IMPORT_REQUEST_BYTES);
+      const response = await post(app, body);
+      expect(response).toEqual({ status: 409, body: { error: expect.stringMatching(/exceeds 1 MiB/) } });
+      // The refusal is recorded like any other import refusal: the same request replays it.
+      expect(await post(app, body)).toEqual(response);
+      expect((await review(app)).plan.revision).toBe(view.plan.revision);
+    });
+    it('refuses a request one byte over the limit before reading it as JSON, and imports nothing', async () => {
+      const { app } = await serve();
+      const view = await review(app), empty = Buffer.byteLength(envelope('', view.plan.revision));
+      const body = envelope('x'.repeat(MAX_IMPORT_REQUEST_BYTES - empty + 1), view.plan.revision);
+      expect(Buffer.byteLength(body)).toBe(MAX_IMPORT_REQUEST_BYTES + 1);
+      expect(await post(app, body)).toEqual({ status: 413, body: { error: 'Request too large.' } });
+      expect((await review(app)).plan.revision).toBe(view.plan.revision);
+    });
+    it('keeps the 16 KiB limit for every other request, the other planning requests included', async () => {
+      const { app } = await serve();
+      const body = JSON.stringify({ pad: 'x'.repeat(MAX_REQUEST_BYTES - 9) });
+      expect(Buffer.byteLength(body)).toBe(MAX_REQUEST_BYTES + 1);
+      for (const path of ['/api/action', '/api/settings', '/api/issues', '/api/runner', '/api/plan/suggestions', '/api/plan/drafts',
+        `/api/plan/suggestions/${randomUUID()}/apply`, `/api/plan/drafts/${randomUUID()}/cancel`]) {
+        const response = await fetch(`${new URL(app.url).origin}${path}`, { method: 'POST', body,
+          headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
+        expect([path, response.status]).toEqual([path, 413]);
+      }
+    });
   });
   it('starts, reads, and applies a suggestion exactly once', async () => {
     const { deps, calls } = planning();
