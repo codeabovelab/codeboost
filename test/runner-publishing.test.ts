@@ -1749,10 +1749,18 @@ describe('the one-click merge job (F6b of #22)', () => {
     },
   } as unknown as PreMergeCoordinator);
   /** GitHub showing the task's published PR at the reviewed pair; `checks()` gives its required checks now. */
-  const gateway = (store: () => Store, checks: () => RequiredCheck[]): MergeGateway & { merged: string[] } => {
-    const merged: string[] = [];
-    return { merged,
+  const gateway = (store: () => Store, checks: () => RequiredCheck[], hang: () => boolean = () => false):
+    MergeGateway & { merged: string[]; inspections: () => number; hung: AbortSignal[] } => {
+    const merged: string[] = [], hung: AbortSignal[] = [];
+    let inspections = 0;
+    return { merged, hung, inspections: () => inspections,
       inspect: async request => {
+        inspections++;
+        // From this inspection on, GitHub does not answer; only the caller's abort ends the read.
+        if (hang() && request?.signal) {
+          hung.push(request.signal);
+          await new Promise((_resolve, reject) => request.signal!.addEventListener('abort', () => reject(request.signal!.reason), { once: true }));
+        }
         const identity = createIdentity(), pr = store().taskPullRequests(identity).find(row => row.number === request?.target?.pullRequest);
         const snapshot = store().getSnapshot(identity);
         return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
@@ -1805,6 +1813,27 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(gh.merged).toEqual([served.store.getSnapshot(served.identity).head]);
     expect(served.store.getTask(served.identity).status).toBe('merged');
    }, 60_000);
+
+  it('stops a waiting merge job promptly on shutdown and leaves it running on disk for the next startup', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, hanging = false;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }], () => hanging);
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 30, maxDelayMs: 30 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks' }), { timeout: 10_000 });
+    // GitHub stops answering the job's next inspection; only the job's own abort can end that read.
+    hanging = true;
+    await vi.waitFor(() => expect(gh.hung).toHaveLength(1), { timeout: 10_000 });
+    const database = served.app.service.config.database, closing = Date.now();
+    await served.close();
+    expect(Date.now() - closing).toBeLessThan(10_000);
+    expect(gh.hung[0]!.aborted).toBe(true);
+    const reopened = new Store(database);
+    try { expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'running', step: 'checks' }); } finally { reopened.close(); }
+  }, 60_000);
 
   it('stops a waiting merge job when the task is cancelled, and closes the task\'s pull requests', async () => {
     const w = world(); mergeable(w);

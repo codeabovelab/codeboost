@@ -11,7 +11,7 @@ With a runner, **Merge PR** no longer merges at once. It starts one **merge job*
 2. waits for GitHub's required checks on the pushed head, for up to 30 minutes;
 3. merges through the existing guarded merge, which reruns the already-fixed check and pins the exact head.
 
-Any change that needs a person (a stale approval, a moved pull request, a failing check) stops the job and says why. A failing or slow required check, or a refusal from GitHub, moves the task to **approved, merge blocked**; **Retry merge** starts the whole job again. The browser follows the job by polling.
+Any change that needs a person (a stale approval, a moved pull request, a failing check) stops the job and says why. A task cancelled while the job runs ends it `cancelled`, however the job learns of it. A failing or slow required check, or a refusal from GitHub, moves the task to **approved, merge blocked**; **Retry merge** starts the whole job again. The browser follows the job by polling.
 
 Without a runner, **Merge PR** works as before.
 
@@ -30,7 +30,7 @@ Without a runner, **Merge PR** works as before.
 
 | Step | What happens | It continues when | It stops when |
 |---|---|---|---|
-| Admission | The click's review token must be current, the task mergeable, and no merge job, runner attempt, publish or preparation active. The job record is saved under the click's action ID and the click returns `merging`. | always | the token is stale, or something is busy (nothing is saved; the click may be sent again) |
+| Admission | The click's review token must be current, the task mergeable, and no merge job, runner attempt, publish or preparation active. The job record is saved under the click's action ID and the click returns the review with the job (`running`, step `preparing`). | always | the token is stale, or something is busy (nothing is saved; the click may be sent again) |
 | Prepare | The job records its own `prepare-merge` action and runs preparation. | preparation is `ready` | preparation needs review (job: `review-required`) or fails (job: `failed`) |
 | Wait for checks | The job inspects the pull request (fresh) at once, then again after 10 s, with the wait doubling up to 60 s. | every required check succeeds, or the required set was read and is empty, and nothing else blocks | a required check fails, or 30 minutes pass (job: `blocked`); the pull request moved, or another blocker appears (job: `failed`) |
 | Merge | The job calls the guarded merge with the current review token. Its inspections rerun the already-fixed check. | GitHub merged or queued the head (job: `merged` or `queued`) | GitHub refused (job: `blocked`), validation refused (job: `failed`), or the outcome is unknown (job: `submitted`; the merge attempt reconciles as before) |
@@ -60,8 +60,8 @@ A rebase moves the pull request's base. The guarded merge would then scan only t
 |---|---|
 | Cancel during preparation | as for `prepare-merge`: the preparation stops, and the task closes when its work has settled |
 | Cancel while waiting | the wait stops at once; the task closes; the job ends `cancelled` |
-| Cancel during the guarded merge | as before: refused while a merge attempt is submitting |
-| Shutdown | the job is aborted and awaited before the store closes; it stays `running` on disk |
+| Cancel during the guarded merge | before GitHub is asked, the merge stops and the job ends `cancelled`; once a merge attempt is submitting, a cancel is refused, as before |
+| Shutdown | the job is aborted and awaited before the store closes. While preparing or waiting, it stays `running` on disk. A guarded merge in progress stops as a click's does: if GitHub was not asked yet, the job stays `running`; if it was, the job ends `submitted` and the merge attempt reconciles as before |
 | Restart | a `running` job becomes `failed` ("The server restarted before the merge finished"); a `prepare-merge` action and a push marker are settled as before |
 
 ## Storage
@@ -76,7 +76,7 @@ Schema v19 adds `merge_jobs`: one row per job (`action_id`, task key, `state`, `
 
 ## Tests
 
-Each row of the step and outcome tables has a regression. The #22 acceptance cases run through the job: a base move that leaves approvals valid merges; a rebase that makes an approval stale stops for review; a breaking command after a rebase fails the job; a collaborator push stops for review; a cancelled or interrupted job leaves the task as stated above. The required-check wait has the three cases the design names: zero required checks, one check pending then passing, and a timeout.
+`test/merge-job.test.ts` runs the job against the real Store and guarded merge with a faked GitHub and preparation. It covers the three wait cases the design names (zero required checks, one check pending then passing, a timeout), a failing check, GitHub still computing mergeability, preparation ending for review or failing, another blocker while waiting, GitHub's refusal, an unknown merge outcome, a merge queue (`queued`), cancel while waiting (told or not) and during the guarded merge's validation, shutdown while waiting and during the guarded merge, startup settlement, resends, a second click, a stale token, a busy runner, and which blockers keep Merge PR available (including Retry merge after `blocked`). `test/pre-merge.test.ts` runs the #22 acceptance cases through the job with real preparation: a base move that leaves approvals valid merges; a rebase that makes an approval stale stops for review; a breaking command after a rebase fails the job; a collaborator push stops for review; a cancel during a command check ends the job `cancelled`. Server tests cover the merge route, `GET /api/merge`, the `prepare-merge` refusal, cancel closing the pull requests, and shutdown; a production test covers startup settlement; a browser test follows a job to merged.
 
 ## Check this document with a reader
 

@@ -122,6 +122,15 @@ describe('runner startup', () => {
     expect(await assembly.sources.vendor(service.config.identity)).toBe('claude');
     expect(() => assembly.sources.planContext({ ...service.config.identity, planId: 'other' })).toThrow(/only its configured plan/);
   });
+  it('fails a merge job an earlier process left running before it assembles anything (F6b)', async () => {
+    const { root, service } = fixture(), calls: string[] = [];
+    const actionId = randomUUID();
+    service.store.beginMergeJob(service.config.identity, { actionId, token: 'review-token' });
+    await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'sha256:x', recovery: () => recovery(calls) });
+    expect(service.store.getMergeJob(service.config.identity, actionId)).toMatchObject({ state: 'failed',
+      reason: expect.stringMatching(/server restarted/) });
+  });
   it('pushes a prepared rewrite only under an exact lease on the PR head it rewrote', async () => {
     const { root, service } = fixture(), calls: string[] = [];
     const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },

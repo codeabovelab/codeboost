@@ -3,10 +3,10 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
-import { MergeJobCoordinator } from '../runner/merge-job.ts';
+import { MergeJobCoordinator, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
 import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
 import type { ReviewService } from '../runner/review.ts';
-import { MergeSubmissionError, type MergeGateway, type RemoteMergeState, type RequiredCheck } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type RemoteMergeState, type RequiredCheck } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { commandDigest } from '../runner/checks.ts';
@@ -67,7 +67,7 @@ function preparation(store: Store, result: (call: number) => PreMergeResult['sta
 }
 /** GitHub showing PR 7 as published; `checks(n)` gives the required checks of the n-th inspection. */
 function github(store: Store, options: { checks?: (n: number) => RequiredCheck[]; change?: (n: number) => Partial<RemoteMergeState>;
-  merge?: () => Promise<{ url: string }> } = {}) {
+  merge?: (signal?: AbortSignal) => Promise<{ url: string }>; queue?: boolean } = {}) {
   let inspections = 0;
   const merged: string[] = [];
   const client: MergeGateway = {
@@ -76,12 +76,17 @@ function github(store: Store, options: { checks?: (n: number) => RequiredCheck[]
       const record = store.taskPullRequests(identity).find(pr => pr.number === 7)!;
       const snapshot = store.getSnapshot(identity);
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
-        mergeQueue: false, requiredChecks: options.checks?.(inspections) ?? [], alreadyFixed: 'clear', pullRequest: 7, draft: false,
+        mergeQueue: options.queue === true, requiredChecks: options.checks?.(inspections) ?? [], alreadyFixed: 'clear', pullRequest: 7, draft: false,
         ...(request?.target?.headBranch ? { published: { headBranch: request.target.headBranch, baseBranch: 'main', crossRepository: false,
           marker: openingMarker(record.openingId), branchOpen: [{ number: 7, base: 'main' }] } } : {}),
         ...options.change?.(inspections) } as RemoteMergeState;
     }),
-    merge: vi.fn(async head => { merged.push(head); return options.merge ? options.merge() : { url: 'https://github.com/owner/repo/pull/7' }; }),
+    merge: vi.fn(async (head, request) => { merged.push(head); return options.merge ? options.merge(request?.signal) : { url: 'https://github.com/owner/repo/pull/7' }; }),
+    ...(options.queue ? {
+      queueWatermark: vi.fn(async () => 'CURSOR'),
+      inspectQueue: vi.fn(async (head: string) => ({ state: 'queued' as const, reviewedHead: head, entryId: 'E', phase: 'QUEUED' as const, position: 0,
+        enqueuedAt: '2026-10-11T00:00:00Z', queueHead: head })),
+    } satisfies MergeQueueGateway : {}),
   };
   return { client, merged, inspections: () => inspections };
 }
@@ -214,4 +219,69 @@ it('leaves a job running on shutdown, and startup ends it as failed', async () =
   f.store.settleInterruptedMergeJobs(identity);
   expect(f.coordinator.latest()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
   expect(() => f.coordinator.start('review-token', randomUUID())).toThrow(/shutting down/);
+});
+
+it('ends queued when the merge queue accepted the head', async () => {
+  const f = setup({ queue: true });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'queued' });
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ kind: 'queue', state: 'queued' });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('refuses a click while the runner or publisher is busy, saving nothing', () => {
+  const f = setup();
+  expect(() => f.coordinator.start('review-token', randomUUID(), () => 'The runner is busy.')).toThrow('The runner is busy.');
+  expect(f.coordinator.latest()).toBeNull();
+  expect(f.prep.calls).toEqual([]);
+});
+
+it('ends cancelled when the task was cancelled while the job waited, even if the job was not told', async () => {
+  const f = setup({ checks: () => [pending()] });
+  f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
+  expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
+});
+
+it('ends cancelled when the task is cancelled during the guarded merge\'s validation', async () => {
+  let cancelAt = Number.POSITIVE_INFINITY, coordinatorRef: MergeJobCoordinator | null = null, storeRef: Store | null = null;
+  const f = setup({ change: n => {
+    if (n === cancelAt) { storeRef!.cancelTask(identity, storeRef!.getTask(identity).stateVersion, randomUUID()); coordinatorRef!.cancel(); }
+    return {};
+  } });
+  coordinatorRef = f.coordinator; storeRef = f.store;
+  // Inspection 1 is the wait; inspections 2+ are the guarded merge's validation passes.
+  cancelAt = 2;
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
+  expect(f.gh.merged).toEqual([]);
+});
+
+it('stops a guarded merge in flight on shutdown, so shutdown does not wait for GitHub', async () => {
+  const f = setup({ merge: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
+  f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.gh.merged).toHaveLength(1));
+  const closing = Date.now();
+  await f.coordinator.close();
+  expect(Date.now() - closing).toBeLessThan(2_000);
+  // GitHub was already asked, so its outcome is unknown: the job ends submitted and the attempt stays in flight.
+  expect(f.coordinator.latest()).toMatchObject({ state: 'submitted' });
+  expect(f.store.getMergeAttempt(identity)?.state).toBe('submitting');
+});
+
+it('offers Merge PR while only blockers the job resolves remain, and a retry after a blocked job', () => {
+  const remote = { mergeable: 'MERGEABLE' };
+  const status = (codes: string[], extra: Partial<{ queue: { state: string } | null; remote: { mergeable: string } | null }> = {}) =>
+    ({ ready: false, action: null, blockers: codes.map(code => ({ code, message: code })), remote, queue: null, ...extra }) as Parameters<typeof withMergeJob>[0];
+  const running = { state: 'running' } as MergeJobView, blocked = { state: 'blocked' } as MergeJobView;
+  expect(withMergeJob(status(['preparation', 'base', 'acceptance', 'check']), null, 'in review')).toMatchObject({ ready: true, action: 'merge', job: null });
+  expect(withMergeJob(status(['mergeable'], { remote: { mergeable: 'UNKNOWN' } }), null, 'in review')).toMatchObject({ ready: true });
+  expect(withMergeJob(status(['mergeable']), null, 'in review')).toMatchObject({ ready: false, action: null });
+  for (const code of ['approval', 'scope', 'unplanned', 'head', 'already-fixed', 'rules', 'base-guard', 'task'])
+    expect(withMergeJob(status(['preparation', code]), null, 'in review')).toMatchObject({ ready: false, action: null });
+  expect(withMergeJob(status([]), running, 'in review')).toMatchObject({ ready: false, job: running });
+  expect(withMergeJob(status([], { queue: { state: 'submitting' } }), null, 'in review')).toMatchObject({ ready: false });
+  expect(withMergeJob(status([], { remote: null }), null, 'in review')).toMatchObject({ ready: false });
+  expect(withMergeJob(status(['preparation']), blocked, 'approved but merge blocked')).toMatchObject({ ready: true, action: 'retry', job: blocked });
 });

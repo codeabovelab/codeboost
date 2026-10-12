@@ -106,7 +106,7 @@ export class MergeJobCoordinator {
     () => ({ outcome: 'preparing' }));
     const prepared = await this.preMerge.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
       snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head, actionId: prepareId });
-    if (signal.aborted) return this.#end(job, signal);
+    if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
     if (prepared.state !== 'ready')
       return this.#finish(job.id, prepared.state === 'review-required' ? 'review-required' : 'failed', prepared.reason);
     // 2. Wait for GitHub's required checks on the pushed head.
@@ -120,13 +120,17 @@ export class MergeJobCoordinator {
     view = this.service.load();
     const mergeId = randomUUID();
     try {
-      const merged = await this.merges.merge(view.token, mergeId);
+      // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
+      // is applied; after, the outcome is unknown.
+      const merged = await this.merges.merge(view.token, mergeId, signal);
       const attempt = store.getMergeAttempt(identity);
       this.#finish(job.id, attempt?.kind === 'queue' && attempt.state !== 'merged' ? 'queued' : 'merged', null, merged.result.url || null);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (error instanceof MergeOutcomeUnknown) return this.#finish(job.id, 'submitted', reason);
-      if (error instanceof MergeNotApplied) return signal.aborted ? this.#end(job, signal) : this.#finish(job.id, 'failed', reason);
+      // A cancel or shutdown, whichever way the merge reported it (stopped, or refused because the task was cancelled).
+      if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
+      if (error instanceof MergeNotApplied) return this.#finish(job.id, 'failed', reason);
       // GitHub refused the attempt this job admitted: approved, merge blocked (design: "GitHub refused the merge").
       const attempt = store.getMergeAttempt(identity);
       if (attempt?.actionId === mergeId && (attempt.state === 'failed' || attempt.state === 'removed'))
@@ -135,9 +139,14 @@ export class MergeJobCoordinator {
     }
   }
 
-  /** Cancel ends the job; shutdown leaves it running on disk for startup to settle. */
+  #cancelled(): boolean {
+    const task = this.service.store.getTask(this.service.config.identity);
+    return task.status === 'cancelled' || task.cancelRequested !== null;
+  }
+  /** A cancelled task ends the job, however the job learned of it; shutdown leaves it running on disk for startup. */
   #end(job: MergeJob, signal: AbortSignal): void {
-    if ((signal.reason as { code?: string } | undefined)?.code === 'CANCELLED') this.#finish(job.id, 'cancelled', 'Task cancelled.');
+    if ((signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled())
+      this.#finish(job.id, 'cancelled', 'Task cancelled.');
   }
 
   /** Approved, merge blocked: the task's next merge prepares again from the start. */
