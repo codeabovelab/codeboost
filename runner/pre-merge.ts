@@ -22,7 +22,7 @@ export interface PreMergeRemote {
   /** The commit the task branch points at on GitHub, or null when it does not exist. */
   readBranch(branch: string, signal?: AbortSignal): Promise<string | null>;
 }
-/** One bounded read of the branch settles a push whose outcome is unknown. */
+/** One read of the branch, bounded as `#settlePush` says, settles a push whose outcome is unknown. */
 export const PUSH_SETTLEMENT_TIMEOUT_MS = 30_000;
 /**
  * GitHub's pull-request API reports a pushed head asynchronously. After a push, no new inspection starts once this long
@@ -44,7 +44,10 @@ type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 // D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
 // of that ownership settlement inside the preparation's one overall deadline.
 export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
-/** Git and GitHub subprocesses abort before the advertised operation deadline, leaving their bounded stop/drain time. */
+/**
+ * Git and GitHub subprocesses abort before the advertised operation deadline, leaving their stop/drain time (bounded,
+ * except for a process that stays in a subprocess's group after it exits, which is waited for).
+ */
 export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
 /** Keep a full process-settlement window between live rebase expiry and its separately budgeted durable cleanup. */
 const REBASE_CLEANUP_HANDOFF_RESERVE_MS = PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
@@ -200,7 +203,8 @@ export class PreMergeCoordinator {
   /**
    * One branch read, all of it, Git's settlement after an abort included, within `limitMs` (at most
    * PUSH_SETTLEMENT_TIMEOUT_MS): the read is aborted the process-settlement reserve before that, and does not start
-   * when less than the reserve is left.
+   * when less than the reserve is left. One case is not bounded: a process that stays in Git's group after Git exits
+   * is waited for, as for every Git call, since its group ID may be reused and it cannot be signalled safely.
    */
   async #settlePush(marker: PushMarker, limitMs = PUSH_SETTLEMENT_TIMEOUT_MS): Promise<{ outcome: PushOutcome; before: number; after: number }> {
     const readMs = Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs) - this.processSettlementReserveMs;
@@ -323,7 +327,8 @@ export class PreMergeCoordinator {
     } catch (error) {
       if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
       // Shutdown: no new GitHub read may start; startup settles the marker. Otherwise one read, within what is left of
-      // the preparation's deadline with Git's settlement reserve kept inside it, settles it; a cancel does not stop that
+      // the preparation's deadline with Git's settlement reserve kept inside it (except for a process that stays in
+      // Git's group after Git exits, which is waited for; see #settlePush), settles it; a cancel does not stop that
       // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
       // the marker stays, as for an unreadable branch.
       let settled = binding;
