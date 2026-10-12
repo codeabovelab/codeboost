@@ -78,6 +78,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   pushedFirst?: (service: ReviewService) => string;
   /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
   afterPush?: (service: ReviewService, pushed: string) => string;
+  /** The push lands, but its read-back (as GitBranchPusher's) sees another head and throws. */
+  readBackFails?: boolean;
   pushFailure?: (service: ReviewService, input: { from: string; to: string }) => Error;
   branchRead?: (current: string, signal?: AbortSignal) => string | null | Promise<string | null>;
   /** Runs while the push reads the remote, before its final local checks (the pusher's `beforePush`). */
@@ -225,6 +227,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
         lagged = { ...lagged, base }; remotePair = { ...remotePair, base };
       }
       if (options.afterPush) remotePair = { ...remotePair, head: options.afterPush(service, input.to) };
+      if (options.readBackFails && remotePair.head !== input.to)
+        throw new Error(`After the push, the branch ${input.branch} is at ${remotePair.head}, not ${input.to}.`);
     },
     // A real branch read is aborted by its signal; so is this one, so a cancel that stopped settlement would show.
     readBranch: async (_branch, signal) => {
@@ -1088,6 +1092,22 @@ it('reviews a collaborator push that lands on the rewritten head right after it 
   } });
   expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator, checked: [] });
   expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
+  expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
+  expect(fixture.checkedHeads).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reviews a collaborator push that lands between the push and its read-back', async () => {
+  let collaborator = '';
+  const fixture = await rebaseFixture('feature\n', 0, { readBackFails: true, afterPush(service, pushed) {
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${pushed}^{tree}`);
+    collaborator = fixtureGit(service.config.repository, 'commit-tree', tree, '-p', pushed, '-m', 'collaborator before the read-back');
+    return collaborator;
+  } });
+  // The push's own read-back failed; the settlement read found the collaborator's head, so it is reviewed, not failed.
+  expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator, checked: [] });
+  expect(fixture.result.reason).toMatch(/moved while the rewritten head was being pushed/);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).pushInProgress).toBeNull();
   expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
   expect(fixture.checkedHeads).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();

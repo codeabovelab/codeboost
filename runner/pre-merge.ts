@@ -298,7 +298,7 @@ export class PreMergeCoordinator {
   async #pushRewrite(remote: RemotePair, view: ReturnType<ReviewService['load']>, signal: AbortSignal, deadline: number,
     authorize: () => Promise<PreMergeAuthorization | undefined>,
     bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => void):
-    Promise<{ result: 'pushed' | 'refused'; stateVersion: number }> {
+    Promise<{ result: 'pushed' | 'refused' | 'moved'; stateVersion: number }> {
     const identity = this.service.config.identity;
     if (!remote.branch) throw new GuardRefusal('The pull request was not published by the runner, so its rewritten head cannot be pushed.');
     const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
@@ -333,13 +333,16 @@ export class PreMergeCoordinator {
       // Git's group after Git exits, which is waited for; see #settlePush), settles it; a cancel does not stop that
       // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
       // the marker stays, as for an unreadable branch.
-      let settled = binding;
+      let settled = binding, outcome: PushOutcome | null = null;
       const left = Math.floor(deadline - performance.now());
       if (!this.#closing && left >= 1) {
-        try { settled = owned(await this.#settlePush(marker, left)); }
+        try { const read = await this.#settlePush(marker, left); settled = owned(read); outcome = read.outcome; }
         catch { /* The marker stays; the next preparation or startup reads the branch again. */ }
       }
       bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head }, settled);
+      // The branch holds neither the pre-push head nor ours: someone else moved it while the push's outcome was unknown
+      // (for example, right after the push, before its read-back). That head is reviewed, as after a refusal.
+      if (outcome === 'moved') return { result: 'moved', stateVersion: settled };
       throw error;
     }
     return { result: 'pushed', stateVersion: owned(this.#finishPush(marker)) };
@@ -504,7 +507,9 @@ export class PreMergeCoordinator {
         return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
           reason: pushed === 'pushed'
             ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
-            : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
+            : pushed === 'moved'
+              ? 'The pull request branch moved while the rewritten head was being pushed; attribution and approvals were refreshed.'
+              : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
       }
       // Nothing but this push may have changed the task meanwhile: a plan revision or review edit applied while it was in
       // flight would otherwise be adopted by the reload below and run checks under approvals it made stale.
