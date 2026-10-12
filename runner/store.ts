@@ -137,6 +137,8 @@ export type MergeJobStep = 'preparing' | 'checks' | 'merging';
 export interface MergeJob {
   /** The click's action ID. */
   id: string;
+  /** The action ID of the guarded merge this job started, once it reaches that step: its attempt carries it. */
+  mergeActionId: string | null;
   /** The review token the click was made with; a resend must carry the same one. */
   token: string;
   state: MergeJobState;
@@ -2109,7 +2111,6 @@ export class Store {
     const saved = decode<{ ok?: unknown; value?: { outcome?: unknown }; preMergeReadiness?: PreMergeReadiness }>(row.response);
     return saved.ok === true && saved.value?.outcome === 'ready' && stable(saved.preMergeReadiness) === stable(readiness);
   }
-  /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   /**
    * Admit a merge job for this click. A resend of the same click returns its job; another click while a job runs, or a
    * reused action ID with another token, is refused. Never touches the task.
@@ -2130,14 +2131,15 @@ export class Store {
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
-      const job: MergeJob = { id: input.actionId, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
+      const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
         url: null, startedAt: now, updatedAt: now };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return { job, resent: false };
     });
   }
   /** Move a running job to another step or record what it waits for. A job no longer running is left unchanged. */
-  updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[] }): MergeJob | null {
+  updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[];
+    mergeActionId?: string }): MergeJob | null {
     return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, ...patch } : null);
   }
   /** End a running job. Returns false when it had already ended. */
@@ -2170,12 +2172,36 @@ export class Store {
       identityKey(identity));
     return row ? decode<MergeJob>(row.data) : null;
   }
-  /** At startup: a job the server stopped running cannot continue; it fails, and the person merges again. */
+  /**
+   * At startup: a job the server stopped running cannot continue. If it had asked GitHub to merge, its merge attempt's
+   * recorded state is its outcome (a refusal blocks the task, as the job would have); otherwise it fails, and the person
+   * merges again.
+   */
   settleInterruptedMergeJobs(identity: PlanIdentity): void {
     const running = this.runningMergeJob(identity);
-    if (running) this.finishMergeJob(identity, running.id, { state: 'failed',
-      reason: 'The server restarted before the merge finished. Merge again.' });
+    if (!running) return;
+    const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
+    if (!attempt || attempt.actionId !== running.mergeActionId) {
+      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished. Merge again.' });
+      return;
+    }
+    if (attempt.state === 'merged' || attempt.state === 'queued') {
+      this.finishMergeJob(identity, running.id, { state: attempt.state, url: attempt.url });
+      return;
+    }
+    if (attempt.state === 'submitting') {
+      this.finishMergeJob(identity, running.id, { state: 'submitted',
+        reason: 'The server restarted while GitHub\'s merge outcome was unknown; it reconciles from GitHub.' });
+      return;
+    }
+    const task = this.getTask(identity);
+    if (task.status === 'in review') {
+      try { this.transitionTask(identity, task.stateVersion, 'approved but merge blocked'); }
+      catch (error) { if (!(error instanceof GuardRefusal)) throw error; }
+    }
+    this.finishMergeJob(identity, running.id, { state: 'blocked', reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}` });
   }
+  /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {
     const snapshot = this.getSnapshot(identity);
     const result: PreMergeActionResult = { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [],
@@ -2251,6 +2277,11 @@ export class Store {
   taskPullRequests(identity: PlanIdentity): TaskPullRequest[] {
     const key = identityKey(identity); this.#task(key);
     return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
+  }
+  /** The latest already-fixed check that found nothing. */
+  latestClearAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
+    const row = this.#get(`SELECT * FROM already_fixed_checks WHERE plan_key=? AND outcome='clear' ORDER BY rowid DESC LIMIT 1`, identityKey(identity));
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
     const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? AND id=?', identityKey(identity), id);

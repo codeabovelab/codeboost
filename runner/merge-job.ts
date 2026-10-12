@@ -120,9 +120,10 @@ export class MergeJobCoordinator {
     if (verdict.kind === 'blocked') return this.#block(job, verdict.reason);
     if (verdict.kind === 'failed') return this.#finish(job.id, 'failed', verdict.reason);
     // 3. Merge through the guarded merge, which re-validates everything and reruns the already-fixed check.
-    this.settle(() => store.updateMergeJob(identity, job.id, { step: 'merging', checks: [] }));
-    view = this.service.load();
+    // The merge's action ID is saved first: after a restart, the attempt carrying it gives the job's outcome.
     const mergeId = randomUUID();
+    this.settle(() => store.updateMergeJob(identity, job.id, { step: 'merging', checks: [], mergeActionId: mergeId }));
+    view = this.service.load();
     try {
       // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
       // is applied; after, the outcome is unknown.
@@ -209,7 +210,9 @@ export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retr
   const running = job?.state === 'running';
   const attempt = status.queue?.state === 'submitting' || status.queue?.state === 'queued' || status.queue?.state === 'merged';
   const computing = status.remote?.mergeable === 'UNKNOWN';
-  const personal = status.blockers.filter(blocker => !JOB_RESOLVES.has(blocker.code) && !(blocker.code === 'mergeable' && computing));
+  // A conflict after the base moved is the job's too: its preparation rebases, through the sandboxed conflict path.
+  const rebaseResolves = status.remote?.mergeable === 'CONFLICTING' && status.blockers.some(blocker => blocker.code === 'base');
+  const personal = status.blockers.filter(blocker => !JOB_RESOLVES.has(blocker.code) && !(blocker.code === 'mergeable' && (computing || rebaseResolves)));
   const ready = !running && !attempt && status.remote !== null && personal.length === 0;
   return { ...status, ready, action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job };
 }

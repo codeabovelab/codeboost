@@ -123,7 +123,7 @@ export class MergeCoordinator {
    */
   #alreadyFixedRange(openingCheck: string | null): { alreadyFixedSince?: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
-    const check = (openingCheck ? store.getAlreadyFixed(identity, openingCheck) : null) ?? store.latestAlreadyFixed(identity);
+    const check = (openingCheck ? store.getAlreadyFixed(identity, openingCheck) : null) ?? store.latestClearAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
     if (!check || check.result.outcome !== 'clear') return { ownCommits };
     return { alreadyFixedSince: store.getSnapshot(identity, check.snapshotId).base, ownCommits };

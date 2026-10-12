@@ -284,6 +284,9 @@ it('offers Merge PR while only blockers the job resolves remain, and a retry aft
   expect(withMergeJob(status([], { queue: { state: 'submitting' } }), null, 'in review')).toMatchObject({ ready: false });
   expect(withMergeJob(status([], { remote: null }), null, 'in review')).toMatchObject({ ready: false });
   expect(withMergeJob(status(['preparation']), blocked, 'approved but merge blocked')).toMatchObject({ ready: true, action: 'retry', job: blocked });
+  // A conflict after the base moved is the job's rebase to resolve; a conflict on its own is a person's.
+  expect(withMergeJob(status(['base', 'mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: true });
+  expect(withMergeJob(status(['mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: false });
 });
 
 it('ends as failed, not blocked, when checks fail on a head that moved while waiting', async () => {
@@ -312,4 +315,23 @@ it('ends blocked when GitHub refuses the merge while shutdown stops the job', as
   await f.coordinator.current;
   expect(f.coordinator.latest()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
+it('settles a job a crash left in its merge step from its merge attempt at startup', async () => {
+  for (const [settle, expected, status] of [
+    [() => undefined, 'submitted', 'in review'],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged'],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked'],
+  ] as const) {
+    // GitHub never answers: the job is in its merge step when the process "crashes".
+    const f = setup({ merge: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
+    f.coordinator.start('review-token', randomUUID());
+    await vi.waitFor(() => expect(f.gh.merged).toHaveLength(1));
+    const job = f.store.runningMergeJob(identity)!, attempt = f.store.getMergeAttempt(identity)!;
+    expect(job).toMatchObject({ step: 'merging', mergeActionId: attempt.actionId });
+    settle(f.store, attempt.id);
+    f.store.settleInterruptedMergeJobs(identity);
+    expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: expected });
+    expect(f.store.getTask(identity).status).toBe(status);
+  }
 });

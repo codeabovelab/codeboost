@@ -52,7 +52,7 @@ Moving the task to **approved, merge blocked** advances its state version, so th
 
 ## The already-fixed range
 
-A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base of the snapshot on which the pull request's own pre-PR check ran (recorded with the opening, schema v19) to the base branch's tip, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the latest clear check. The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
+A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base of the snapshot on which the pull request's own pre-PR check ran (recorded with the opening, schema v19) to the base branch's tip, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the latest clear check, whatever later checks found. The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
 
 ## Cancel, shutdown and restart
 
@@ -62,7 +62,7 @@ A rebase moves the pull request's base. The guarded merge would then scan only t
 | Cancel while waiting | the wait stops at once; the task closes; the job ends `cancelled` |
 | Cancel during the guarded merge | before GitHub is asked, the merge stops and the job ends `cancelled`; once a merge attempt is submitting, a cancel is refused, as before |
 | Shutdown | the job is stopped in shutdown's first, synchronous step, before requests drain, and awaited before the store closes. While preparing or waiting, it stays `running` on disk. A guarded merge in progress stops as a click's does: if GitHub was not asked yet, the job stays `running`; if it was, the job ends as the merge attempt records it: `blocked` if GitHub refused, otherwise `submitted`, and the attempt reconciles as before |
-| Restart | a `running` job becomes `failed` ("The server restarted before the merge finished"); a `prepare-merge` action and a push marker are settled as before |
+| Restart | a `running` job that had not asked GitHub to merge becomes `failed` ("The server restarted before the merge finished"). One that had (its merge action ID is saved before the guarded merge starts) ends as its merge attempt records it: `merged`, `queued`, `submitted`, or `blocked` after a refusal, which also moves the task to approved, merge blocked. A `prepare-merge` action and a push marker are settled as before |
 
 ## Storage
 
@@ -72,6 +72,7 @@ Schema v19 adds `merge_jobs`: one row per job (`action_id`, task key, `state`, `
 
 - `POST /api/action` with `merge` returns `{ job }` at once when a runner is configured.
 - `GET /api/merge` returns `{ queue, job }`.
+- Merge PR is offered while the only blockers left are ones the job resolves: preparation, a moved base (with a merge conflict it causes), `cmd:` checks, pending required checks, and mergeability GitHub is still computing.
 - The browser polls `GET /api/merge` with the existing 2 s to 30 s backoff while a job runs, shows its step in the merge banner, lists waiting checks in the blocker dialog, and offers **Retry merge** when the job is `blocked`. The design's full step list and a Cancel button come later.
 
 ## Tests
