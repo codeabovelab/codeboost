@@ -1,9 +1,9 @@
-import { Ajv2020 } from 'ajv/dist/2020.js';
+import { Ajv2020, type SchemaObject, type ValidateFunction } from 'ajv/dist/2020.js';
 import { identityKey, type PlanIdentity } from './identity.ts';
 import { parseV1 } from './parse-v1.ts';
 import registry from '../schema/versions.json' with { type: 'json' };
-import planSchema from '../schema/versions/1/plan.schema.json' with { type: 'json' };
-import editSchema from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
+import planSchemaV1 from '../schema/versions/1/plan.schema.json' with { type: 'json' };
+import editSchemaV1 from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
 
 export interface PlanFile {
   path: string; kind: 'add' | 'edit' | 'delete' | 'rename';
@@ -52,24 +52,139 @@ export class PlanError extends Error {
     this.diagnostics = diagnostics;
   }
 }
-const ajv = new Ajv2020({ allErrors: true, strict: true });
-const v1 = registry.versions['1'];
-if (v1.validator !== 'v1' || v1.plan !== 'versions/1/plan.schema.json' ||
-    v1.edit !== 'versions/1/plan-edit.schema.json' || v1.semantics !== 'versions/1/semantics.md')
-  throw new Error('Unsupported v1 registry dispatch.');
-const planShape = ajv.compile<Plan>(planSchema);
-const replyShape = ajv.compile<EditReply>(editSchema);
+export interface SchemaRegistry {
+  readonly current: number;
+  readonly versions: Readonly<Record<string, { readonly plan: string; readonly edit: string; readonly semantics: string; readonly validator: string }>>;
+}
+export type SemanticValidator = (value: Plan, context: PlanContext) => Validation;
+/** One registered schema version: its compiled snapshots and the semantic validator its registry key selects. */
+export interface SchemaVersion {
+  readonly version: number;
+  readonly paths: { readonly plan: string; readonly edit: string };
+  readonly plan: ValidateFunction<Plan>;
+  readonly edit: ValidateFunction<EditReply>;
+  /** The semantic checks. Call it only after this version's `plan` shape check, as `PlanSchemas.validate` does; it need
+   * not repeat that check (v1's does, through the production registry). Null when no implementation exists for the
+   * registry's validator key: such a version is unsupported. */
+  readonly validate: SemanticValidator | null;
+}
+export interface PlanSchemas {
+  readonly current: SchemaVersion;
+  readonly versions: ReadonlyMap<number, SchemaVersion>;
+  /** The version a value declares, or the current version when it declares none that is registered. */
+  select(value: unknown): SchemaVersion;
+  /** Shape, then semantics, both from one selected version. */
+  validate(value: unknown, context: PlanContext): Validation;
+  /** Shape only, but a version with no validator implementation is refused as unsupported here too. */
+  assertPlan(value: unknown): asserts value is Plan;
+  /** The same for an edit reply, against its version's edit schema. */
+  assertEditReply(value: unknown): asserts value is EditReply;
+}
+const SCHEMA_ID_BASE = 'https://github.com/codeabovelab/codeboost/schema/';
+/** Every retained snapshot, by registry path. A snapshot is used only when a registry entry names its path. */
+const RETAINED_SCHEMAS: Readonly<Record<string, SchemaObject>> = {
+  'versions/1/plan.schema.json': planSchemaV1, 'versions/1/plan-edit.schema.json': editSchemaV1,
+};
+/** Each semantic validator, by registry key, with the normative document it implements. */
+export type SemanticValidators = Readonly<Record<string, { readonly semantics: string; readonly validate: SemanticValidator }>>;
+const SEMANTIC_VALIDATORS: SemanticValidators = {
+  v1: { semantics: 'versions/1/semantics.md', validate: validateV1 },
+};
+
+/**
+ * Compile every registered version's plan and edit snapshots into one validator. Each snapshot path is named once
+ * and each `$id` must equal its path, so every `$id` is registered exactly once. These are build defects and throw:
+ * a registry key that is not a version number; a registry entry naming a path with no retained snapshot, or a
+ * snapshot or semantics path already named in the registry; a snapshot whose `$id` does not match its path or whose
+ * role (plan or edit) differs, or that does not require `schema_version` and accept only its own version; a
+ * validator key or implementation used by two versions, or bound to another semantics document; a missing current
+ * version. A validator key with no implementation loads, and validation reports that version as unsupported.
+ */
+export function loadPlanSchemas(source: SchemaRegistry, snapshots: Readonly<Record<string, SchemaObject>> = RETAINED_SCHEMAS,
+  validators: SemanticValidators = SEMANTIC_VALIDATORS): PlanSchemas {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const versions = new Map<number, SchemaVersion>(), named = new Set<string>(), keys = new Set<string>();
+  const implementations = new Set<SemanticValidator>();
+  const compile = (key: string, path: string, version: number, role: 'plan' | 'edit') => {
+    // Each snapshot belongs to one role in one version. (Ajv would return its cached function for a shared one.)
+    if (named.has(path)) throw new Error(`Schema version ${key} names ${path}, which is already named in the registry.`);
+    named.add(path);
+    const schema = Object.hasOwn(snapshots, path) ? snapshots[path] : undefined;
+    if (!schema) throw new Error(`Schema version ${key} names ${path}, which is not a retained snapshot.`);
+    if (schema.$id !== SCHEMA_ID_BASE + path) throw new Error(`The retained snapshot at ${path} has a different $id.`);
+    // Selection trusts the declared version only because each snapshot accepts that version and no other.
+    const declared = (schema.properties as { schema_version?: { enum?: unknown } } | undefined)?.schema_version?.enum;
+    if (!Array.isArray(schema.required) || !schema.required.includes('schema_version')
+        || !Array.isArray(declared) || declared.length !== 1 || declared[0] !== version)
+      throw new Error(`The retained snapshot at ${path} must require schema_version and accept only ${version}.`);
+    // A plan requires its items and not edits, and an edit reply the reverse, so an entry cannot swap the two roles.
+    const [own, other] = role === 'plan' ? ['items', 'edits'] : ['edits', 'items'];
+    if (!schema.required.includes(own) || schema.required.includes(other))
+      throw new Error(`Schema version ${key} names ${path} as its ${role} schema, which it is not.`);
+    return ajv.compile(schema);
+  };
+  for (const [key, entry] of Object.entries(source.versions)) {
+    const version = Number(key);
+    if (!/^[1-9][0-9]*$/.test(key) || !Number.isSafeInteger(version)) throw new Error(`Schema version ${key} is not a version number.`);
+    // Each version has a dedicated implementation; a later version never reuses an earlier one's validator.
+    if (keys.has(entry.validator)) throw new Error(`Schema version ${key} reuses validator ${entry.validator}.`);
+    keys.add(entry.validator);
+    const implementation = Object.hasOwn(validators, entry.validator) ? validators[entry.validator]! : null;
+    if (implementation && implementation.semantics !== entry.semantics)
+      throw new Error(`Schema version ${key} pairs validator ${entry.validator} with ${entry.semantics}, but it implements ${implementation.semantics}.`);
+    if (implementation && implementations.has(implementation.validate))
+      throw new Error(`Schema version ${key} reuses another version's validator implementation.`);
+    if (implementation) implementations.add(implementation.validate);
+    if (named.has(entry.semantics)) throw new Error(`Schema version ${key} names ${entry.semantics}, which is already named in the registry.`);
+    named.add(entry.semantics);
+    versions.set(version, Object.freeze({ version, paths: Object.freeze({ plan: entry.plan, edit: entry.edit }),
+      plan: compile(key, entry.plan, version, 'plan') as ValidateFunction<Plan>,
+      edit: compile(key, entry.edit, version, 'edit') as ValidateFunction<EditReply>,
+      validate: implementation?.validate ?? null }));
+  }
+  const current = versions.get(source.current);
+  if (!current) throw new Error(`The current schema version ${source.current} is not registered.`);
+  const select = (value: unknown) => {
+    const declared = value !== null && typeof value === 'object' && Object.hasOwn(value, 'schema_version')
+      ? (value as { schema_version: unknown }).schema_version : undefined;
+    // An undeclared or unregistered version gets the current schema, whose diagnostics then name the bad field.
+    return (typeof declared === 'number' && versions.get(declared)) || current;
+  };
+  return Object.freeze({ current, versions, select, validate(value: unknown, context: PlanContext): Validation {
+    const version = select(value);
+    if (!version.plan(value)) return { errors: shapeErrors(version.plan, 'schema'), warnings: [] };
+    if (!version.validate) return { errors: [unsupported(version.version)], warnings: [] };
+    return version.validate(value, context);
+  }, assertPlan(value: unknown): asserts value is Plan {
+    const version = select(value);
+    if (!version.plan(value)) throw new PlanError(shapeErrors(version.plan, 'schema'));
+    if (!version.validate) throw new PlanError([unsupported(version.version)]);
+  }, assertEditReply(value: unknown): asserts value is EditReply {
+    const version = select(value);
+    if (!version.edit(value)) throw new PlanError(shapeErrors(version.edit, 'edit-schema'));
+    if (!version.validate) throw new PlanError([unsupported(version.version)]);
+  } });
+}
+const unsupported = (version: number): Diagnostic =>
+  ({ code: 'version', message: `Schema version ${version} is not supported: codeboost has no semantic validator for it.` });
+function shapeErrors(shape: ValidateFunction, code: string): Diagnostic[] {
+  return (shape.errors ?? []).map(e => ({ code, message: `${e.instancePath || '/'} ${e.message}` }));
+}
+const PLAN_SCHEMAS: PlanSchemas = loadPlanSchemas(registry);
+/** The registry path of a retained version's plan or edit schema, for passing the exact snapshot to a provider. */
+export function retainedSchemaPath(version: number, kind: 'plan' | 'edit'): string {
+  const entry = PLAN_SCHEMAS.versions.get(version);
+  if (!entry) throw new Error(`Schema version ${version} is not registered.`);
+  return entry.paths[kind];
+}
+export const CURRENT_SCHEMA_VERSION = PLAN_SCHEMAS.current.version;
 
 function fail(code: string, message: string): never { throw new PlanError([{ code, message }]); }
 export function assertPlan(value: unknown): asserts value is Plan {
-  if (!planShape(value)) throw new PlanError((planShape.errors ?? []).map(e => ({
-    code: 'schema', message: `${e.instancePath || '/'} ${e.message}`,
-  })));
+  PLAN_SCHEMAS.assertPlan(value);
 }
 export function assertEditReply(value: unknown): asserts value is EditReply {
-  if (!replyShape(value)) throw new PlanError((replyShape.errors ?? []).map(e => ({
-    code: 'edit-schema', message: `${e.instancePath || '/'} ${e.message}`,
-  })));
+  PLAN_SCHEMAS.assertEditReply(value);
 }
 /** Canonical paths make duplicate checks reliable and exclude Git metadata. */
 export function isRepoPath(path: string): boolean {
@@ -128,14 +243,7 @@ function linkTarget(path: string, target: string, key: (path: string) => string,
 }
 
 export function validatePlan(value: unknown, context: PlanContext): Validation {
-  try { assertPlan(value); } catch (error) {
-    if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };
-    throw error;
-  }
-  const validators: Record<string, (value: Plan, context: PlanContext) => Validation> = { v1: validateV1 };
-  const validator = validators[registry.versions[value.schema_version].validator];
-  if (!validator) return { errors: [{ code: 'version', message: 'Unsupported semantic validator.' }], warnings: [] };
-  return validator(value, context);
+  return PLAN_SCHEMAS.validate(value, context);
 }
 
 /** Validate only work still to run, starting with the runner-audited tree at its checkpoint. */
@@ -313,7 +421,10 @@ export function importPlan(source: string | Uint8Array, format: 'json' | 'yaml',
   let data: unknown;
   try { data = parseV1(source, format); }
   catch (error) { fail('parse', `Cannot parse plan: ${(error as Error).message}`); }
-  assertPlan(data); // No migrations exist yet: only released v1 is accepted.
+  assertPlan(data);
+  // No migrations exist yet: an import must already be in the current version.
+  if (data.schema_version !== PLAN_SCHEMAS.current.version)
+    fail('version', `Plans are imported in schema version ${PLAN_SCHEMAS.current.version}; no migration from version ${data.schema_version} exists.`);
   const plan = { ...data, revision };
   const result = completedItems === undefined ? validatePlan(data, context) : validateContinuationPlan(plan, context, completedItems, true);
   if (result.errors.length) throw new PlanError(result.errors);
@@ -340,6 +451,8 @@ export function applySuggestion(plan: Plan, reply: unknown, index: number, conte
       binding.schemaVersion !== plan.schema_version || binding.baseRevision !== reply.base_revision ||
       binding.issue !== plan.issue || context.issue !== plan.issue)
     fail('suggestion-identity', 'Suggestion does not belong to this plan context.');
+  // The reply was checked by its own version's edit schema, which must be the plan's.
+  if (reply.schema_version !== plan.schema_version) fail('version', 'Suggestion uses a different schema version than the plan.');
   if (reply.base_revision !== plan.revision) fail('stale-revision', 'Suggestion was drafted against a different revision.');
   if (!Number.isInteger(index) || !reply.edits[index]) fail('edit-index', 'Suggestion index is out of range.');
   const edit = reply.edits[index]!;

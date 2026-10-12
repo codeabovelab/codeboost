@@ -2,3 +2,9 @@
 web/public/*.js linguist-generated=false linguist-vendored=false
 web/public/*.css linguist-generated=false linguist-vendored=false
 web/public/*.html linguist-generated=false linguist-vendored=false
+
+# Retained version files. The snapshots and semantics a registry entry names are pinned by SHA-256
+# (test/schema-versions.test.ts), so check out everything in a version directory with LF line endings.
+schema/versions/** text eol=lf
+# The unversioned CLI copies must equal the current snapshots byte for byte (test/registry.test.ts).
+schema/*.schema.json text eol=lf
