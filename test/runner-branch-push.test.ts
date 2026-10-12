@@ -328,6 +328,19 @@ describe('GitBranchPusher', () => {
     }
   }, 40_000);
 
+  it('waits for a process that stays in Git\'s group before a branch read returns', async () => {
+    const s = await setup(), bin = join(s.root, 'fake-bin-group');
+    mkdirSync(bin);
+    // Git's place on PATH: `ls-remote` answers nothing and exits, leaving a child in its own group for 12 s more, past
+    // the 10 s bounded group drain an unsettled return would stop at.
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+      `require('node:child_process').spawn('sleep', ['12'], { stdio: 'ignore' }).unref();`)}\n`, { mode: 0o755 });
+    const began = performance.now();
+    await expect(pusher(s, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }).instance.readBranch(IDENTITY, BRANCH)).resolves.toBeNull();
+    // A member of Git's group is never abandoned: the read returned only after it had gone.
+    expect(performance.now() - began).toBeGreaterThanOrEqual(11_500);
+  }, 60_000);
+
   it('removes a configured enterprise token of any shape from Git\'s error text', async () => {
     const s = await setup(), head = await runnerCommit(s, 'one'), token = 'enterprise-secret-0123456789';
     const missing = new GitBranchPusher({ repository: s.repository, repositoryId: 'repo-1', remote: 'acme/app',

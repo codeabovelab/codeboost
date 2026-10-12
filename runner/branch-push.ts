@@ -181,7 +181,8 @@ export class GitBranchPusher implements BranchPusher {
   /** The commit `ref` points at on the remote, or null when it does not exist. */
   async #read(ref: string, signal?: AbortSignal): Promise<string | null> {
     // A read changes nothing, so it need not wait for a process that escaped Git's group and holds its output: it returns
-    // failed (the output may be incomplete) after the bounded drain. The caller then knows nothing: a push marker stays.
+    // failed (the output may be incomplete) after the pipe drain. The caller then knows nothing: a push marker stays.
+    // Members still in Git's group are waited for, as for every Git call.
     const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true, undefined, true);
     // ls-remote matches patterns by their tail, so `refs/heads/x/<ref>` would match too: keep only the exact name.
     const matches = out.split('\n').filter(Boolean).map(line => line.split('\t')).filter(([, name]) => name === ref);
@@ -194,7 +195,7 @@ export class GitBranchPusher implements BranchPusher {
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
       ...remote ? ['-c', `protocol.${protocol}.allow=always`, ...CREDENTIAL_HELPER] : [], ...args],
     { cwd: this.#config.repository.path, env: pushEnvironment(this.#config.env), timeoutMs: this.#config.timeoutMs ?? 120_000,
-      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, allowUnsettledReturn: readOnly });
+      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, boundEscapedOutput: readOnly });
     // Aborted before or while Git ran: the caller's reason (such as shutdown) is what leaves, not Git's failure.
     signal?.throwIfAborted();
     if (outcome.status !== 0) throw gitFailure(args[0]!, outcome.status, [outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join('\n'),
