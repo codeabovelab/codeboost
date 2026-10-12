@@ -112,17 +112,18 @@ export class MergeCoordinator {
     if (!latest || latest.number === null) throw new MergeTargetUnavailable(`The task has no published pull request into ${published.baseBranch}.`);
     if (published.configured !== undefined && published.configured !== latest.number)
       throw new MergeTargetUnavailable(`github.pullRequest is #${published.configured}, but the task's pull request is #${latest.number}. Remove github.pullRequest from the review configuration.`);
-    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange() },
+    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange(latest.checkId) },
       openingId: latest.openingId, marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
   }
 
   /**
-   * The already-fixed scan of a runner-published PR (F6b of #22): from the base the task's last clear check scanned (the
-   * pre-PR check), so base commits a pre-merge rebase brought under the PR are covered, excluding the task's own commits.
+   * The already-fixed scan of a runner-published PR (F6b of #22): from the base the PR's own pre-PR check scanned, so base
+   * commits any pre-merge rebase brought under the PR are covered, even after a re-publish recorded a newer check from a
+   * rebased base. The task's own commits are excluded. An opening recorded before schema v19 uses the latest clear check.
    */
-  #alreadyFixedRange(): { alreadyFixedSince?: string; ownCommits: string[] } {
+  #alreadyFixedRange(openingCheck: string | null): { alreadyFixedSince?: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
-    const check = store.latestAlreadyFixed(identity);
+    const check = (openingCheck ? store.getAlreadyFixed(identity, openingCheck) : null) ?? store.latestAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
     if (!check || check.result.outcome !== 'clear') return { ownCommits };
     return { alreadyFixedSince: store.getSnapshot(identity, check.snapshotId).base, ownCommits };

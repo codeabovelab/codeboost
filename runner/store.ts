@@ -40,6 +40,8 @@ export interface TaskPullRequest {
   ownerReviewVersion: number;
   /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
   refresh: { head: string; draft: boolean; stateVersion: number } | null;
+  /** The clear already-fixed check this opening followed; null for an opening recorded before schema v19. */
+  checkId: string | null;
 }
 export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; reviewVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
@@ -351,6 +353,9 @@ export class Store {
           this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (
             id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS merge_jobs_plan ON merge_jobs(plan_key);`);
+          // The pre-PR already-fixed check each opening followed: the merge's scan starts at that check's base.
+          if (!this.#db.prepare('PRAGMA table_info(task_pull_requests)').all().some(column => column.name === 'check_id'))
+            this.#db.exec('ALTER TABLE task_pull_requests ADD COLUMN check_id TEXT');
           this.#db.exec('PRAGMA user_version=19');
         }
       });
@@ -2239,12 +2244,17 @@ export class Store {
       number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
       ownerVersion: row.owner_version as number, ownerReviewVersion: row.owner_review_version as number,
       refresh: row.refresh_head === null ? null : { head: row.refresh_head as string, draft: row.refresh_draft === 1, stateVersion: row.refresh_version as number },
+      checkId: (row.check_id as string | null | undefined) ?? null,
     };
   }
   /** Every PR codeboost opened or started to open for the task, oldest first. */
   taskPullRequests(identity: PlanIdentity): TaskPullRequest[] {
     const key = identityKey(identity); this.#task(key);
     return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
+  }
+  getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
+    const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? AND id=?', identityKey(identity), id);
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   latestAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
     const key = identityKey(identity); this.#task(key);
@@ -2311,9 +2321,9 @@ export class Store {
       if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
       const openingId = randomUUID(), now = new Date().toISOString();
       this.#touch(key);
-      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
-        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now);
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at,check_id)
+        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
+        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now, input.checkId);
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }

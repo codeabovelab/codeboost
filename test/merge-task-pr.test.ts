@@ -343,6 +343,23 @@ describe('the merge gate with a runner block (#121)', () => {
     expect([...gh.targets.at(-1)!.ownCommits!].sort()).toEqual([oid(12), oid(2)].sort());
   });
 
+  it('keeps scanning from the PR\'s own pre-PR check after a re-publish records a newer check from a rebased base', async () => {
+    const { store } = published(), gh = github(store);
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+    // A re-publish after an amendment: the runner runs again and records a clear check scanned from the rebased base.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    expect(clear(store).snapshotId).toBe(store.getSnapshot(identity).id);
+    expect(store.getSnapshot(identity).base).toBe(oid(10));
+    toReview(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await merges.status(undefined, true);
+    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(1) });
+  });
+
   it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
     const { store } = published();
     const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));

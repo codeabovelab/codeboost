@@ -303,3 +303,13 @@ it('asks GitHub to merge nothing once stopped, even if the checks pass meanwhile
   expect(f.gh.merged).toEqual([]);
   expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
 });
+
+it('ends blocked when GitHub refuses the merge while shutdown stops the job', async () => {
+  let coordinatorRef: MergeJobCoordinator | null = null;
+  const f = setup({ merge: async () => { coordinatorRef!.stop(); throw new MergeSubmissionError('Base branch was modified.', 'refused'); } });
+  coordinatorRef = f.coordinator;
+  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.current;
+  expect(f.coordinator.latest()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});

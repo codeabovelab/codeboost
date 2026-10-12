@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import { MergeNotApplied, MergeOutcomeUnknown, type MergeCoordinator, type MergeStatus } from './merge.ts';
+import { MergeOutcomeUnknown, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
 import type { MergeJob, MergeJobState } from './store.ts';
@@ -131,14 +131,18 @@ export class MergeJobCoordinator {
       this.#finish(job.id, attempt?.kind === 'queue' && attempt.state !== 'merged' ? 'queued' : 'merged', null, merged.result.url || null);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      // Once this job's merge attempt exists, GitHub was asked: its recorded state is the answer, whatever else (a cancel,
+      // shutdown) happened meanwhile. A refusal blocks (design: "GitHub refused the merge"); anything else is unknown.
+      const attempt = store.getMergeAttempt(identity);
+      if (attempt?.actionId === mergeId) {
+        if (attempt.state === 'failed' || attempt.state === 'removed') return this.#block(job, `GitHub refused the merge: ${attempt.reason ?? reason}`);
+        if (attempt.state === 'merged') return this.#finish(job.id, 'merged', null, attempt.url);
+        if (attempt.state === 'queued') return this.#finish(job.id, 'queued', null, attempt.url);
+        return this.#finish(job.id, 'submitted', reason);
+      }
       if (error instanceof MergeOutcomeUnknown) return this.#finish(job.id, 'submitted', reason);
       // A cancel or shutdown, whichever way the merge reported it (stopped, or refused because the task was cancelled).
       if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
-      if (error instanceof MergeNotApplied) return this.#finish(job.id, 'failed', reason);
-      // GitHub refused the attempt this job admitted: approved, merge blocked (design: "GitHub refused the merge").
-      const attempt = store.getMergeAttempt(identity);
-      if (attempt?.actionId === mergeId && (attempt.state === 'failed' || attempt.state === 'removed'))
-        return this.#block(job, `GitHub refused the merge: ${attempt.reason ?? reason}`);
       this.#finish(job.id, 'failed', reason);
     }
   }

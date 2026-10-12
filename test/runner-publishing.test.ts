@@ -1814,6 +1814,35 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(served.store.getTask(served.identity).status).toBe('merged');
    }, 60_000);
 
+  it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, release!: () => void, preparing = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, mergeGateway: gh, runnerPublished: true,
+      // A preparation that answers a cancel with "stopping" and closes the task only once its own work has settled.
+      preMerge: service => ({
+        get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null, close: async () => undefined,
+        cancelTask: () => 'stopping' as const,
+        start: async (expected: { actionId: string }) => {
+          preparing = true; await held; preparing = false;
+          const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
+          service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID());
+          return service.store.settlePreMergeAction(identity, expected.actionId,
+            { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'Task cancelled.' }, null);
+        },
+      } as unknown as PreMergeCoordinator) });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(() => expect(preparing).toBe(true), { timeout: 10_000 });
+    expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    expect(w.github.prs[0]!.open).toBe(true);
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 10_000 });
+    await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
+  }, 60_000);
+
   it('stops a waiting merge job promptly on shutdown and leaves it running on disk for the next startup', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, hanging = false;
@@ -1842,13 +1871,14 @@ describe('the one-click merge job (F6b of #22)', () => {
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
     const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
-      mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+      // Waits far longer than this test: only the cancel route's own stop can end the job in time.
+      mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 60_000, maxDelayMs: 60_000 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks' }), { timeout: 10_000 });
     expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'closed' });
-    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 10_000 });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 5_000 });
     await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
     expect(gh.merged).toEqual([]);
    }, 60_000);
