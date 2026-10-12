@@ -159,9 +159,12 @@ function renderMerge() {
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
   $("merge").disabled = !merge.ready;
+  $("merge").removeAttribute("aria-disabled");
   const job = merge.job;
   if (job?.state === "running") {
-    $("merge").disabled = true;
+    // Keep the control focusable while its job runs; repeat activation is ignored because the merge is not ready.
+    $("merge").disabled = false;
+    $("merge").setAttribute("aria-disabled", "true");
     $("merge").textContent = { preparing: "Preparing…", checks: "Waiting for checks…", merging: "Merging…" }[job.step] ?? "Merging…";
     $("merge-details").hidden = false;
     $("merge-details").textContent = "Merge status";
@@ -577,7 +580,9 @@ $("merge").onclick = async () => {
   mergeGeneration++;
   mergePollState = null;
   mergePollDelay = 2000;
-  $("merge").disabled = true;
+  // With merge jobs, the click returns at once and the focused control must keep focus: mark it, do not disable it.
+  if (data.merge && "job" in data.merge) $("merge").setAttribute("aria-disabled", "true");
+  else $("merge").disabled = true;
   try {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };

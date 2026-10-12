@@ -62,17 +62,21 @@ export class MergeJobCoordinator {
   start(token: unknown, actionId: string, busy: () => string | null = () => null): MergeJobView {
     const { store, config } = this.service, identity = config.identity;
     const saved = store.getMergeJob(identity, actionId);
-    if (saved) return mergeJobView(store.beginMergeJob(identity, { actionId, token: token as string }).job);
+    if (saved) {
+      const { job } = store.beginMergeJob(identity, { actionId, token: token as string });
+      // A refused click replays its refusal; anything else is the job this click started.
+      if (job.refused) throw new GuardRefusal(job.reason ?? 'The merge was refused.');
+      return mergeJobView(job);
+    }
+    // Shutdown decides nothing about this click: it may be sent again, so nothing is saved.
     if (this.#closing) throw new GuardRefusal('The server is shutting down.');
-    if (this.#active) throw new GuardRefusal('A merge is already running for this task.');
-    if (typeof token !== 'string' || this.service.load().token !== token) throw new GuardRefusal('Stale review state. Refresh before merging.');
-    const task = store.getTask(identity);
-    if (!MERGEABLE_STATUSES.includes(task.status)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
-    if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
-    const reason = busy();
-    if (reason) throw new GuardRefusal(reason);
-    this.preMerge.assertStartable();
-    const { job } = store.beginMergeJob(identity, { actionId, token });
+    const refusal = this.#admissionRefusal(token, busy);
+    if (refusal !== null) {
+      // A definite refusal is this click's outcome; a resend replays it (as the guarded merge does).
+      if (typeof token === 'string' && token) store.recordMergeJobRefusal(identity, { actionId, token, reason: refusal });
+      throw new GuardRefusal(refusal);
+    }
+    const { job } = store.beginMergeJob(identity, { actionId, token: token as string });
     const abort = new AbortController(); this.#abort = abort;
     const run = Promise.resolve().then(() => this.#run(job, abort.signal)).catch(error => {
       // Anything unexpected ends the job, unless shutdown stopped it: startup then settles it.
@@ -80,6 +84,24 @@ export class MergeJobCoordinator {
     }).finally(() => { if (this.#active === run) { this.#active = null; this.#abort = null; } });
     this.#active = run;
     return mergeJobView(job);
+  }
+
+  /** Why this click may not start a job now, or null. A preparation stopping for shutdown throws instead (not definite). */
+  #admissionRefusal(token: unknown, busy: () => string | null): string | null {
+    const { store, config } = this.service, identity = config.identity;
+    if (this.#active) return 'A merge is already running for this task.';
+    if (typeof token !== 'string' || this.service.load().token !== token) return 'Stale review state. Refresh before merging.';
+    const task = store.getTask(identity);
+    if (!MERGEABLE_STATUSES.includes(task.status)) return `The task is ${task.status}; merge it from review.`;
+    if (task.cancelRequested !== null) return 'The task is being cancelled.';
+    const reason = busy();
+    if (reason) return reason;
+    try { this.preMerge.assertStartable(); }
+    catch (error) {
+      if (!(error instanceof GuardRefusal) || /shutting down/i.test(error.message)) throw error;
+      return error.message;
+    }
+    return null;
   }
 
   /** The task was cancelled: stop waiting at once. Preparation and the guarded merge stop through their own routes. */
@@ -168,27 +190,34 @@ export class MergeJobCoordinator {
     const { store, config } = this.service, identity = config.identity;
     const until = performance.now() + this.checkWaitMs;
     let delay = this.firstDelayMs, waiting: { context: string; state: string }[] = [];
+    const timedOut = (): CheckVerdict => ({ kind: 'blocked', reason: `Required checks did not pass within ${Math.round(this.checkWaitMs / 60_000)} minutes: ${
+      waiting.length ? waiting.map(check => `${check.context} is ${check.state}`).join(', ') : 'GitHub has not determined mergeability'}.` });
     for (;;) {
       if (signal.aborted) return { kind: 'cancelled' };
       const task = store.getTask(identity);
       if (task.status === 'cancelled' || task.cancelRequested !== null) return { kind: 'cancelled' };
+      // No inspection starts after the wait's limit, and each one is stopped when the limit arrives.
+      const left = Math.floor(until - performance.now());
+      if (left < 1) return timedOut();
+      const limit = AbortSignal.timeout(left);
       let status: MergeStatus;
-      try { status = await this.merges.status(this.service.load(), true, signal); }
+      try { status = await this.merges.status(this.service.load(), true, AbortSignal.any([signal, limit])); }
       catch (error) {
         if (signal.aborted) return { kind: 'cancelled' };
+        if (limit.aborted) return timedOut();
         return { kind: 'failed', reason: error instanceof Error ? error.message : String(error) };
       }
       const verdict = classify(status);
       if (verdict.kind !== 'wait') return verdict;
       waiting = verdict.checks;
       this.settle(() => store.updateMergeJob(identity, job.id, { checks: waiting }));
-      const left = until - performance.now();
-      if (left <= 0) return { kind: 'blocked', reason: `Required checks did not pass within ${Math.round(this.checkWaitMs / 60_000)} minutes: ${
-        waiting.length ? waiting.map(check => `${check.context} is ${check.state}`).join(', ') : 'GitHub has not determined mergeability'}.` };
-      await sleep(Math.min(delay, left), signal).catch(() => undefined);
+      const remaining = until - performance.now();
+      if (remaining <= 0) return timedOut();
+      await sleep(Math.min(delay, remaining), signal).catch(() => undefined);
       delay = Math.min(delay * 2, this.maxDelayMs);
     }
   }
+
 }
 
 /** Blockers the merge job resolves itself: it prepares (rebase, push, cmd: checks) and waits for required checks. */

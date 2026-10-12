@@ -30,12 +30,12 @@ Without a runner, **Merge PR** works as before.
 
 | Step | What happens | It continues when | It stops when |
 |---|---|---|---|
-| Admission | The click's review token must be current, the task mergeable, and no merge job, runner attempt, publish or preparation active. The job record is saved under the click's action ID and the click returns the review with the job (`running`, step `preparing`). | always | the token is stale, or something is busy (nothing is saved; the click may be sent again) |
+| Admission | The click's review token must be current, the task mergeable, and no merge job, runner attempt, publish or preparation active. The job record is saved under the click's action ID and the click returns the review with the job (`running`, step `preparing`). | always | the token is stale, or something is busy. The refusal is saved under the click's action ID, so a resend replays it; only a refusal because the server is shutting down saves nothing and may be sent again |
 | Prepare | The job records its own `prepare-merge` action and runs preparation. | preparation is `ready` | preparation needs review (job: `review-required`) or fails (job: `failed`) |
 | Wait for checks | The job inspects the pull request (fresh) at once, then again after 10 s, with the wait doubling up to 60 s. | every required check succeeds, or the required set was read and is empty, and nothing else blocks | a required check fails, or 30 minutes pass (job: `blocked`); the pull request moved, or another blocker appears (job: `failed`) |
 | Merge | The job calls the guarded merge with the current review token. Its inspections rerun the already-fixed check. | GitHub merged or queued the head (job: `merged` or `queued`) | GitHub refused (job: `blocked`), validation refused (job: `failed`), or the outcome is unknown (job: `submitted`; the merge attempt reconciles as before) |
 
-While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. Unreadable branch rules never pass. Another blocker outranks a failing check: checks that fail on a head a collaborator pushed say nothing about this review, so the job ends `failed` and the task stays in review.
+While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. No inspection starts after the 30 minutes, and one still running when they end is stopped, so the job never merges after its limit. Unreadable branch rules never pass. Another blocker outranks a failing check: checks that fail on a head a collaborator pushed say nothing about this review, so the job ends `failed` and the task stays in review.
 
 ## Outcomes
 
@@ -52,7 +52,7 @@ Moving the task to **approved, merge blocked** advances its state version, so th
 
 ## The already-fixed range
 
-A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base-branch tip the pull request's own pre-PR check scanned through (that check is recorded with the opening, schema v19) to the base branch's tip now, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the latest clear check, whatever later checks found. The check reads at most 250 base commits: if more landed since the pre-PR check, its answer is unknown and merging stays blocked, as for a pull request never rebased. There is no person override yet (the Continue action of `pull-request-opening.md` is a later slice). The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
+A rebase moves the pull request's base. The guarded merge would then scan only the base commits after the new base and miss the ones the rebase brought in. Each merge inspection of a runner-published pull request therefore scans from the base-branch tip the pull request's own pre-PR check scanned through (that check is recorded with the opening, schema v19) to the base branch's tip now, even after a re-publish recorded a newer check from a rebased base. An opening recorded before schema v19 uses the task's oldest clear check: a compare range excludes its own start commit, so only a scan from the first clear check's tip onward is provably continuous. The check reads at most 250 base commits: if more landed since the pre-PR check, its answer is unknown and merging stays blocked, as for a pull request never rebased. There is no person override yet (the Continue action of `pull-request-opening.md` is a later slice). The task's own commits, the ledger's owned entries, are excluded, as in the pre-PR check. Without such a check, the scan starts at the pull request's base, as before.
 
 ## Cancel, shutdown and restart
 
@@ -73,6 +73,7 @@ Schema v19 adds `merge_jobs`: one row per job (`action_id`, task key, `state`, `
 - `POST /api/action` with `merge` returns `{ job }` at once when a runner is configured.
 - `GET /api/merge` returns `{ queue, job }`.
 - Merge PR is offered while the only blockers left are ones the job resolves or reports: preparation, a moved base (with a merge conflict it causes), `cmd:` checks, required checks (the job waits for pending ones and ends `blocked` on failing ones, so a person can retry after re-running CI), and mergeability GitHub is still computing.
+- While a job runs, the Merge button keeps keyboard focus: it is marked `aria-disabled`, not disabled, and a repeat activation starts nothing.
 - The browser polls `GET /api/merge` with the existing 2 s to 30 s backoff while a job runs, shows its step in the merge banner, lists waiting checks in the blocker dialog, and offers **Retry merge** when the job is `blocked`. The design's full step list and a Cancel button come later.
 
 ## Tests

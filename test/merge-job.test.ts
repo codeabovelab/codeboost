@@ -199,15 +199,17 @@ it('keeps the readiness preparation recorded valid while the job records its pro
   expect(readyAt).not.toBeNull();
 });
 
-it('replays a resent click, refuses a second click while a job runs, and saves nothing for a stale token', async () => {
+it('replays a resent click, refuses a second click while a job runs, and replays a refusal for a stale token', async () => {
   const f = setup({ checks: () => [pending()] });
-  const id = randomUUID();
-  expect(() => f.coordinator.start('stale-token', randomUUID())).toThrow(/Stale review state/);
-  expect(f.coordinator.latest()).toBeNull();
+  const id = randomUUID(), stale = randomUUID();
+  expect(() => f.coordinator.start('stale-token', stale)).toThrow(/Stale review state/);
+  expect(f.store.getMergeJob(identity, stale)).toMatchObject({ state: 'failed', refused: true });
+  expect(() => f.coordinator.start('stale-token', stale)).toThrow(/Stale review state/);
   const first = f.coordinator.start('review-token', id);
   expect(f.coordinator.start('review-token', id)).toMatchObject({ id: first.id, state: 'running' });
   expect(() => f.coordinator.start('review-token', randomUUID())).toThrow(GuardRefusal);
   expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
+  expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   f.coordinator.cancel(); await settled(f.coordinator);
   expect(f.prep.calls).toHaveLength(1);
 });
@@ -231,11 +233,22 @@ it('ends queued when the merge queue accepted the head', async () => {
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
-it('refuses a click while the runner or publisher is busy, saving nothing', () => {
-  const f = setup();
-  expect(() => f.coordinator.start('review-token', randomUUID(), () => 'The runner is busy.')).toThrow('The runner is busy.');
-  expect(f.coordinator.latest()).toBeNull();
+it('refuses a click while the runner or publisher is busy, and replays that refusal once it is idle', () => {
+  const f = setup(), id = randomUUID();
+  expect(() => f.coordinator.start('review-token', id, () => 'The runner is busy.')).toThrow('The runner is busy.');
+  // The response was lost; the same click is resent after the runner became idle: it replays, starting nothing.
+  expect(() => f.coordinator.start('review-token', id)).toThrow('The runner is busy.');
+  expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
+  expect(f.coordinator.latest()).toMatchObject({ id, state: 'failed', refused: true, reason: 'The runner is busy.' });
+  expect(f.coordinator.active).toBe(false);
   expect(f.prep.calls).toEqual([]);
+});
+
+it('saves nothing for a click refused because the server is shutting down, so it may be sent again', () => {
+  const f = setup(), id = randomUUID();
+  f.coordinator.stop();
+  expect(() => f.coordinator.start('review-token', id)).toThrow(/shutting down/);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
 });
 
 it('ends cancelled when the task was cancelled while the job waited, even if the job was not told', async () => {
@@ -373,10 +386,34 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
 });
 
-it('refuses a click while a preparation is already running, saving nothing', () => {
-  const f = setup();
+it('refuses a click while a preparation is already running, and replays that refusal', () => {
+  const f = setup(), id = randomUUID();
   (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('Pre-merge preparation is already running.'); };
-  expect(() => f.coordinator.start('review-token', randomUUID())).toThrow('Pre-merge preparation is already running.');
-  expect(f.coordinator.latest()).toBeNull();
+  expect(() => f.coordinator.start('review-token', id)).toThrow('Pre-merge preparation is already running.');
+  expect(f.coordinator.latest()).toMatchObject({ id, refused: true });
   expect(f.prep.calls).toEqual([]);
+});
+
+it('starts no inspection after the wait limit and stops one that runs into it', async () => {
+  let inspections = 0, hang = false;
+  const f = setup({ checks: () => [pending()] });
+  const inspect = f.gh.client.inspect;
+  f.gh.client.inspect = (async (request: Parameters<typeof inspect>[0]) => {
+    inspections++;
+    // From the second inspection on, GitHub does not answer; only the wait's limit (or a cancel) ends the read.
+    if (hang && request?.signal) await new Promise((_resolve, reject) => request.signal!.addEventListener('abort', () => reject(request.signal!.reason), { once: true }));
+    return inspect(request);
+  }) as typeof inspect;
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 400, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
+  coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(coordinator.latest()?.step).toBe('checks'));
+  hang = true;
+  const started = Date.now();
+  await coordinator.current;
+  expect(Date.now() - started).toBeLessThan(3_000);
+  expect(coordinator.latest()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/did not pass within/) });
+  const after = inspections;
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(inspections).toBe(after);
+  expect(f.gh.merged).toEqual([]);
 });

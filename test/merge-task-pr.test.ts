@@ -362,17 +362,19 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(9) });
   });
 
-  it('scans from the latest clear check for a PR opened before schema v19, even when a later check was not clear', async () => {
+  it('scans from the oldest clear check for a PR opened before schema v19, whatever later checks found', async () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-v19-')); roots.push(root);
     const path = join(root, 'state.sqlite');
     const { store } = published(path);
     const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
     store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
-    // A later re-publish whose check could not complete (unknown), recorded from the rebased base.
+    // A later re-publish recorded a clear check scanned from the rebased base, then one that could not complete. A compare
+    // range excludes its start, so starting at the later clear check's tip could skip the rebased base commit itself.
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
     store.markRunning(identity, attempt.id);
     store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(19) } });
     store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'unknown', reason: 'GitHub could not be read.' } });
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
     // The opening was recorded before v19: it carries no check.

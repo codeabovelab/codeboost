@@ -636,22 +636,31 @@ test('follows a one-click merge job from preparation through the required-check 
  let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('running','merging'),job('merged',null)];
- let polls=0,reviews=0;
- await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+ let polls=0,reviews=0,mergeClicks=0;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}mergeClicks++;
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json(),running=job('running','preparing');
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running},job:running})});});
  await page.route('**/api/merge',async route=>{const next=steps[Math.min(polls,steps.length-1)];polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:next})});});
- await page.route('**/api/review',async route=>{reviews++;await route.continue();});
+ // A runner server reports merging as a job (its merge status carries `job`).
+ await page.route('**/api/review',async route=>{reviews++;const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ const button=page.locator('#merge');
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
- await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toBeDisabled();
+ // The focused control keeps focus while its job runs: marked, not disabled (AGENTS.md, Async review UI).
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveAttribute('aria-disabled','true');
+ // Not disabled in the DOM (Playwright's toBeEnabled counts aria-disabled as disabled), and still focused.
+ await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
  await expect(page.locator('#banner')).toContainText('Preparing the merge');
- await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toHaveAttribute('aria-disabled','true');
+ await expect(button).toBeFocused();
  await expect(page.locator('#banner')).toContainText('Waiting for required checks: ci is pending.');
+ // A repeat activation while the job runs starts nothing.
+ await button.press('Enter');
  await page.getByRole('button',{name:'Merge status',exact:true}).click();
  await expect(page.locator('dialog')).toContainText('ci: pending');
  await page.keyboard.press('Escape');
- await expect(page.getByRole('button',{name:'Merging…',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'Merging…',exact:true})).toHaveAttribute('aria-disabled','true');
+ expect(mergeClicks).toBe(1);
  const reloadsBeforeEnd=reviews;
  await expect(page.locator('#banner')).toHaveText('Merged.');
  expect(reviews).toBeGreaterThan(reloadsBeforeEnd);

@@ -139,6 +139,8 @@ export interface MergeJob {
   id: string;
   /** The action ID of the guarded merge this job started, once it reaches that step: its attempt carries it. */
   mergeActionId: string | null;
+  /** The click was refused at admission; a resend replays the refusal (`reason`). */
+  refused?: boolean;
   /** The review token the click was made with; a resend must carry the same one. */
   token: string;
   state: MergeJobState;
@@ -2137,6 +2139,29 @@ export class Store {
       return { job, resent: false };
     });
   }
+  /**
+   * Save a definite admission refusal under the click's action ID, so a resend replays it rather than starting a job.
+   * A resend of the same click returns the saved record; another request under that ID is refused as a reused ID.
+   */
+  recordMergeJobRefusal(identity: PlanIdentity, input: { actionId: string; token: string; reason: string }): MergeJob {
+    assertUuidV4(input.actionId, 'Action ID');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#task(key);
+      const existing = this.#get('SELECT plan_key, data FROM merge_jobs WHERE id=?', input.actionId);
+      if (existing) {
+        const job = decode<MergeJob>(existing.data);
+        if (job.token !== input.token || existing.plan_key !== key) throw new ActionIdReused('Action ID already used for a different request.');
+        return job;
+      }
+      const now = new Date().toISOString();
+      const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'failed', step: null,
+        reason: input.reason.slice(0, 2_000), checks: [], url: null, startedAt: now, updatedAt: now, refused: true };
+      this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
+      return job;
+    });
+  }
   /** Move a running job to another step or record what it waits for. A job no longer running is left unchanged. */
   updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[];
     mergeActionId?: string }): MergeJob | null {
@@ -2289,9 +2314,12 @@ export class Store {
     const key = identityKey(identity); this.#task(key);
     return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
   }
-  /** The latest already-fixed check that found nothing. */
-  latestClearAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
-    const row = this.#get(`SELECT * FROM already_fixed_checks WHERE plan_key=? AND outcome='clear' ORDER BY rowid DESC LIMIT 1`, identityKey(identity));
+  /**
+   * The first already-fixed check that found nothing. A compare range excludes its start commit, so only a scan from
+   * this check's tip onward is provably continuous for an opening that did not record its own check.
+   */
+  oldestClearAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
+    const row = this.#get(`SELECT * FROM already_fixed_checks WHERE plan_key=? AND outcome='clear' ORDER BY rowid ASC LIMIT 1`, identityKey(identity));
     return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
