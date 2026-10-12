@@ -575,7 +575,17 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
-    const json = (status: number, value: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
+    // A reply sent before the request's body is read (a refusal) closes the connection (#157). Node then discards the
+    // body, and the connection stays busy while it does: shutdown's idle-connection close skips it, and nothing closes
+    // it once it goes idle, so a large body held it until the client or the keep-alive timeout dropped it. Accepted
+    // cost: a client still sending can be reset before it reads the refusal. The UI keeps an import's action ID for a
+    // resend. `req.complete` cannot tell whether a body is unread: it is still false while the handler starts.
+    const declaresBody = req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] ?? 0) > 0;
+    const head = (status: number, contentType: string) => {
+      if (declaresBody && !req.readableEnded) res.setHeader('Connection', 'close');
+      res.writeHead(status, { 'Content-Type': contentType });
+    };
+    const json = (status: number, value: unknown) => { head(status, 'application/json'); res.end(JSON.stringify(value)); };
     try {
       if (req.headers.host !== `127.0.0.1:${actualPort}` || (req.headers.origin && req.headers.origin !== origin)) { json(403, { error: 'Local origin required.' }); return; }
       const path = new URL(req.url ?? '/', origin).pathname;
@@ -602,8 +612,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const chunks: Buffer[] = []; let size = 0;
         const limit = path === '/api/plan/import' ? MAX_IMPORT_REQUEST_BYTES : MAX_REQUEST_BYTES;
         activeRequest.readingBody=true;
-        try { for await (const chunk of req) { size += chunk.length; if (size > limit) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
+        // Past the limit, the rest of the body is read and discarded, and the 413 goes out once it ends (#157). Node does
+        // not discard the rest of a body the handler has started reading, so a reply mid-body either held the connection
+        // half read until the keep-alive timeout (about 6 s) or reset the client. Closing the connection instead (as
+        // `head` does for a refusal before the body is read) can also reset a client still sending before it reads the
+        // reply. Shutdown still destroys a request that is discarding its body (readingBody stays set), as it does any
+        // request still reading one.
+        try { for await (const chunk of req) { size += chunk.length; if (size <= limit) chunks.push(chunk); else chunks.length = 0; } }
         finally { activeRequest.readingBody=false; }
+        if (size > limit) { json(413, { error: 'Request too large.' }); return; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
         // Admitted requests drain normally (AGENTS.md); only the irreversible merge boundary rechecks the flag.
@@ -695,11 +712,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
       const file = files[path];
-      if (file) { res.writeHead(200, { 'Content-Type': `${file[1]}; charset=utf-8` }); res.end(readFileSync(new URL(file[0], publicRoot))); return; }
+      if (file) { head(200, `${file[1]}; charset=utf-8`); res.end(readFileSync(new URL(file[0], publicRoot))); return; }
       const font = /^\/fonts\/(ibm-plex-(?:sans|mono)-latin-(?:400|500|600)-normal\.woff2)$/.exec(path);
       if (font) {
         const family = font[1]!.startsWith('ibm-plex-sans') ? 'ibm-plex-sans' : 'ibm-plex-mono';
-        res.writeHead(200, { 'Content-Type': 'font/woff2' }); res.end(readFileSync(fileURLToPath(new URL(`../node_modules/@fontsource/${family}/files/${font[1]}`, import.meta.url)))); return;
+        head(200, 'font/woff2'); res.end(readFileSync(fileURLToPath(new URL(`../node_modules/@fontsource/${family}/files/${font[1]}`, import.meta.url)))); return;
       }
       json(404, { error: 'Not found.' });
     } catch (error) {
