@@ -245,7 +245,10 @@ export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retr
   // A conflict after the base moved is the job's too: its preparation rebases, through the sandboxed conflict path.
   const rebaseResolves = status.remote?.mergeable === 'CONFLICTING' && status.blockers.some(blocker => blocker.code === 'base');
   const personal = status.blockers.filter(blocker => !JOB_RESOLVES.has(blocker.code) && !(blocker.code === 'mergeable' && (computing || rebaseResolves)));
-  const ready = !running && !attempt && status.remote !== null && personal.length === 0;
+  // The task's status is read after the inspection that produced `status`: a task cancelled or merged meanwhile is never
+  // offered Merge PR, even if that inspection had no task blocker.
+  const ready = !running && !attempt && status.remote !== null && personal.length === 0
+    && MERGEABLE_STATUSES.includes(taskStatus as (typeof MERGEABLE_STATUSES)[number]);
   return { ...status, ready, action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job };
 }
 

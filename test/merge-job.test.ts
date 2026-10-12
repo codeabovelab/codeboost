@@ -162,6 +162,21 @@ it('ends failed, leaving the task in review, when GitHub refuses because the hea
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it('ends failed, leaving the task in review, when the review changed while GitHub was asked to merge and refused', async () => {
+  let storeRef: Store | null = null;
+  const f = setup({ merge: async () => {
+    // A person adds a change request while the merge command is on its way; then GitHub refuses.
+    const store = storeRef!, snapshot = store.getSnapshot(identity);
+    store.addReviewNote(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, 'P1', 'change', 'Changed during the merge.');
+    throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
+  } });
+  storeRef = f.store;
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/review changed while GitHub was asked to merge/) });
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed' });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
 it('ends failed, leaving the task in review, when a failing check arrives after the review changed', async () => {
   let storeRef: Store | null = null;
   const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], during: () => {
@@ -373,6 +388,9 @@ it('offers Merge PR while only blockers the job resolves remain, and a retry aft
   expect(withMergeJob(status([], { queue: { state: 'submitting' } }), null, 'in review')).toMatchObject({ ready: false });
   expect(withMergeJob(status([], { remote: null }), null, 'in review')).toMatchObject({ ready: false });
   expect(withMergeJob(status(['preparation']), blocked, 'approved but merge blocked')).toMatchObject({ ready: true, action: 'retry', job: blocked });
+  // The task's status, read after the inspection, wins: a task cancelled or merged meanwhile is never offered Merge PR.
+  for (const closed of ['cancelled', 'merged', 'running'])
+    expect(withMergeJob(status([]), null, closed)).toMatchObject({ ready: false, action: null });
   // A conflict after the base moved is the job's rebase to resolve; a conflict on its own is a person's.
   expect(withMergeJob(status(['base', 'mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: true });
   expect(withMergeJob(status(['mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: false });
@@ -412,6 +430,12 @@ it('settles a job a crash left in its merge step from its merge attempt at start
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged'],
     [(store: Store, id: string) => store.queueMergeAttempt(identity, id, 'https://github.com/owner/repo/pull/7'), 'queued', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Head branch was modified.', requiresFreshReview: true }), 'failed', 'in review'],
+    // GitHub refused while a person changed the review: the refusal says nothing about the changed review.
+    [(store: Store, id: string) => {
+      const snapshot = store.getSnapshot(identity);
+      store.addReviewNote(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, 'P1', 'change', 'Changed during the merge.');
+      store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' });
+    }, 'failed', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked'],
   ] as const) {
     // GitHub never answers: the job is in its merge step when the process "crashes".

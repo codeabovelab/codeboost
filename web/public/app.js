@@ -244,7 +244,7 @@ async function pollMergeQueue(generation) {
     renderMerge();
   } catch (error) {
     if (generation !== mergeGeneration || !data?.merge?.available) return;
-    $("banner").textContent = `Could not refresh merge-queue status. ${error.message}`;
+    $("banner").textContent = `Could not refresh merge status. ${error.message}`;
     backOffMergePoll();
     scheduleMergePoll();
   }

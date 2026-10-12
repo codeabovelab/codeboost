@@ -2195,6 +2195,15 @@ export class Store {
           return this.finishMergeJob(identity, id, { state: 'failed',
             reason: 'The review or task changed while waiting for required checks; the preparation no longer applies. Merge again.' });
       }
+      // GitHub refused the job's own merge attempt: the block applies only to the review that attempt was admitted for.
+      // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is.
+      const attempt = job.mergeActionId ? this.getMergeAttempt(identity) : null;
+      if (attempt && attempt.actionId === job.mergeActionId) {
+        const plan = this.#current(key);
+        if (plan.revision !== attempt.revision || plan.snapshot_id !== attempt.snapshotId || plan.review_version !== attempt.reviewVersion)
+          return this.finishMergeJob(identity, id, { state: 'failed',
+            reason: `${reason} The review changed while GitHub was asked to merge; review it, then merge again.` });
+      }
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);
