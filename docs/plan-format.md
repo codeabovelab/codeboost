@@ -95,6 +95,8 @@ questions: []
 
 Import accepts UTF-8 JSON or one YAML 1.2 document representing JSON-compatible data. Reject invalid UTF-8, input above 1 MiB, and nesting deeper than 50 containers before producing a plan. Parse into an intermediate syntax tree with duplicate-key detection; do not convert an unchecked YAML graph into application objects.
 
+`POST /api/plan/import` sends the source as one JSON string in a request body of at most 6 MiB + 16 KiB (6,307,840 bytes, `MAX_IMPORT_REQUEST_BYTES` in `web/server.ts`). Any JSON encoding writes each UTF-8 byte of the source as at most 6 bytes: YAML accepts a raw control character in a quoted scalar, and JSON writes it as `\u0001`. So every source within the 1 MiB parser limit fits, with 16 KiB left for the rest of the request. A larger body is read to its end, then refused with HTTP 413 before it is parsed (#157). A body within the limit whose source is above 1 MiB gets the parser's refusal. Every other `POST` keeps its 16 KiB limit (#146).
+
 For both formats, object keys must be strings and unique after decoding at every level; reject duplicates rather than choosing the first or last value. JSON follows RFC 8259 syntax. YAML allows mappings, sequences, strings (including quoted and block strings), the exact plain literals `true`, `false`, and `null`, and numbers spelled using the JSON number grammar. Reject empty implicit values, non-finite values (`.nan`/`.inf`), non-JSON number spellings such as hex/octal or numeric separators, complex/non-string keys, every anchor and alias, merge keys (`<<`), explicit tags (including custom tags), extra documents, and parser warnings/errors before schema validation. Ordinary YAML 1.2 plain strings remain strings; do not infer dates, functions, or application-specific types. Integers used for issue, revision, or indexes must also be exactly representable safe integers in the implementation.
 
 Only after these checks convert to JSON-compatible values, select the registered schema, and validate. Never enable alias expansion or custom object construction. Required fixtures: equivalent JSON/YAML produce identical structured plans; duplicate decoded keys in either format, anchors/aliases, merge keys, tags, non-finite/non-JSON numbers, empty values, complex keys, multiple documents, excessive depth, and oversized input all fail before schema validation. An ordinary quoted string containing `<<` or `&` as part of its text is data, not YAML syntax.
@@ -153,6 +155,14 @@ Issue text and agent-produced plan fields remain untrusted. The prompt builder s
 | **You edit on the Plans screen** | Each change is checked as you type. Approving saves the revision. |
 
 codeboost keeps the master copy in its own database. The copy in the PR description is written from that master and is never read back.
+
+### What the shipped Plans screen does today
+
+This guide and the v1 contract describe the full design. The Plans screen built in lane G (#145) differs from it in these ways:
+
+- **Not built yet (#155):** pasting a plan, editing on the Plans screen, showing check warnings, answering open questions, a whole-plan approval step, and the amendment-proposal flow (the runner does not save a plan-change proposal, and the Plans screen cannot show or edit one; see "When the plan is wrong" in the design doc). Today an import, or an applied agent draft or suggestion, creates the next revision directly.
+- **Does not yet conform to the v1 suggestion-card contract (#159):** after one card is applied, the other cards lose their Apply control instead of showing it disabled. One **Dismiss suggestions** control discards the whole response; cards have no Dismiss of their own.
+- **Control names:** the import button is **Import next revision**. A suggestion card's button is **Apply this edit**, and a draft's is **Apply draft**.
 
 ## Suggested edits (plan assistant)
 

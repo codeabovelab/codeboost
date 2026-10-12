@@ -180,19 +180,21 @@ export class GitBranchPusher implements BranchPusher {
 
   /** The commit `ref` points at on the remote, or null when it does not exist. */
   async #read(ref: string, signal?: AbortSignal): Promise<string | null> {
-    const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true);
+    // A read changes nothing, so it need not wait for a process that escaped Git's group and holds its output: it returns
+    // failed (the output may be incomplete) after the bounded drain. The caller then knows nothing: a push marker stays.
+    const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true, undefined, true);
     // ls-remote matches patterns by their tail, so `refs/heads/x/<ref>` would match too: keep only the exact name.
     const matches = out.split('\n').filter(Boolean).map(line => line.split('\t')).filter(([, name]) => name === ref);
     if (matches.length > 1 || (matches[0] && !COMMIT_ID.test(matches[0][0]!))) throw new Error(`The remote's answer for ${ref} is malformed.`);
     return matches[0]?.[0] ?? null;
   }
 
-  async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer): Promise<string> {
+  async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer, readOnly = false): Promise<string> {
     const protocol = this.#url.startsWith('/') ? 'file' : 'https';
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
       ...remote ? ['-c', `protocol.${protocol}.allow=always`, ...CREDENTIAL_HELPER] : [], ...args],
     { cwd: this.#config.repository.path, env: pushEnvironment(this.#config.env), timeoutMs: this.#config.timeoutMs ?? 120_000,
-      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input });
+      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, allowUnsettledReturn: readOnly });
     // Aborted before or while Git ran: the caller's reason (such as shutdown) is what leaves, not Git's failure.
     signal?.throwIfAborted();
     if (outcome.status !== 0) throw gitFailure(args[0]!, outcome.status, [outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join('\n'),

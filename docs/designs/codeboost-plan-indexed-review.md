@@ -6,7 +6,7 @@ Repo: codeabovelab/codeboost
 Status: APPROVED
 Mode: Builder (open source / research)
 Writing standard: plain language, ISO 24495-1:2023
-Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes")
+Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes"). The summary and build-step status were updated later as lanes merged. For the current state of each lane, see the lane table in `docs/architecture.md`.
 
 ## About this document
 
@@ -27,7 +27,7 @@ Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel bui
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
 - **How it stays safe.** Agents run inside a container that holds only the task's code and the credential for that phase, so your other files and credentials are not there. Ask, code-writing runs, and conflict resolution use provider-specific containers; exact-head `cmd:` checks use a credential-free read-only profile. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **Where the build is.** Built: the plan and linking library, SQLite store, review screen with Ask and change requests, guarded merge gate with merge-queue support, agent isolation boundary, opt-in code-writing runner and publishing, durable local rebase/conflict resolution, and pre-merge base/head refresh with exact-head `cmd:` checks. Still deferred: pushing the rewritten head, waiting for its required checks, handing that exact pair to guarded merge, and the Planning, Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
+- **Where the build is.** Built: the plan and linking library, SQLite store, review screen with Ask and change requests, guarded merge gate with merge-queue support, agent isolation boundary, Plans screen (lane G, #145; #155 lists unbuilt parts and #159 tracks suggestion-card non-conformance), opt-in code-writing runner and publishing, durable local rebase/conflict resolution, and pre-merge base/head refresh with exact-head `cmd:` checks. Still deferred: pushing the rewritten head, waiting for its required checks, handing that exact pair to guarded merge, and the Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 
@@ -189,6 +189,8 @@ This keeps the plan out of the code, and there is only one master copy.
 3. moves the task to **needs amendment** and frees the queue for other tasks;
 4. waits for you to approve or edit the proposal on the planning screen. Your approval creates the next plan revision;
 5. puts the task back in the queue at its old position, and re-runs that plan item from the start.
+
+The runner does not yet save this proposal, and the Plans screen cannot show or edit one (#155). Today a needs-amendment pause comes from an out-of-scope edit (next paragraph), and the next revision comes from an import or an applied agent draft or suggestion.
 
 If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope. Execution deliberately pauses in **needs amendment** before any later item or check invocation. A person must approve a revised plan and continuation; the runner reconciles the already-executed prefix with the audited current head, then validates remaining operations from that actual checkpoint. Do not silently add the file to scope or erase its original out-of-scope evidence.
 
@@ -567,7 +569,7 @@ The numbers below identify delivery milestones, not a requirement to implement t
 3. **Optional validation.** A future real-PR comparison may test the assumptions in "How we will know it works," but it is non-blocking under the superseding decision above.
 4. **Merge gate and merging** (product workflow step 9): the merge rules, the pre-merge sequence, and merging through `gh`. Increment 1 merged (PR #23), and merge-queue support merged (#38, #46, closing #24); the rest waits for the runner in build step 5. See the scope and completion criteria below.
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6). Isolation boundary merged (lane D, PRs #31, #40, #44, #47, #50); the runner (lane F) is next.
-6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3). Backend in progress (lane E); no screen yet.
+6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3). *Done for T18:* planning backend (lane E, E1–E4) and the Plans screen (lane G, G1–G4, #145; PRs #148, #150, #151, #152). Not built: paste import, in-screen editing, the amendment-proposal view, check warnings, answering questions and a whole-plan approval step (#155). The suggestion cards do not yet conform to the v1 contract (#159).
 7. **Queue, schedule, and recovery** (steps 4 and 5).
 8. **Issue list, sorted by how critical each issue is** (step 1). *Done:* ranking backend (H1–H3), the Issues screen (H4a, #55), and the author-bound "trust this issue" action and runner guard (H4b, #108, PR #139) have merged.
 9. **Learning from your feedback** (step 10): lessons, the Lessons inbox, and the Learning screen. It needs the reject loop from steps 4 to 7.
@@ -651,8 +653,8 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## What to do next
 
-1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1) and the Issues screen (H4a).
-2. Finish the open lane PRs listed in "Lane status", then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1), the Issues screen (H4a), planning acceptance (E4) and the Plans screen (G1–G4, #145; #155 lists unbuilt parts and #159 tracks suggestion-card non-conformance).
+2. Finish the open lane work listed in the lane table in `docs/architecture.md`, then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
 3. Optionally run the non-blocking human validation tracked in #19.
 4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
 5. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
@@ -1892,9 +1894,11 @@ Critical gaps (no test, no handling, and silent): 0.
 
 **Scheduling decision (2026-09-24).** Run up to three implementation tasks concurrently in separate feature branches and worktrees. The foundation and review screen are the baseline, not new assignments. Recheck current main, open PRs, and existing implementations before taking a lane; unchecked historical T-items are not proof that their code is missing. These lanes authorize a development schedule, not simultaneous task execution in the shipped runner.
 
+**Current state.** The lane plans below record the original schedule. B0 and lanes C, D, E, G, H and K are done, so their rows and handoff steps describe past work, not current owners or blockers. For the current state of each lane, see the lane table in `docs/architecture.md`. Before editing a shared file, follow "Task resumption and ownership" in `AGENTS.md`.
+
 #### Lane status (checked 2026-09-26, after #55)
 
-This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
+This table is a snapshot from 2026-09-26 and is not kept current. For the current state of each lane, see the lane table in `docs/architecture.md`. This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
 
 | Lane | Merged | Open PRs | Next |
 |---|---|---|---|
@@ -1951,10 +1955,10 @@ Read each row left to right: finish and validate step 1 before step 2 within tha
 | Lane | Prerequisites | Scope / ownership | Completion check |
 |---|---|---|---|
 | F — runner and pre-merge automation | C and D merged; invocation contract available | Build step 5 runner plus #22 / remaining build step 4; T3, T6, T11. Own `runner/`, rebase helpers and shared acceptance persistence during this wave. | Preserve ledger attribution through rebase; recompute approval staleness; execute and persist head-bound checks; cover timeout, cancellation, shutdown and collaborator-push races; complete #22 acceptance. |
-| G — planning screen | E merged; C releases shared UI files | Build step 6 UI and T18 integration. Own `web/` and dedicated browser tests during this wave. Route persistence changes through F. UI work can use controlled provider fixtures until D is available. | Import, generation and Apply preserve user drafts and attachments and reject stale/replayed suggestions. Final completion requires real D-backed invocation and integration with F/store, not fixtures alone. |
+| G — planning screen | Done: G1–G4 (#145; PRs #148, #150, #151, #152) | Build step 6 UI and T18 integration. During this wave G owned the shared screen files `web/public/index.html`, `app.js` and `style.css` and the Plans browser tests, and released them after G4. `web/server.ts` is F's server contract; G3 changed it once (PR #151) (see `docs/implementation/planning-screen.md`). | Done. Import, generation and Apply preserve user drafts and attachments and reject stale/replayed suggestions. G4 (PR #152) met the final condition: real D-backed invocation and integration with F/store, not fixtures alone. |
 | H — issue prioritization | Done: access contract and ranking policy (H1); retrieval/ranking (#39, #42); Issues screen (#55); author-bound trust, runner/publish guards, prompt comment evidence, and trust controls (#108, PR #139) | Build step 8: issue retrieval, normalization, ranking, and trust enforcement with dedicated unit, integration, and browser tests. | Done. Stable ranking has visible reasons and explicit unavailable/stale states; H4b persists trust, fails closed at runner and publishing boundaries, controls comment inclusion, records delivered comment evidence, and works in demo mode. |
 
-F, G and H can proceed together within these ownership boundaries. If F and G need an incompatible shared storage/API change, land that small prerequisite first; neither edits the other's files in parallel. Merge independent backend modules first, then their shared integration, and rerun checks on the combined head.
+F, G and H ran together within these ownership boundaries. G and H are done; for the current state of each lane, see `docs/architecture.md`. If two lanes need an incompatible shared storage/API change, land that small prerequisite first; neither edits the other's files in parallel. Merge independent backend modules first, then their shared integration, and rerun checks on the combined head.
 
 #### Wave 3: lifecycle features and learning
 
@@ -1967,7 +1971,7 @@ F, G and H can proceed together within these ownership boundaries. If F and G ne
 #### Ownership and integration rules
 
 1. Each task uses its own branch/worktree from current remote main or a documented prerequisite branch. Record its issue, milestone, T-IDs, dependencies, owner and exact files in the PR. Delegated reviewers report findings; the implementation task's main agent owns its writes.
-2. One integration owner controls `runner/store.ts`, shared runner/review wiring, `web/server.ts`, `web/cli.ts`, `web/public/app.js`, `web/public/index.html`, `web/public/style.css`, shared browser fixtures, package manifests/lockfiles, schema registry and common CI configuration. C holds this ownership first; in wave 2 F owns runner/storage and G owns web. C owns common configuration in wave 1 and hands it to F before F1; D exclusively owns the new `.github/workflows/agent-isolation.yml`. D must route changes to existing `.github/workflows/ci.yml`, package scripts or lockfiles through the common-configuration owner. Separate worktrees do not remove this constraint.
+2. One integration owner controls `runner/store.ts`, shared runner/review wiring, `web/server.ts`, `web/cli.ts`, `web/public/app.js`, `web/public/index.html`, `web/public/style.css`, shared browser fixtures, package manifests/lockfiles, schema registry and common CI configuration. C held this ownership first. In wave 2, lanes F, G and H each held parts of it; G released its shared screen files after G4 (#145). Before editing any of these files now, check open PRs, branches and worktrees, and name one integration owner for any overlap, as "Task resumption and ownership" in `AGENTS.md` requires. The wave 1 plan gave C common configuration, to hand to F before F1, and gave D exclusive ownership of the new `.github/workflows/agent-isolation.yml`, with D's changes to existing `.github/workflows/ci.yml`, package scripts or lockfiles routed through the common-configuration owner. C and D are done. Separate worktrees do not remove this constraint.
 3. Keep this plan under one documentation owner. Lane owners record detailed progress and review rounds in their own issues/PRs; the documentation owner updates milestone status after integration. Never check off a milestone because only one parallel increment landed.
 4. A blocked integration does not block disjoint modules or fixture work, but those tasks must report the missing production integration. No stub provider, skipped Docker test or mocked merge outcome counts as completed production behavior.
 5. Every lane runs its targeted acceptance checks and required regressions. After its final integration change, rerun typecheck, unit/integration tests and applicable browser/Docker checks against the exact pushed head. Complete automated review and the review-lesson audit before an authorized merge. Revalidate downstream work after prerequisite changes.
@@ -2134,7 +2138,7 @@ Overall (the lowest pass): **1 → 8**. D22 is complete: DESIGN.md defines the r
 ### Not in scope
 
 - **Phone and tablet layouts.** codeboost is a desktop tool (D25).
-- **Queue, Plans, Issues, and Settings screens.** Not reviewed here. Review them before build steps 6 to 8.
+- **Queue, Plans, Issues, and Settings screens.** Not reviewed here. The Plans screen (build step 6) and the Issues screen (build step 8) were built without this review; review the Queue screen and the full Settings screen (today a question-agent dialog) before they are built.
 - **Motion design.** None is needed for this tool.
 
 ### What already exists
@@ -2161,9 +2165,9 @@ None proposed. Every fix is in the plan and in the tasks below.
 
 Built from this review's decisions. Tick each one as you ship it.
 
-**Status (checked against `main` on 2026-09-26).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
+**Status (checked against `main` on 2026-09-26; Plans entries updated after G4, PR #152).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
 - Built: two-tab composer and "n pending changes" tags (part of DT4); the notice below 1280px (part of DT13); the `?` shortcut help (part of DT12); a blocker list from the guarded merge gate (part of DT7).
-- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Plans, Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 6 to 9; Issues became a link in #55); Lessons inbox and Learning screen (DT14, DT15, build step 9).
+- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 7 to 9; Issues became a link in #55 and Plans in G1, #148); the approved Plans mockup's expandable row editing (not built, #155) and bottom-drawer plan assistant (the built screen puts the assistant in a side panel); Lessons inbox and Learning screen (DT14, DT15, build step 9).
 - Not yet audited against their Verify lines: DT2, DT3, DT5, DT6, DT9, DT10, DT11.
 - File paths in the DTs (`web/review`, `web/shell` and others) are proposed names. Today all UI code is in `web/public/`.
 

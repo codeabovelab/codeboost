@@ -311,6 +311,23 @@ describe('GitBranchPusher', () => {
     expect(remoteRefs(s)).toBe('');
   });
 
+  it('fails a branch read promptly when a process outside Git\'s group holds its output', async () => {
+    const s = await setup(), bin = join(s.root, 'fake-bin'), pidFile = join(s.root, 'escaped.pid');
+    mkdirSync(bin);
+    // Git's place on PATH: `ls-remote` leaves a process in a new session holding the inherited output, then exits.
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+      `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`
+      + `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`)}\n`, { mode: 0o755 });
+    try {
+      const began = performance.now();
+      const read = pusher(s, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }).instance.readBranch(IDENTITY, BRANCH);
+      await expect(read).rejects.toThrow(/outside its group still holds its output/);
+      expect(performance.now() - began).toBeLessThan(20_000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 40_000);
+
   it('removes a configured enterprise token of any shape from Git\'s error text', async () => {
     const s = await setup(), head = await runnerCommit(s, 'one'), token = 'enterprise-secret-0123456789';
     const missing = new GitBranchPusher({ repository: s.repository, repositoryId: 'repo-1', remote: 'acme/app',
