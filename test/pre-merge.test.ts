@@ -8,6 +8,7 @@ import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESER
 import { MergeCoordinator } from '../runner/merge.ts';
 import { MergeJobCoordinator } from '../runner/merge-job.ts';
 import type { MergeGateway } from '../github/merge.ts';
+import { openingMarker } from '../github/pull-requests.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -27,7 +28,17 @@ const unusedPush = { push: async () => { throw new Error('No push expected.'); }
 vi.setConfig({ testTimeout: 15_000 });
 afterEach(() => { vi.restoreAllMocks(); for (const service of services.splice(0)) service.close(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-const markRunnerOwned = (service: ReviewService) => {
+/** The task's PR as the runner publishes it (F6b tests): a clear pre-PR check, then PR 7 from BRANCH into main. */
+const publishPullRequest = (service: ReviewService) => {
+  const identity = service.config.identity, store = service.store, snapshot = store.getSnapshot(identity);
+  const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: snapshot.id,
+    reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: snapshot.base } });
+  const opening = store.beginPullRequest(identity, { checkId: check.id, repository: 'acme/app', base: 'main', headBranch: BRANCH,
+    headSha: snapshot.head, draft: false });
+  expect(store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/acme/app/pull/7',
+    headSha: snapshot.head, draft: false }, true)).toBe('in review');
+};
+const markRunnerOwned = (service: ReviewService, published = false) => {
   const identity = service.config.identity;
   service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'queued');
   const attempt = service.store.admitAttempt(identity, { expectedStateVersion: service.store.getTask(identity).stateVersion,
@@ -35,7 +46,8 @@ const markRunnerOwned = (service: ReviewService) => {
   service.store.markRunning(identity, attempt.id);
   service.store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
     result: { unchanged: false, head: service.store.getSnapshot(identity).head } });
-  service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
+  if (published) publishPullRequest(service);
+  else service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
   service.config.runnerRepository = service.config.repository;
 };
 const markRunnerUnchanged = (service: ReviewService) => {
@@ -75,6 +87,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   rebaseResult?: (service: ReviewService, input: { oldHead: string; onto: string }, run: number) => string | undefined;
   /** Branch reads never answer; only their abort signal ends them. */
   branchReadHangs?: boolean;
+  /** The runner published the task's PR 7 (merging then requires preparation, as in production). */
+  published?: boolean;
   /** Set up everything but start no preparation; `result` is then null. */
   deferStart?: boolean;
   /** Remote fetches fail once codeboost has pushed. */
@@ -115,7 +129,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
   let view = service.load();
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
-  if (options.runnerCommitted !== false) markRunnerOwned(service); else markRunnerUnchanged(service);
+  if (options.runnerCommitted !== false) markRunnerOwned(service, options.published === true); else markRunnerUnchanged(service);
   view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
   let rebaseAborts = 0;
@@ -1403,14 +1417,21 @@ it('starts no settlement read when less than the process-settlement reserve is l
 
 // F6b of #22: the acceptance cases, run through the one-click merge job with real preparation.
 async function mergeJob(rebasedText: string, commandExit?: number, options: Parameters<typeof rebaseFixture>[2] = {}) {
-  const fixture = await rebaseFixture(rebasedText, commandExit, { ...options, deferStart: true });
+  const fixture = await rebaseFixture(rebasedText, commandExit, { ...options, deferStart: true, published: true });
   const merged: string[] = [];
+  // As production builds it with a runner: the task's published PR, which requires durable preparation readiness.
   const gateway: MergeGateway = {
-    inspect: async () => ({ base: fixture.remote().base, head: fixture.remote().head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
-      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false }),
+    inspect: async request => {
+      const pr = fixture.service.store.taskPullRequests(fixture.service.config.identity).find(row => row.number === request?.target?.pullRequest)!;
+      return { base: fixture.remote().base, head: fixture.remote().head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
+        rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false,
+        published: { headBranch: request!.target!.headBranch!, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr.openingId),
+          branchOpen: [{ number: 7, base: 'main' }] } };
+    },
     merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/7' }; },
   };
-  const merges = new MergeCoordinator(fixture.service, gateway);
+  const merges = new MergeCoordinator(fixture.service, gateway, undefined, undefined,
+    { repository: 'acme/app', baseBranch: 'main', requiresPreparation: true });
   const jobs = new MergeJobCoordinator(fixture.service, fixture.coordinator, merges, undefined, { checkWaitMs: 2_000, firstDelayMs: 5, maxDelayMs: 20 });
   const start = () => jobs.start(fixture.service.load().token, randomUUID());
   const settled = async () => { await jobs.current; return jobs.latest()!; };

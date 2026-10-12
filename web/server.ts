@@ -764,6 +764,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
+    // Same turn: a merge job (F6b) stops before it can ask GitHub to merge; its settlement is awaited below.
+    mergeJobs?.stop();
     // Same turn as the admission flag: a request already reading its body must not start a new Ask worker.
     questions.stopAdmission();
     runner?.rejectAdmission();

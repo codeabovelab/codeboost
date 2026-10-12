@@ -85,9 +85,13 @@ export class MergeJobCoordinator {
   /** The task was cancelled: stop waiting at once. Preparation and the guarded merge stop through their own routes. */
   cancel(): void { this.#abort?.abort(Object.assign(new Error('Task cancelled.'), { code: 'CANCELLED' })); }
 
-  async close(): Promise<void> {
+  /** Shutdown's first, synchronous step: no job starts, and a running one stops before it can ask GitHub to merge. */
+  stop(): void {
     this.#closing = true;
     this.#abort?.abort(new Error('Server shutdown.'));
+  }
+  async close(): Promise<void> {
+    this.stop();
     await this.#active;
   }
 
@@ -212,13 +216,15 @@ export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retr
  * ends the job for a person to act.
  */
 export function classify(status: MergeStatus): CheckVerdict {
+  // Another blocker comes first: checks failing on a head nobody reviewed (a collaborator pushed) say nothing about this
+  // review, so the job ends for a person to look, rather than blocking on those checks.
+  const computing = status.remote.mergeable === 'UNKNOWN';
+  const other = status.blockers.filter(blocker => blocker.code !== 'check' && !(blocker.code === 'mergeable' && computing));
+  if (other.length) return { kind: 'failed', reason: other[0]!.message };
   const failing = status.remote.requiredChecks.filter(check => check.state === 'failure');
   if (failing.length) return { kind: 'blocked', reason: `Required check${failing.length === 1 ? '' : 's'} failed: ${failing.map(check => check.context).join(', ')}.` };
   const waiting = status.remote.requiredChecks.filter(check => check.state !== 'success')
     .map(check => ({ context: check.context, state: check.state }));
-  const computing = status.remote.mergeable === 'UNKNOWN';
-  const other = status.blockers.filter(blocker => blocker.code !== 'check' && !(blocker.code === 'mergeable' && computing));
-  if (other.length) return { kind: 'failed', reason: other[0]!.message };
   if (waiting.length || computing) return { kind: 'wait', checks: waiting };
   return status.ready ? { kind: 'ready' } : { kind: 'failed', reason: status.blockers[0]?.message ?? 'Merge is blocked.' };
 }

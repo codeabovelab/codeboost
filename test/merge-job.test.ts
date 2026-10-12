@@ -285,3 +285,21 @@ it('offers Merge PR while only blockers the job resolves remain, and a retry aft
   expect(withMergeJob(status([], { remote: null }), null, 'in review')).toMatchObject({ ready: false });
   expect(withMergeJob(status(['preparation']), blocked, 'approved but merge blocked')).toMatchObject({ ready: true, action: 'retry', job: blocked });
 });
+
+it('ends as failed, not blocked, when checks fail on a head that moved while waiting', async () => {
+  const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], change: () => ({ head: oid(40) }) });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/head moved/) });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('asks GitHub to merge nothing once stopped, even if the checks pass meanwhile', async () => {
+  let passing = false;
+  const f = setup({ checks: () => [passing ? { context: 'ci', appId: null, state: 'success' } : pending()] });
+  f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
+  f.coordinator.stop(); passing = true;
+  await f.coordinator.current;
+  expect(f.gh.merged).toEqual([]);
+  expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
+});

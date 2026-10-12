@@ -1828,9 +1828,11 @@ describe('the one-click merge job (F6b of #22)', () => {
     hanging = true;
     await vi.waitFor(() => expect(gh.hung).toHaveLength(1), { timeout: 10_000 });
     const database = served.app.service.config.database, closing = Date.now();
-    await served.close();
-    expect(Date.now() - closing).toBeLessThan(10_000);
+    const closed = served.close();
+    // Shutdown's first synchronous turn stops the job, before any drain, so it cannot ask GitHub to merge meanwhile.
     expect(gh.hung[0]!.aborted).toBe(true);
+    await closed;
+    expect(Date.now() - closing).toBeLessThan(10_000);
     const reopened = new Store(database);
     try { expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'running', step: 'checks' }); } finally { reopened.close(); }
   }, 60_000);

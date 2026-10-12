@@ -35,7 +35,7 @@ Without a runner, **Merge PR** works as before.
 | Wait for checks | The job inspects the pull request (fresh) at once, then again after 10 s, with the wait doubling up to 60 s. | every required check succeeds, or the required set was read and is empty, and nothing else blocks | a required check fails, or 30 minutes pass (job: `blocked`); the pull request moved, or another blocker appears (job: `failed`) |
 | Merge | The job calls the guarded merge with the current review token. Its inspections rerun the already-fixed check. | GitHub merged or queued the head (job: `merged` or `queued`) | GitHub refused (job: `blocked`), validation refused (job: `failed`), or the outcome is unknown (job: `submitted`; the merge attempt reconciles as before) |
 
-While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. Unreadable branch rules never pass.
+While waiting, an unknown mergeability (GitHub is still computing it) and a pending or missing required check keep the job waiting. Unreadable branch rules never pass. Another blocker outranks a failing check: checks that fail on a head a collaborator pushed say nothing about this review, so the job ends `failed` and the task stays in review.
 
 ## Outcomes
 
@@ -61,7 +61,7 @@ A rebase moves the pull request's base. The guarded merge would then scan only t
 | Cancel during preparation | as for `prepare-merge`: the preparation stops, and the task closes when its work has settled |
 | Cancel while waiting | the wait stops at once; the task closes; the job ends `cancelled` |
 | Cancel during the guarded merge | before GitHub is asked, the merge stops and the job ends `cancelled`; once a merge attempt is submitting, a cancel is refused, as before |
-| Shutdown | the job is aborted and awaited before the store closes. While preparing or waiting, it stays `running` on disk. A guarded merge in progress stops as a click's does: if GitHub was not asked yet, the job stays `running`; if it was, the job ends `submitted` and the merge attempt reconciles as before |
+| Shutdown | the job is stopped in shutdown's first, synchronous step, before requests drain, and awaited before the store closes. While preparing or waiting, it stays `running` on disk. A guarded merge in progress stops as a click's does: if GitHub was not asked yet, the job stays `running`; if it was, the job ends `submitted` and the merge attempt reconciles as before |
 | Restart | a `running` job becomes `failed` ("The server restarted before the merge finished"); a `prepare-merge` action and a push marker are settled as before |
 
 ## Storage
