@@ -60,6 +60,13 @@ export interface MergeTarget {
   ownPullRequests?: readonly number[];
   /** The task branch of a published target (#121). The inspection then also reads `RemoteMergeState.published`. */
   headBranch?: string;
+  /**
+   * Where the already-fixed commit scan starts: the base the task's last clear check scanned from. A rebase moves the
+   * PR's base past base commits that check never saw (F6b of #22). Default: the PR's base commit.
+   */
+  alreadyFixedSince?: string;
+  /** Commits the task made; the already-fixed scan does not count them. Default: none. */
+  ownCommits?: readonly string[];
 }
 
 export interface MergeResult { url: string; }
@@ -100,7 +107,7 @@ export interface GhMergeConfig {
   baseBranch?: string;
 }
 
-type ResolvedTarget = { pullRequest: number; ownPullRequests: readonly number[]; headBranch?: string };
+type ResolvedTarget = { pullRequest: number; ownPullRequests: readonly number[]; headBranch?: string; alreadyFixedSince?: string; ownCommits?: readonly string[] };
 type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;
 export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
@@ -172,7 +179,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const own = target?.ownPullRequests ?? [];
     if (own.some(number => !validNumber(number))) throw new Error('Invalid pull request number.');
     if (target?.headBranch !== undefined && (typeof target.headBranch !== 'string' || !BRANCH.test(target.headBranch))) throw new Error('Invalid pull request branch.');
-    return { pullRequest, ownPullRequests: [...new Set([pullRequest, ...own])], ...(target?.headBranch !== undefined ? { headBranch: target.headBranch } : {}) };
+    if (target?.alreadyFixedSince !== undefined && (typeof target.alreadyFixedSince !== 'string' || !SHA.test(target.alreadyFixedSince))) throw new Error('Invalid already-fixed scan start.');
+    if (target?.ownCommits !== undefined && (!Array.isArray(target.ownCommits) || target.ownCommits.some(sha => typeof sha !== 'string' || !SHA.test(sha)))) throw new Error('Invalid own commit.');
+    return { pullRequest, ownPullRequests: [...new Set([pullRequest, ...own])], ...(target?.headBranch !== undefined ? { headBranch: target.headBranch } : {}),
+      ...(target?.alreadyFixedSince !== undefined ? { alreadyFixedSince: target.alreadyFixedSince } : {}),
+      ...(target?.ownCommits !== undefined ? { ownCommits: [...new Set(target.ownCommits)].sort() } : {}) };
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -197,14 +208,15 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    * The check stops early enough that its `gh` processes, which may need both grace periods after an abort, settle before
    * the inspection's deadline; stopped that way it is `unknown`.
    */
-  async #alreadyFixed(ownPullRequests: readonly number[], baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
+  async #alreadyFixed(target: ResolvedTarget, baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
     // A check started with no settle time left could leave processes running past the inspection's deadline.
     const runFor = deadlineAt - MERGE_CHECK_SETTLE_MS - Date.now();
     if (runFor <= 0) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' };
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), runFor);
     try {
-      const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [...ownPullRequests], ownCommits: new Set() },
+      const result = await this.checks.check({ issue: this.config.issue, taskBase: target.alreadyFixedSince ?? base, baseBranch,
+        ownPullRequests: [...target.ownPullRequests], ownCommits: new Set(target.ownCommits ?? []) },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
       // An answer that arrives after the check was stopped is not used. (One after a caller's abort is refused by the
       // inspection itself, once the rule reads have ended.)
@@ -234,7 +246,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     // process they started outlives the inspection.
     const failed = new AbortController(), reads = signal ? AbortSignal.any([signal, failed.signal]) : failed.signal;
     const stopOthers = (error: unknown) => { failed.abort(error); throw error; };
-    const alreadyFixed = this.#alreadyFixed(target.ownPullRequests, pr.baseRefName, base, deadlineAt, reads);
+    const alreadyFixed = this.#alreadyFixed(target, pr.baseRefName, base, deadlineAt, reads);
     const [ruleRead, listRead] = await Promise.allSettled([
       this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
       published ? this.#branchOpen(target.headBranch!, reads).catch(stopOthers) : undefined,

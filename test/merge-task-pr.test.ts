@@ -252,7 +252,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
     const status = await merges.status();
     expect(status.blockers).toEqual([]);
-    expect(gh.targets[0]).toEqual({ pullRequest: 7, ownPullRequests: [7], headBranch: BRANCH });
+    expect(gh.targets[0]).toEqual({ pullRequest: 7, ownPullRequests: [7], headBranch: BRANCH, alreadyFixedSince: oid(1), ownCommits: [oid(2)] });
     await merges.merge('review-token');
     expect(gh.merged).toEqual([7]);
     expect(store.getMergeAttempt(identity)).toMatchObject({ pullRequest: 7, state: 'merged' });
@@ -332,6 +332,17 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.merged).toEqual([]);
   });
 
+  it('scans for an earlier fix from the pre-PR check\'s base after a rebase, skipping the task\'s own commits', async () => {
+    const { store } = published(), gh = github(store);
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    // A pre-merge rebase moved the reviewed base from oid(1) to oid(10) and rewrote the owned head oid(2) as oid(12).
+    store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await merges.status(undefined, true);
+    expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 7, alreadyFixedSince: oid(1) });
+    expect([...gh.targets.at(-1)!.ownCommits!].sort()).toEqual([oid(12), oid(2)].sort());
+  });
+
   it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
     const { store } = published();
     const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));
@@ -358,7 +369,7 @@ describe('the merge gate with a runner block (#121)', () => {
     toReview(store);
     const gh = github(store);
     await new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED).status();
-    expect(gh.targets[0]).toEqual({ pullRequest: 8, ownPullRequests: [7, 8], headBranch: BRANCH });
+    expect(gh.targets[0]).toEqual({ pullRequest: 8, ownPullRequests: [7, 8], headBranch: BRANCH, alreadyFixedSince: oid(1), ownCommits: [oid(2)] });
   });
 
   it('refuses when the task\'s PR changes between the validation passes', async () => {

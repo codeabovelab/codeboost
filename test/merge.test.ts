@@ -1297,6 +1297,17 @@ it('gives an injected check the merge inputs and fails closed on an unknown outc
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, { check: checks.check })).toThrow(/merge repository/);
 });
 
+it('scans for an earlier fix from the target\'s scan start and skips the task\'s own commits (F6b)', async () => {
+  const inputs: AlreadyFixedInput[] = [];
+  const checks: AlreadyFixedGateway = { repository: 'Owner/Repo', check: async input => { inputs.push(input); return { outcome: 'clear', baseHead: sha('9') }; } };
+  const run = async (args: readonly string[]) => mergeReads(args, { baseRefName: 'release/1', baseRefOid: sha('c') });
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks);
+  await client.inspect({ fresh: true, target: { pullRequest: 7, alreadyFixedSince: sha('a'), ownCommits: [sha('e'), sha('d'), sha('e')] } });
+  expect(inputs[0]).toEqual({ issue: 21, taskBase: sha('a'), baseBranch: 'release/1', ownPullRequests: [7], ownCommits: new Set([sha('d'), sha('e')]) });
+  await expect(client.inspect({ fresh: true, target: { pullRequest: 7, alreadyFixedSince: 'main' } })).rejects.toThrow(/scan start/);
+  await expect(client.inspect({ fresh: true, target: { pullRequest: 7, ownCommits: ['x'] } })).rejects.toThrow(/own commit/);
+});
+
 it('keeps the caller cancellation when the merge check is aborted', async () => {
   const controller = new AbortController();
   let started!: () => void;
