@@ -283,10 +283,13 @@ export class MergeCoordinator {
       // A new snapshot or plan revision after an attempt (a rebase, for example) needs every item approved again for it;
       // the attempt's own reason (often GitHub's refusal) would not say so.
       const { store, config } = this.service;
-      const replaced = store.getSnapshot(config.identity).id !== attempt.snapshotId || store.getPlan(config.identity).revision !== attempt.revision;
-      return { code: 'queue-head', message: replaced
-        ? `The pull request changed after the last merge attempt${attempt.reason ? ` (${attempt.reason})` : ''}. Approve every item again for the replacement snapshot, then merge.`
-        : attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+      const after = attempt.reason ? ` (${attempt.reason})` : '';
+      const message = store.getSnapshot(config.identity).id !== attempt.snapshotId
+        ? `The pull request changed after the last merge attempt${after}. Approve every item again for the replacement snapshot, then merge.`
+        : store.getPlan(config.identity).revision !== attempt.revision
+          ? `The plan changed after the last merge attempt${after}. Approve every item again for the new plan revision, then merge.`
+          : attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.';
+      return { code: 'queue-head', message };
     }
     return null;
   }

@@ -711,6 +711,8 @@ it('requires current-snapshot approvals after an ordinary queue removal and forc
     await h.coordinator.pollQueue();
     h.replaceHead(sha('c'));
     expect((await h.coordinator.status(h.view())).action).toBeNull();
+    expect((await h.coordinator.status(h.view())).blockers).toEqual(expect.arrayContaining([{ code: 'queue-head',
+      message: 'The pull request changed after the last merge attempt (Checks failed.). Approve every item again for the replacement snapshot, then merge.' }]));
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'replacement-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
@@ -723,6 +725,9 @@ it('requires current-revision approvals after a same-snapshot plan amendment', a
     await h.coordinator.pollQueue();
     h.amendPlan();
     expect((await h.coordinator.status(h.view())).action).toBeNull();
+    // The snapshot is unchanged: the message names the plan, not a replacement snapshot.
+    expect((await h.coordinator.status(h.view())).blockers).toEqual(expect.arrayContaining([{ code: 'queue-head',
+      message: 'The plan changed after the last merge attempt (Checks failed.). Approve every item again for the new plan revision, then merge.' }]));
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'amended-plan-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
