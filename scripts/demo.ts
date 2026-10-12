@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, lstatSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join, relative, isAbsolute, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from '../runner/store.ts';
 import type { ReviewConfig } from '../runner/review.ts';
 import type { Plan } from '../core/plan.ts';
+import { probePathIdentity } from '../runner/path-identity.ts';
 import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from './git-environment.ts';
 /** Disposable fixture only. Never runs against the user's working repository. */
 export function createDemo(directory: string): ReviewConfig {
@@ -51,10 +52,7 @@ export function createDemo(directory: string): ReviewConfig {
     {id:'P2',title:'Document retry behavior',intent:'Describe the retry strategy for maintainers.',files:[{path:'README.md',kind:'edit',renamed_from:null,change:'Explain the capped exponential delay.'}],acceptance:[{type:'check',text:'Documentation agrees with the implementation.'}],depends_on:['P1']},
     {id:'P3',title:'Confirm API compatibility',intent:'Confirm the function signature is unchanged.',files:[{path:'retry.ts',kind:'edit',renamed_from:null,change:'Keep the public function signature.'}],acceptance:[{type:'check',text:'No API change is needed.'}],depends_on:['P1']},
   ]};
-  const probe=mkdtempSync(join(root,'identity-'));
-  let pathIdentity:ReviewConfig['pathIdentity'];
-  try { writeFileSync(join(probe,'case'),'');writeFileSync(join(probe,'café'),'');pathIdentity={caseSensitive:!existsSync(join(probe,'CASE')),unicodeNormalization:existsSync(join(probe,'cafe\u0301'))?'NFC':'none'}; }
-  finally {rmSync(probe,{recursive:true});}
+  const pathIdentity=probePathIdentity(root);
   const config:ReviewConfig={database:join(root,'review.sqlite'),repository,identity,pathIdentity,demo:true};
   const store=new Store(config.database);
   try { store.createPlan(JSON.stringify(plan),'json',{identity,issue:3,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:p=>p,allowedCommands:[]},base,head);

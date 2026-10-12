@@ -26,6 +26,7 @@ import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 import { commandCheckDeps } from './checks.ts';
 import { PreMergeCoordinator, type PreMergeAuthorization } from './pre-merge.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
+import { assertPathIdentity } from './path-identity.ts';
 
 /**
  * The production runner (#91): D's real workspace, launcher, recovery, export and removal, under the database's runner
@@ -215,6 +216,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   o.lock.verify();
   const runnerOwner = service.store.runnerOwnerToken(o.lock.file);
   ownerOnlyDirectory(config.root);
+  // #162: plan path keys follow pathIdentity, so it must match the filesystem the task checkouts live on. Checked before
+  // recovery and the image build, so a wrong setting is reported at once.
+  assertPathIdentity(review.pathIdentity, ownerOnlyDirectory(config.root, runnerOwner, 'attempts'));
   // Per database (its runner token): retention reads references from this Store only, so it must never see another
   // database's files. The lock is per database, so two runners can share a root or a configured directory.
   const diagnosticsDir = ownerOnlyDirectory(config.diagnosticsDir ?? config.root, runnerOwner, 'diagnostics');
