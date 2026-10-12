@@ -207,7 +207,14 @@ it('replays a resent click, refuses a second click while a job runs, and replays
   expect(() => f.coordinator.start('stale-token', stale)).toThrow(/Stale review state/);
   const first = f.coordinator.start('review-token', id);
   expect(f.coordinator.start('review-token', id)).toMatchObject({ id: first.id, state: 'running' });
-  expect(() => f.coordinator.start('review-token', randomUUID())).toThrow(GuardRefusal);
+  await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
+  const second = randomUUID();
+  expect(() => f.coordinator.start('review-token', second)).toThrow(/already running/);
+  expect(f.store.getMergeJob(identity, second)).toMatchObject({ refused: true });
+  // The saved refusal is that click's alone: the running job stays the task's job, and Merge PR stays withheld.
+  expect(f.coordinator.latest()).toMatchObject({ id: first.id, state: 'running', step: 'checks' });
+  const resolvable = { ready: false, action: null, blockers: [{ code: 'check', message: 'pending' }], remote: { mergeable: 'MERGEABLE' }, queue: null } as Parameters<typeof withMergeJob>[0];
+  expect(withMergeJob(resolvable, f.coordinator.latest(), 'in review')).toMatchObject({ ready: false, action: null });
   expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   f.coordinator.cancel(); await settled(f.coordinator);
@@ -239,7 +246,8 @@ it('refuses a click while the runner or publisher is busy, and replays that refu
   // The response was lost; the same click is resent after the runner became idle: it replays, starting nothing.
   expect(() => f.coordinator.start('review-token', id)).toThrow('The runner is busy.');
   expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
-  expect(f.coordinator.latest()).toMatchObject({ id, state: 'failed', refused: true, reason: 'The runner is busy.' });
+  expect(f.store.getMergeJob(identity, id)).toMatchObject({ state: 'failed', refused: true, reason: 'The runner is busy.' });
+  expect(f.coordinator.latest()).toBeNull();
   expect(f.coordinator.active).toBe(false);
   expect(f.prep.calls).toEqual([]);
 });
@@ -390,7 +398,7 @@ it('refuses a click while a preparation is already running, and replays that ref
   const f = setup(), id = randomUUID();
   (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('Pre-merge preparation is already running.'); };
   expect(() => f.coordinator.start('review-token', id)).toThrow('Pre-merge preparation is already running.');
-  expect(f.coordinator.latest()).toMatchObject({ id, refused: true });
+  expect(f.store.getMergeJob(identity, id)).toMatchObject({ refused: true });
   expect(f.prep.calls).toEqual([]);
 });
 

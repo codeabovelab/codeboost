@@ -57,7 +57,8 @@ export class MergeJobCoordinator {
 
   /**
    * Admit the click and start its job after the caller's transaction commits. A resend of the same click returns its
-   * job without starting another. Refusals save nothing, so the same click may be sent again.
+   * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend; only a
+   * refusal during shutdown saves nothing, so that click may be sent again.
    */
   start(token: unknown, actionId: string, busy: () => string | null = () => null): MergeJobView {
     const { store, config } = this.service, identity = config.identity;

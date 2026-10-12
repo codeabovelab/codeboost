@@ -2204,8 +2204,10 @@ export class Store {
     const row = this.#get('SELECT data FROM merge_jobs WHERE id=? AND plan_key=?', id, identityKey(identity));
     return row ? decode<MergeJob>(row.data) : null;
   }
+  /** The task's latest job. A refused click started none: its refusal is replayed to that click alone, never shown here. */
   latestMergeJob(identity: PlanIdentity): MergeJob | null {
-    const row = this.#get('SELECT data FROM merge_jobs WHERE plan_key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    const row = this.#get(`SELECT data FROM merge_jobs WHERE plan_key=? AND json_extract(data,'$.refused') IS NOT 1
+      ORDER BY rowid DESC LIMIT 1`, identityKey(identity));
     return row ? decode<MergeJob>(row.data) : null;
   }
   runningMergeJob(identity: PlanIdentity): MergeJob | null {

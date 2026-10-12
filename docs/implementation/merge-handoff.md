@@ -71,7 +71,7 @@ Schema v19 adds `merge_jobs`: one row per job (`action_id`, task key, `state`, `
 ## API and browser
 
 - `POST /api/action` with `merge` returns `{ job }` at once when a runner is configured.
-- `GET /api/merge` returns `{ queue, job }`.
+- `GET /api/merge` returns `{ queue, job }`: `job` is the task's latest job. A saved refusal is not a job; it is replayed only to its own click.
 - Merge PR is offered while the only blockers left are ones the job resolves or reports: preparation, a moved base (with a merge conflict it causes), `cmd:` checks, required checks (the job waits for pending ones and ends `blocked` on failing ones, so a person can retry after re-running CI), and mergeability GitHub is still computing.
 - While a job runs, the Merge button keeps keyboard focus: it is marked `aria-disabled`, not disabled, and a repeat activation starts nothing.
 - The browser polls `GET /api/merge` with the existing 2 s to 30 s backoff while a job runs, shows its step in the merge banner, lists waiting checks in the blocker dialog, and offers **Retry merge** when the job is `blocked`. The design's full step list and a Cancel button come later.
