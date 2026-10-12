@@ -204,11 +204,13 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
   const drainMs = 10_000, prompt = 3_000, big = 4 * 1024 * 1024;
   const serveLong = () => serve(undefined, undefined, drainMs);
   /** Starts a POST with `first` bytes of body; `send` writes more, `end` ends it. Records the reply and when it came. */
-  function oversized(app: App, first: number, options: { path?: string; token?: string; contentType?: string } = {}) {
+  function oversized(app: App, first: number, options: { path?: string; token?: string; contentType?: string; length?: number } = {}) {
     const url = new URL(origin(app));
     const state: { status?: number; body?: string; connection?: string; error?: Error; endedAt?: number; repliedAt?: number } = {};
     const req = httpRequest({ host: url.hostname, port: url.port, path: options.path ?? '/api/action', method: 'POST',
-      headers: { 'x-codeboost-token': options.token ?? app.token, 'content-type': options.contentType ?? 'application/json' } }, res => {
+      // Without a length the body is sent chunked; the browser sends a Content-Length.
+      headers: { 'x-codeboost-token': options.token ?? app.token, 'content-type': options.contentType ?? 'application/json',
+        ...(options.length === undefined ? {} : { 'content-length': options.length }) } }, res => {
       state.repliedAt = performance.now(); state.status = res.statusCode; state.connection = res.headers.connection;
       let data = ''; res.on('data', chunk => { data += chunk; }); res.on('end', () => { state.body = data; });
     });
@@ -225,6 +227,8 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
   });
   const timed = async (close: () => Promise<void>) => { const started = performance.now(); await close(); return performance.now() - started; };
   const refused = JSON.stringify({ error: 'Request too large.' });
+  /** close() ends by closing the Store, so a read through it then fails. */
+  const storeClosed = (app: App) => expect(() => app.service.store.questionProvider()).toThrow();
 
   it('replies 413 only once the whole body has arrived', async () => {
     const { app } = await serveLong();
@@ -244,6 +248,7 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
       headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
     expect({ status: response.status, body: await response.text() }).toEqual({ status: 413, body: refused });
     expect(await timed(close)).toBeLessThan(prompt);
+    storeClosed(app);
   });
   it('still replies 413, after the body ends, to an oversized body that completes during the shutdown drain', async () => {
     const { app, close } = await serveLong();
@@ -271,7 +276,8 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
     ['a wrong token', { token: 'f'.repeat(64) }, 403],
     ['an unsupported content type', { contentType: 'text/plain' }, 405],
     ['a path that takes no POST', { path: '/' }, 405],
-  ] as const)('closes the connection when it refuses %s before reading a large body, so shutdown is prompt', async (_label, options, status) => {
+  ].flatMap(([label, options, status]) => [[label, 'chunked', options, status], [label, 'Content-Length', { ...options as object, length: big }, status]]) as
+    [string, string, Parameters<typeof oversized>[2], number][])('closes the connection when it refuses %s before reading a large %s body, so shutdown is prompt', async (_label, _kind, options, status) => {
     const { app, close } = await serveLong();
     const sent = oversized(app, big, options);
     sent.end();
@@ -280,6 +286,7 @@ describe('an oversized request body (#157)', { timeout: 30_000 }, () => {
     if (sent.state.status !== undefined) expect(sent.state).toMatchObject({ status, connection: 'close' });
     else expect(sent.state.error).toBeDefined();
     expect(await timed(close)).toBeLessThan(prompt);
+    storeClosed(app);
   });
   it.each([
     ['a static file', 'GET', '/', undefined, 200],
