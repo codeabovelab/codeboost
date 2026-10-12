@@ -45,8 +45,9 @@ type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 // of that ownership settlement inside the preparation's one overall deadline.
 export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
 /**
- * Git and GitHub subprocesses abort before the advertised operation deadline, leaving their stop/drain time (bounded,
- * except for a process that stays in a subprocess's group after it exits, which is waited for).
+ * Git and GitHub subprocesses abort before the advertised operation deadline, leaving their stop/drain time. That time
+ * is bounded except in two cases, which are waited for, fail-closed: a process that stays in a subprocess's group after
+ * it exits, and, for Git calls that change something (fetch, push), a process that left the group but holds its output.
  */
 export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
 /** Keep a full process-settlement window between live rebase expiry and its separately budgeted durable cleanup. */
