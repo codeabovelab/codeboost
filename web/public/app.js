@@ -218,7 +218,8 @@ async function pollMergeQueue(generation) {
     const update = await api("/api/merge");
     if (generation !== mergeGeneration || !data?.merge?.available) return;
     if (data.merge.job?.state === "running") {
-      // A merge job (F6b): follow its step; once it ends, reload the review, which shows the outcome.
+      // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
+      // a background reload would erase the person's selection and input; Refresh shows the outcome.
       const job = update.job;
       if (job?.state === "running") {
         const changed = job.step !== data.merge.job.step || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
@@ -228,8 +229,11 @@ async function pollMergeQueue(generation) {
         renderMerge();
         return;
       }
-      await refresh();
-      if (job) $("banner").textContent = mergeJobText(job);
+      const ended = `${job ? mergeJobText(job) : "The merge job ended."} Refresh to see the result.`;
+      const blockers = data.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+      data = { ...data, merge: { ...data.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: ended }, ...blockers] } };
+      $("banner").textContent = ended;
+      renderMerge();
       return;
     }
     const queue = update.queue;
@@ -257,7 +261,7 @@ function mergeJobText(job) {
     failed: `Merge stopped. ${job.reason ?? ""} Merge again when ready.`.trim(), cancelled: "Merge cancelled.",
   }[job.state] ?? job.state;
 }
-const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge"]);
+const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
 function withMergeQueue(view, queue) {
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
   if (queue?.state === "merged")

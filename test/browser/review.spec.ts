@@ -689,7 +689,17 @@ test('follows a one-click merge job from preparation through the required-check 
  await expect(page.getByRole('button',{name:'Merging…',exact:true})).toHaveAttribute('aria-disabled','true');
  expect(mergeClicks).toBe(1);
  const reloadsBeforeEnd=reviews;
- await expect(page.locator('#banner')).toHaveText('Merged.');
- expect(reviews).toBeGreaterThan(reloadsBeforeEnd);
+ // The job's end updates only the merge control (AGENTS.md, Async review UI): no background reload erases the
+ // person's selection or input.
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
+ expect(reviews).toBe(reloadsBeforeEnd);
+ await expect(button).toHaveAttribute('aria-disabled','true');await expect(button).toHaveJSProperty('disabled',false);
  expect(polls).toBe(3);
+ await page.locator('#merge-details').click();
+ await expect(page.locator('dialog')).toContainText('Merged. Refresh to see the result.');
+ await page.keyboard.press('Escape');
+ // Refresh loads the outcome.
+ const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await reloaded;
+ expect(reviews).toBeGreaterThan(reloadsBeforeEnd);
 });
