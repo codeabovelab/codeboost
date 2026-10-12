@@ -629,6 +629,9 @@ test('hides Retry until a timed-out invocation has actually settled',async({page
  settle('Late answer');
  await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible({timeout:10000});
 });
+/** Whether the element is drawn with the muted surface background a control that cannot act uses (poll it: buttons may animate their background). */
+const looksInactive=(locator:import('@playwright/test').Locator)=>locator.evaluate(el=>{const probe=document.createElement('div');probe.style.background='var(--surface)';document.body.append(probe);
+ const surface=getComputedStyle(probe).backgroundColor;probe.remove();return getComputedStyle(el).backgroundColor===surface;});
 test('keeps focus on the Merge button when a merge-job click is refused (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -646,6 +649,8 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  // The refusal leaves the control marked, not disabled, and focused (AGENTS.md, Async review UI).
  await expect(button).toHaveAttribute('aria-disabled','true');
  await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
+ // It is drawn as a control that cannot act, as a disabled one is.
+ await expect.poll(()=>looksInactive(button)).toBe(true);
  // Activating it again starts nothing: the merge is not ready.
  await button.press('Enter');
  expect(mergeClicks).toBe(1);
@@ -671,6 +676,7 @@ test('follows a one-click merge job from preparation through the required-check 
  await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveAttribute('aria-disabled','true');
  // Not disabled in the DOM (Playwright's toBeEnabled counts aria-disabled as disabled), and still focused.
  await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
+ await expect.poll(()=>looksInactive(button)).toBe(true);
  await expect(page.locator('#banner')).toContainText('Preparing the merge');
  await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toHaveAttribute('aria-disabled','true');
  await expect(button).toBeFocused();

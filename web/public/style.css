@@ -100,7 +100,7 @@ button[aria-disabled="true"] {
 }
 button.primary,
 #approve,
-#merge:not(:disabled) {
+#merge:not(:disabled):not([aria-disabled="true"]) {
   background: var(--primary);
   color: var(--on-primary);
   border-color: var(--primary);
@@ -112,7 +112,7 @@ button.primary[aria-disabled="true"] {
   border-color: var(--line);
 }
 #approve:hover,
-#merge:not(:disabled):hover {
+#merge:not(:disabled):not([aria-disabled="true"]):hover {
   background: var(--hover);
 }
 [hidden] {
