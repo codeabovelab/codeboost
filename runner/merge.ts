@@ -1,5 +1,5 @@
 import type { ReviewService } from './review.ts';
-import { mergeActionResponse, type MergeAttempt } from './store.ts';
+import { mergeActionResponse, type MergeAttempt, type TaskPullRequest } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type MergeTarget, type RemoteMergeState } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
@@ -112,23 +112,25 @@ export class MergeCoordinator {
     if (!latest || latest.number === null) throw new MergeTargetUnavailable(`The task has no published pull request into ${published.baseBranch}.`);
     if (published.configured !== undefined && published.configured !== latest.number)
       throw new MergeTargetUnavailable(`github.pullRequest is #${published.configured}, but the task's pull request is #${latest.number}. Remove github.pullRequest from the review configuration.`);
-    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange() },
+    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange(here, published.baseBranch) },
       openingId: latest.openingId, marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
   }
 
   /**
-   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the task's first clear
-   * pre-PR check scanned through. That check scanned the task's base up to that tip and found nothing; every base commit
-   * a later rebase can bring under the PR landed after it, so the scan covers them whichever opening the merge follows
-   * (a new opening after a rebase included). The task's own commits are excluded.
+   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the pre-PR check of the
+   * task's first opening into the current base branch scanned through. That check scanned the branch from the task's
+   * base to that tip and found nothing; every base commit a later rebase onto the branch can bring under the PR landed
+   * after it, so the scan covers them whichever of the task's openings into the branch the merge follows (a re-publish,
+   * or a new opening after the person closed the PR). An earlier opening into another base branch says nothing about
+   * this one. A first opening recorded before schema v19 has no check: the task's oldest clear check is used. The task's
+   * own commits are excluded.
    */
-  #alreadyFixedRange(): { alreadyFixedSince?: string; ownCommits: string[] } {
+  #alreadyFixedRange(here: TaskPullRequest[], base: string): { alreadyFixedSince?: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
-    const check = store.oldestClearAlreadyFixed(identity);
+    const first = here.find(pr => pr.base === base);
+    const check = first?.checkId ? store.getAlreadyFixed(identity, first.checkId) : store.oldestClearAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
     if (!check || check.result.outcome !== 'clear') return { ownCommits };
-    // That check scanned its snapshot's base up to the base branch's tip then (`baseHead`) and found nothing, so the merge
-    // scans only what landed after that tip.
     return { alreadyFixedSince: check.result.baseHead, ownCommits };
   }
 
