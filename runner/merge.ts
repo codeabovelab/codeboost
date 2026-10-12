@@ -117,21 +117,25 @@ export class MergeCoordinator {
   }
 
   /**
-   * The already-fixed scan of a runner-published PR (F6b of #22): from the base-branch tip the pre-PR check of the
-   * task's first opening into the current base branch scanned through. That check scanned the branch from the task's
-   * base to that tip and found nothing; every base commit a later rebase onto the branch can bring under the PR landed
-   * after it, so the scan covers them whichever of the task's openings into the branch the merge follows (a re-publish,
-   * or a new opening after the person closed the PR). An earlier opening into another base branch says nothing about
-   * this one. A first opening recorded before schema v19 has no check: the task's oldest clear check is used. The task's
-   * own commits are excluded.
+   * The already-fixed scan of a runner-published PR (F6b of #22). It must cover every base commit after the task's
+   * original base (its first snapshot's), since a rebase can bring any of them under the PR. The pre-PR check of the
+   * task's first opening into the current base branch scanned that branch from its snapshot's base to its tip and found
+   * nothing; when that base is the task's original base, the scan starts at that tip, and every later rebase onto the
+   * branch brought in only commits after it, whichever of the task's openings the merge follows. An opening into another
+   * base branch says nothing about this one. A first opening recorded before schema v19 has no check: the task's oldest
+   * clear check stands in. Otherwise (no such check, or one that scanned from a rebased base), the scan starts at the
+   * task's original base. The task's own commits are excluded.
    */
-  #alreadyFixedRange(here: TaskPullRequest[], base: string): { alreadyFixedSince?: string; ownCommits: string[] } {
+  #alreadyFixedRange(here: TaskPullRequest[], base: string): { alreadyFixedSince: string; ownCommits: string[] } {
     const { store, config } = this.service, identity = config.identity;
+    const original = store.firstSnapshot(identity).base;
     const first = here.find(pr => pr.base === base);
     const check = first?.checkId ? store.getAlreadyFixed(identity, first.checkId) : store.oldestClearAlreadyFixed(identity);
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
-    if (!check || check.result.outcome !== 'clear') return { ownCommits };
-    return { alreadyFixedSince: check.result.baseHead, ownCommits };
+    if (check?.result.outcome !== 'clear') return { alreadyFixedSince: original, ownCommits };
+    let scannedFrom: string | null = null;
+    try { scannedFrom = store.getSnapshot(identity, check.snapshotId).base; } catch { /* unknown: scan from the original base */ }
+    return { alreadyFixedSince: scannedFrom === original ? check.result.baseHead : original, ownCommits };
   }
 
   /** Whether GitHub shows the task's published PR where it was opened, as the only open PR from its branch. */

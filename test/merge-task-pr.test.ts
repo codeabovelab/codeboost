@@ -430,6 +430,27 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 8, alreadyFixedSince: oid(29) });
   });
 
+  it('scans from the task\'s original base when the first opening into the base branch followed a rebase', async () => {
+    const { store } = published();
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    // PR 7 went into main from the original base oid(1). A pre-merge rebase moved the task onto main's oid(10), then
+    // github.baseBranch became release (which contains oid(10)); the first opening into release followed a check that
+    // scanned release only from oid(10). Base commits between oid(1) and oid(10) were scanned on release by no check.
+    store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id,
+      reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(29) } });
+    const release = store.beginPullRequest(identity, { checkId: check.id, repository: 'owner/repo', base: 'release', headBranch: BRANCH, headSha: store.getSnapshot(identity).head, draft: false });
+    store.recordPullRequestOpened(identity, release.openingId, { number: 8, url: url(8), headSha: store.getSnapshot(identity).head, draft: false }, false);
+    toReview(store);
+    const gh = github(store);
+    await new MergeCoordinator(service(store), gh.client, undefined, undefined, { ...PUBLISHED, baseBranch: 'release' }).status(undefined, true);
+    expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 8, alreadyFixedSince: oid(1) });
+  });
+
   it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
     const { store } = published();
     const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));

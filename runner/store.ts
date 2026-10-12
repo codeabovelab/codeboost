@@ -506,6 +506,12 @@ export class Store {
     this.#run("UPDATE requests SET state='invalidated',reason='Repository snapshot changed.' WHERE key=? AND state IN ('pending','ready')", key);
     return snapshot;
   }
+  /** The task's first snapshot: its base is where the task began, before any rebase. */
+  firstSnapshot(identity: PlanIdentity): Snapshot {
+    const row = this.#get('SELECT data FROM snapshots WHERE key=? ORDER BY rowid ASC LIMIT 1', identityKey(identity));
+    if (!row) throw new Error('Unknown snapshot.');
+    return decode<Snapshot>(row.data);
+  }
   getSnapshot(identity: PlanIdentity, id?: string): Snapshot {
     const key = identityKey(identity);
     const row = this.#get('SELECT data FROM snapshots WHERE key=? AND id=?', key, id ?? this.#current(key).snapshot_id!);
