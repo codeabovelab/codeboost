@@ -61,8 +61,8 @@ export interface MergeTarget {
   /** The task branch of a published target (#121). The inspection then also reads `RemoteMergeState.published`. */
   headBranch?: string;
   /**
-   * Where the already-fixed commit scan starts: the base-branch tip the PR's own pre-PR check scanned through. A rebase moves the
-   * PR's base past base commits that check never saw (F6b of #22). Default: the PR's base commit.
+   * Where the already-fixed commit scan starts, so it covers every base commit after the task's original base, which a
+   * rebase can bring under the PR (F6b of #22; the runner picks it, `merge-handoff.md`). Default: the PR's base commit.
    */
   alreadyFixedSince?: string;
   /** Commits the task made; the already-fixed scan does not count them. Default: none. */
@@ -202,9 +202,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
 
   /**
    * The pre-merge "already fixed" check runs the pre-PR check (`github/already-fixed.ts`) with the same rules. This PR and
-   * the task's other recorded PRs are its own: excluded while open, a match once merged. The base-branch scan starts at the
-   * PR's base commit, the base the merge is validated against; the task has no own commits on the base branch before its
-   * merge.
+   * the task's other recorded PRs are its own: excluded while open, a match once merged. The base-branch scan starts at
+   * `target.alreadyFixedSince` when given (a runner-published PR), else at the PR's base commit; `target.ownCommits`, the
+   * task's own commits a rebase may have rewritten, are not counted.
    * The check stops early enough that its `gh` processes, which may need both grace periods after an abort, settle before
    * the inspection's deadline; stopped that way it is `unknown`.
    */

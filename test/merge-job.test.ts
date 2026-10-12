@@ -384,6 +384,22 @@ it('blocks the job and the task in one write, leaving a task that moved meanwhil
   expect(store.getTask(identity).status).toBe('cancelled');
 });
 
+it('rolls the task back when ending a blocked job fails, and leaves the task alone for a job that already ended', () => {
+  const store = publishedTask(), id = randomUUID();
+  store.beginMergeJob(identity, { actionId: id, token: 'review-token' });
+  const finish = store.finishMergeJob.bind(store);
+  store.finishMergeJob = () => { throw new Error('disk full'); };
+  expect(() => store.blockMergeJob(identity, id, 'Required check failed: ci.')).toThrow('disk full');
+  // One transaction: the task did not move without its job.
+  expect(store.getTask(identity).status).toBe('in review');
+  store.finishMergeJob = finish;
+  expect(store.finishMergeJob(identity, id, { state: 'failed', reason: 'The pull request moved.' })).toBe(true);
+  const before = store.getTask(identity).stateVersion;
+  expect(store.blockMergeJob(identity, id, 'late')).toBe(false);
+  expect(store.getTask(identity)).toMatchObject({ status: 'in review', stateVersion: before });
+  expect(store.getMergeJob(identity, id)).toMatchObject({ state: 'failed' });
+});
+
 it('decides a retried job only from its own merge attempt, never from an earlier refused one', async () => {
   // The first job's merge is refused: its attempt stays on record as failed.
   let refuse = true, conflictFrom = Number.POSITIVE_INFINITY;

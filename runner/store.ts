@@ -2180,6 +2180,10 @@ export class Store {
   blockMergeJob(identity: PlanIdentity, id: string, reason: string): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
+      const job = this.getMergeJob(identity, id);
+      if (!job) throw new Error('Unknown merge job.');
+      // A job that already ended decides nothing about the task now.
+      if (job.state !== 'running') return false;
       const task = this.#task(key);
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
