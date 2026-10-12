@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { GuardRefusal } from '../runner/lifecycle.ts';
+import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
 import { MergeJobCoordinator, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
 import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
@@ -67,13 +67,16 @@ function preparation(store: Store, result: (call: number) => PreMergeResult['sta
 }
 /** GitHub showing PR 7 as published; `checks(n)` gives the required checks of the n-th inspection. */
 function github(store: Store, options: { checks?: (n: number) => RequiredCheck[]; change?: (n: number) => Partial<RemoteMergeState>;
-  merge?: (signal?: AbortSignal) => Promise<{ url: string }>; queue?: boolean; unreadable?: (n: number) => boolean } = {}) {
+  merge?: (signal?: AbortSignal) => Promise<{ url: string }>; queue?: boolean; unreadable?: (n: number) => boolean;
+  during?: (n: number) => void } = {}) {
   let inspections = 0;
   const merged: string[] = [];
   const client: MergeGateway = {
     inspect: vi.fn(async request => {
       inspections++;
       if (options.unreadable?.(inspections)) throw new Error('GitHub returned HTTP 502');
+      // Something that happens locally while GitHub's answer is on its way.
+      options.during?.(inspections);
       const record = store.taskPullRequests(identity).find(pr => pr.number === 7)!;
       const snapshot = store.getSnapshot(identity);
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
@@ -149,6 +152,20 @@ it('ends failed, without merging, when GitHub cannot be read while waiting for c
   expect(f.gh.inspections()).toBe(2);
   expect(f.gh.merged).toEqual([]);
   expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('ends failed, leaving the task in review, when a failing check arrives after the review changed', async () => {
+  let storeRef: Store | null = null;
+  const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], during: () => {
+    // A person adds a change request while the job's inspection is reading GitHub.
+    const store = storeRef!, snapshot = store.getSnapshot(identity);
+    store.addReviewNote(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, 'P1', 'change', 'Changed during the wait.');
+  } });
+  storeRef = f.store;
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed while waiting for required checks/) });
+  expect(f.store.getTask(identity).status).toBe('in review');
+  expect(f.gh.merged).toEqual([]);
 });
 
 it('waits while GitHub is still computing mergeability', async () => {
@@ -257,7 +274,10 @@ it('leaves a job running on shutdown, and startup ends it as failed', async () =
   expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
   f.store.settleInterruptedMergeJobs(identity);
   expect(f.coordinator.latest()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
-  expect(() => f.coordinator.start('review-token', randomUUID())).toThrow(/shutting down/);
+  // Not a definite refusal: the route answers 503 and the browser keeps the click's key (nothing was saved).
+  const id = randomUUID();
+  expect(() => f.coordinator.start('review-token', id)).toThrow(ShuttingDownError);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
 });
 
 it('ends queued when the merge queue accepted the head', async () => {
@@ -447,6 +467,14 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   f.store.updateMergeJob(identity, crashed, { step: 'merging', mergeActionId: randomUUID() });
   f.store.settleInterruptedMergeJobs(identity);
   expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
+});
+
+it('answers a preparation stopping for shutdown as not applied, saving nothing', () => {
+  const f = setup(), id = randomUUID();
+  (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('The server is shutting down.'); };
+  expect(() => f.coordinator.start('review-token', id)).toThrow(ShuttingDownError);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+  expect(f.prep.calls).toEqual([]);
 });
 
 it('refuses a click while a preparation is already running, and replays that refusal', () => {

@@ -2176,8 +2176,11 @@ export class Store {
   /**
    * End a running job `blocked` and, in the same transaction, move a task still in review to approved, merge blocked,
    * so the job and the task cannot disagree after a crash. A task that moved meanwhile keeps its status.
+   * With `readyFor`, the block applies only while the preparation's readiness still holds (checked in the same
+   * transaction): a check result that arrived after a review edit or another task change says nothing about the
+   * changed review, so the job then ends `failed` and the task keeps its status.
    */
-  blockMergeJob(identity: PlanIdentity, id: string, reason: string): boolean {
+  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
       const job = this.getMergeJob(identity, id);
@@ -2185,6 +2188,13 @@ export class Store {
       // A job that already ended decides nothing about the task now.
       if (job.state !== 'running') return false;
       const task = this.#task(key);
+      if (readyFor) {
+        const snapshot = this.getSnapshot(identity);
+        if (!this.preMergeReady(identity, { stateVersion: task.state_version as number, reviewVersion: this.#current(key).review_version as number,
+          snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: readyFor.commandPolicyDigest }))
+          return this.finishMergeJob(identity, id, { state: 'failed',
+            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies. Merge again.' });
+      }
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);

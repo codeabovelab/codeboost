@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MergeOutcomeUnknown, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
@@ -23,8 +23,8 @@ type CheckVerdict = { kind: 'ready' } | { kind: 'wait'; checks: { context: strin
 
 /**
  * The one-click merge (F6b of #22): preparation, the wait for GitHub's required checks on the pushed head, then the
- * guarded merge. One job per task at a time; its progress is saved in `merge_jobs`, never on the task, so the readiness
- * preparation records stays bound while the job waits.
+ * guarded merge. One job per task at a time; its progress is saved in `merge_jobs`, never on the task, so the
+ * preparation's readiness record stays bound while the job waits.
  */
 export class MergeJobCoordinator {
   readonly service: ReviewService;
@@ -71,8 +71,8 @@ export class MergeJobCoordinator {
       if (job.refused) throw new GuardRefusal(job.reason ?? 'The merge was refused.');
       return mergeJobView(job);
     }
-    // Shutdown decides nothing about this click: it may be sent again, so nothing is saved.
-    if (this.#closing) throw new GuardRefusal('The server is shutting down.');
+    // Shutdown decides nothing about this click: nothing is saved, and the route answers 503 so the same click is resent.
+    if (this.#closing) throw new ShuttingDownError();
     const refusal = this.#admissionRefusal(token, busy);
     if (refusal !== null) {
       // A definite refusal is this click's outcome; a resend replays it (as the guarded merge does).
@@ -101,7 +101,8 @@ export class MergeJobCoordinator {
     if (reason) return reason;
     try { this.preMerge.assertStartable(); }
     catch (error) {
-      if (!(error instanceof GuardRefusal) || /shutting down/i.test(error.message)) throw error;
+      if (error instanceof GuardRefusal && /shutting down/i.test(error.message)) throw new ShuttingDownError();
+      if (!(error instanceof GuardRefusal)) throw error;
       return error.message;
     }
     return null;
@@ -142,7 +143,8 @@ export class MergeJobCoordinator {
     this.settle(() => store.updateMergeJob(identity, job.id, { step: 'checks' }));
     const verdict = await this.#awaitChecks(job, signal);
     if (verdict.kind === 'cancelled') return this.#end(job, signal);
-    if (verdict.kind === 'blocked') return this.#block(job, verdict.reason);
+    // A failing or slow check blocks only while the readiness it was read for still holds (in the block's transaction).
+    if (verdict.kind === 'blocked') return this.#block(job, verdict.reason, true);
     if (verdict.kind === 'failed') return this.#finish(job.id, 'failed', verdict.reason);
     // 3. Merge through the guarded merge, which re-validates everything and reruns the already-fixed check.
     // The merge's action ID is saved first: after a restart, the attempt carrying it gives the job's outcome.
@@ -184,8 +186,9 @@ export class MergeJobCoordinator {
   }
 
   /** Approved, merge blocked: the task's next merge prepares again from the start. One Store transaction. */
-  #block(job: MergeJob, reason: string): void {
-    try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason)); }
+  #block(job: MergeJob, reason: string, whileReady = false): void {
+    const readyFor = whileReady ? { commandPolicyDigest: this.service.commandPolicyDigest() } : undefined;
+    try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason, readyFor)); }
     catch { /* Startup settles a job that could not be ended now. */ }
   }
 
