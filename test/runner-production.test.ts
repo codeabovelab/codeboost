@@ -14,6 +14,7 @@ import type { InvocationInput } from '../agents/contract.ts';
 import { ISSUE_READ_ACTIVE_MS, type IssueAccess } from '../github/issues.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
+import { probePathIdentity } from '../runner/path-identity.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 import type { GitRebaser } from '../runner/rebase.ts';
@@ -97,6 +98,27 @@ describe('runner configuration', () => {
 });
 
 describe('runner startup', () => {
+  it('refuses to start when pathIdentity disagrees with the filesystem that holds the task checkouts (#162)', async () => {
+    const { root, service } = fixture(), runnerRoot = join(root, 'runner');
+    mkdirSync(runnerRoot, { mode: 0o700 });
+    const probed = probePathIdentity(runnerRoot);
+    for (const pathIdentity of [{ ...probed, caseSensitive: !probed.caseSensitive },
+      { ...probed, unicodeNormalization: probed.unicodeNormalization === 'NFC' ? 'none' as const : 'NFC' as const }]) {
+      service.config = { ...service.config, pathIdentity };
+      const calls: string[] = [];
+      await expect(setUpRunner({ service, capability, config: { root: runnerRoot, committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+        buildImage: () => { calls.push('image'); return 'x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } }))
+        .rejects.toThrow(/pathIdentity .* does not match the filesystem that holds the task checkouts/);
+      // Refused before recovery and the image build, and the probe leaves nothing behind.
+      expect(calls).toEqual(['verify']);
+      const attempts = join(runnerRoot, service.store.runnerOwnerToken({ dev: 1n, ino: 2n }), 'attempts');
+      expect(readdirSync(attempts)).toEqual([]);
+    }
+    // The probed identity itself starts.
+    service.config = { ...service.config, pathIdentity: probed };
+    await expect(setUpRunner({ service, capability, config: { root: runnerRoot, committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) })).resolves.toBeDefined();
+  });
   it('verifies the lock, recovers, then builds the image, before it assembles anything', async () => {
     const { root, service } = fixture(), calls: string[] = [];
     const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
