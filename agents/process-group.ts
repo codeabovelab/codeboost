@@ -49,6 +49,13 @@ export interface ProcessGroupOptions {
    * Callers without durable ownership wait fail-closed instead of returning while unknown work is still live.
    */
   readonly allowUnsettledReturn?: boolean;
+  /**
+   * Bound only the wait for the output pipes once the whole group is gone: a process that left the group but still holds
+   * them makes the call return failed (`ESTDIOHELD`) after the pipe drain, instead of waiting for it. Members of the
+   * group are still waited for, fail-closed. For callers whose command changes nothing (a read), so a process that
+   * escaped the group cannot affect anything they decide.
+   */
+  readonly boundEscapedOutput?: boolean;
 }
 
 const DEFAULT_GRACE_MS = 5_000;
@@ -94,7 +101,8 @@ export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drai
  * returns control to the event loop. On abort or at the deadline the whole group gets SIGTERM, then SIGKILL after the
  * grace period, so a child that ignores SIGTERM is still bounded. The promise settles only after the leader has
  * exited and every other member of its group is gone, unless a caller with durable recovery ownership explicitly
- * allows an unsettled return. Never rejects: failures are in the outcome, shaped like `runDocker`'s, so `status` is a
+ * allows an unsettled return. `boundEscapedOutput` bounds only the wait for a process outside the group that holds the
+ * output pipes. Never rejects: failures are in the outcome, shaped like `runDocker`'s, so `status` is a
  * number only when the command ran to completion.
  */
 export function runInProcessGroup(file: string, args: readonly string[],
@@ -175,7 +183,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
       options.signal?.removeEventListener('abort', onAbort);
       void drainGroup(group, options.allowUnsettledReturn === true).then(async drained => {
         let stdioTimer: ReturnType<typeof setTimeout> | undefined;
-        if (options.allowUnsettledReturn) {
+        if (options.allowUnsettledReturn || options.boundEscapedOutput) {
           await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
         } else await closed;
         // Cleared so a finished call never keeps the process alive.

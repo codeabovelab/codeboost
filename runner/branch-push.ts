@@ -116,7 +116,7 @@ export class GitBranchPusher implements BranchPusher {
     const unique = [...new Set(commits)];
     await this.#git(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--', this.#url, ...unique], signal, true);
     const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false,
-      Buffer.from(`${unique.join('\n')}\n`));
+      Buffer.from(`${unique.join('\n')}\n`), true);
     const records = found.split('\n');
     if (records.length !== unique.length || records.some((record, index) => record !== `${unique[index]} commit`))
       throw new Error('The refreshed remote base or head is not a commit in the runner repository.');
@@ -134,7 +134,7 @@ export class GitBranchPusher implements BranchPusher {
     if (input.expected !== undefined && !COMMIT_ID.test(input.expected)) throw new Error('A full commit ID is required.');
     const ref = this.#ref(input.branch);
     // Git answers "<id> missing" for an absent object; any other failure (no repository, permissions) keeps Git's error.
-    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`));
+    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`), true);
     if (found === `${input.head} missing`) throw new Error(`The runner repository has no commit ${input.head}.`);
     if (found !== `${input.head} commit`) throw new Error(`${input.head} is not a commit in the runner repository.`);
     const remote = await this.#read(ref, signal);
@@ -181,7 +181,8 @@ export class GitBranchPusher implements BranchPusher {
   /** The commit `ref` points at on the remote, or null when it does not exist. */
   async #read(ref: string, signal?: AbortSignal): Promise<string | null> {
     // A read changes nothing, so it need not wait for a process that escaped Git's group and holds its output: it returns
-    // failed (the output may be incomplete) after the bounded drain. The caller then knows nothing: a push marker stays.
+    // failed (the output may be incomplete) after the pipe drain. The caller then knows nothing: a push marker stays.
+    // Members still in Git's group are waited for, as for every Git call.
     const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true, undefined, true);
     // ls-remote matches patterns by their tail, so `refs/heads/x/<ref>` would match too: keep only the exact name.
     const matches = out.split('\n').filter(Boolean).map(line => line.split('\t')).filter(([, name]) => name === ref);
@@ -189,12 +190,16 @@ export class GitBranchPusher implements BranchPusher {
     return matches[0]?.[0] ?? null;
   }
 
+  /**
+   * `readOnly` (ls-remote, cat-file: commands that change nothing) bounds the wait for a process that left Git's group
+   * but holds its output: the call fails after the pipe drain instead. Members of Git's group are always waited for.
+   */
   async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer, readOnly = false): Promise<string> {
     const protocol = this.#url.startsWith('/') ? 'file' : 'https';
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
       ...remote ? ['-c', `protocol.${protocol}.allow=always`, ...CREDENTIAL_HELPER] : [], ...args],
     { cwd: this.#config.repository.path, env: pushEnvironment(this.#config.env), timeoutMs: this.#config.timeoutMs ?? 120_000,
-      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, allowUnsettledReturn: readOnly });
+      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, boundEscapedOutput: readOnly });
     // Aborted before or while Git ran: the caller's reason (such as shutdown) is what leaves, not Git's failure.
     signal?.throwIfAborted();
     if (outcome.status !== 0) throw gitFailure(args[0]!, outcome.status, [outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join('\n'),
