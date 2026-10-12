@@ -163,6 +163,9 @@ export class MergeJobCoordinator {
       // shutdown) happened meanwhile. A refusal blocks (design: "GitHub refused the merge"); anything else is unknown.
       const attempt = store.getMergeAttempt(identity);
       if (attempt?.actionId === mergeId) {
+        // A refusal because the head changed needs a fresh review, not a retry: the task is not "approved" any more.
+        if ((attempt.state === 'failed' || attempt.state === 'removed') && attempt.requiresFreshReview)
+          return this.#finish(job.id, 'failed', `GitHub refused the merge: ${attempt.reason ?? reason} Review the new head, then merge again.`);
         if (attempt.state === 'failed' || attempt.state === 'removed') return this.#block(job, `GitHub refused the merge: ${attempt.reason ?? reason}`);
         if (attempt.state === 'merged') return this.#finish(job.id, 'merged', null, attempt.url);
         if (attempt.state === 'queued') return this.#finish(job.id, 'queued', null, attempt.url);

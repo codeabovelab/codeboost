@@ -1848,6 +1848,51 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(prepared).toBe(1);
   }, 60_000);
 
+  it('answers 503 and saves nothing when shutdown stops a merge click\'s trust read', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, hang = false, reading = false;
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number, options = {}) {
+      if (!hang) return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+      reading = true;
+      // GitHub does not answer; only the request's own abort (at the end of shutdown's drain) ends the read.
+      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true }));
+    } };
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hang = true;
+    const clicked = merge(served.app, token, id);
+    await vi.waitFor(() => expect(reading).toBe(true), { timeout: 10_000 });
+    const closed = served.close();
+    expect(await clicked).toMatchObject({ status: 503 });
+    await closed;
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('answers 503 when shutdown stops the reload after a merge job was saved, and the resent click replays it', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, hanging = false;
+    // From the click on, GitHub does not answer; only the caller's abort ends each read.
+    const gh = gateway(() => storeRef!, () => [], () => hanging);
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hanging = true;
+    const clicked = merge(served.app, token, id);
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, id)).not.toBeNull(), { timeout: 10_000 });
+    await vi.waitFor(() => expect(gh.hung.length).toBeGreaterThan(0), { timeout: 10_000 });
+    const closed = served.close();
+    expect(await clicked).toMatchObject({ status: 503 });
+    await closed;
+    // The job was saved: a resend after restart replays it rather than starting another.
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
+  }, 60_000);
+
   it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;

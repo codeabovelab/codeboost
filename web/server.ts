@@ -684,14 +684,21 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             let untrusted: string|null=null;
             if(config.github&&!mergeJobs.saved(input.actionId)) {
               if(stopping||runner?.closing)throw new ShuttingDownError();
-              const access=await readIssueAccess(requestAbort.signal);
+              let access: IssueAccess;
+              // A read stopped by shutdown decides nothing: 503, and the browser resends the same click.
+              try { access=await readIssueAccess(requestAbort.signal); }
+              catch (error) { if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError(); throw error; }
               try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
             }
             const job=mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
               ?'The runner or publisher is busy; the merge cannot start yet.':null));
             const running=mergeJobs.current;
             if(running)void running.finally(()=>{ if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); });
-            json(200,{...(await load(requestAbort.signal)),job});return;
+            // The job is saved; a reload stopped by shutdown answers 503, and the resent click replays the job.
+            let loaded: Awaited<ReturnType<typeof load>>;
+            try { loaded=await load(requestAbort.signal); }
+            catch (error) { if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError(); throw error; }
+            json(200,{...loaded,job});return;
           }
           let merged: Awaited<ReturnType<MergeCoordinator['merge']>>;
           // A merge stopped for a passing reason applied nothing, so answer 503 and the browser resends the same key.

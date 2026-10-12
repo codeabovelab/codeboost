@@ -154,6 +154,14 @@ it('ends failed, without merging, when GitHub cannot be read while waiting for c
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it('ends failed, leaving the task in review, when GitHub refuses because the head changed', async () => {
+  const f = setup({ merge: async () => { throw new MergeSubmissionError('Head branch was modified. Review and try the merge again.', 'refused'); } });
+  f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/^GitHub refused the merge: Head branch was modified.*Review the new head/) });
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed', requiresFreshReview: true });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
 it('ends failed, leaving the task in review, when a failing check arrives after the review changed', async () => {
   let storeRef: Store | null = null;
   const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], during: () => {
@@ -403,6 +411,7 @@ it('settles a job a crash left in its merge step from its merge attempt at start
     [() => undefined, 'submitted', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged'],
     [(store: Store, id: string) => store.queueMergeAttempt(identity, id, 'https://github.com/owner/repo/pull/7'), 'queued', 'in review'],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Head branch was modified.', requiresFreshReview: true }), 'failed', 'in review'],
     [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked'],
   ] as const) {
     // GitHub never answers: the job is in its merge step when the process "crashes".

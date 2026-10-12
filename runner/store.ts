@@ -2257,6 +2257,12 @@ export class Store {
         reason: 'The server restarted while GitHub\'s merge outcome was unknown; it reconciles from GitHub.' });
       return;
     }
+    if (attempt.requiresFreshReview) {
+      // The head changed: the task needs a fresh review, so it is not moved to approved, merge blocked.
+      this.finishMergeJob(identity, running.id, { state: 'failed',
+        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head, then merge again.` });
+      return;
+    }
     this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
