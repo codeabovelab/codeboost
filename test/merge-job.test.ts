@@ -182,6 +182,8 @@ it('stops waiting at once when the task is cancelled', async () => {
   const f = setup({ checks: () => [pending()] });
   f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
+  // As the cancel route does: the task's cancel commits first, then the job is told.
+  expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   f.coordinator.cancel();
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
   expect(f.gh.merged).toEqual([]);

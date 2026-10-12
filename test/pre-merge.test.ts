@@ -1482,8 +1482,9 @@ it('ends the job cancelled when the task is cancelled while a command check runs
   f.start();
   await vi.waitFor(() => expect(f.runner.isActive(f.service.config.identity)).toBe(true));
   const identity = f.service.config.identity;
+  // As the cancel route does: the task's cancel commits (it waits on the running check), then the job is told.
+  expect(f.coordinator.cancelTask(f.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
   f.jobs.cancel();
-  f.coordinator.cancelTask(f.service.store.getTask(identity).stateVersion, randomUUID());
   expect(await f.settled()).toMatchObject({ state: 'cancelled' });
   expect(new Set(f.cancelReasons)).toEqual(new Set(['cancelled']));
   expect(f.merged).toEqual([]);

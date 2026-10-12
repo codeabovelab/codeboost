@@ -1820,27 +1820,41 @@ describe('the one-click merge job (F6b of #22)', () => {
     const held = new Promise<void>(resolve => { release = resolve; });
     const gh = gateway(() => storeRef!, () => []);
     const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, mergeGateway: gh, runnerPublished: true,
-      // A preparation that answers a cancel with "stopping" and closes the task only once its own work has settled.
-      preMerge: service => ({
-        get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null, close: async () => undefined,
-        cancelTask: () => 'stopping' as const,
-        start: async (expected: { actionId: string }) => {
-          preparing = true; await held; preparing = false;
-          const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
-          service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID());
-          return service.store.settlePreMergeAction(identity, expected.actionId,
-            { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'Task cancelled.' }, null);
-        },
-      } as unknown as PreMergeCoordinator) });
+      // A preparation caught in its push: it holds a real push marker, so a cancel waits ("stopping") until the push
+      // settles, and clearing the marker closes the task, as production does.
+      preMerge: service => {
+        const identity = service.config.identity;
+        let marker: { attemptId: string } | null = null;
+        return {
+          get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null, close: async () => undefined,
+          cancelTask: (stateVersion: number, actionId: string) => service.store.cancelTask(identity, stateVersion, actionId),
+          start: async (expected: { actionId: string }) => {
+            preparing = true;
+            const reviewed = () => ({ revision: service.store.getPlan(identity).revision, snapshotId: service.store.getSnapshot(identity).id, reviewVersion: service.store.reviewVersion(identity) });
+            const head = service.store.getSnapshot(identity).head, rewritten = 'e'.repeat(40);
+            service.store.recordRebase(identity, reviewed(), 'f'.repeat(40), rewritten, [{ oldSha: head, newSha: rewritten }]);
+            marker = service.store.beginPrePush(identity, reviewed(), service.store.getTask(identity).stateVersion,
+              { branch: service.store.taskPullRequests(identity)[0]!.headBranch, from: head, to: rewritten });
+            await held;
+            service.store.finishPrePush(service.store.getTask(identity).planKey, marker.attemptId);
+            preparing = false;
+            const snapshot = service.store.getSnapshot(identity);
+            return service.store.settlePreMergeAction(identity, expected.actionId,
+              { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'Task cancelled.' }, null);
+          },
+        } as unknown as PreMergeCoordinator;
+      } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
-    await vi.waitFor(() => expect(preparing).toBe(true), { timeout: 10_000 });
+    await vi.waitFor(() => expect(served.store.getTask(served.identity).pushInProgress).not.toBeNull(), { timeout: 10_000 });
     expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    expect(served.store.getTask(served.identity)).toMatchObject({ status: 'in review', cancelRequested: expect.any(String) });
     expect(w.github.prs[0]!.open).toBe(true);
     release();
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 10_000 });
     await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
+    expect(served.store.getTask(served.identity).status).toBe('cancelled');
   }, 60_000);
 
   it('stops a waiting merge job promptly on shutdown and leaves it running on disk for the next startup', async () => {

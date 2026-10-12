@@ -229,20 +229,22 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // Commits from another revision without a scope checkpoint have no audited continuation prefix to reconcile; rerunning
     // the plan on top of them could redo or contradict that work. Earlier attempts that committed nothing leave none.
     if (!continuation && !begun && earlierCommits) throw new GuardRefusal('The plan changed after runner commits without a scope checkpoint; those commits cannot be reconciled safely.');
+    const reviewed = task.status === 'in review' || task.status === 'approved but merge blocked';
     if (action === 'start') {
       if (continuation) throw new GuardRefusal('This task has a scope checkpoint; resume it after approving the amended continuation.');
       // Point to resume wherever resume could run (a running task that ran any revision too); any other status is named as it is.
       const ran = begun || task.requeuePending;
       if (next !== null && ((ran && task.status === 'queued') || (task.status === 'running' && (started || task.requeuePending))))
         throw new GuardRefusal('This plan has already started running; resume the task instead.');
-      if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
+      // A task whose merge was blocked (F6b) is reviewed work too: an amended plan may run on it to fix what blocked it.
+      if (!reviewed && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
       if (ran) throw new GuardRefusal(begun ? `This plan revision has already run; the task is ${task.status}.` : 'Recovery left this task to requeue; it cannot start until that is resolved.');
       const unapproved = service.store.unapprovedExecutionItems(identity, service.store.getPlan(identity).revision);
       if (unapproved.length) throw new GuardRefusal(`Approve every plan item before running it. Waiting for: ${unapproved.join(', ')}.`);
-      return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
+      return { fromItem: next!, claimRequeue: false, queue: reviewed };
     }
     // As for start: point to start only where start's own checks pass.
-    const startWould = (task.status === 'in review' || task.status === 'queued') && !begun && !task.requeuePending;
+    const startWould = (reviewed || task.status === 'queued') && !begun && !task.requeuePending;
     const toStart = 'This plan revision has not started running yet; start the task instead.';
     if (task.status !== 'running' && task.status !== 'queued') {
       if (startWould) throw new GuardRefusal(toStart);

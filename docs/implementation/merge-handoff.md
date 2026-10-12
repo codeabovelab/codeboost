@@ -43,7 +43,7 @@ While waiting, an unknown mergeability (GitHub is still computing it) and a pend
 |---|---|---|
 | `merged`, `queued` | merged, or in review while queued | nothing |
 | `submitted` | unchanged | refresh; the merge attempt settles from GitHub |
-| `blocked` | approved, merge blocked | fix the check or GitHub's reason, then **Retry merge** |
+| `blocked` | approved, merge blocked | fix the check or GitHub's reason, then **Retry merge**; or amend the plan and start it, so the runner fixes the code (start accepts a blocked task as it accepts one in review) |
 | `review-required` | unchanged | review the refreshed pull request, then merge again |
 | `failed` | unchanged | read the reason, then merge again |
 | `cancelled` | cancelled | nothing |
