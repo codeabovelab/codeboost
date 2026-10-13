@@ -297,31 +297,47 @@ it('refuses readiness when local issue trust is revoked during the final remote 
 });
 
 it('refuses readiness when local issue trust is revoked during the final review load', async () => {
-  let trusted = true, finalInspected = false;
+  let trusted = true, refreshes = 0, inspected = 0;
   const fixture = await rebaseFixture('feature\n', undefined, {
-    authorize: async () => ({ refresh: async () => undefined,
+    authorize: async () => ({ refresh: async () => { refreshes++; },
       validate: () => { if (!trusted) throw new Error('Issue trust was revoked.'); } }),
-    duringFinalInspect: (_service, _coordinator, read) => { if (read === 3) finalInspected = true; },
-    // Only the load after the last remote inspection: trust holds through that inspection's own check.
-    duringLoad: () => { if (finalInspected) trusted = false; },
+    duringFinalInspect: (_service, _coordinator, read) => { inspected = read; },
+    // The rebase authorizes first; the review load after the second (final) authorization read is the final one.
+    duringLoad: () => { if (refreshes === 2) trusted = false; },
   });
+  // Refused by the check after the final remote inspection, not earlier.
+  expect(inspected).toBe(3);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Issue trust was revoked.' });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
-it('refuses readiness when the task changes during the final review load', async () => {
-  let finalInspected = false, cancelled = false;
+it('inspects the pull request after its last review load, so no worker await follows the final remote read', async () => {
+  const events: string[] = [];
   const fixture = await rebaseFixture('feature\n', undefined, {
-    duringFinalInspect: (_service, _coordinator, read) => { if (read === 3) finalInspected = true; },
-    // Only the load after the last remote inspection; the review itself does not change.
+    duringLoad: () => { events.push('load'); },
+    duringFinalInspect: () => { events.push('inspect'); },
+  });
+  expect(fixture.result).toMatchObject({ state: 'ready' });
+  expect(events.lastIndexOf('inspect')).toBeGreaterThan(events.lastIndexOf('load'));
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when the task changes during the final review load', async () => {
+  let refreshes = 0, inspected = 0, cancelled = false;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    authorize: async () => ({ refresh: async () => { refreshes++; }, validate: () => undefined }),
+    duringFinalInspect: (_service, _coordinator, read) => { inspected = read; },
+    // The rebase authorizes first; the review load after the second (final) authorization read is the final one.
     duringLoad: service => {
-      if (!finalInspected || cancelled) return;
+      if (refreshes !== 2 || cancelled) return;
       cancelled = true;
       const identity = service.config.identity;
       service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID());
     },
   });
   expect(cancelled).toBe(true);
+  // Refused by the check after the final remote inspection, not earlier.
+  expect(inspected).toBe(3);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
   await fixture.coordinator.close(); await fixture.runner.close();
 });

@@ -204,6 +204,39 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
 
+  it('reinspects the pull request after the final review load, refusing one that moved during it', async () => {
+    const { store } = published();
+    let remoteBase = oid(1), refreshed = false;
+    const gh = github(store, () => ({ base: remoteBase }));
+    prepare(store);
+    const reviewing = service(store), load = reviewing.load.bind(reviewing);
+    // The review loaded after the last external authorization read is the final one; the pull request moves meanwhile.
+    reviewing.load = vi.fn(async (options?: Parameters<ReviewService['load']>[0]) => { if (refreshed) remoteBase = oid(3); return load(options); }) as ReviewService['load'];
+    const merges = new MergeCoordinator(reviewing, gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { refreshed = true; }, validate: () => undefined }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/pull request changed during merge validation/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('refuses admission when the review changes while the final review load runs', async () => {
+    const { store } = published(), gh = github(store);
+    let refreshed = false, changed = false;
+    prepare(store);
+    const reviewing = service(store), load = reviewing.load.bind(reviewing);
+    // The final load still answers with the reviewed token, but an approval change lands while it runs.
+    reviewing.load = vi.fn(async (options?: Parameters<ReviewService['load']>[0]) => {
+      if (refreshed && !changed) { changed = true; store.saveReview(identity, expectedOf(store) as never, [], []); }
+      return load(options);
+    }) as ReviewService['load'];
+    const merges = new MergeCoordinator(reviewing, gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { refreshed = true; }, validate: () => undefined }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/Review changed during merge validation/);
+    expect(changed).toBe(true);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('captures the queue event boundary after the final authorization and pull request reads', async () => {
     const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
     let authorized = false;
@@ -464,7 +497,8 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(store);
     const merges = new MergeCoordinator(service(store), gh.client);
     await merges.merge('review-token');
-    expect(gh.targets).toEqual([undefined, undefined]);
+    // Every inspection (two validation passes and the one after the final review load) asks for no particular PR.
+    expect(gh.targets).toEqual([undefined, undefined, undefined]);
     expect(gh.merged).toEqual([99]);
     expect(store.getMergeAttempt(identity)!.pullRequest).toBe(99);
   });

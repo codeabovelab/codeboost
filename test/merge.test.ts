@@ -131,7 +131,8 @@ it('blocks command acceptance that has no current passing runner result', async 
 
 it('rechecks the exact base and head, then invokes the guarded head merge', async () => {
   const view = readyView(), service = serviceFor(view);
-  const client = gateway([remote(view), remote(view)]);
+  // Two validation passes, then one more inspection after the final review load.
+  const client = gateway([remote(view), remote(view), remote(view)]);
   const merged = await new MergeCoordinator(service, client).merge(view.token);
   expect(client.heads).toEqual([view.snapshot.head]);
   expect(merged.result.url).toContain('/pr/1');

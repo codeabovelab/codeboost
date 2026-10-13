@@ -411,8 +411,9 @@ export class PreMergeCoordinator {
     const authorizedBlocker = this.#reviewBlocker(view, true);
     if (authorizedBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: authorizedBlocker };
-    // The authorization read above is asynchronous, so the PR may have moved after the earlier inspection. Reinspect
-    // it, then immediately recheck every local generation before recording readiness.
+    // The authorization read and the review load above are asynchronous, so the PR may have moved after the earlier
+    // inspection. Reinspect it as the last await, then recheck every local generation and local trust in this turn
+    // before recording readiness; the review loaded above stays current while the generations are unchanged.
     const authorizedRemote = await this.remote.inspect(signal); signal.throwIfAborted();
     assertCurrent(guarded);
     authorization?.validate();
@@ -422,16 +423,6 @@ export class PreMergeCoordinator {
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during final authorization; attribution and approvals were refreshed.' };
     }
-    view = await load();
-    // That load awaited its history work: recheck every local generation and local trust again, in this turn.
-    assertCurrent(guarded);
-    authorization?.validate();
-    if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
-      return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
-        reason: 'The local review changed after final authorization; reload it.' };
-    const postAuthorizationBlocker = this.#reviewBlocker(view, true);
-    if (postAuthorizationBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
-      checked, reason: postAuthorizationBlocker };
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null,
       readiness: { stateVersion: this.service.store.getTask(identity).stateVersion,
         reviewVersion: this.service.store.reviewVersion(identity), snapshotId: view.snapshot.id,

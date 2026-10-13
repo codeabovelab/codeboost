@@ -433,13 +433,24 @@ export class MergeCoordinator {
           throw new Error(`Merge requirements changed after queue correlation. ${boundary.status.blockers[0]!.message}`);
         commandStatus = boundary.status;
       }
-      // The external authorization read completed before the final PR inspection and queue boundary. Re-read local
-      // trust synchronously after those awaits so neither remote identity nor local authorization can race admission.
-      // The review is loaded first: its history work is the last await, so the local trust check and the token check
-      // below run in the same turn as the attempt that begins after them.
+      // The final review load awaits its history worker, so the pull request is inspected once more after it: the last
+      // await before admission is a remote read. The external authorization read completed before both; local trust and
+      // the review's generations are then rechecked synchronously, in the same turn as the attempt that begins after them.
       const final = await this.service.load({ signal });
-      authorization?.validate();
       if (final.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
+      const last = await this.#statusForMerge(final, signal);
+      if (last.status.remote.base !== commandStatus.remote.base || last.status.remote.head !== commandStatus.remote.head
+        || last.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(last))
+        throw new Error('The pull request changed during merge validation. Refresh before merging.');
+      if (!last.status.ready) throw new Error(`Merge requirements changed during validation. ${last.status.blockers[0]!.message}`);
+      commandStatus = last.status;
+      authorization?.validate();
+      if (this.service.store && this.service.config) {
+        const { store, config } = this.service;
+        if (store.reviewVersion(config.identity) !== final.expected.reviewVersion || store.getPlan(config.identity).revision !== final.expected.revision
+          || store.getSnapshot(config.identity).id !== final.expected.snapshotId)
+          throw new Error('Review changed during merge validation. Refresh before merging.');
+      }
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
