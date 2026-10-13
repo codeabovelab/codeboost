@@ -158,8 +158,9 @@ function renderMerge() {
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
-  // Likewise once the merge job this key started has ended (a job is saved under its click's action ID): a retry is new.
-  if (mergeAction && merge.job?.id === mergeAction.actionId && merge.job.state !== "running") mergeAction = null;
+  // Likewise once the merge job this key started has ended (a job is saved under its click's action ID), or another job is
+  // the latest: one job runs at a time, so this key's job has ended or never started. Either way a click is a new action.
+  if (mergeAction && merge.job && !(merge.job.id === mergeAction.actionId && merge.job.state === "running")) mergeAction = null;
   // With merge jobs (their status carries `job`), a click's answer arrives while the control may hold focus, so it is
   // marked, never disabled; activation is ignored while the merge is not ready.
   if ("job" in merge) {
