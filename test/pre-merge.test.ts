@@ -198,7 +198,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair: { base: string; head: string; branch?: string } = { base: onto, head, branch: BRANCH };
   const pushes: { branch: string; from: string; to: string }[] = [];
-  let lagging = 0, lagged = remotePair, branchReads = 0;
+  let lagging = 0, lagged = remotePair, branchReads = 0, fetchesAfterPush = 0;
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
@@ -213,6 +213,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
       return remotePair;
     }, fetch: async () => {
+      if (pushes.length) fetchesAfterPush++;
       if (pushes.length) options.duringFetchAfterPush?.(service);
       if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push');
     },
@@ -258,7 +259,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
-    branchReads: () => branchReads,
+    branchReads: () => branchReads, fetchesAfterPush: () => fetchesAfterPush,
     /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
     moveRemote: (pair: { base: string; head: string }, shown?: { base: string; head: string }, reads = 0) => {
       remotePair = { ...remotePair, ...pair };
@@ -966,6 +967,8 @@ it('does not record a refused push\'s observation into a review edited during th
   expect(fixture.coordinator.last?.stale).toBe(true);
   // The collaborator head was not recorded into the edited review.
   expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  // Caught before the collaborator head was even fetched.
+  expect(fixture.fetchesAfterPush()).toBe(0);
   expect(pushMarker(fixture)).toBeNull();
   await fixture.coordinator.close(); await fixture.runner.close();
 });
