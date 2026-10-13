@@ -1,11 +1,16 @@
 import { imageSize } from 'image-size';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { lstatSync, opendirSync } from 'node:fs';
 import { resolve as resolvePath, join } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
-/** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
-export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number; maxDiffBytes?: number; maxFileEntries?: number; maxDurationMs?: number } = {}): History {
+export interface HistoryLimits { maxBlobBytes?: number; maxObjectEntries?: number; maxDiffBytes?: number; maxFileEntries?: number; maxDurationMs?: number }
+/**
+ * Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. Git runs as asynchronous child
+ * processes: `signal` kills the running one, and the read settles only after that process has exited.
+ */
+export async function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: HistoryLimits = {}, signal?: AbortSignal): Promise<History> {
+  signal?.throwIfAborted();
   const maxDurationMs = limits.maxDurationMs ?? 30_000;
   if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1 || maxDurationMs > 30_000) throw new Error('Duration budget must be a positive integer no larger than 30000 ms.');
   const deadline = performance.now() + maxDurationMs;
@@ -28,35 +33,43 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     if (diffBytes > maxDiffBytes) throw new Error('Review history exceeds the cumulative diff byte budget; choose a narrower base.');
     return data;
   };
-  const run = (...args: string[]) => {
+  const run = async (...args: string[]): Promise<Buffer> => {
     const timeout = remaining();
-    let result: Buffer;
-    try {
-      result = execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
-        cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout, killSignal: 'SIGKILL',
+    // execFile reports an abort, the timeout or a full buffer at once, while the child it is killing may still run. The
+    // child's `close` comes after it has exited, so wait for both; a child that never started (no PID) has nothing to
+    // wait for, and Node may not emit `close` for every failed spawn.
+    const { error, stdout } = await new Promise<{ error: Error | null; stdout: Buffer }>(resolve => {
+      let result: { error: Error | null; stdout: Buffer } | null = null, closed = false;
+      const child = execFile('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
+        cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout, killSignal: 'SIGKILL', encoding: 'buffer', ...(signal ? { signal } : {}),
         // Allowlisted: inherited variables can redirect repository, index, config and object lookup, and Git reads
         // variables outside the GIT_ namespace too, such as HOME and XDG_CONFIG_HOME for user attributes.
         env: { PATH: process.env.PATH ?? '', GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
           GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/dev/null' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-    } catch (error) {
-      if ((error as { code?: string }).code === 'ETIMEDOUT') throw new Error('History read exceeded its overall deadline.', { cause: error });
+      }, (failure, output) => { result = { error: failure, stdout: output }; if (closed || child.pid === undefined) resolve(result); });
+      child.once('close', () => { closed = true; if (result) resolve(result); });
+      // No Git command here reads input; close it as the synchronous adapter's ignored stdin did.
+      child.stdin?.end();
+    });
+    if (error) {
+      if (signal?.aborted) throw signal.reason;
+      const failure = error as { killed?: boolean; code?: unknown };
+      if (failure.killed && failure.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw new Error('History read exceeded its overall deadline.', { cause: error });
       throw error;
     }
     remaining();
-    return result;
+    return stdout;
   };
   // Parent-rewriting files are not immutable commit ancestry. Resolve via Git so
   // linked worktrees use the common administrative directory as well.
-  const commonDirectory = resolvePath(repo, run('rev-parse', '--git-common-dir').toString().trim());
+  const commonDirectory = resolvePath(repo, (await run('rev-parse', '--git-common-dir')).toString().trim());
   for (const name of ['info/grafts', 'shallow']) {
     const path = join(commonDirectory, name);
     if (lstatSync(path, { throwIfNoEntry: false }))
       throw new Error(`Review repositories must not use graft or shallow ancestry metadata (${name}).`);
   }
   // Inspect storage without following links before any object-resolving command.
-  const objects = resolvePath(repo, run('rev-parse', '--git-path', 'objects').toString().trim());
+  const objects = resolvePath(repo, (await run('rev-parse', '--git-path', 'objects')).toString().trim());
   const pending = [objects];
   let inspected = 0;
   while (pending.length) {
@@ -78,9 +91,9 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
   }
   const alternates = join(objects, 'info/alternates');
   if (lstatSync(alternates, { throwIfNoEntry: false })) throw new Error('Review repositories must not use object alternates.');
-  const resolve = (ref: string) => run('rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`).toString().trim();
-  const base = resolve(baseRef), head = resolve(headRef);
-  const records = run('rev-list', '--reverse', '--parents', `${base}..${head}`).toString().trim().split('\n').filter(Boolean);
+  const resolve = async (ref: string) => (await run('rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`)).toString().trim();
+  const base = await resolve(baseRef), head = await resolve(headRef);
+  const records = (await run('rev-list', '--reverse', '--parents', `${base}..${head}`)).toString().trim().split('\n').filter(Boolean);
   if (records.length > 500) throw new Error('Review history exceeds 500 commits; choose a narrower base.');
   let expectedParent = base;
   const commits = records.map(record => {
@@ -92,13 +105,13 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
   if (expectedParent !== head) throw new Error('The base must be an ancestor of the head.');
   const blobs = new Map<string, { text: string | null; byteSize: number; preview?: string }>();
   let previewBytes = 0, previewPixels = 0;
-  const version = (oid: string, mode: string): FileVersion | null => {
+  const version = async (oid: string, mode: string): Promise<FileVersion | null> => {
     if (/^0+$/.test(oid)) return null;
     if (mode === '160000') return { oid, mode, text: null }; // gitlink is not a local blob
     if (!blobs.has(oid)) {
-      const size = Number(run('cat-file', '-s', oid).toString().trim());
+      const size = Number((await run('cat-file', '-s', oid)).toString().trim());
       if (!Number.isSafeInteger(size) || size < 0 || size > maxBlobBytes - blobBytes) throw new Error('Review history exceeds the cumulative blob byte budget; choose a narrower base.');
-      const data = run('cat-file', 'blob', oid);
+      const data = await run('cat-file', 'blob', oid);
       blobBytes += data.length;
       let text: string | null = null;
       if (!data.includes(0)) { try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data); } catch { /* binary */ } }
@@ -122,8 +135,8 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     }
     return { oid, mode, ...blobs.get(oid)! };
   };
-  const diff = (from: string, to: string, contexts: boolean): FileDelta[] => {
-    const raw = accountDiff(run('diff', '--ignore-submodules=none', '--no-relative', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--'));
+  const diff = async (from: string, to: string, contexts: boolean): Promise<FileDelta[]> => {
+    const raw = accountDiff(await run('diff', '--ignore-submodules=none', '--no-relative', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--'));
     const fields = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw).split('\0');
     const result: FileDelta[] = [];
     for (let i = 0; i < fields.length && fields[i];) {
@@ -135,12 +148,12 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
       const first = fields[i++]!;
       const oldPath = status === 'A' ? null : first;
       const newPath = status === 'D' ? null : status === 'R' ? fields[i++]! : first;
-      const before = version(oldOid!, oldMode!), after = version(newOid!, newMode!);
+      const before = await version(oldOid!, oldMode!), after = await version(newOid!, newMode!);
       const ranges: FileDelta['contexts'] = [];
       if (contexts && (before?.text !== null || after?.text !== null)) {
         const paths = [...new Set([oldPath, newPath].filter((path): path is string => path !== null))];
         // Literal pathspecs preserve filenames containing Git pathspec metacharacters.
-        const patch = accountDiff(run('diff', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`))).toString();
+        const patch = accountDiff(await run('diff', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`))).toString();
         for (const line of patch.split('\n')) {
           const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line);
           if (hunk) ranges.push({ oldStart: +hunk[1]!, oldCount: +(hunk[2] ?? 1), newStart: +hunk[3]!, newCount: +(hunk[4] ?? 1), name: hunk[5]!.trim() });
@@ -150,8 +163,8 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     }
     return result;
   };
-  for (const commit of commits) commit.files = diff(commit.parent, commit.sha, false);
-  const final = diff(base, head, true);
+  for (const commit of commits) commit.files = await diff(commit.parent, commit.sha, false);
+  const final = await diff(base, head, true);
   remaining();
   return { base, head, commits, final };
 }

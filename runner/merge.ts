@@ -1,10 +1,9 @@
-import type { ReviewService } from './review.ts';
+import type { ReviewService, ReviewView } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type MergeTarget, type RemoteMergeState } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
 
-type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
 /** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (github/merge.ts). */
@@ -62,6 +61,9 @@ export class MergeCoordinator {
   /** The click the active merge serves; a resend of it joins that merge before its action is saved. */
   #activeClick: { actionId: string; token: string } | null = null;
   #abort: AbortController | null = null;
+  /** Ends the review loads of replayed clicks at shutdown; close() waits for those replays to settle. */
+  #replayAbort = new AbortController();
+  #replays = new Set<Promise<unknown>>();
   #queuePoll: Promise<MergeQueueStatus | null> | null = null;
   #queueAbort: AbortController | null = null;
   #closing = false;
@@ -158,8 +160,8 @@ export class MergeCoordinator {
       approval.revision === plan.revision && approval.snapshotId === snapshot.id && approval.reviewVersion !== undefined && approval.reviewVersion >= attempt.reviewVersion));
   }
 
-  async status(view = this.service.load(), fresh = false, signal?: AbortSignal): Promise<MergeStatus> {
-    return (await this.#status(view, fresh, signal)).status;
+  async status(view?: ReviewView, fresh = false, signal?: AbortSignal): Promise<MergeStatus> {
+    return (await this.#status(view ?? await this.service.load({ signal }), fresh, signal)).status;
   }
 
   /** Fresh exact base/head pair for pre-merge preparation, using the same task-PR resolution as merge admission. */
@@ -256,7 +258,8 @@ export class MergeCoordinator {
     return null;
   }
 
-  async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
+  async displayStatus(view?: ReviewView, signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
+    view ??= await this.service.load({ signal });
     try { return await this.status(view, false, signal); }
     catch (error) {
       if (error instanceof ShuttingDownError) throw error;
@@ -360,9 +363,15 @@ export class MergeCoordinator {
     // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after
     // it. A failed re-read is not answered with the older record: read() turns a storage error into "resend" (503).
     const current = () => read()?.response ?? saved.response;
-    let view: ReviewView;
-    try { view = this.service.load(); } catch (error) { return Promise.resolve().then(() => answer(current(), unavailable(error))); }
-    return this.displayStatus(view).then(status => answer(current(), status), error => answer(current(), unavailable(error)));
+    const signal = this.#replayAbort.signal;
+    const replayed = (async () => {
+      let status: MergeStatus | MergeUnavailableStatus;
+      try { status = await this.displayStatus(await this.service.load({ signal }), signal); } catch (error) { status = unavailable(error); }
+      return answer(current(), status);
+    })();
+    const tracked = replayed.then(() => undefined, () => undefined);
+    this.#replays.add(tracked); void tracked.then(() => this.#replays.delete(tracked));
+    return replayed;
   }
 
   async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
@@ -371,14 +380,14 @@ export class MergeCoordinator {
     try {
       // Captured when the request arrives and re-checked in the admission transaction after the final await.
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
-      let view = this.service.load();
+      let view = await this.service.load({ signal });
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
       // Capture the externally authorized issue identity before validation. Its final external refresh precedes the
       // final PR inspection; a synchronous local trust check then closes the admission window without another await.
       const authorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
-      view = this.service.load();
+      view = await this.service.load({ signal });
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       const { status: finalStatus, resolved: finalTarget } = await this.#statusForMerge(view, signal);
       // The same PR, opened by the same opening, in every pass (#121).
@@ -426,8 +435,11 @@ export class MergeCoordinator {
       }
       // The external authorization read completed before the final PR inspection and queue boundary. Re-read local
       // trust synchronously after those awaits so neither remote identity nor local authorization can race admission.
+      // The review is loaded first: its history work is the last await, so the local trust check and the token check
+      // below run in the same turn as the attempt that begins after them.
+      const final = await this.service.load({ signal });
       authorization?.validate();
-      if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
+      if (final.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
@@ -563,7 +575,9 @@ export class MergeCoordinator {
     const active = this.#active, poll = this.#queuePoll;
     this.#abort?.abort(new Error('Merge cancelled during shutdown.'));
     this.#queueAbort?.abort(new Error('Merge-queue inspection cancelled during shutdown.'));
+    this.#replayAbort.abort(new Error('Merge status refresh cancelled during shutdown.'));
     if (active) try { await active; } catch {}
+    await Promise.all(this.#replays);
     if (poll) try { await poll; } catch {}
   }
 }

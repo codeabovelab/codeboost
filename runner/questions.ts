@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ReviewService } from './review.ts';
+import type { ReviewService, ReviewView } from './review.ts';
 import { QuestionWorker } from './question-agent.ts';
 import { LeftoverLedger } from './question-leftovers.ts';
 import { StopError, type QuestionScope } from './question-container.ts';
@@ -8,7 +8,7 @@ import { settleWith, type ShutdownCapability } from './lifecycle.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
 const QUESTION_TIMEOUT_MS = 120_000;
 const SHUTDOWN_SETTLE_MS = 20_000;
-export function questionPrompt(view: ReturnType<ReviewService['load']>, note: ReviewNote): string {
+export function questionPrompt(view: ReviewView, note: ReviewNote): string {
   let remaining = 100_000;
   const changes = view.segments.filter(s => s.row === note.item).map(s => {
     const content = s.content.slice(0, Math.max(0, remaining)); remaining -= content.length;
@@ -40,16 +40,22 @@ export class Questions {
   get stopping() { return this.closing; }
   /**
    * A question saved by a request that was admitted before shutdown began: no agent (and no container worker) starts,
-   * but it gets a retryable failed answer, as it would had shutdown cancelled it.
+   * but it gets a retryable failed answer, as it would had shutdown cancelled it. `view` gives the answer its context
+   * ID; without one (shutdown stopped the request's review load), the note is read from the Store and the answer has no
+   * context ID. Like the other settlement writes, these still land after the Store write gate closes.
    */
-  markStopped(id: string, view: ReturnType<ReviewService['load']>) {
-    const note = view.notes.find(n=>n.id===id && n.kind==='question');
+  markStopped(id: string, view?: ReviewView) {
+    const identity=this.service.config.identity;
+    const note: { answer?: unknown; contextId?: string } | undefined = view ? view.notes.find(n=>n.id===id && n.kind==='question')
+      : this.service.store.getReviewNotes(identity).find(n=>n.id===id && n.kind==='question');
     if (!note || note.answer || this.running.has(id)) return;
-    const attempt=randomUUID();
-    this.service.store.beginAnswer(this.service.config.identity,id,attempt,this.service.store.questionProvider()??undefined,note.contextId);
-    this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:'Server stopped. Retry the question.'});
+    const attempt=randomUUID(), contextId=note.contextId;
+    this.write(() => {
+      this.service.store.beginAnswer(identity,id,attempt,this.service.store.questionProvider()??undefined,contextId);
+      this.service.store.finishAnswer(identity,id,attempt,{status:'failed',error:'Server stopped. Retry the question.'});
+    });
   }
-  start(id: string, view: ReturnType<ReviewService['load']>) {
+  start(id: string, view: ReviewView) {
     if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');
     if (this.running.has(id)) throw new Error('Agent is already answering this question.');
     const note = view.notes.find(n=>n.id===id && n.kind==='question');

@@ -77,14 +77,16 @@ function withLaterOpening() {
   return { store, first, later, adopt };
 }
 
+/** The review state the fake review below expects. */
+const expectedOf = (store: Store) => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
 function service(store: Store) {
   const snapshot = store.getSnapshot(identity);
   const view = {
     items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
     plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: snapshot.id, base: oid(1), head: oid(2) }, token: 'review-token',
-    expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
+    expected: expectedOf(store),
   };
-  return { store, config: { identity }, load: vi.fn(() => view), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService;
+  return { store, config: { identity }, load: vi.fn(async () => view), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService;
 }
 
 /**
@@ -182,6 +184,22 @@ describe('the merge gate with a runner block (#121)', () => {
       if (revoked) throw new GuardRefusal('Issue trust was revoked during the final pull request refresh.');
     } }));
     await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final pull request refresh/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('revalidates local authorization after the final review load', async () => {
+    const { store } = published(), gh = github(store);
+    let refreshed = false, revoked = false;
+    prepare(store);
+    const reviewing = service(store), load = reviewing.load.bind(reviewing);
+    // The review loaded after the last external authorization read is the final one; trust is revoked while it loads.
+    reviewing.load = vi.fn(async (options?: Parameters<ReviewService['load']>[0]) => { if (refreshed) revoked = true; return load(options); }) as ReviewService['load'];
+    const merges = new MergeCoordinator(reviewing, gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { refreshed = true; }, validate: () => {
+      if (revoked) throw new GuardRefusal('Issue trust was revoked during the final review load.');
+    } }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final review load/i);
     expect(gh.merged).toEqual([]);
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
@@ -369,7 +387,7 @@ describe('the merge gate with a runner block (#121)', () => {
 
   it('does not settle an attempt for another PR that was admitted while this status read was in flight', async () => {
     const { store } = published();
-    const view = service(store).load();
+    const view = await service(store).load();
     // No PR is pinned when the read starts; the attempt for PR 8 is admitted by another coordinator during the read.
     const gh = github(store, () => ({ pullRequest: 99, pullRequestState: 'MERGED' }));
     gh.client.before = () => { store.beginMergeAttempt(identity, view.expected as never, oid(2), null, 'direct', null, null, { pullRequest: 8, openingId: null }); };
@@ -385,7 +403,7 @@ describe('the merge gate with a runner block (#121)', () => {
 
   it('settles a direct attempt only from its own PR, even after a newer PR is recorded', async () => {
     const { store, first, adopt } = withLaterOpening();
-    const view = service(store).load();
+    const view = await service(store).load();
     const attempt = store.beginMergeAttempt(identity, view.expected as never, oid(2), null, 'direct', null, null, { pullRequest: 7, openingId: first.openingId });
     // A newer PR recorded while the attempt is in flight; the attempt keeps the PR it was started for.
     adopt();
@@ -398,7 +416,7 @@ describe('the merge gate with a runner block (#121)', () => {
 
   it('never settles an attempt from the state of another PR', async () => {
     const { store, opening: first } = published();
-    const view = service(store).load();
+    const view = await service(store).load();
     const attempt = store.beginMergeAttempt(identity, view.expected as never, oid(2), null, 'direct', null, null, { pullRequest: 7, openingId: first.openingId });
     const gh = github(store, () => ({ pullRequest: 8, pullRequestState: 'MERGED' }));
     const shown = await new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED).displayStatus();
@@ -408,15 +426,14 @@ describe('the merge gate with a runner block (#121)', () => {
 
   it('polls the queue for the attempt\'s own PR; an attempt saved without one uses github.pullRequest or reports why it cannot', async () => {
     const { store, opening: first } = published();
-    const view = service(store).load();
+    const view = await service(store).load();
     store.beginMergeAttempt(identity, view.expected as never, oid(2), 'CURSOR', 'queue', null, null, { pullRequest: 7, openingId: first.openingId });
     const gh = github(store);
     await new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED).pollQueue();
     expect(gh.queued).toEqual([7]);
 
     const legacy = published();
-    const legacyView = service(legacy.store).load();
-    legacy.store.beginMergeAttempt(identity, legacyView.expected as never, oid(2), 'CURSOR', 'queue');
+    legacy.store.beginMergeAttempt(identity, expectedOf(legacy.store) as never, oid(2), 'CURSOR', 'queue');
     expect(legacy.store.getMergeAttempt(identity)!.pullRequest).toBeNull();
     const old = github(legacy.store);
     const before = legacy.store.getMergeAttempt(identity);
@@ -435,7 +452,7 @@ describe('the merge gate with a runner block (#121)', () => {
   it('shows the review\'s own blockers beside one that names no PR to inspect', async () => {
     const store = runningTask(); toReview(store);
     const reviewing = service(store);
-    (reviewing.load() as unknown as { items: Array<{ state: string }> }).items[0]!.state = 'pending';
+    (await reviewing.load() as unknown as { items: Array<{ state: string }> }).items[0]!.state = 'pending';
     const shown = await new MergeCoordinator(reviewing, github(store).client, undefined, undefined, PUBLISHED).displayStatus();
     expect(shown.blockers).toEqual([
       { code: 'pull-request', message: 'The task has no published pull request into main.' },
@@ -455,7 +472,7 @@ describe('the merge gate with a runner block (#121)', () => {
 
 describe('admission re-reads the task\'s PR record (#121)', () => {
   const admit = (store: Store, target: { pullRequest: number; openingId: string | null }) =>
-    store.beginMergeAttempt(identity, service(store).load().expected as never, oid(2), null, 'direct', null, null, target);
+    store.beginMergeAttempt(identity, expectedOf(store) as never, oid(2), null, 'direct', null, null, target);
   it('refuses a PR that is no longer the task\'s latest, or another number', () => {
     const { store, first, later, adopt } = withLaterOpening();
     expect(() => admit(store, { pullRequest: 9, openingId: first.openingId })).toThrow(GuardRefusal);
