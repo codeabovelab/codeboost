@@ -1,14 +1,16 @@
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
 import { ghEnvironment } from './gh-env.ts';
 import { markerOf } from './pull-requests.ts';
-import { runWithInput } from './run-with-input.ts';
+import { ghAnswered, runWithInput } from './run-with-input.ts';
+import { RemoteTimeout } from './timeout.ts';
 import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
 /**
  * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
  * it exits. Every gh call of this gateway settles only when gh has stopped, so a call aborted at a deadline settles up
- * to 0.4 s later. That keeps a merge click (14 s deadline in runner/merge.ts) within 14.4 s, inside the 14.5 s shutdown
- * drain and below the 15-second serving request budget, and an inspection (at most 12 s) within 12.4 s.
+ * to 0.4 s later, and an inspection (at most 12 s) within 12.4 s. A merge click (14 s deadline in runner/merge.ts) can
+ * also be waiting on its issue-trust read, whose stop wait is 0.75 s (github/issues.ts), so it settles within about
+ * 14.75 s: below the 15-second serving request budget, though past the 14.5 s shutdown drain (docs/implementation/merge-queue.md).
  */
 export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
 /**
@@ -373,12 +375,14 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const generation = this.#generation;
     if (!options.fresh && this.#inflight?.generation === generation && this.#inflight.key === key) return this.#inflight.promise;
     const timeout = new AbortController(), deadlineAt = Date.now() + timeoutMs;
-    const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(new RemoteTimeout('GitHub merge-state inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     const attempt = this.#inspectNow(target, deadlineAt, signal).catch(error => {
       // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's; a stopped gh
-      // call can settle after both have fired.
-      if (signal.aborted) throw signal.reason;
+      // call can settle after both have fired. A CommandFailed is a gh exit, reported as itself (#48): gh exited before
+      // the abort. (When one stage's gh exit stops the other stages, they settle with that same exit; traced, not tested.)
+      // A gh call that the abort stopped fails with the abort's reason instead.
+      if (signal.aborted && !ghAnswered(error)) throw signal.reason;
       throw error;
     }).then(state => {
       if (this.#generation === generation) this.#cache = { key, expiresAt: Date.now() + 5_000, state };
@@ -396,7 +400,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const [owner, name] = this.config.repository.split('/') as [string, string];
     const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid timelineItems(last:1,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id}}}}}}`;
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue watermark timed out.')), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(new RemoteTimeout('GitHub merge-queue watermark timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
@@ -419,8 +423,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         throw new Error('GitHub returned an invalid merge-queue watermark.');
       return (edge as { cursor: string }).cursor;
     } catch (error) {
-      if (options.signal?.aborted) throw options.signal.reason;
-      if (timeout.signal.aborted && !options.signal?.aborted) throw new Error('GitHub merge-queue watermark timed out.');
+      // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's. A CommandFailed
+      // is gh's own answer, given before the abort, and is reported as itself (#48).
+      if (signal.aborted && !ghAnswered(error)) throw signal.reason;
       throw error;
     } finally { clearTimeout(timer); }
   }
@@ -436,7 +441,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const [owner, name] = this.config.repository.split('/') as [string, string];
     const query = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(first:100,after:$after,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id __typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}} pageInfo{hasNextPage endCursor}}}}}`;
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue inspection timed out.')), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(new RemoteTimeout('GitHub merge-queue inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
@@ -516,8 +521,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (correlated && (attemptEvents.length !== 2 || attemptEvents[1]?.type !== 'RemovedFromMergeQueueEvent')) throw new Error('GitHub returned an ambiguous terminal event sequence for the current enqueue attempt.');
       return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
     } catch (error) {
-      if (options.signal?.aborted) throw options.signal.reason;
-      if (timeout.signal.aborted && !options.signal?.aborted) throw new Error('GitHub merge-queue inspection timed out.');
+      // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's. A CommandFailed
+      // is gh's own answer, given before the abort, and is reported as itself (#48).
+      if (signal.aborted && !ghAnswered(error)) throw signal.reason;
       throw error;
     } finally { clearTimeout(timer); }
   }
@@ -535,7 +541,10 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     } catch (error) {
       if (error instanceof MergeSubmissionError) throw error;
       const message = error instanceof Error ? error.message : 'GitHub merge submission failed with an unknown outcome.';
-      const outcome = !options.signal?.aborted && confirmedMergeRefusal(message) ? 'refused' : 'unknown';
+      // GitHub's refusal stays definite though an abort arrived after gh had already answered (a CommandFailed is gh's
+      // own exit); an error from the abort itself is never a refusal (#48).
+      const answered = !options.signal?.aborted || ghAnswered(error);
+      const outcome = answered && confirmedMergeRefusal(message) ? 'refused' : 'unknown';
       throw new MergeSubmissionError(message, outcome, { cause: error });
     } finally { this.#generation++; this.#cache = null; }
   }

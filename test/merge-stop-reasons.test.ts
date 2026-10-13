@@ -1,0 +1,274 @@
+// Issue #48: the original timeout/cancellation reason must survive gateway, coordinator, durable attempt and response.
+// Interleavings are ordered by deferred gates or observed process state. The two real-process tests also need the
+// command to start and exit well inside their timers (1.5 s and a 3 s pipe grace); under heavy load they can fail, not pass.
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, expect, it, vi } from 'vitest';
+import { ReviewService } from '../runner/review.ts';
+import { MergeCoordinator, MergeNotApplied } from '../runner/merge.ts';
+import { GhMergeGateway, MergeSubmissionError } from '../github/merge.ts';
+import { CommandFailed, runWithInput } from '../github/run-with-input.ts';
+import { GhIssueGateway, ISSUE_READ_ACTIVE_MS, withIssueReadDeadline } from '../github/issues.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
+import { Store } from '../runner/store.ts';
+
+type ReviewView = ReturnType<ReviewService['load']>;
+type Run = ConstructorParameters<typeof GhMergeGateway>[1];
+const sha = (digit: string) => digit.repeat(40);
+const config = { repository: 'owner/repo', pullRequest: 7, issue: 24 };
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+/** A gh call that runs until its signal aborts, then settles (with that signal's reason) only when `release` opens. */
+function stoppingRun() {
+  const started = deferred(), stopped = deferred(), release = deferred();
+  const run: Run = (_args, options) => new Promise<string>((_, reject) => {
+    started.resolve();
+    options?.signal?.addEventListener('abort', () => { stopped.resolve(); void release.promise.then(() => reject(options.signal!.reason)); }, { once: true });
+  });
+  return { run, started: started.promise, stopped: stopped.promise, release: () => release.resolve() };
+}
+function readyView(extra: Record<string, unknown> = {}): ReviewView {
+  return {
+    items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
+    plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: 'snapshot', base: sha('a'), head: sha('b') }, token: 'review-token', ...extra,
+  } as unknown as ReviewView;
+}
+
+afterEach(() => { vi.useRealTimers(); });
+
+it('gateway queue watermark keeps its own earlier timeout when the caller aborts during the gh stop wait', async () => {
+  const gh = stoppingRun(), caller = new AbortController();
+  const gateway = new GhMergeGateway(config, gh.run);
+  const watermark = gateway.queueWatermark(sha('b'), { signal: caller.signal, timeoutMs: 1 }).catch((error: unknown) => error);
+  await gh.stopped; // The watermark's own 1 ms deadline fired first and is stopping gh.
+  caller.abort(new Error('Merge cancelled during shutdown.'));
+  gh.release();
+  expect(((await watermark) as Error).message).toBe('GitHub merge-queue watermark timed out.');
+});
+
+it('gateway queue inspection keeps its own earlier timeout when the caller aborts during the gh stop wait', async () => {
+  const gh = stoppingRun(), caller = new AbortController();
+  const gateway = new GhMergeGateway(config, gh.run);
+  const inspection = gateway.inspectQueue(sha('b'), { signal: caller.signal, timeoutMs: 1, afterCursor: null }).catch((error: unknown) => error);
+  await gh.stopped;
+  caller.abort(new Error('Merge-queue inspection cancelled during shutdown.'));
+  gh.release();
+  expect(((await inspection) as Error).message).toBe('GitHub merge-queue inspection timed out.');
+});
+
+it('an issue read keeps its own earlier timeout when the caller aborts during the gh stop wait', async () => {
+  const gh = stoppingRun(), caller = new AbortController();
+  const reading = new GhIssueGateway('owner/repo', gh.run).issueAccess(24, { signal: caller.signal, timeoutMs: 1 }).catch((error: unknown) => error);
+  await gh.stopped;
+  caller.abort(new Error('Merge cancelled during shutdown.'));
+  gh.release();
+  const error = await reading;
+  expect(error).toBeInstanceOf(RemoteTimeout);
+  expect((error as Error).message).toBe('Issue retrieval timed out.');
+});
+
+it('gateway merge never reports its own abort as GitHub\'s refusal, even when the abort reason reads like one', async () => {
+  const gh = stoppingRun(), caller = new AbortController();
+  const merging = new GhMergeGateway(config, gh.run).merge(sha('b'), { signal: caller.signal }).catch((error: unknown) => error);
+  await gh.started;
+  caller.abort(new Error('GraphQL: Head branch was modified. Review and try the merge again.'));
+  gh.release();
+  const error = await merging as MergeSubmissionError;
+  expect(error).toBeInstanceOf(MergeSubmissionError);
+  expect(error.outcome).toBe('unknown');
+});
+
+/** A gh call whose answer (gh's own failure) is delivered only after its signal aborted: it answered before the abort. */
+function lateAnswerRun(answer: Error) {
+  const stopped = deferred(), release = deferred();
+  const run: Run = (_args, options) => new Promise<string>((_, reject) => {
+    options?.signal?.addEventListener('abort', () => { stopped.resolve(); void release.promise.then(() => reject(answer)); }, { once: true });
+  });
+  return { run, stopped: stopped.promise, release: () => release.resolve() };
+}
+it.each([
+  ['queue watermark', (run: Run, signal: AbortSignal) => new GhMergeGateway(config, run).queueWatermark(sha('b'), { signal, timeoutMs: 1 })],
+  ['queue inspection', (run: Run, signal: AbortSignal) => new GhMergeGateway(config, run).inspectQueue(sha('b'), { signal, timeoutMs: 1, afterCursor: null })],
+  ['merge-state inspection', (run: Run, signal: AbortSignal) => new GhMergeGateway(config, run).inspect({ fresh: true, signal, timeoutMs: 1 })],
+  ['issue read', (run: Run, signal: AbortSignal) => new GhIssueGateway('owner/repo', run).issueAccess(24, { signal, timeoutMs: 1 })],
+] as const)('%s reports gh\'s own answer when its deadline fires after gh answered', async (_read, read) => {
+  // gh exited with this answer before the deadline fired; runWithInput reports it as a CommandFailed.
+  const answer = new CommandFailed('gh failed (exit 1): GraphQL: Could not resolve to a PullRequest with the number of 7.', '', '');
+  const gh = lateAnswerRun(answer);
+  const reading = read(gh.run, new AbortController().signal).catch((error: unknown) => error);
+  await gh.stopped; // The read's own 1 ms deadline fired; gh's answer is already on its way.
+  gh.release();
+  expect(await reading).toBe(answer);
+});
+
+it('coordinator keeps gh\'s answer before admission when shutdown comes after it and writes are already closed', async () => {
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const store = new Store(':memory:');
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Merge', questions: [], items: [{ id: 'P1', title: 'Merge', intent: 'Merge safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const view = readyView({ expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } });
+  // gh exited with this answer; its delivery is held until after the coordinator's own shutdown abort.
+  const answer = new CommandFailed('gh failed (exit 1): GraphQL: Could not resolve to a PullRequest with the number of 7.', '', '');
+  const gh = lateAnswerRun(answer);
+  const coordinator = new MergeCoordinator({ store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService, new GhMergeGateway(config, gh.run));
+  const actionId = randomUUID();
+  try {
+    const merging = coordinator.merge(view.token, actionId).catch((error: unknown) => error);
+    // The server's shutdown order: the Store's write gate closes, then the merge coordinator is aborted.
+    store.closeWrites();
+    const closing = coordinator.close();
+    await gh.stopped;
+    gh.release();
+    const error = await merging as Error;
+    await closing;
+    // Not saved (writes are closed), so resendable; but gh's answer is the reason given, not the shutdown.
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/Could not resolve to a PullRequest/);
+    expect(error.message).not.toMatch(/shutdown/);
+    expect(store.savedAction(identity, { actionId, kind: 'merge', request: { token: view.token } })).toBeUndefined();
+  } finally { store.close(); }
+});
+
+it('keeps a refusal\'s text when a storage error stops it from being saved', async () => {
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const store = new Store(':memory:');
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Merge', questions: [], items: [{ id: 'P1', title: 'Merge', intent: 'Merge safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const view = readyView({ expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } });
+  const answer = new CommandFailed('gh failed (exit 1): GraphQL: Could not resolve to a PullRequest with the number of 7.', '', '');
+  const run: Run = async () => { throw answer; };
+  const coordinator = new MergeCoordinator({ store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService, new GhMergeGateway(config, run));
+  vi.spyOn(store, 'userAction').mockImplementation(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  try {
+    const error = await coordinator.merge(view.token, randomUUID()).catch((error: unknown) => error) as Error;
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/could not be saved.*Could not resolve to a PullRequest/);
+  } finally { vi.restoreAllMocks(); await coordinator.close(); store.close(); }
+});
+
+it('coordinator reports the inspection timeout that stopped validation, not a shutdown that arrived while gh was stopping', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const gh = stoppingRun();
+  const view = readyView();
+  const coordinator = new MergeCoordinator({ load: vi.fn(() => view) } as unknown as ReviewService, new GhMergeGateway(config, gh.run));
+  const merging = coordinator.merge(view.token).catch((error: unknown) => error);
+  await gh.started;
+  await vi.advanceTimersByTimeAsync(6_000); // The fresh inspection's 6 s deadline fires; the 14 s merge deadline has not.
+  await gh.stopped;
+  const closing = coordinator.close(); // Shutdown aborts the merge while the timed-out gh call is still stopping.
+  gh.release();
+  const error = await merging as Error;
+  await closing;
+  expect(error).toBeInstanceOf(MergeNotApplied);
+  expect(error.message).toBe('GitHub merge-state inspection timed out.');
+});
+
+it.each([false, true])('a gateway inspection timeout before admission is resendable, not saved as the click\'s definite refusal (saved meanwhile by another coordinator: %s)', async savedMeanwhile => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const store = new Store(':memory:');
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Merge', questions: [], items: [{ id: 'P1', title: 'Merge', intent: 'Merge safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const view = readyView({ expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } });
+  const gh = stoppingRun();
+  const coordinator = new MergeCoordinator({ store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService, new GhMergeGateway(config, gh.run));
+  const actionId = randomUUID();
+  try {
+    const merging = coordinator.merge(view.token, actionId).catch((error: unknown) => error);
+    await gh.started;
+    // Another coordinator on this database settles the same click with a refusal while this one's read runs.
+    if (savedMeanwhile) store.userAction(identity, { actionId, kind: 'merge', request: { token: view.token } },
+      () => ({ attemptId: 'other', state: 'failed', reason: 'Required review is missing.', url: null }));
+    await vi.advanceTimersByTimeAsync(6_000);
+    gh.release();
+    const error = await merging as Error;
+    // The saved outcome is the answer; without one, the timeout is.
+    if (savedMeanwhile) { expect(error).not.toBeInstanceOf(MergeNotApplied); expect(error.message).toBe('Required review is missing.'); return; }
+    expect(error.message).toBe('GitHub merge-state inspection timed out.');
+    // A timeout applied nothing: the click must stay resendable (503), with nothing saved under its key.
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    // Nothing is saved under the click's key: a saved refusal would be thrown here instead.
+    expect(store.savedAction(identity, { actionId, kind: 'merge', request: { token: view.token } })).toBeUndefined();
+  } finally { await coordinator.close(); store.close(); }
+});
+
+it.each([
+  ['refusal', 1], ['success', 0],
+] as const)('gateway merge keeps GitHub\'s %s when the deadline fires after gh exited but before its pipes closed', async (answer, exitCode) => {
+  const dir = mkdtempSync(join(tmpdir(), 'issue-48-reason-'));
+  const script = join(dir, 'gh.cjs');
+  // gh exits with its answer (1 after printing a refusal, or 0); a grandchild that inherited stdout/stderr keeps the
+  // pipes open, as runWithInput allows. Only the exit status decides: a success ignores the refusal text on stderr.
+  writeFileSync(script, `
+    const { spawn } = require('node:child_process'); const fs = require('node:fs'); const path = require('node:path');
+    const dir = process.argv[2];
+    const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
+    fs.writeFileSync(path.join(dir, 'grandchild'), String(g.pid)); g.unref();
+    process.stderr.write('GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)\\n');
+    fs.writeFileSync(path.join(dir, 'child'), String(process.pid));
+    process.exitCode = ${exitCode};
+  `);
+  const run: Run = (_args, options) => runWithInput(process.execPath, [script, dir], { signal: options?.signal, killGraceMs: 250, pipeGraceMs: 3_000 });
+  const abort = new AbortController();
+  try {
+    let settled = false;
+    const merging = new GhMergeGateway(config, run).merge(sha('b'), { signal: abort.signal }).catch((error: unknown) => error)
+      .finally(() => { settled = true; });
+    // Wait until gh has been reaped: Node has then emitted its 'exit' and runWithInput is in its pipe grace period.
+    const gone = (pid: number) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+    for (let i = 0; i < 1_000 && !(existsSync(join(dir, 'child')) && readFileSync(join(dir, 'child'), 'utf8') && gone(Number(readFileSync(join(dir, 'child'), 'utf8')))); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    expect(gone(Number(readFileSync(join(dir, 'child'), 'utf8')))).toBe(true);
+    // Still draining the pipes: the abort below lands after exit and before the answer, the window under test.
+    expect(settled).toBe(false);
+    abort.abort(new Error('Merge request deadline exceeded.'));
+    const outcome = await merging;
+    if (answer === 'success') expect(outcome).toEqual({ url: 'https://github.com/owner/repo/pull/7' });
+    else {
+      expect(outcome).toBeInstanceOf(MergeSubmissionError);
+      expect((outcome as MergeSubmissionError).message).toMatch(/Head branch was modified/);
+      expect((outcome as MergeSubmissionError).outcome).toBe('refused');
+    }
+  } finally {
+    try { process.kill(Number(readFileSync(join(dir, 'grandchild'), 'utf8'))); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 15_000);
+
+it('an issue read that runs out of time reports a RemoteTimeout', async () => {
+  // A consistency check, not a behaviour guard: execution and planning issue reads share this deadline, and nothing on
+  // those paths reads the class yet. (The merge path's trust read is tested through the server in merge-queue-poll.)
+  vi.useFakeTimers();
+  try {
+    const read = withIssueReadDeadline(new AbortController().signal, signal => new Promise<never>((_resolve, reject) =>
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
+    const outcome = read.catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(ISSUE_READ_ACTIVE_MS);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(RemoteTimeout);
+    expect((error as Error).message).toBe('Issue retrieval timed out.');
+  } finally { vi.useRealTimers(); }
+});
+
+it('keeps a command\'s exit status when its own timeout fires after it exited, while its pipes drain', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'merge-stop-timeout-'));
+  const script = join(dir, 'gh.cjs');
+  // Exits at once with its answer; a grandchild keeps the pipes open past the command's 1.5 s timeout.
+  writeFileSync(script, `
+    const { spawn } = require('node:child_process'); const fs = require('node:fs'); const path = require('node:path');
+    const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
+    fs.writeFileSync(path.join(process.argv[2], 'grandchild'), String(g.pid)); g.unref();
+    process.stdout.write('answered');
+  `);
+  try {
+    expect(await runWithInput(process.execPath, [script, dir], { timeout: 1_500, killGraceMs: 250, pipeGraceMs: 3_000 })).toBe('answered');
+  } finally {
+    try { process.kill(Number(readFileSync(join(dir, 'grandchild'), 'utf8'))); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 15_000);

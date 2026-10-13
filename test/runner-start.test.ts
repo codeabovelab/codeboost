@@ -14,6 +14,7 @@ import type { AttemptKind } from '../runner/lifecycle.ts';
 import { approveItem } from '../core/approvals.ts';
 import type { IssueTrustGateway } from '../github/issues.ts';
 import { fixtureGit } from './fixtures/git.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -131,7 +132,20 @@ describe('start (#91 part 2)', () => {
       body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
     expect(store.getAttempts(identity)).toEqual([]);
   });
-  it('returns the first durable success when an identical concurrent access read fails later', async () => {
+  it('does not record a collaborator read that timed out, so the same action ID reads trust again', async () => {
+    let result: ReturnType<Parameters<typeof trustGateway>[0]> = new RemoteTimeout('Issue retrieval timed out.');
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => result) });
+    const actionId = randomUUID();
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 503,
+      body: { error: 'Issue trust could not be verified: Issue retrieval timed out.' } });
+    expect(store.getAttempts(identity)).toEqual([]);
+    result = { authorLogin: 'member', collaborator: true };
+    expect((await act(app, 'start', { actionId })).body.result).toMatchObject({ outcome: 'started', item: 'P1' });
+  });
+  it.each([
+    ['fails', () => new Error('later GitHub failure')],
+    ['times out', () => new RemoteTimeout('Issue retrieval timed out.')],
+  ])('returns the first durable success when an identical concurrent access read %s later', async (_case, failure) => {
     const secondStarted = Promise.withResolvers<void>(), releaseFailure = Promise.withResolvers<void>();
     let reads = 0;
     const gateway: IssueTrustGateway = {
@@ -139,7 +153,7 @@ describe('start (#91 part 2)', () => {
       async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
       async issueAccess(number) {
         if (++reads === 1) { await secondStarted.promise; return { number, authorLogin: 'member', collaborator: true }; }
-        secondStarted.resolve(); await releaseFailure.promise; throw new Error('later GitHub failure');
+        secondStarted.resolve(); await releaseFailure.promise; throw failure();
       },
       async issueText(number) { return { number, title: '', body: '', comments: [] }; },
     };

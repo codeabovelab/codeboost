@@ -131,7 +131,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     if (!SHA.test(input.taskBase)) throw new Error('Invalid task base commit.');
     if (!BRANCH.test(input.baseBranch)) throw new Error('Invalid base branch name.');
     if (input.ownPullRequests.some(number => !Number.isSafeInteger(number) || number < 1)) throw new Error('Invalid pull request number.');
-    // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown.
+    // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown. A `gh` call
+    // that exited before the deadline keeps its answer (#48), so a check whose stages all answered in time still returns it.
     // The two stages are independent and run together. The first failure stops the other, and the check still waits for
     // both to settle, so it never returns while a `gh` process it started is running.
     const deadline = AbortSignal.timeout(this.deadlineMs), failed = new AbortController();
