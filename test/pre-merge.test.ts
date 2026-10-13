@@ -51,6 +51,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
   /** Runs on each inspection that still shows the pre-push pull request (the wait for the new head to show). */
   duringVisibilityWait?: (service: ReviewService) => void;
+  /** Runs inside each fetch after a push or refusal, while the fetch is in flight. */
+  duringFetchAfterPush?: (service: ReviewService) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   closeAfterCommandAdmission?: boolean;
@@ -210,7 +212,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
       if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
       return remotePair;
-    }, fetch: async () => { if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push'); },
+    }, fetch: async () => {
+      if (pushes.length) options.duringFetchAfterPush?.(service);
+      if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push');
+    },
     push: async input => {
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
       options.duringPushRead?.(service, coordinator);
@@ -962,6 +967,25 @@ it('does not record a refused push\'s observation into a review edited during th
   // The collaborator head was not recorded into the edited review.
   expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
   expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('does not record a refused push\'s observation into a review edited while the new head was fetched', async () => {
+  let collaborator = '', edited = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushedFirst(service) {
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+    return collaborator;
+  }, duringFetchAfterPush(service) {
+    // A person edits the review while the collaborator head is being fetched.
+    if (edited) return; edited = true;
+    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the fetch.');
+  } });
+  expect(edited).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
