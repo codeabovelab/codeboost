@@ -158,6 +158,8 @@ function renderMerge() {
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
+  // Likewise once the merge job this key started has ended (a job is saved under its click's action ID): a retry is new.
+  if (mergeAction && merge.job?.id === mergeAction.actionId && merge.job.state !== "running") mergeAction = null;
   // With merge jobs (their status carries `job`), a click's answer arrives while the control may hold focus, so it is
   // marked, never disabled; activation is ignored while the merge is not ready.
   if ("job" in merge) {
@@ -598,6 +600,8 @@ $("merge").onclick = async () => {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
+    // The composer stayed editable while the request was in flight: keep what the person typed meanwhile.
+    rememberDraft();
     mergeAction = null;
     if (updated.job) {
       // A merge job runs in the background (F6b); the page follows it.
@@ -614,6 +618,7 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
+    rememberDraft();
     // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
     // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
     if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeAction = null;

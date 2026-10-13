@@ -1893,6 +1893,27 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
   }, 60_000);
 
+  it('answers a merge click with the job\'s latest record when it ended during the click\'s reload', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, slow = false;
+    const base = gateway(() => storeRef!, () => []);
+    // The click's reload reads GitHub's display status (not fresh) slowly; the job's own fresh inspections answer at once.
+    const gh: MergeGateway = { merge: base.merge, inspect: async request => {
+      if (slow && !request?.fresh) await new Promise(resolve => setTimeout(resolve, 1_500));
+      return base.inspect(request);
+    } };
+    const served = await serve(w, { before: service => { completeAll(service); acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    slow = true;
+    const clicked = await merge(served.app, token, id);
+    // The job merged while the click's response was being prepared: the response says so, not "preparing".
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ state: 'merged' });
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id, state: 'merged' } } });
+  }, 60_000);
+
   it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;

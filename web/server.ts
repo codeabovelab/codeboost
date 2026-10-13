@@ -727,7 +727,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             let loaded: Awaited<ReturnType<typeof load>>;
             try { loaded=await load(requestAbort.signal); }
             catch (error) { if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError(); throw error; }
-            json(200,{...loaded,job});return;
+            // The job may have moved on (or ended) while the review reloaded: answer its latest record, not the admission's.
+            const latest=mergeJobs.latest();
+            json(200,{...loaded,job:latest?.id===job.id?latest:job});return;
           }
           let merged: Awaited<ReturnType<MergeCoordinator['merge']>>;
           // A merge stopped for a passing reason applied nothing, so answer 503 and the browser resends the same key.
