@@ -22,7 +22,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - When synchronous work moves behind an await (a worker thread, a subprocess, an async API), list every await it adds and apply the local-generation rule under "Guarded external actions" to each one. A local await must not follow the final remote validation: the last await before an irreversible external action is that validation.
 - Work that leaves a serializing path (the event loop, a lock, a single queue) needs its own concurrency bound. Queued work must honour cancellation and deadlines.
 - Never compare clock readings across threads or processes. Pass a relative budget and let each side count it on its own monotonic clock.
-- A test that hosts the server in its own process must wait for observable state before acting. Do not rely on the server blocking the test's event loop to order steps.
+- A test that runs the server in the test's own process must wait for observable state before acting. Do not rely on the server blocking the test's event loop to order steps.
 
 ## Async review UI
 
