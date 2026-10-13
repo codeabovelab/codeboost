@@ -49,6 +49,8 @@ const markRunnerUnchanged = (service: ReviewService) => {
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator, timeoutMs?: number) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
+  /** Runs on each inspection that still shows the pre-push pull request (the wait for the new head to show). */
+  duringVisibilityWait?: (service: ReviewService) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   closeAfterCommandAdmission?: boolean;
@@ -203,7 +205,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
-      if (lagging > 0) { lagging--; return lagged; }
+      if (lagging > 0) { lagging--; options.duringVisibilityWait?.(service); return lagged; }
       remoteReads++;
       // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
       if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
@@ -942,6 +944,27 @@ it('returns to review without pushing when the branch moved off the rewritten he
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('does not record a refused push\'s observation into a review edited during the wait for the new head', async () => {
+  let collaborator = '', edited = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 1, pushedFirst(service) {
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+    return collaborator;
+  }, duringVisibilityWait(service) {
+    // A person edits the review while GitHub still shows the pre-push head.
+    if (edited) return; edited = true;
+    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the wait.');
+  } });
+  expect(edited).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  // The collaborator head was not recorded into the edited review.
+  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('waits for GitHub to report the collaborator head that refused the push before reviewing it', async () => {
   let collaborator = '';
   const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 2, pushedFirst(service) {
@@ -1327,7 +1350,8 @@ it('reports a failure after a push as stale when a plan revision landed while th
     const tree = fixtureGit(service.config.repository, 'rev-parse', `${head}^{tree}`);
     return fixtureGit(service.config.repository, 'commit-tree', tree, '-p', head, '-m', 'collaborator on top');
   } });
-  expect(pushed.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  // The revision is caught before the collaborator head is fetched and recorded: the failure names the change.
+  expect(pushed.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(pushed.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await pushed.coordinator.close(); await pushed.runner.close();
   // A refused push, then a failure while reviewing the collaborator head that refused it.
@@ -1337,7 +1361,7 @@ it('reports a failure after a push as stale when a plan revision landed while th
     fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
     return fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
   } });
-  expect(refused.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  expect(refused.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(refused.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await refused.coordinator.close(); await refused.runner.close();
 });
