@@ -8,7 +8,8 @@ import { writeFileSync } from 'node:fs';
 import { LOAD_ATTEMPTS, ReviewService } from '../runner/review.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
-import { HISTORY_CANCEL_GRACE_MS, HISTORY_DEADLINE_GRACE_MS, HISTORY_START_GRACE_MS, runHistoryJob, type HistoryJob } from '../runner/history-job.ts';
+import { HISTORY_CANCEL_GRACE_MS, HISTORY_DEADLINE_GRACE_MS, HISTORY_START_GRACE_MS, MAX_HISTORY_WORKERS, runHistoryJob, type HistoryJob } from '../runner/history-job.ts';
+import { Worker } from 'node:worker_threads';
 import { runHistoryWork } from '../runner/history-work.ts';
 import { startServer } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
@@ -369,4 +370,85 @@ it('reports the deadline, not staleness, when a load runs out of time on its las
     await expect(loading).rejects.toThrow('Review load exceeded its overall deadline.');
     expect(git.pids()).toHaveLength(LOAD_ATTEMPTS);
   } finally { clock.mockRestore(); }
+});
+
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+it(`runs at most ${MAX_HISTORY_WORKERS} history workers at once, starting a waiting load when a slot frees`, async () => {
+  const { git, service } = held();
+  const loads = Array.from({ length: MAX_HISTORY_WORKERS + 1 }, () => service.load());
+  for (let n = 1; n <= MAX_HISTORY_WORKERS; n++) await git.held(n);
+  await pause(500);
+  // The extra load waits for a slot: no worker, so no Git process.
+  expect(git.pids()).toHaveLength(MAX_HISTORY_WORKERS);
+  git.open(1);
+  await git.held(MAX_HISTORY_WORKERS + 1);
+  for (let n = 2; n <= MAX_HISTORY_WORKERS + 1; n++) git.open(n);
+  const views = await Promise.all(loads);
+  expect(new Set(views.map(view => view.snapshot.id)).size).toBe(1);
+});
+
+it('never starts a load that is aborted while it waits for a worker slot', async () => {
+  const { git, service } = held();
+  const running = Array.from({ length: MAX_HISTORY_WORKERS }, () => service.load());
+  for (let n = 1; n <= MAX_HISTORY_WORKERS; n++) await git.held(n);
+  const controller = new AbortController(), reason = new Error('Stopped while waiting.');
+  const waiting = service.load({ signal: controller.signal });
+  // Long enough for a started worker to reach Git: none did, because this load is waiting for a slot.
+  await pause(500);
+  expect(git.pids()).toHaveLength(MAX_HISTORY_WORKERS);
+  controller.abort(reason);
+  await expect(waiting).rejects.toBe(reason);
+  for (let n = 1; n <= MAX_HISTORY_WORKERS; n++) git.open(n);
+  await Promise.all(running);
+  await pause(300);
+  expect(git.pids()).toHaveLength(MAX_HISTORY_WORKERS);
+});
+
+it('counts the wait for a worker slot against the budget, never starting a load whose time ran out', async () => {
+  const { git, service } = held();
+  const running = Array.from({ length: MAX_HISTORY_WORKERS }, () => service.load());
+  for (let n = 1; n <= MAX_HISTORY_WORKERS; n++) await git.held(n);
+  await expect(service.load({ maxDurationMs: 300 })).rejects.toThrow('History work exceeded its overall deadline.');
+  for (let n = 1; n <= MAX_HISTORY_WORKERS; n++) git.open(n);
+  await Promise.all(running);
+  await pause(300);
+  expect(git.pids()).toHaveLength(MAX_HISTORY_WORKERS);
+});
+
+it('keeps a worker slot until the worker thread has ended, not merely until its job was cancelled', async () => {
+  const { git, service } = held();
+  const controller = new AbortController(), reason = new Error('Stopped by the test.');
+  const heartbeat = new SharedArrayBuffer(4), beats = new Int32Array(heartbeat);
+  // Workers stuck in synchronous work hold every slot; they end only when terminated after the cancel grace.
+  const busy = Array.from({ length: MAX_HISTORY_WORKERS }, () => runHistoryJob({ repository: '.', base: 'HEAD', head: 'HEAD', budgetMs: 30_000, heartbeat } as HistoryJob,
+    controller.signal, fixtureUrl('history-worker-busy.ts')));
+  busy.forEach(job => job.catch(() => undefined));
+  await vi.waitFor(() => expect(Atomics.load(beats, 0)).toBeGreaterThan(0));
+  const waiting = service.load();
+  controller.abort(reason);
+  await pause(HISTORY_CANCEL_GRACE_MS / 2);
+  expect(git.pids()).toHaveLength(0);
+  for (const job of busy) await expect(job).rejects.toBe(reason);
+  await git.held(1); git.open(1);
+  await expect(waiting).resolves.toBeDefined();
+});
+
+it('keeps waiting for the worker thread to exit when terminating it fails', async () => {
+  let worker: Worker | undefined;
+  const terminate = vi.spyOn(Worker.prototype, 'terminate').mockImplementationOnce(function (this: Worker) {
+    worker = this; return Promise.reject(new Error('Terminate failed.'));
+  });
+  try {
+    let settled = false;
+    const job = runHistoryJob({ repository: '.', base: 'HEAD', head: 'HEAD', budgetMs: 200, startMs: 0 } as HistoryJob, undefined,
+      fixtureUrl('history-worker-slow-start.ts')).finally(() => { settled = true; });
+    job.catch(() => undefined);
+    // The budget, deadline grace and cancel grace pass; the failed terminate leaves the thread running.
+    await vi.waitFor(() => expect(worker).toBeDefined(), { timeout: 10_000 });
+    await pause(500);
+    expect(settled).toBe(false);
+    await worker!.terminate();
+    await expect(job).rejects.toThrow('History work exceeded its overall deadline.');
+  } finally { terminate.mockRestore(); }
 });

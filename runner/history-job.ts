@@ -29,12 +29,45 @@ export const HISTORY_CANCEL_GRACE_MS = 1_000;
 export const HISTORY_DEADLINE_GRACE_MS = 1_000;
 /** How long a worker may take to start (load its modules) before its budget is counted from its creation instead. */
 export const HISTORY_START_GRACE_MS = 5_000;
+/**
+ * How many history workers run at once. The server no longer serializes review loads, so tabs and refreshes could
+ * otherwise start any number of threads and Git processes; later jobs wait for a slot.
+ */
+export const MAX_HISTORY_WORKERS = 2;
+
+/** Slots in use and jobs waiting for one, in arrival order. A slot is held until its worker thread has ended. */
+let running = 0;
+const waiting: { grant: () => void }[] = [];
+const release = () => {
+  running--;
+  while (running < MAX_HISTORY_WORKERS && waiting.length) { running++; waiting.shift()!.grant(); }
+};
+/**
+ * Waits for a worker slot. A job waiting for one is not started at all if its signal aborts (it rejects with the
+ * signal's reason) or its budget runs out first (it rejects with the deadline error).
+ */
+function acquire(budgetMs: number, signal?: AbortSignal): Promise<void> {
+  if (running < MAX_HISTORY_WORKERS) { running++; return Promise.resolve(); }
+  return new Promise((resolve, reject) => {
+    const entry = { grant: () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); resolve(); } };
+    const leave = (reason: unknown) => {
+      const index = waiting.indexOf(entry);
+      if (index < 0) return;
+      waiting.splice(index, 1); clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(reason);
+    };
+    const onAbort = () => leave(signal!.reason);
+    const timer = setTimeout(() => leave(new Error('History work exceeded its overall deadline.')), budgetMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    waiting.push(entry);
+  });
+}
 
 const workerUrl = new URL('./history-worker.ts', import.meta.url);
 
 /**
  * Runs a history job in its own worker thread, so Git processes, object storage inspection and linking never block
- * the caller's event loop.
+ * the caller's event loop. At most MAX_HISTORY_WORKERS run at once; a job waits for a slot first, and the wait counts
+ * against its budget.
  *
  * Lifecycle: the job is running until the worker replies, fails or exits. An abort, or the budget passing without a
  * reply, sends a cancel: the worker kills its running Git process, waits for it to exit, and replies. A worker that has
@@ -43,8 +76,20 @@ const workerUrl = new URL('./history-worker.ts', import.meta.url);
  * not exited within the grace (a process in an uninterruptible kernel wait), which then outlives the job. The returned
  * promise settles only after the worker thread has ended. An abort rejects with the signal's reason, unchanged.
  */
-export function runHistoryJob(job: HistoryJob, signal?: AbortSignal, url: URL = workerUrl): Promise<{ history: History; segments: Segment[] | null }> {
-  if (signal?.aborted) return Promise.reject(signal.reason);
+export async function runHistoryJob(job: HistoryJob, signal?: AbortSignal, url: URL = workerUrl): Promise<{ history: History; segments: Segment[] | null }> {
+  signal?.throwIfAborted();
+  const queued = performance.now();
+  await acquire(job.budgetMs, signal);
+  try {
+    const budgetMs = Math.ceil(job.budgetMs - (performance.now() - queued));
+    if (budgetMs < 1) throw new Error('History work exceeded its overall deadline.');
+    signal?.throwIfAborted();
+    return await runInWorker({ ...job, budgetMs }, url, signal);
+  } finally { release(); }
+}
+
+/** One job in one worker thread; settles only after that thread has ended (see runHistoryJob). */
+function runInWorker(job: HistoryJob, url: URL, signal?: AbortSignal): Promise<{ history: History; segments: Segment[] | null }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(url, { workerData: job });
     // The outcome is decided once (the first reply, failure or stop) and delivered once the thread has exited.
@@ -58,8 +103,9 @@ export function runHistoryJob(job: HistoryJob, signal?: AbortSignal, url: URL = 
       signal?.removeEventListener('abort', onAbort);
       (outcome ?? (() => reject(new Error('History worker stopped without a reply.'))))();
     };
-    // A reply is the worker's last act; terminate makes sure the thread ends and resolves once it has.
-    const end = () => { void worker.terminate().then(deliver, deliver); };
+    // A reply is the worker's last act; terminate makes sure the thread ends and resolves once it has. A rejected
+    // terminate proves nothing about the thread, so the job then waits for its `exit` event, which delivers.
+    const end = () => { void worker.terminate().then(deliver, () => undefined); };
     const stop = (reason: unknown) => {
       if (stopping || outcome) return;
       stopping = true;

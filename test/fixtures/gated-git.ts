@@ -15,7 +15,9 @@ export function gatedGit(root: string, match: string) {
   mkdirSync(dir, { recursive: true }); writeFileSync(log, '');
   const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-  const wait = `open(my $f, ">>", shift); print $f "$$\\n"; close $f; my $n = () = do { local @ARGV = ($ARGV[0] =~ s/gate-$/calls/r); <> };`
+  // The append and the count run under one lock, so calls that start together still get distinct numbers.
+  const wait = `use Fcntl qw(:flock); my $log = shift; open(my $f, ">>", $log); flock($f, LOCK_EX); select((select($f), $| = 1)[0]);`
+    + ` print $f "$$\\n"; my $n = () = do { open(my $r, "<", $log); <$r> }; close $f;`
     + ` my $g = shift; select(undef, undef, undef, 0.02) until -e "$g$n"; exec @ARGV`;
   writeFileSync(join(dir, 'git'), `#!/bin/sh
 case "$*" in

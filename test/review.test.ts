@@ -10,18 +10,23 @@ import { approveItem, reviewedSegment } from '../core/approvals.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { identityKey } from '../core/identity.ts';
 import { fixtureGit } from './fixtures/git.ts';
+import { gatedGit } from './fixtures/gated-git.ts';
 // A passthrough, so the stale-key test can count how often load() serializes a segment.
 vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
 // Each integration case performs several bounded real-Git reads.
 vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
-afterEach(()=>{services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
+// Restorers for a test's clock and environment stubs, run even when the test times out before its own cleanup.
+const restores:(()=>void)[]=[];
+afterEach(()=>{restores.splice(0).forEach(restore=>restore());vi.unstubAllEnvs();services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const config=createDemo(join(root,'demo'));const service=new ReviewService(config);services.push(service);return {service,config};}
 // History reading and linking share the worker's budget (history-job.test.ts); the work after them shares the same deadline.
 it('counts the work after the history worker against the load\'s one overall deadline',async ()=>{
- const {service}=fixture();let now=0;const clock=vi.spyOn(performance,'now').mockImplementation(()=>now);
- try{const loading=service.load({maxDurationMs:30_000});now=30_000;await expect(loading).rejects.toThrow('Review load exceeded its overall deadline.');}
- finally{clock.mockRestore();}
+ const root=mkdtempSync(join(tmpdir(),'codeboost-review-gate-'));roots.push(root);const git=gatedGit(root,'--git-common-dir');vi.stubEnv('PATH',git.path);
+ const {service}=fixture();let now=0;const clock=vi.spyOn(performance,'now').mockImplementation(()=>now);restores.push(()=>clock.mockRestore());
+ // The clock passes the deadline only once the worker holds its budget and is reading: the time is spent after it.
+ const loading=service.load({maxDurationMs:30_000});loading.catch(()=>undefined);await git.held(1);now=30_000;git.open(1);
+ await expect(loading).rejects.toThrow('Review load exceeded its overall deadline.');
 });
 it('closes the review service when merge gateway construction fails', async()=>{
  const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const demo=createDemo(join(root,'demo'));
