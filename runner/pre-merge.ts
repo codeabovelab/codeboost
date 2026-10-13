@@ -500,7 +500,12 @@ export class PreMergeCoordinator {
       // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
       const seen = await this.#awaitHeadChange(initial, signal, remaining);
       if (pushed !== 'pushed' || seen.head !== view.snapshot.head || seen.base !== initial.base) {
+        // As on the pushed path below: a plan revision or review edit that landed during the wait (or the fetch) must not
+        // have this preparation's remote observation recorded into it.
+        const binding = { stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id };
+        assertCurrent(binding);
         const moved = seen; await this.remote.fetch(moved, signal); signal.throwIfAborted();
+        assertCurrent(binding);
         // Traced from the reviewed head and its rewrite lineage, nearest first. That lineage holds the pushed head, every
         // earlier rewrite codeboost may already have pushed, and the original head a collaborator may have built on.
         view = track(this.#refresh(moved, reviewBudget, view.snapshot.head));

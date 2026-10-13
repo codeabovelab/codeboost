@@ -64,6 +64,10 @@ const markRunnerUnchanged = (service: ReviewService) => {
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator, timeoutMs?: number) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
+  /** Runs on each inspection that still shows the pre-push pull request (the wait for the new head to show). */
+  duringVisibilityWait?: (service: ReviewService) => void;
+  /** Runs inside each fetch after a push or refusal, while the fetch is in flight. */
+  duringFetchAfterPush?: (service: ReviewService) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   closeAfterCommandAdmission?: boolean;
@@ -213,7 +217,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair: { base: string; head: string; branch?: string } = { base: onto, head, branch: BRANCH };
   const pushes: { branch: string; from: string; to: string }[] = [];
-  let lagging = 0, lagged = remotePair, branchReads = 0;
+  let lagging = 0, lagged = remotePair, branchReads = 0, fetchesAfterPush = 0;
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
@@ -222,12 +226,16 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
-      if (lagging > 0) { lagging--; return lagged; }
+      if (lagging > 0) { lagging--; options.duringVisibilityWait?.(service); return lagged; }
       remoteReads++;
       // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
       if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
       return remotePair;
-    }, fetch: async () => { if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push'); },
+    }, fetch: async () => {
+      if (pushes.length) fetchesAfterPush++;
+      if (pushes.length) options.duringFetchAfterPush?.(service);
+      if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push');
+    },
     push: async input => {
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
       options.duringPushRead?.(service, coordinator);
@@ -270,7 +278,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const result = options.deferStart ? null as unknown as PreMergeResult : await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
-    branchReads: () => branchReads,
+    branchReads: () => branchReads, fetchesAfterPush: () => fetchesAfterPush,
     /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
     moveRemote: (pair: { base: string; head: string }, shown?: { base: string; head: string }, reads = 0) => {
       remotePair = { ...remotePair, ...pair };
@@ -961,6 +969,48 @@ it('returns to review without pushing when the branch moved off the rewritten he
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('does not record a refused push\'s observation into a review edited during the wait for the new head', async () => {
+  let collaborator = '', edited = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 1, pushedFirst(service) {
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+    return collaborator;
+  }, duringVisibilityWait(service) {
+    // A person edits the review while GitHub still shows the pre-push head.
+    if (edited) return; edited = true;
+    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the wait.');
+  } });
+  expect(edited).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  // The collaborator head was not recorded into the edited review.
+  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  // Caught before the collaborator head was even fetched.
+  expect(fixture.fetchesAfterPush()).toBe(0);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('does not record a refused push\'s observation into a review edited while the new head was fetched', async () => {
+  let collaborator = '', edited = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushedFirst(service) {
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+    return collaborator;
+  }, duringFetchAfterPush(service) {
+    // A person edits the review while the collaborator head is being fetched.
+    if (edited) return; edited = true;
+    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the fetch.');
+  } });
+  expect(edited).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('waits for GitHub to report the collaborator head that refused the push before reviewing it', async () => {
   let collaborator = '';
   const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 2, pushedFirst(service) {
@@ -1346,7 +1396,8 @@ it('reports a failure after a push as stale when a plan revision landed while th
     const tree = fixtureGit(service.config.repository, 'rev-parse', `${head}^{tree}`);
     return fixtureGit(service.config.repository, 'commit-tree', tree, '-p', head, '-m', 'collaborator on top');
   } });
-  expect(pushed.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  // The revision is caught before the collaborator head is fetched and recorded: the failure names the change.
+  expect(pushed.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(pushed.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await pushed.coordinator.close(); await pushed.runner.close();
   // A refused push, then a failure while reviewing the collaborator head that refused it.
@@ -1356,7 +1407,7 @@ it('reports a failure after a push as stale when a plan revision landed while th
     fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
     return fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
   } });
-  expect(refused.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  expect(refused.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(refused.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await refused.coordinator.close(); await refused.runner.close();
 });
