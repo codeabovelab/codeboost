@@ -19,6 +19,10 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Bound the HTTP drain during shutdown. After its grace period, abort and await owned work before awaiting server closure so an admitted poll cannot deadlock teardown.
 - Polling endpoints should read only the state they need. Do not rebuild Git history or the full review merely to retrieve background-job status.
 - Back off recurring external-status polling to a bounded cap. Reset the interval only after a meaningful lifecycle change or explicit user action.
+- When synchronous work moves behind an await (a worker thread, a subprocess, an async API), list every await it adds. A check that used to run in the same turn as the write it guards must run again after that await, in the write's turn. The last await before an irreversible external action must be its final remote validation.
+- Work that leaves a serializing path (the event loop, a lock, a single queue) needs its own concurrency bound. Queued work must honour cancellation and deadlines, and each slot is held until its work has settled.
+- Never compare clock readings across threads or processes. Pass a relative budget and let each side count it on its own monotonic clock.
+- A test that hosts the server in its own process must wait for observable state before acting. Do not rely on the server blocking the test's event loop to order steps.
 
 ## Async review UI
 
