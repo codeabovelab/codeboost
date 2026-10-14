@@ -107,7 +107,7 @@ const passing = (context = 'ci'): RequiredCheck => ({ context, appId: null, stat
 
 it('merges at once when the required set was read and is empty', async () => {
   const f = setup();
-  const started = f.coordinator.start('review-token', randomUUID());
+  const started = await f.coordinator.start('review-token', randomUUID());
   expect(started).toMatchObject({ state: 'running', step: 'preparing' });
   expect(started).not.toHaveProperty('token');
   expect(await settled(f.coordinator)).toMatchObject({ state: 'merged', step: null, url: 'https://github.com/owner/repo/pull/7' });
@@ -119,7 +119,7 @@ it('merges at once when the required set was read and is empty', async () => {
 it('waits while a required check is pending, then merges once it passes', async () => {
   const seen: string[] = [];
   const f = setup({ checks: n => (n <= 2 ? [pending()] : [passing()]) });
-  const job = f.coordinator.start('review-token', randomUUID());
+  const job = await f.coordinator.start('review-token', randomUUID());
   const poll = setInterval(() => { const latest = f.coordinator.latest(); if (latest?.checks.length) seen.push(`${latest.step}:${latest.checks[0]!.state}`); }, 1);
   const done = await settled(f.coordinator); clearInterval(poll);
   expect(done).toMatchObject({ id: job.id, state: 'merged' });
@@ -129,7 +129,7 @@ it('waits while a required check is pending, then merges once it passes', async 
 
 it('ends approved, merge blocked when required checks do not pass in time', async () => {
   const f = setup({ checks: () => [pending('build'), { context: 'deploy', appId: null, state: 'missing' }] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   const done = await settled(f.coordinator);
   expect(done.state).toBe('blocked');
   expect(done.reason).toMatch(/did not pass within .*build is pending, deploy is missing/);
@@ -139,7 +139,7 @@ it('ends approved, merge blocked when required checks do not pass in time', asyn
 
 it('stops at once when a required check fails, without waiting for the time limit', async () => {
   const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked', reason: 'Required check failed: build.' });
   expect(f.gh.inspections()).toBe(1);
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
@@ -147,7 +147,7 @@ it('stops at once when a required check fails, without waiting for the time limi
 
 it('ends failed, without merging, when GitHub cannot be read while waiting for checks', async () => {
   const f = setup({ checks: () => [pending()], unreadable: n => n === 2 });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/HTTP 502/) });
   expect(f.gh.inspections()).toBe(2);
   expect(f.gh.merged).toEqual([]);
@@ -156,7 +156,7 @@ it('ends failed, without merging, when GitHub cannot be read while waiting for c
 
 it('ends failed, leaving the task in review, when GitHub refuses because the head changed', async () => {
   const f = setup({ merge: async () => { throw new MergeSubmissionError('Head branch was modified. Review and try the merge again.', 'refused'); } });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/^GitHub refused the merge: Head branch was modified.*Review the new head/) });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed', requiresFreshReview: true });
   expect(f.store.getTask(identity).status).toBe('in review');
@@ -171,7 +171,7 @@ it('ends failed, leaving the task in review, when the review changed while GitHu
     throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
   } });
   storeRef = f.store;
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/review changed while GitHub was asked to merge/) });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed' });
   expect(f.store.getTask(identity).status).toBe('in review');
@@ -185,7 +185,7 @@ it('ends failed, leaving the task in review, when a failing check arrives after 
     store.addReviewNote(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, 'P1', 'change', 'Changed during the wait.');
   } });
   storeRef = f.store;
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed while waiting for required checks/) });
   expect(f.store.getTask(identity).status).toBe('in review');
   expect(f.gh.merged).toEqual([]);
@@ -193,14 +193,14 @@ it('ends failed, leaving the task in review, when a failing check arrives after 
 
 it('waits while GitHub is still computing mergeability', async () => {
   const f = setup({ change: n => (n <= 2 ? { mergeable: 'UNKNOWN' } : {}) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
 });
 
 it('ends for review or as failed when preparation does, and merges nothing', async () => {
   for (const [outcome, state] of [['review-required', 'review-required'], ['failed', 'failed']] as const) {
     const f = setup({ prepare: () => outcome });
-    f.coordinator.start('review-token', randomUUID());
+    await f.coordinator.start('review-token', randomUUID());
     expect(await settled(f.coordinator)).toMatchObject({ state, reason: `preparation ${outcome}` });
     expect(f.gh.merged).toEqual([]);
     expect(f.store.getTask(identity).status).toBe('in review');
@@ -209,28 +209,28 @@ it('ends for review or as failed when preparation does, and merges nothing', asy
 
 it('ends as failed, for a person, when another blocker appears while waiting', async () => {
   const f = setup({ change: () => ({ base: oid(30) }) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/base branch moved/) });
   expect(f.gh.merged).toEqual([]);
 });
 
 it('ends approved, merge blocked when GitHub refuses the merge', async () => {
   const f = setup({ merge: async () => { throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused'); } });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge: .*expected/) });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
 });
 
 it('ends submitted when GitHub\'s merge outcome is unknown; the attempt stays in flight', async () => {
   const f = setup({ merge: async () => { throw new MergeSubmissionError('connection reset', 'unknown'); } });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'submitted' });
   expect(f.store.getMergeAttempt(identity)?.state).toBe('submitting');
 });
 
 it('stops waiting at once when the task is cancelled', async () => {
   const f = setup({ checks: () => [pending()] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
   // As the cancel route does: the task's cancel commits first, then the job is told.
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
@@ -242,7 +242,7 @@ it('stops waiting at once when the task is cancelled', async () => {
 it('keeps the readiness preparation recorded valid while the job records its progress', async () => {
   let readyAt: number | null = null;
   const f = setup({ checks: n => { if (n === 1) readyAt = f.store.getTask(identity).stateVersion; return n <= 3 ? [pending()] : [passing()]; } });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
   // The guarded merge admitted the readiness bound at preparation: the job's own writes never advanced the task.
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'merged' });
@@ -252,20 +252,20 @@ it('keeps the readiness preparation recorded valid while the job records its pro
 it('replays a resent click, refuses a second click while a job runs, and replays a refusal for a stale token', async () => {
   const f = setup({ checks: () => [pending()] });
   const id = randomUUID(), stale = randomUUID();
-  expect(() => f.coordinator.start('stale-token', stale)).toThrow(/Stale review state/);
+  await expect(f.coordinator.start('stale-token', stale)).rejects.toThrow(/Stale review state/);
   expect(f.store.getMergeJob(identity, stale)).toMatchObject({ state: 'failed', refused: true });
-  expect(() => f.coordinator.start('stale-token', stale)).toThrow(/Stale review state/);
-  const first = f.coordinator.start('review-token', id);
-  expect(f.coordinator.start('review-token', id)).toMatchObject({ id: first.id, state: 'running' });
+  await expect(f.coordinator.start('stale-token', stale)).rejects.toThrow(/Stale review state/);
+  const first = await f.coordinator.start('review-token', id);
+  expect(await f.coordinator.start('review-token', id)).toMatchObject({ id: first.id, state: 'running' });
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
   const second = randomUUID();
-  expect(() => f.coordinator.start('review-token', second)).toThrow(/already running/);
+  await expect(f.coordinator.start('review-token', second)).rejects.toThrow(/already running/);
   expect(f.store.getMergeJob(identity, second)).toMatchObject({ refused: true });
   // The saved refusal is that click's alone: the running job stays the task's job, and Merge PR stays withheld.
   expect(f.coordinator.latest()).toMatchObject({ id: first.id, state: 'running', step: 'checks' });
   const resolvable = { ready: false, action: null, blockers: [{ code: 'check', message: 'pending' }], remote: { mergeable: 'MERGEABLE' }, queue: null } as Parameters<typeof withMergeJob>[0];
   expect(withMergeJob(resolvable, f.coordinator.latest(), 'in review')).toMatchObject({ ready: false, action: null });
-  expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
+  await expect(f.coordinator.start('other-token', id)).rejects.toThrow(/already used/);
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   f.coordinator.cancel(); await settled(f.coordinator);
   expect(f.prep.calls).toHaveLength(1);
@@ -278,7 +278,7 @@ it('resolves close only once the job has settled, so shutdown can await its last
   const held = new Promise<void>(resolve => { release = resolve; });
   const prepared = f.prep.fake.start.bind(f.prep.fake);
   (f.prep.fake as unknown as { start: typeof prepared }).start = async expected => { await held; return prepared(expected); };
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()).toMatchObject({ state: 'running', step: 'preparing' }));
   let closed = false;
   const closing = f.coordinator.close().then(() => { closed = true; });
@@ -291,7 +291,7 @@ it('resolves close only once the job has settled, so shutdown can await its last
 
 it('leaves a job running on shutdown, and startup ends it as failed', async () => {
   const f = setup({ checks: () => [pending()] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
   await f.coordinator.close();
   expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
@@ -299,13 +299,13 @@ it('leaves a job running on shutdown, and startup ends it as failed', async () =
   expect(f.coordinator.latest()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
   // Not a definite refusal: the route answers 503 and the browser keeps the click's key (nothing was saved).
   const id = randomUUID();
-  expect(() => f.coordinator.start('review-token', id)).toThrow(ShuttingDownError);
+  await expect(f.coordinator.start('review-token', id)).rejects.toThrow(ShuttingDownError);
   expect(f.store.getMergeJob(identity, id)).toBeNull();
 });
 
 it('ends queued when the merge queue accepted the head', async () => {
   const f = setup({ queue: true });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'queued' });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ kind: 'queue', state: 'queued' });
   expect(f.store.getTask(identity).status).toBe('in review');
@@ -313,36 +313,36 @@ it('ends queued when the merge queue accepted the head', async () => {
 
 it('leaves the task approved, merge blocked when a retried job is queued', async () => {
   const f = setup({ queue: true, checks: n => (n === 1 ? [{ context: 'build', appId: null, state: 'failure' }] : []) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked' });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'queued' });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
 });
 
-it('refuses a click while the runner or publisher is busy, and replays that refusal once it is idle', () => {
+it('refuses a click while the runner or publisher is busy, and replays that refusal once it is idle', async () => {
   const f = setup(), id = randomUUID();
-  expect(() => f.coordinator.start('review-token', id, () => 'The runner is busy.')).toThrow('The runner is busy.');
+  await expect(f.coordinator.start('review-token', id, () => 'The runner is busy.')).rejects.toThrow('The runner is busy.');
   // The response was lost; the same click is resent after the runner became idle: it replays, starting nothing.
-  expect(() => f.coordinator.start('review-token', id)).toThrow('The runner is busy.');
-  expect(() => f.coordinator.start('other-token', id)).toThrow(/already used/);
+  await expect(f.coordinator.start('review-token', id)).rejects.toThrow('The runner is busy.');
+  await expect(f.coordinator.start('other-token', id)).rejects.toThrow(/already used/);
   expect(f.store.getMergeJob(identity, id)).toMatchObject({ state: 'failed', refused: true, reason: 'The runner is busy.' });
   expect(f.coordinator.latest()).toBeNull();
   expect(f.coordinator.active).toBe(false);
   expect(f.prep.calls).toEqual([]);
 });
 
-it('saves nothing for a click refused because the server is shutting down, so it may be sent again', () => {
+it('saves nothing for a click refused because the server is shutting down, so it may be sent again', async () => {
   const f = setup(), id = randomUUID();
   f.coordinator.stop();
-  expect(() => f.coordinator.start('review-token', id)).toThrow(/shutting down/);
+  await expect(f.coordinator.start('review-token', id)).rejects.toThrow(/shutting down/);
   expect(f.store.getMergeJob(identity, id)).toBeNull();
 });
 
 it('ends cancelled when the task was cancelled while the job waited, even if the job was not told', async () => {
   const f = setup({ checks: () => [pending()] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
@@ -357,14 +357,14 @@ it('ends cancelled when the task is cancelled during the guarded merge\'s valida
   coordinatorRef = f.coordinator; storeRef = f.store;
   // Inspection 1 is the wait; inspections 2+ are the guarded merge's validation passes.
   cancelAt = 2;
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
   expect(f.gh.merged).toEqual([]);
 });
 
 it('stops a guarded merge in flight on shutdown, so shutdown does not wait for GitHub', async () => {
   const f = setup({ merge: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.gh.merged).toHaveLength(1));
   const closing = Date.now();
   await f.coordinator.close();
@@ -398,7 +398,7 @@ it('offers Merge PR while only blockers the job resolves remain, and a retry aft
 
 it('ends as failed, not blocked, when checks fail on a head that moved while waiting', async () => {
   const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], change: () => ({ head: oid(40) }) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/head moved/) });
   expect(f.store.getTask(identity).status).toBe('in review');
 });
@@ -406,7 +406,7 @@ it('ends as failed, not blocked, when checks fail on a head that moved while wai
 it('asks GitHub to merge nothing once stopped, even if the checks pass meanwhile', async () => {
   let passing = false;
   const f = setup({ checks: () => [passing ? { context: 'ci', appId: null, state: 'success' } : pending()] });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
   f.coordinator.stop(); passing = true;
   await f.coordinator.current;
@@ -418,7 +418,7 @@ it('ends blocked when GitHub refuses the merge while shutdown stops the job', as
   let coordinatorRef: MergeJobCoordinator | null = null;
   const f = setup({ merge: async () => { coordinatorRef!.stop(); throw new MergeSubmissionError('Base branch was modified.', 'refused'); } });
   coordinatorRef = f.coordinator;
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   await f.coordinator.current;
   expect(f.coordinator.latest()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
@@ -440,7 +440,7 @@ it('settles a job a crash left in its merge step from its merge attempt at start
   ] as const) {
     // GitHub never answers: the job is in its merge step when the process "crashes".
     const f = setup({ merge: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
-    f.coordinator.start('review-token', randomUUID());
+    await f.coordinator.start('review-token', randomUUID());
     await vi.waitFor(() => expect(f.gh.merged).toHaveLength(1));
     const job = f.store.runningMergeJob(identity)!, attempt = f.store.getMergeAttempt(identity)!;
     expect(job).toMatchObject({ step: 'merging', mergeActionId: attempt.actionId });
@@ -487,12 +487,12 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   let refuse = true, conflictFrom = Number.POSITIVE_INFINITY;
   const f = setup({ merge: async () => { if (refuse) throw new MergeSubmissionError('Base branch was modified.', 'refused'); return { url: 'u' }; },
     change: n => (n >= conflictFrom ? { mergeable: 'CONFLICTING' } : {}) });
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked' });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed' });
   // Retry: the guarded merge's second validation pass now sees a conflict, so it refuses before asking GitHub.
   refuse = false; conflictFrom = f.gh.inspections() + 3;
-  f.coordinator.start('review-token', randomUUID());
+  await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/merge conflicts/) });
   // At startup too: a job that saved its merge action ID but never got an attempt fails, whatever older attempts say.
   const crashed = randomUUID();
@@ -502,14 +502,14 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
 });
 
-it('refuses, saves and replays a click on a task that is not mergeable or is being cancelled', () => {
+it('refuses, saves and replays a click on a task that is not mergeable or is being cancelled', async () => {
   const f = setup(), queued = randomUUID();
   f.store.transitionTask(identity, f.store.getTask(identity).stateVersion, 'queued');
-  expect(() => f.coordinator.start('review-token', queued)).toThrow('The task is queued; merge it from review.');
+  await expect(f.coordinator.start('review-token', queued)).rejects.toThrow('The task is queued; merge it from review.');
   expect(f.store.getMergeJob(identity, queued)).toMatchObject({ refused: true });
   f.store.transitionTask(identity, f.store.getTask(identity).stateVersion, 'in review');
   // A resend replays the refusal, even though the task is in review again.
-  expect(() => f.coordinator.start('review-token', queued)).toThrow('The task is queued; merge it from review.');
+  await expect(f.coordinator.start('review-token', queued)).rejects.toThrow('The task is queued; merge it from review.');
   // A cancel that waits for a push of the rewritten head to settle keeps the task in review, cancel requested.
   const snapshot = f.store.getSnapshot(identity), reviewed = { revision: 1, snapshotId: snapshot.id, reviewVersion: f.store.reviewVersion(identity) };
   f.store.recordRebase(identity, reviewed, oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
@@ -518,23 +518,23 @@ it('refuses, saves and replays a click on a task that is not mergeable or is bei
     { branch: BRANCH, from: oid(2), to: oid(12) });
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
   const cancelling = randomUUID();
-  expect(() => f.coordinator.start('review-token', cancelling)).toThrow('The task is being cancelled.');
+  await expect(f.coordinator.start('review-token', cancelling)).rejects.toThrow('The task is being cancelled.');
   expect(f.store.getMergeJob(identity, cancelling)).toMatchObject({ refused: true });
   expect(f.prep.calls).toEqual([]);
 });
 
-it('answers a preparation stopping for shutdown as not applied, saving nothing', () => {
+it('answers a preparation stopping for shutdown as not applied, saving nothing', async () => {
   const f = setup(), id = randomUUID();
   (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('The server is shutting down.'); };
-  expect(() => f.coordinator.start('review-token', id)).toThrow(ShuttingDownError);
+  await expect(f.coordinator.start('review-token', id)).rejects.toThrow(ShuttingDownError);
   expect(f.store.getMergeJob(identity, id)).toBeNull();
   expect(f.prep.calls).toEqual([]);
 });
 
-it('refuses a click while a preparation is already running, and replays that refusal', () => {
+it('refuses a click while a preparation is already running, and replays that refusal', async () => {
   const f = setup(), id = randomUUID();
   (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('Pre-merge preparation is already running.'); };
-  expect(() => f.coordinator.start('review-token', id)).toThrow('Pre-merge preparation is already running.');
+  await expect(f.coordinator.start('review-token', id)).rejects.toThrow('Pre-merge preparation is already running.');
   expect(f.store.getMergeJob(identity, id)).toMatchObject({ refused: true });
   expect(f.prep.calls).toEqual([]);
 });

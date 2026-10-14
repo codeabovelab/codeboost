@@ -19,6 +19,11 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Bound the HTTP drain during shutdown. After its grace period, abort and await owned work before awaiting server closure so an admitted poll cannot deadlock teardown.
 - Polling endpoints should read only the state they need. Do not rebuild Git history or the full review merely to retrieve background-job status.
 - Back off recurring external-status polling to a bounded cap. Reset the interval only after a meaningful lifecycle change or explicit user action.
+- When synchronous work moves behind an await (a worker thread, a subprocess, an async API), list every await it adds and apply the local-generation rule under "Guarded external actions" to each one. A local await must not follow the final remote validation: the last await before an irreversible external action is that validation.
+- Work that leaves a serializing path (the event loop, a lock, a single queue) needs its own concurrency bound. Queued work must honour cancellation and deadlines.
+- Attach a rejection handler to a promise when it is created whenever anything is awaited before the promise is consumed. A rejection that settles in between reaches Node's process-wide unhandled-rejection handler, which by default exits the process.
+- Never compare clock readings across threads or processes. Pass a relative budget and let each side count it on its own monotonic clock.
+- A test that runs the server in the test's own process must wait for observable state before acting. Do not rely on the server blocking the test's event loop to order steps.
 
 ## Async review UI
 
@@ -45,6 +50,8 @@ Before opening or updating a PR for asynchronous behavior, test every applicable
 - A child process exits, but a descendant outside its process group still holds its output pipes.
 
 Every reproduced race requires a failing-before and passing-after regression. Assert both the visible result and the durable state when they can diverge.
+
+A race regression must assert that the interleaving it names actually happened (for example which abort stopped which stage, or that a deadline fired before a release) before it uses the outcome as evidence. Otherwise machine load can turn it into a test of a different order that still passes.
 
 ## Review readiness
 

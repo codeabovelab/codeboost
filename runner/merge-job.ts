@@ -62,18 +62,26 @@ export class MergeJobCoordinator {
    * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend; only a
    * refusal during shutdown saves nothing, so that click may be sent again.
    */
-  start(token: unknown, actionId: string, busy: () => string | null = () => null): MergeJobView {
+  async start(token: unknown, actionId: string, busy: () => string | null = () => null, signal?: AbortSignal): Promise<MergeJobView> {
     const { store, config } = this.service, identity = config.identity;
-    const saved = store.getMergeJob(identity, actionId);
-    if (saved) {
+    const replay = () => {
       const { job } = store.beginMergeJob(identity, { actionId, token: token as string });
       // A refused click replays its refusal; anything else is the job this click started.
       if (job.refused) throw new GuardRefusal(job.reason ?? 'The merge was refused.');
       return mergeJobView(job);
-    }
+    };
+    if (store.getMergeJob(identity, actionId)) return replay();
     // Shutdown decides nothing about this click: nothing is saved, and the route answers 503 so the same click is resent.
     if (this.#closing) throw new ShuttingDownError();
-    const refusal = this.#admissionRefusal(token, busy);
+    // The review load awaits a history worker (#170), so it comes first: everything after it, from the token check to the
+    // job's admission, runs in one turn. A load stopped by shutdown decides nothing, as above.
+    let reviewToken: string;
+    try { reviewToken = (await this.service.load({ signal })).token; }
+    catch (error) { if (this.#closing || signal?.aborted) throw new ShuttingDownError(); throw error; }
+    // A resend of this click, or shutdown, may have arrived while the review loaded.
+    if (store.getMergeJob(identity, actionId)) return replay();
+    if (this.#closing) throw new ShuttingDownError();
+    const refusal = this.#admissionRefusal(token, reviewToken, busy);
     if (refusal !== null) {
       // A definite refusal is this click's outcome; a resend replays it (as the guarded merge does).
       if (typeof token === 'string' && token) store.recordMergeJobRefusal(identity, { actionId, token, reason: refusal });
@@ -90,10 +98,10 @@ export class MergeJobCoordinator {
   }
 
   /** Why this click may not start a job now, or null. A preparation stopping for shutdown throws instead (not definite). */
-  #admissionRefusal(token: unknown, busy: () => string | null): string | null {
+  #admissionRefusal(token: unknown, reviewToken: string, busy: () => string | null): string | null {
     const { store, config } = this.service, identity = config.identity;
     if (this.#active) return 'A merge is already running for this task.';
-    if (typeof token !== 'string' || this.service.load().token !== token) return 'Stale review state. Refresh before merging.';
+    if (typeof token !== 'string' || reviewToken !== token) return 'Stale review state. Refresh before merging.';
     const task = store.getTask(identity);
     if (!MERGEABLE_STATUSES.includes(task.status)) return `The task is ${task.status}; merge it from review.`;
     if (task.cancelRequested !== null) return 'The task is being cancelled.';
@@ -129,7 +137,7 @@ export class MergeJobCoordinator {
   async #run(job: MergeJob, signal: AbortSignal): Promise<void> {
     const { store, config } = this.service, identity = config.identity;
     // 1. Prepare: refresh, rebase, review check, push, cmd: checks.
-    let view = this.service.load();
+    let view = await this.service.load({ signal });
     const prepareId = randomUUID(), task = store.getTask(identity);
     store.userAction(identity, { actionId: prepareId, kind: 'prepare-merge',
       request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion, mergeJob: job.id } },
@@ -150,7 +158,7 @@ export class MergeJobCoordinator {
     // The merge's action ID is saved first: after a restart, the attempt carrying it gives the job's outcome.
     const mergeId = randomUUID();
     this.settle(() => store.updateMergeJob(identity, job.id, { step: 'merging', checks: [], mergeActionId: mergeId }));
-    view = this.service.load();
+    view = await this.service.load({ signal });
     try {
       // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
       // is applied; after, the outcome is unknown.
@@ -210,7 +218,7 @@ export class MergeJobCoordinator {
       if (left < 1) return timedOut();
       const limit = AbortSignal.timeout(left);
       let status: MergeStatus;
-      try { status = await this.merges.status(this.service.load(), true, AbortSignal.any([signal, limit])); }
+      try { status = await this.merges.status(undefined, true, AbortSignal.any([signal, limit])); }
       catch (error) {
         if (signal.aborted) return { kind: 'cancelled' };
         if (limit.aborted) return timedOut();

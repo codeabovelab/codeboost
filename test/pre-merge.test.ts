@@ -19,6 +19,22 @@ import type { InvocationHandle, InvocationResult } from '../agents/contract.ts';
 import type { TaskWorkspace, WorkspaceRef } from '../runner/execution.ts';
 import { MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
 import { BranchPushRefused } from '../runner/branch-push.ts';
+import { UpstreamFailure } from '../runner/lifecycle.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
+
+// A passthrough, so a test can act while a preparation's worker history read is in flight.
+const historyReads = vi.hoisted(() => ({ during: undefined as (() => void) | undefined }));
+vi.mock('../runner/history-job.ts', async original => {
+  const actual = await original<typeof import('../runner/history-job.ts')>();
+  return { ...actual, readHistoryInWorker: vi.fn((...args: Parameters<typeof actual.readHistoryInWorker>) => {
+    const reading = actual.readHistoryInWorker(...args); historyReads.during?.(); return reading;
+  }) };
+});
+afterEach(() => { historyReads.during = undefined; });
+/** The review state a load would expect, read synchronously so a hook acts at its exact point in the preparation. */
+const reviewState = (service: ReviewService) => ({ revision: service.store.getPlan(service.config.identity).revision,
+  snapshotId: service.store.getSnapshot(service.config.identity).id, reviewVersion: service.store.reviewVersion(service.config.identity) });
 
 const roots: string[] = [], services: ReviewService[] = [];
 const BRANCH = 'codeboost/task-1';
@@ -69,6 +85,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   /** Runs inside each fetch after a push or refusal, while the fetch is in flight. */
   duringFetchAfterPush?: (service: ReviewService) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
+  /** Runs while each review load the preparation starts is in flight. */
+  duringLoad?: (service: ReviewService) => void;
   closeDuringCommand?: boolean;
   closeAfterCommandAdmission?: boolean;
   commandWaitsForDeadline?: boolean;
@@ -79,7 +97,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   rebaseCleanupFailure?: Error;
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
-  authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
+  /** The second argument lets an authorization stop the preparation while its read is settling. */
+  authorize?: (signal: AbortSignal, fixture: { coordinator: PreMergeCoordinator }) => Promise<PreMergeAuthorization>;
   reserves?: { processMs?: number; commandMs?: number; pushVisibleMs?: number };
   /** The PR API keeps reporting the pre-push head for this many inspections after a push. */
   pushVisibleAfter?: number;
@@ -107,6 +126,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   branchRead?: (current: string, signal?: AbortSignal) => string | null | Promise<string | null>;
   /** Runs while the push reads the remote, before its final local checks (the pusher's `beforePush`). */
   duringPushRead?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
+  /** Saves the preparation's outcome under this action ID, as the server's prepare-merge action does. */
+  actionId?: string;
+  /** Runs while a command check runs (when its workspace is materialized). */
+  duringCommand?: (service: ReviewService) => void;
+  /** Runs after a command check's terminal write, while the runner releases its workspace. */
+  duringRelease?: (service: ReviewService) => void;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -133,10 +158,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     acceptance: commandExit === undefined ? [{ type: 'check', text: 'a changed' }] : [{ type: 'cmd', text: 'npm test' }], depends_on: [] }] };
   const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands };
   service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
-  let view = service.load();
+  let view = await service.load();
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
   if (options.runnerCommitted !== false) markRunnerOwned(service, options.published === true); else markRunnerUnchanged(service);
-  view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
+  view = await service.load(); view = await service.act({ action: 'approve', item: 'P1', token: view.token });
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
   let rebaseAborts = 0;
   const rebaseBudgets: Array<number | undefined> = [], abortBudgets: Array<number | undefined> = [];
@@ -166,11 +191,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const workspace: TaskWorkspace = {
     async materialize(attempt, checkedHead) {
       checkedHeads.push(checkedHead);
+      options.duringCommand?.(service);
       return { clone: { id: attempt.id, taskId: 'task', directory: repository, head: checkedHead }, storage: {} } as WorkspaceRef;
     },
     async snapshotDeclaredLinks() { throw new Error('not used'); }, async checkTree() { throw new Error('not used'); },
     async inspectChanges() { throw new Error('not used'); }, async commit() { throw new Error('not used'); },
-    async release() { if (options.releaseFails) throw new Error('cleanup failed'); },
+    async release() { options.duringRelease?.(service); if (options.releaseFails) throw new Error('cleanup failed'); },
   };
   const cancelReasons: string[] = [];
   const runner = new RunnerCoordinator(service.store, commandCheckDeps(service.store, workspace, input => {
@@ -219,10 +245,20 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const pushes: { branch: string; from: string; to: string }[] = [];
   let lagging = 0, lagged = remotePair, branchReads = 0, fetchesAfterPush = 0;
   let authorizationChecks = 0;
-  const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
+  const authorize = options.authorize ? (signal: AbortSignal) => options.authorize!(signal, { coordinator }) : (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
     validate: () => { remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair; },
   }) : undefined);
+  if (options.duringLoad) {
+    const load = service.load.bind(service);
+    service.load = (loadOptions?: Parameters<ReviewService['load']>[0]) => {
+      const loading = load(loadOptions);
+      // A hook that throws fails this load as a worker failure would: asynchronously, once the real load has settled.
+      try { options.duringLoad!(service); }
+      catch (error) { return loading.then(() => { throw error; }, () => { throw error; }); }
+      return loading;
+    };
+  }
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
@@ -275,9 +311,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     }) as RunnerCoordinator['start'];
   }
   const task = service.store.getTask(identity);
+  const actionRequest = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
+  if (options.actionId) service.store.userAction(identity, { actionId: options.actionId, kind: 'prepare-merge', request: actionRequest }, () => ({ outcome: 'preparing' }));
   const result = options.deferStart ? null as unknown as PreMergeResult : await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
-  return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+    ...(options.actionId ? { actionId: options.actionId } : {}) });
+  return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, actionRequest, pushes, remote: () => remotePair,
     branchReads: () => branchReads, fetchesAfterPush: () => fetchesAfterPush,
     /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
     moveRemote: (pair: { base: string; head: string }, shown?: { base: string; head: string }, reads = 0) => {
@@ -290,7 +329,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
 it('preserves an approval when a moved base leaves its attributed fingerprint unchanged', async () => {
   const { service, coordinator, runner, result, rebased } = await rebaseFixture('feature\n');
   expect(result).toMatchObject({ state: 'ready', head: rebased, checked: [], reason: null });
-  expect(service.load().items.find(item => item.id === 'P1')?.state).toBe('approved');
+  expect((await service.load()).items.find(item => item.id === 'P1')?.state).toBe('approved');
   await coordinator.close(); await runner.close();
 });
 it('prepares a published original head when every runner item was unchanged', async () => {
@@ -303,13 +342,13 @@ it('returns to review when a moved-base rewrite changes an approved fingerprint'
   const { service, coordinator, runner, result, rebased } = await rebaseFixture('changed by rebase\n');
   expect(result).toMatchObject({ state: 'review-required', head: rebased, checked: [] });
   expect(result.reason).toMatch(/requires refreshed attribution or approval/);
-  expect(service.load().items.find(item => item.id === 'P1')?.state).toBe('stale');
+  expect((await service.load()).items.find(item => item.id === 'P1')?.state).toBe('stale');
   await coordinator.close(); await runner.close();
 });
 
 it('marks a failed preparation stale when its final remote inspection was invalidated by a review edit', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { duringFinalInspect(service) {
-    const current = service.load();
+    const current = { expected: reviewState(service) };
     service.store.addReviewNote(service.config.identity, current.expected, 'P1', 'change', 'Changed during inspection.');
   } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
@@ -340,7 +379,7 @@ it('keeps a failed live cleanup current while its rebase marker awaits recovery'
 it('keeps a failed rebase bound to the review that started it when that review changes in flight', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, {
     duringRebase(service) {
-      const current = service.load();
+      const current = { expected: reviewState(service) };
       service.store.addReviewNote(service.config.identity, current.expected, 'P1', 'change', 'Changed during rebase.');
     },
     rebaseFailure: new Error('rebase failed'), rebaseCleanupFailure: new Error('cleanup failed'),
@@ -348,6 +387,28 @@ it('keeps a failed rebase bound to the review that started it when that review c
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it.each([
+  ['timed out', () => new RemoteTimeout('Issue retrieval timed out.')],
+  ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', '')],
+] as const)('saves a preparation whose issue-trust read %s before shutdown with that answer, not the shutdown (#48)', async (_case, answer) => {
+  const actionId = randomUUID();
+  let stoppedFirst = false;
+  const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
+  const fixture = await rebaseFixture('feature\n', undefined, { actionId, authorize: async (signal, { coordinator }) => {
+    // The read answered (or ran out of time) before shutdown, and surfaces while shutdown stops the preparation. This is
+    // the error the server's readIssueAccess builds then: its own answer, wrapped, with the answer as the cause.
+    void coordinator.close();
+    stoppedFirst = signal.aborted;
+    throw new UpstreamFailure(expected, { cause });
+  } });
+  expect(stoppedFirst).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expected });
+  expect(fixture.service.store.savedAction(fixture.service.config.identity, { actionId, kind: 'prepare-merge', request: fixture.actionRequest })?.response)
+    .toMatchObject({ outcome: 'failed', reason: expected });
+  expect(fixture.rebaseRuns()).toBe(0);
+  await fixture.runner.close();
 });
 
 it('revalidates authorization before starting the delayed local rebase', async () => {
@@ -377,11 +438,194 @@ it('refuses readiness when local issue trust is revoked during the final remote 
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('refuses a review edit made during the review reload after the push, which awaits a history worker (#170)', async () => {
+  let refreshes = 0, edited = false;
+  // A passing command check, so a missing guard would run it under the stale approvals.
+  const fixture = await rebaseFixture('feature\n', 0, {
+    authorize: async () => ({ refresh: async () => { refreshes++; }, validate: () => undefined }),
+    // The rebase authorizes first and the push second; the next review load is the reload after the push.
+    duringLoad: service => {
+      if (refreshes !== 2 || edited) return;
+      edited = true;
+      service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'change', 'Changed during the reload after the push.');
+    },
+  });
+  expect(edited).toBe(true);
+  expect(fixture.pushes).toHaveLength(1);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  expect(fixture.checkedHeads).toEqual([]); // No command check ran under the stale approvals.
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when the task is reassigned during the review reload after a command check (#170)', async () => {
+  // A passing command check; the reload that follows it is the first load after the check settled.
+  let settledChecks = 0, changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringLoad(service) {
+    const identity = service.config.identity;
+    settledChecks = service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check' && attempt.state === 'completed').length;
+    if (settledChecks !== 1 || changed) return;
+    changed = true;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports a failure of the review reload after the rebase itself as current, not stale', async () => {
+  let firstHead: string | undefined, failed = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringLoad(service) {
+    const head = service.store.getSnapshot(service.config.identity).head;
+    firstHead ??= head;
+    if (head === firstHead || failed) return;
+    failed = true;
+    throw new Error('History worker timed out.'); // The reload fails on its own; nothing else changed.
+  } });
+  expect(failed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'History worker timed out.' });
+  expect(fixture.coordinator.last?.stale).toBe(false);
+  expect(fixture.pushes).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports a command check stopped by a reassignment as stale, not as a current failure', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringCommand(service) {
+    if (changed) return;
+    changed = true;
+    const identity = service.config.identity;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses, as stale, a reassignment after a command check\'s terminal write, while its workspace is released', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringRelease(service) {
+    if (changed) return;
+    changed = true;
+    const identity = service.config.identity;
+    // The check has already settled as completed; only the task's context changes now.
+    expect(service.store.getAttempts(identity).some(attempt => attempt.kind === 'check' && attempt.state === 'completed')).toBe(true);
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses, as stale, a change request added while a command check runs, instead of adopting it', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringCommand(service) {
+    if (changed) return;
+    changed = true;
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'change', 'Requested during the check.');
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when local issue trust is revoked during the final review load', async () => {
+  let trusted = true, refreshes = 0, inspected = 0;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    authorize: async () => ({ refresh: async () => { refreshes++; },
+      validate: () => { if (!trusted) throw new Error('Issue trust was revoked.'); } }),
+    duringFinalInspect: (_service, _coordinator, read) => { inspected = read; },
+    // The rebase authorizes first and the push (F6a) second; the review load after the third (final) authorization read
+    // is the final one.
+    duringLoad: () => { if (refreshes === 3) trusted = false; },
+  });
+  // Refused by the check after the final remote inspection, not earlier.
+  expect(inspected).toBe(3);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Issue trust was revoked.' });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('inspects the pull request after its last review load, so no worker await follows the final remote read', async () => {
+  const events: string[] = [];
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    duringLoad: () => { events.push('load'); },
+    duringFinalInspect: () => { events.push('inspect'); },
+  });
+  expect(fixture.result).toMatchObject({ state: 'ready' });
+  expect(events.lastIndexOf('inspect')).toBeGreaterThan(events.lastIndexOf('load'));
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when the task changes during the final review load', async () => {
+  let refreshes = 0, inspected = 0, cancelled = false;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    authorize: async () => ({ refresh: async () => { refreshes++; }, validate: () => undefined }),
+    duringFinalInspect: (_service, _coordinator, read) => { inspected = read; },
+    // The rebase authorizes first and the push (F6a) second; the review load after the third (final) authorization read
+    // is the final one.
+    duringLoad: service => {
+      if (refreshes !== 3 || cancelled) return;
+      cancelled = true;
+      const identity = service.config.identity;
+      service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID());
+    },
+  });
+  expect(cancelled).toBe(true);
+  // Refused by the guard on the final review load itself, before the final remote inspection, and reported as stale.
+  expect(inspected).toBe(2);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses to rebase when the task changes while the old history is read', async () => {
+  let changed = false;
+  historyReads.during = () => {
+    if (changed) return;
+    changed = true;
+    // Still mergeable and the same review: only the task's state version moves.
+    const service = fixtureService!, identity = service.config.identity;
+    service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
+  };
+  let fixtureService: ReviewService | undefined;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringLoad: service => { fixtureService = service; } });
+  expect(changed).toBe(true);
+  expect(fixture.rebaseRuns()).toBe(0);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses to record a moved pull request head when the task changes while its history is read', async () => {
+  let moved = false, changed = false, reviewing: ReviewService | undefined;
+  historyReads.during = () => {
+    if (!moved || changed) return;
+    changed = true;
+    // Still mergeable and the same review: only the task's state version moves.
+    const identity = reviewing!.config.identity;
+    reviewing!.store.transitionTask(identity, reviewing!.store.getTask(identity).stateVersion, 'in review');
+  };
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    reviewing = service;
+    if (call !== 2) return;
+    moved = true;
+    writeFileSync(join(service.config.repository, 'late.txt'), 'late collaborator push\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'late push');
+    return { base: service.store.getSnapshot(service.config.identity).base, head: fixtureGit(service.config.repository, 'rev-parse', 'HEAD') };
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('does not report readiness while a current change request remains open', async () => {
   const fixture = await rebaseFixture('feature\n');
-  const current = fixture.service.load();
+  const current = await fixture.service.load();
   fixture.service.store.addReviewNote(fixture.service.config.identity, current.expected, 'P1', 'change', 'Please revise this.');
-  const changed = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
+  const changed = await fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const result = await fixture.coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: changed.expected.reviewVersion!, snapshotId: changed.snapshot.id, base: changed.snapshot.base, head: changed.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', checked: [] });
@@ -391,8 +635,8 @@ it('does not report readiness while a current change request remains open', asyn
 
 it('preserves an unpushed rebased head across review and preparation retries', async () => {
   const first = await rebaseFixture('changed by rebase\n');
-  let view = first.service.load();
-  view = first.service.act({ action: 'approve', item: 'P1', token: view.token });
+  let view = await first.service.load();
+  view = await first.service.act({ action: 'approve', item: 'P1', token: view.token });
   const task = first.service.store.getTask(first.service.config.identity);
   const result = await first.coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
@@ -428,7 +672,7 @@ it('does not report readiness when command-check cleanup is unresolved', async (
 it('revalidates task and review versions after the final remote read', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, {
     duringFinalInspect(service) {
-      const view = service.load();
+      const view = { expected: reviewState(service) };
       service.store.addReviewNote(service.config.identity, view.expected, 'P1', 'change', 'Changed while preparing.');
     },
   });
@@ -440,7 +684,7 @@ it('revalidates task and review versions after the final remote read', async () 
 it('revalidates task and review versions after final authorization', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
     if (call !== 4) return; // validations: 1 rebase, 2 push read, 3 push boundary, 4 final
-    const view = service.load();
+    const view = { expected: reviewState(service) };
     service.store.addReviewNote(service.config.identity, view.expected, 'P1', 'change', 'Changed during authorization.');
   } });
   expect(fixture.result).toMatchObject({ state: 'failed' });
@@ -453,18 +697,18 @@ it('refreshes a pull request head that moves during final authorization', async 
     if (call !== 4) return; // validations: 1 rebase, 2 push read, 3 push boundary, 4 final
     writeFileSync(join(service.config.repository, 'late.txt'), 'late collaborator push\n');
     fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'late push');
-    return { base: service.load().snapshot.base, head: fixtureGit(service.config.repository, 'rev-parse', 'HEAD') };
+    return { base: service.store.getSnapshot(service.config.identity).base, head: fixtureGit(service.config.repository, 'rev-parse', 'HEAD') };
   } });
   expect(fixture.result).toMatchObject({ state: 'review-required' });
   expect(fixture.result.reason).toMatch(/moved during final authorization/);
-  expect(fixture.service.load().snapshot.head).toBe(fixture.result.head);
+  expect((await fixture.service.load()).snapshot.head).toBe(fixture.result.head);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
 it('marks historical readiness stale after the review changes', async () => {
   const fixture = await rebaseFixture('feature\n');
   expect(fixture.coordinator.last).toMatchObject({ state: 'ready', stale: false });
-  const view = fixture.service.load();
+  const view = await fixture.service.load();
   fixture.service.store.addReviewNote(fixture.service.config.identity, view.expected, 'P1', 'change', 'Review changed later.');
   expect(fixture.coordinator.last).toMatchObject({ state: 'ready', stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
@@ -477,7 +721,7 @@ it.each([
   const fixture = await rebaseFixture(text, exitCode);
   expect(fixture.result.state).toBe(state);
   expect(fixture.coordinator.last).toMatchObject({ state, stale: false });
-  const view = fixture.service.load();
+  const view = await fixture.service.load();
   fixture.service.store.addReviewNote(fixture.service.config.identity, view.expected, 'P1', 'change', 'Review changed later.');
   expect(fixture.coordinator.last).toMatchObject({ state, stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
@@ -547,11 +791,45 @@ it('stops an active command check when the operation-wide deadline expires', asy
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('refuses to record a head moved before preparation when the task changes while its history is read', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = await service.load();
+  const work = join(root, 'collaborator');
+  fixtureGit(config.repository, 'branch', 'collaborator-push', view.snapshot.head);
+  fixtureGit(config.repository, 'worktree', 'add', '-q', work, 'collaborator-push');
+  writeFileSync(join(work, 'README.md'), 'A collaborator changed this before preparation.\n');
+  fixtureGit(work, 'add', 'README.md'); fixtureGit(work, 'commit', '-qm', 'collaborator push');
+  const moved = { base: view.snapshot.base, head: fixtureGit(work, 'rev-parse', 'HEAD') };
+  let changed = false;
+  historyReads.during = () => {
+    if (changed) return;
+    changed = true;
+    // Still mergeable and the same review: only the task's state version moves.
+    service.store.transitionTask(config.identity, service.store.getTask(config.identity).stateVersion, 'in review');
+  };
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => moved, fetch: async () => undefined,
+      push: async () => { throw new Error('No push expected.'); }, readBranch: async () => { throw new Error('No branch read expected.'); } });
+  const task = service.store.getTask(config.identity);
+  const result = await coordinator.start({ stateVersion: task.stateVersion,
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+  expect(changed).toBe(true);
+  expect(result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
+  expect(service.store.getSnapshot(config.identity).head).toBe(view.snapshot.head);
+  await coordinator.close();
+});
+
 it('refreshes the moved head against its prior base when the PR base and head advance together', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load();
+  const view = await service.load();
   const initial = { base: view.snapshot.base, head: view.snapshot.head };
   const branch = 'collaborator-refresh', work = join(root, 'collaborator');
   fixtureGit(config.repository, 'branch', branch, initial.head);
@@ -575,7 +853,7 @@ it('refreshes the moved head against its prior base when the PR base and head ad
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result.reason).toMatch(/head moved/);
   expect(result).toMatchObject({ state: 'review-required', base: initial.base, head: moved.head, checked: [] });
-  const refreshed = service.load();
+  const refreshed = await service.load();
   expect(refreshed.snapshot).toMatchObject({ base: initial.base, head: moved.head });
   expect(refreshed.segments.some(segment => segment.row === 'Unplanned')).toBe(true);
   expect(refreshed.items.some(item => item.state !== 'approved')).toBe(true);
@@ -611,13 +889,13 @@ it('traces an unpushed rewrite back to the base of a collaborator head', async (
     acceptance: [{ type: 'check', text: 'a changed' }], depends_on: [] }] };
   const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands: [] };
   service.store.createPlan(JSON.stringify(plan), 'json', context, oldBase, oldHead);
-  let view = service.load();
+  let view = await service.load();
   service.store.recordHistory(identity, view.expected, oldBase, oldHead,
     [{ sha: oldHead, owner: 'P1', origin: 'owned', sourceSha: null }]);
-  markRunnerOwned(service); view = service.load();
+  markRunnerOwned(service); view = await service.load();
   service.store.recordRebase(identity, view.expected, newBase, rewrittenHead,
     [{ oldSha: oldHead, newSha: rewrittenHead }]);
-  view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
+  view = await service.load(); view = await service.act({ action: 'approve', item: 'P1', token: view.token });
   let reads = 0;
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
@@ -631,7 +909,7 @@ it('traces an unpushed rewrite back to the base of a collaborator head', async (
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', base: oldBase, head: collaboratorHead });
   expect(result.reason).toMatch(/moved during preparation/);
-  expect(service.load().snapshot).toMatchObject({ base: oldBase, head: collaboratorHead });
+  expect((await service.load()).snapshot).toMatchObject({ base: oldBase, head: collaboratorHead });
   await coordinator.close();
 });
 
@@ -639,7 +917,7 @@ it('refuses preparation before review or remote work while runner cleanup is unr
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-unresolved-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity);
+  const view = await service.load(), task = service.store.getTask(config.identity);
   for (const kind of ['marker', 'resources'] as const) {
     let inspected = false;
     const load = vi.spyOn(service, 'load');
@@ -665,7 +943,7 @@ it('refuses preparation before review or remote work while a durable rebase mark
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-rebase-marker-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load();
+  const view = await service.load();
   service.store.beginRebase(config.identity, { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
     reviewVersion: view.expected.reviewVersion! },
     service.store.getTask(config.identity).stateVersion,
@@ -692,7 +970,7 @@ it('preserves an already-requested shutdown without loading the review', async (
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-pre-aborted-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity);
+  const view = await service.load(), task = service.store.getTask(config.identity);
   const load = vi.spyOn(service, 'load');
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
@@ -711,7 +989,7 @@ it('settles an admitted action after shutdown aborts its remote refresh', async 
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-shutdown-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
+  const view = await service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
   const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
   service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   const capability = service.store.shutdownCapability();
@@ -735,7 +1013,7 @@ it('applies one operation-wide deadline to remote work and later checks', async 
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-deadline-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity);
+  const view = await service.load(), task = service.store.getTask(config.identity);
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
       stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
@@ -752,7 +1030,7 @@ it('aborts remote work early enough to reserve bounded subprocess settlement', a
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-remote-settlement-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity);
+  const view = await service.load(), task = service.store.getTask(config.identity);
   let abortedAt = -1;
   const processReserve = 1_000, operationTimeout = 2_000;
   const coordinator = new PreMergeCoordinator(service,
@@ -810,7 +1088,7 @@ it('makes a preparation action resendable when its terminal storage write fails'
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-settlement-failure-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
+  const view = await service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
   const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
   const readiness = { stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
     snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
@@ -845,7 +1123,7 @@ it('settles a failed preparation even when the fallback snapshot read would fail
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-fallback-read-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
-  const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
+  const view = await service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
   const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
   service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   const original = service.store.getSnapshot.bind(service.store); let reads = 0;
@@ -871,7 +1149,7 @@ it('threads the remaining operation budget through every synchronous review relo
   const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS
     + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 10_000, processMs = 10_000;
   const fixture = await rebaseFixture('feature\n', undefined, { operationTimeoutMs, reserves: { processMs, commandMs: 0 } });
-  const view = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
+  const view = await fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const original = fixture.service.load.bind(fixture.service); const budgets: number[] = [];
   vi.spyOn(fixture.service, 'load').mockImplementation(options => {
     budgets.push(options?.maxDurationMs ?? -1); return original(options);
@@ -901,10 +1179,10 @@ it('rechecks the remote after local preparation and refreshes a head that moved 
     acceptance: [{ type: 'check', text: 'a changed' }], depends_on: [] }] };
   const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands: [] };
   service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
-  let view = service.load();
+  let view = await service.load();
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
-  markRunnerOwned(service); view = service.load();
-  view = service.act({ action: 'approve', item: 'P1', token: view.token });
+  markRunnerOwned(service); view = await service.load();
+  view = await service.act({ action: 'approve', item: 'P1', token: view.token });
   const work = join(root, 'collaborator'); fixtureGit(repository, 'branch', 'collaborator-race', head);
   fixtureGit(repository, 'worktree', 'add', '-q', work, 'collaborator-race');
   writeFileSync(join(work, 'a.txt'), 'collaborator\n'); fixtureGit(work, 'commit', '-am', 'collaborator', '-q');
@@ -921,13 +1199,13 @@ it('rechecks the remote after local preparation and refreshes a head that moved 
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', base, head: moved.head, checked: [] });
   expect(result.reason).toMatch(/moved during preparation/);
-  expect(service.load().segments.some(segment => segment.row === 'Unplanned')).toBe(true);
+  expect((await service.load()).segments.some(segment => segment.row === 'Unplanned')).toBe(true);
   await coordinator.close();
 });
 
 // F6a of #22: the reviewed, rewritten head is pushed over exactly the remote head it rewrote, bracketed by a durable marker.
-const prepareAgain = (fixture: Awaited<ReturnType<typeof rebaseFixture>>) => {
-  const identity = fixture.service.config.identity, view = fixture.service.load();
+const prepareAgain = async (fixture: Awaited<ReturnType<typeof rebaseFixture>>) => {
+  const identity = fixture.service.config.identity, view = await fixture.service.load();
   return fixture.coordinator.start({ stateVersion: fixture.service.store.getTask(identity).stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
 };
@@ -979,13 +1257,13 @@ it('does not record a refused push\'s observation into a review edited during th
   }, duringVisibilityWait(service) {
     // A person edits the review while GitHub still shows the pre-push head.
     if (edited) return; edited = true;
-    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the wait.');
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'change', 'Changed during the wait.');
   } });
   expect(edited).toBe(true);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(fixture.coordinator.last?.stale).toBe(true);
   // The collaborator head was not recorded into the edited review.
-  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  expect((await fixture.service.load()).snapshot.head).not.toBe(collaborator);
   // Caught before the collaborator head was even fetched.
   expect(fixture.fetchesAfterPush()).toBe(0);
   expect(pushMarker(fixture)).toBeNull();
@@ -1002,12 +1280,12 @@ it('does not record a refused push\'s observation into a review edited while the
   }, duringFetchAfterPush(service) {
     // A person edits the review while the collaborator head is being fetched.
     if (edited) return; edited = true;
-    service.store.addReviewNote(service.config.identity, service.load().expected, 'P1', 'change', 'Changed during the fetch.');
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'change', 'Changed during the fetch.');
   } });
   expect(edited).toBe(true);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
   expect(fixture.coordinator.last?.stale).toBe(true);
-  expect(fixture.service.load().snapshot.head).not.toBe(collaborator);
+  expect((await fixture.service.load()).snapshot.head).not.toBe(collaborator);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1020,7 +1298,7 @@ it('waits for GitHub to report the collaborator head that refused the push befor
     return collaborator;
   } });
   expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator });
-  expect(fixture.service.load().snapshot.head).toBe(collaborator);
+  expect((await fixture.service.load()).snapshot.head).toBe(collaborator);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1049,7 +1327,7 @@ it('keeps the push marker when the branch cannot be read, blocks merging, and se
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'timed out' });
   const marker = pushMarker(fixture);
   expect(marker).toMatchObject({ branch: BRANCH, to: fixture.rebased });
-  const view = fixture.service.load();
+  const view = await fixture.service.load();
   expect(() => fixture.service.store.transitionTask(identity, fixture.service.store.getTask(identity).stateVersion, 'queued'))
     .toThrow(/push of the rewritten head is in progress/);
   expect(() => fixture.service.store.beginMergeAttempt(identity, { ...view.expected, reviewVersion: view.expected.reviewVersion! },
@@ -1067,7 +1345,7 @@ it('keeps the push marker when the branch cannot be read, blocks merging, and se
 it('pushes nothing when the review changes at the push boundary', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
     if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
-    const view = service.load();
+    const view = { expected: reviewState(service) };
     service.store.addReviewNote(service.config.identity, view.expected, 'P1', 'change', 'Changed at the push boundary.');
   } });
   expect(fixture.result).toMatchObject({ state: 'failed' });
@@ -1112,7 +1390,7 @@ it('leaves the push marker for startup when shutdown interrupts the push, and st
 it('waits for GitHub to report the pushed head before the later inspections compare against it', async () => {
   const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 2 });
   expect(fixture.result).toMatchObject({ state: 'ready', head: fixture.rebased, checked: ['P1'] });
-  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
+  expect((await fixture.service.load()).snapshot.head).toBe(fixture.rebased);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1122,7 +1400,7 @@ it('fails without refreshing the review when GitHub never reports the pushed hea
   expect(fixture.result.reason).toMatch(/has not reported the pull request's new head yet/);
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(fixture.checkedHeads).toEqual([]);
-  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
+  expect((await fixture.service.load()).snapshot.head).toBe(fixture.rebased);
   expect(pushMarker(fixture)).toBeNull();
   await fixture.coordinator.close(); await fixture.runner.close();
 });
@@ -1161,7 +1439,7 @@ it('reviews a collaborator push that lands on the rewritten head right after it 
   } });
   expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator, checked: [] });
   expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
-  expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
+  expect((await fixture.service.load()).snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
   expect(fixture.checkedHeads).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
@@ -1177,7 +1455,7 @@ it('reviews a collaborator push that lands between the push and its read-back', 
   expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator, checked: [] });
   expect(fixture.result.reason).toMatch(/moved while the rewritten head was being pushed/);
   expect(fixture.service.store.getTask(fixture.service.config.identity).pushInProgress).toBeNull();
-  expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
+  expect((await fixture.service.load()).snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
   expect(fixture.checkedHeads).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
@@ -1193,8 +1471,8 @@ it('keeps waiting while GitHub still reports the pre-push head, even if the base
   expect(fixture.result).toMatchObject({ state: 'review-required', head: fixture.rebased, checked: [] });
   expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
   // The review stays on the head the branch holds, against the base it descends from: never back on the pre-push head.
-  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
-  expect(fixture.service.load().segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
+  expect((await fixture.service.load()).snapshot.head).toBe(fixture.rebased);
+  expect((await fixture.service.load()).segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1212,7 +1490,7 @@ it('pushes nothing when a cancel is committed while the push reads the remote, a
 it('pushes nothing when the reviewed snapshot changes at the push boundary', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
     if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
-    const identity = service.config.identity, view = service.load(), snapshot = service.store.getSnapshot(identity);
+    const identity = service.config.identity, view = { expected: reviewState(service) }, snapshot = service.store.getSnapshot(identity);
     const tree = fixtureGit(service.config.repository, 'rev-parse', `${snapshot.head}^{tree}`);
     const later = fixtureGit(service.config.repository, 'commit-tree', tree, '-p', snapshot.head, '-m', 'later');
     service.store.recordHistory(identity, view.expected, snapshot.base, later, []);
@@ -1255,7 +1533,7 @@ it('after a refused push, traces a lagging earlier push of codeboost\'s own rewr
   expect(fixture.pushes.at(-1)).toMatchObject({ from: original, to: r2 });
   // R1 is reviewed against B1, the base it was rewritten onto: the upstream base commit is not attributed to the PR.
   expect(fixture.service.store.getSnapshot(identity)).toMatchObject({ base: b1, head: r1 });
-  expect(fixture.service.load().segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
+  expect((await fixture.service.load()).segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1453,6 +1731,33 @@ it('pushes nothing when the task is reassigned while the push authorization is r
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it.each([
+  ['reassigned', (service: ReviewService) => {
+    const identity = service.config.identity;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  }],
+  ['given a review edit', (service: ReviewService) => {
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'question', 'Asked during the reload after the rebase.');
+  }],
+] as const)('pushes nothing when the task is %s during the review reload after the rebase (#170)', async (_case, change) => {
+  // The first load sees the original head; the first one that sees another head is the reload after the rebase.
+  let firstHead: string | undefined, changed = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringLoad(service) {
+    const head = service.store.getSnapshot(service.config.identity).head;
+    firstHead ??= head;
+    if (head === firstHead || changed) return;
+    changed = true;
+    change(service);
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  expect(fixture.pushes).toEqual([]);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('keeps the process-settlement reserve inside a settlement read\'s time limit', async () => {
   // Reserve plus 2 s left: the read may run for at most about 2 s, leaving the reserve for Git to settle.
   let startedAt = 0, failedAt = 0, pushedAt = 0;
@@ -1508,7 +1813,7 @@ async function mergeJob(rebasedText: string, commandExit?: number, options: Para
   const merges = new MergeCoordinator(fixture.service, gateway, undefined, undefined,
     { repository: 'acme/app', baseBranch: 'main', requiresPreparation: true });
   const jobs = new MergeJobCoordinator(fixture.service, fixture.coordinator, merges, undefined, { checkWaitMs: 2_000, firstDelayMs: 5, maxDelayMs: 20 });
-  const start = () => jobs.start(fixture.service.load().token, randomUUID());
+  const start = async () => jobs.start((await fixture.service.load()).token, randomUUID());
   const settled = async () => { await jobs.current; return jobs.latest()!; };
   const close = async () => { await jobs.close(); await fixture.coordinator.close(); await fixture.runner.close(); };
   return { ...fixture, merged, merges, jobs, start, settled, close };
@@ -1516,7 +1821,7 @@ async function mergeJob(rebasedText: string, commandExit?: number, options: Para
 
 it('merges through the job when a moved base leaves approvals valid, pushing and checking the rewritten head', async () => {
   const f = await mergeJob('feature\n', 0);
-  f.start();
+  await f.start();
   expect(await f.settled()).toMatchObject({ state: 'merged' });
   expect(f.pushes).toHaveLength(1);
   expect(f.checkedHeads).toEqual([f.rebased]);
@@ -1526,7 +1831,7 @@ it('merges through the job when a moved base leaves approvals valid, pushing and
 
 it('stops the job for review when the rebase makes an approval stale, and merges nothing', async () => {
   const f = await mergeJob('changed by rebase\n');
-  f.start();
+  await f.start();
   expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
   expect(f.merged).toEqual([]);
   await f.close();
@@ -1534,7 +1839,7 @@ it('stops the job for review when the rebase makes an approval stale, and merges
 
 it('fails the job when a command check breaks on the rewritten head', async () => {
   const f = await mergeJob('feature\n', 1);
-  f.start();
+  await f.start();
   expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
   expect(f.merged).toEqual([]);
   await f.close();
@@ -1545,7 +1850,7 @@ it('stops the job for review when a collaborator pushed to the pull request', as
   const repository = f.service.config.repository;
   writeFileSync(join(repository, 'late.txt'), 'collaborator\n'); fixtureGit(repository, 'add', 'late.txt'); fixtureGit(repository, 'commit', '-qm', 'collaborator');
   f.moveRemote({ base: f.remote().base, head: fixtureGit(repository, 'rev-parse', 'HEAD') });
-  f.start();
+  await f.start();
   expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/head moved/) });
   expect(f.pushes).toEqual([]);
   expect(f.merged).toEqual([]);
@@ -1559,7 +1864,7 @@ it('stops a retry for review when its preparation rebases after GitHub refused t
     rebaseResult: (service, input, run) => run < 2 ? undefined : fixtureGit(service.config.repository, 'commit-tree',
       fixtureGit(service.config.repository, 'rev-parse', `${input.oldHead}^{tree}`), '-p', input.onto, '-m', 'feature, rebased again'),
   }, () => refuse);
-  f.start();
+  await f.start();
   expect(await f.settled()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
   expect(f.service.store.getTask(f.service.config.identity).status).toBe('approved but merge blocked');
   // The base moves again before the person retries: the retry's preparation rebases, making a new snapshot.
@@ -1567,10 +1872,10 @@ it('stops a retry for review when its preparation rebases after GitHub refused t
   const repository = f.service.config.repository, base = f.remote().base;
   const moved = fixtureGit(repository, 'commit-tree', fixtureGit(repository, 'rev-parse', `${base}^{tree}`), '-p', base, '-m', 'base moved after the refusal');
   f.moveRemote({ base: moved, head: f.remote().head });
-  f.start();
+  await f.start();
   // After a merge attempt, a replacement snapshot needs every item approved again (#24): the retry stops for review.
   expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
-  expect(f.service.load().items.every(item => item.state === 'stale')).toBe(true);
+  expect((await f.service.load()).items.every(item => item.state === 'stale')).toBe(true);
   expect((await f.merges.status()).blockers).toEqual(expect.arrayContaining([
     expect.objectContaining({ code: 'queue-head', message: expect.stringMatching(/Approve every item again for the replacement snapshot/) })]));
   expect(f.merged).toHaveLength(1);
@@ -1579,8 +1884,9 @@ it('stops a retry for review when its preparation rebases after GitHub refused t
 
 it('ends the job cancelled when the task is cancelled while a command check runs', async () => {
   const f = await mergeJob('feature\n', 0, { commandWaitsForCancellation: true });
-  f.start();
-  await vi.waitFor(() => expect(f.runner.isActive(f.service.config.identity)).toBe(true));
+  await f.start();
+  // The preparation's review loads each await a history worker (#170) before the check starts.
+  await vi.waitFor(() => expect(f.runner.isActive(f.service.config.identity)).toBe(true), { timeout: 20_000 });
   const identity = f.service.config.identity;
   // As the cancel route does: the task's cancel commits (it waits on the running check), then the job is told.
   expect(f.coordinator.cancelTask(f.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');

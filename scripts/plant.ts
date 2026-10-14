@@ -12,7 +12,7 @@ export interface PlantInput { declaredText: string; undeclaredText: string; unde
 /** Prepare a separate local experiment clone. Never rewrites/pushes the source repository.
  * The experiment operator runs this before the reviewer sees the PR; sealed.json is unblinding data.
  */
-export function plant(config: ReviewConfig, destination: string, input: PlantInput): string {
+export async function plant(config: ReviewConfig, destination: string, input: PlantInput): Promise<string> {
   const root=resolve(destination);
   if(existsSync(root))throw new Error('Experiment destination must not exist.');
   let parent=root; const missing:string[]=[];
@@ -32,7 +32,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   try{plan=source.getPlan(config.identity);snapshot=source.getSnapshot(config.identity);entries=source.getLedger(config.identity);}finally{source.close();}
   if(plan.items.some(item=>item.files.some(file=>pathKey(file.path)===pathKey(input.undeclaredPath)||(file.renamed_from!==null&&pathKey(file.renamed_from)===pathKey(input.undeclaredPath)))))throw new Error('Undeclared plant must be outside every declared file.');
   for(const item of plan.items) for(const file of item.files) { pathKey(file.path); if(file.renamed_from) pathKey(file.renamed_from); }
-  const history=readHistory(config.repository,snapshot.base,snapshot.head);
+  const history=await readHistory(config.repository,snapshot.base,snapshot.head);
   const owners=new Map(entries.map(entry=>[entry.sha,entry.owner]));
   const candidates=history.commits.flatMap((commit,index)=>{
     const item=plan.items.find(item=>item.id===owners.get(commit.sha));
@@ -91,5 +91,5 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
 if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href){
   const [configFile,destination,inputFile]=process.argv.slice(2);
   if(!configFile||!destination||!inputFile)throw new Error('Usage: node scripts/plant.ts review.json NEW_DIRECTORY plant-input.json');
-  console.log(plant(JSON.parse(readFileSync(configFile,'utf8')),destination,JSON.parse(readFileSync(inputFile,'utf8'))));
+  console.log(await plant(JSON.parse(readFileSync(configFile,'utf8')),destination,JSON.parse(readFileSync(inputFile,'utf8'))));
 }
