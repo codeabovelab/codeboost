@@ -76,12 +76,14 @@ test('keeps question and change-request text typed before the first review load 
   await page.getByLabel('Change to request').fill('Change typed before the review loaded.');
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
   await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the review loaded.');
-  await page.getByLabel('Question about this item').focus();
+  // Typed after the last mode switch: only the page's handling of the response can save this part.
+  await page.getByLabel('Question about this item').press('End');
+  await page.getByLabel('Question about this item').pressSequentially(' Still typing.');
 
   release();
   await expect(page.locator('#banner')).not.toHaveText(LOADING, { timeout: 30_000 });
   await expect(page.locator('[data-select="P1"]')).toHaveAttribute('aria-current', 'true');
-  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the review loaded.');
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the review loaded. Still typing.');
   await expect(page.getByLabel('Question about this item')).toBeFocused();
   await expect(page.getByText('Retained draft')).toHaveCount(0);
   await page.getByRole('button', { name: 'Request change', exact: true }).click();
@@ -92,7 +94,7 @@ test('keeps question and change-request text typed before the first review load 
   await page.locator('[data-select="P2"]').click();
   await expect(page.getByLabel('Question about this item')).toHaveValue('');
   await page.locator('[data-select="P1"]').click();
-  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the review loaded.');
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the review loaded. Still typing.');
 
   expect(actions).toEqual([]);
   expect(app.service.store.getReviewNotes(app.service.config.identity)).toEqual([]);
@@ -107,16 +109,19 @@ test('keeps text typed before a failed first load and gives it to the first item
   await page.getByRole('button', { name: 'Request change', exact: true }).click();
   await page.getByLabel('Change to request').fill('Change typed before the failed load.');
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  // Typed after the last mode switch, so no mode switch saved this part.
+  await page.getByLabel('Question about this item').press('End');
+  await page.getByLabel('Question about this item').pressSequentially(' Still typing.');
 
   release();
   await expect(page.locator('#banner')).toContainText('Could not read this branch’s history.');
   await expect(page.getByLabel('Question about this item')).toBeDisabled();
-  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load.');
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load. Still typing.');
 
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect(page.locator('[data-select="P1"]')).toHaveAttribute('aria-current', 'true', { timeout: 30_000 });
   await expect(page.getByLabel('Question about this item')).toBeEnabled();
-  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load.');
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load. Still typing.');
   await expect(page.getByText('Retained draft')).toHaveCount(0);
   await page.getByRole('button', { name: 'Request change', exact: true }).click();
   await expect(page.getByLabel('Change to request')).toHaveValue('Change typed before the failed load.');

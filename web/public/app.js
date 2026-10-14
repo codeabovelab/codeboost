@@ -1194,8 +1194,9 @@ async function importPlan(event) {
   event.preventDefault();
   if (planImportPending) return;
   // The busy refusal and the "still loading" refusal keep the current status ownership, so a running Apply, review read
-  // or Refresh plan replaces them with its result instead of being hidden by them. With nothing running, the "no plan"
-  // refusal and the file refusal below claim the line, like the import itself.
+  // or Refresh plan replaces them with its result instead of being hidden by them. The "no plan" refusal claims the line
+  // only when nothing is running. The file refusal below always claims it, like the import itself: feedback on the
+  // file just chosen is newer than any read already running, so that read's result must not replace it.
   if (busy && busyKind !== "read") {
     setPlanStatus(planStatusGeneration, "warn", "! Wait for the current review action before importing a plan.");
     return;
