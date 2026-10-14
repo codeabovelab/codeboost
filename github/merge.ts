@@ -9,8 +9,10 @@ import { BRANCH, REPOSITORY, SHA } from './validate.ts';
  * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
  * it exits. Every gh call of this gateway settles only when gh has stopped, so a call aborted at a deadline settles up
  * to 0.4 s later, and an inspection (at most 12 s) within 12.4 s. A merge click (14 s deadline in runner/merge.ts) can
- * also be waiting on its issue-trust read, whose stop wait is 0.75 s (github/issues.ts), so it settles within about
- * 14.75 s: below the 15-second serving request budget, though past the 14.5 s shutdown drain (docs/implementation/merge-queue.md).
+ * also be waiting on its issue-trust read, whose stop wait is 0.75 s (github/issues.ts), or on a review load, whose
+ * history worker gets 1 s after the abort before it is terminated (runner/history-job.ts). So it settles about 0.75 s
+ * after its deadline, or about 1 s or a little more when a review load was running: past the 14.5 s shutdown drain
+ * (docs/implementation/merge-queue.md).
  */
 export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
 /**

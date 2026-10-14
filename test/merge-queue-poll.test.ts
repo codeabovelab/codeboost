@@ -276,8 +276,9 @@ async function serveApproved(gateway: (app: () => Awaited<ReturnType<typeof star
   const send = () => fetch(new URL('/api/action', app.url), { method: 'POST', headers: { 'x-codeboost-token': app.token, 'Content-Type': 'application/json' }, body: click });
   return { app, send, remove: () => rmSync(root, { recursive: true, force: true }) };
 }
-const remoteFor = async (app: Awaited<ReturnType<typeof startServer>>, mergeQueue: boolean): Promise<RemoteMergeState> => {
-  const snapshot = (await app.service.load()).snapshot;
+// The recorded snapshot, read from the Store: a review load here would run a history worker inside every inspection.
+const remoteFor = (app: Awaited<ReturnType<typeof startServer>>, mergeQueue: boolean): RemoteMergeState => {
+  const snapshot = app.service.store.getSnapshot(app.service.config.identity);
   return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue,
     requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
 };
@@ -330,8 +331,9 @@ it('answers a merge click whose issue-trust read gh answered before the merge de
     async issueText(number: number) { return { number, title: '', body: '', comments: [] }; },
   };
   const { app, send, remove } = await serveApproved(app => ({
-    // The first inspection after the click's first trust read takes 2.5 s, so the refresh starts late enough that its own
-    // 12 s would end after the 14 s deadline: the deadline is what stops it, after gh had answered.
+    // The first inspection after the click's first trust read takes 2.5 s (plus the click's review loads), so the refresh
+    // starts late enough that its own 12 s would end after the 14 s deadline: the deadline is what stops it, after gh had
+    // answered.
     inspect: async () => { if (slowNext) { slowNext = false; await new Promise(resolve => setTimeout(resolve, 2_500)); } return remoteFor(app(), false); },
     merge: async () => { throw new Error('The merge command must not run.'); },
   }), { github: true, issues });
@@ -366,8 +368,10 @@ it.each(['alone', 'before the merge deadline'] as const)('answers a merge click 
     async issueText(number: number) { return { number, title: '', body: '', comments: [] }; },
   };
   const { app, send, remove } = await serveApproved(app => ({
-    // In the deadline case the first inspection after each click's first trust read takes 1.6 s, so the refresh's own 12 s
-    // ends at about 13.6 s, before the 14 s deadline, while gh is still stopping when the deadline fires.
+    // In the deadline case the first inspection after each click's first trust read takes 1.6 s, so in production the
+    // refresh's own 12 s would end at about 13.6 s plus the click's review loads, near the 14 s deadline, with gh still
+    // stopping when the deadline fires. This mock ignores the read's own timeout and answers RemoteTimeout once aborted,
+    // so the answer does not depend on which of the two fires first.
     inspect: async () => {
       if (slowNext) { slowNext = false; await new Promise(resolve => setTimeout(resolve, 1_600)); }
       return remoteFor(app(), false);

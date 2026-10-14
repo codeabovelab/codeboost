@@ -8,7 +8,7 @@ import { timedOut } from '../github/timeout.ts';
 
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
-/** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (0.4 s in github/merge.ts, 0.75 s for the issue-trust read in github/issues.ts). */
+/** The longest a merge click may run before it is aborted; the stop wait of the step it was in comes on top (a gh call: 0.4 s in github/merge.ts, 0.75 s for the issue-trust read in github/issues.ts; a review load: its history worker's 1 s grace, then termination, in runner/history-job.ts). */
 export const MERGE_OPERATION_TIMEOUT_MS = 14_000;
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The blocker codes `#attemptBlocker` produces: what the merge attempt on record says. The Record type forces every code to be listed. */
