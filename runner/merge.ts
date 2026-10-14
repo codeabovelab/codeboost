@@ -259,12 +259,17 @@ export class MergeCoordinator {
 
   /**
    * The status to answer a merge click with. The click's status was read before the command, so its readiness is
-   * recomputed from the attempt the command left on record, which is active or merged after a submission (#48).
+   * recomputed from the attempt on record, which is active or merged after a submission (#48). That GitHub readiness
+   * is stale once the command ran: if the attempt has already ended (a queue poll during the server's review reload),
+   * the answer offers no action and asks for a refresh, so a retry is only offered from a fresh GitHub read.
    */
   statusAfterMerge(status: MergeStatus | MergeUnavailableStatus): MergeStatus | MergeUnavailableStatus {
     // An unavailable status already offers nothing.
     if (status.remote === null) return status;
-    return this.#withAttempt(this.#attempt(), status.blockers.filter(blocker => !Object.hasOwn(ATTEMPT_BLOCKERS, blocker.code)), status.remote);
+    const current = this.#withAttempt(this.#attempt(), status.blockers.filter(blocker => !Object.hasOwn(ATTEMPT_BLOCKERS, blocker.code)), status.remote);
+    if (!current.ready) return current;
+    return { ...current, ready: false, action: null,
+      blockers: [{ code: 'refresh', message: 'The merge attempt ended. Refresh to read GitHub\'s current state before trying again.' }, ...current.blockers] };
   }
 
   /** What the merge attempt on record says, shown first. */

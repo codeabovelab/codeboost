@@ -283,6 +283,29 @@ const remoteFor = (app: Awaited<ReturnType<typeof startServer>>, mergeQueue: boo
     requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
 };
 
+// Copilot (126b07f): a queue poll can end the attempt while the server reloads the review after a successful enqueue.
+// The click's GitHub readiness was read before the command, so its answer must not offer a retry from it.
+it('answers a successful enqueue inactively when a poll ends the attempt before the answer is built', async () => {
+  const h = harness();
+  try {
+    const before = await h.coordinator.status(h.view); // The pre-command readiness the server holds for the click.
+    expect(before).toMatchObject({ ready: true, action: 'merge' });
+    const merging = h.coordinator.merge(h.view.token, randomUUID());
+    await h.commandRunning();
+    h.commands[0]!.resolve({ url: 'https://github.example/pr/7' });
+    await merging;
+    // During the server's post-command review load, a poll sees GitHub remove the entry.
+    const polling = h.coordinator.pollQueue();
+    await h.inspectionRunning();
+    h.inspections[0]!.resolve({ state: 'removed', reviewedHead: sha('b'), removedAt: '2026-10-14T08:05:00Z', reason: 'A required check failed.' });
+    await polling;
+    expect(h.store.getMergeAttempt(h.identity)?.state).not.toMatch(/^(submitting|queued|merged)$/);
+    const answer = h.coordinator.statusAfterMerge(before);
+    expect(answer).toMatchObject({ ready: false, action: null });
+    expect(answer.blockers.map(blocker => blocker.code)).toContain('refresh');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 // Copilot's fifth concern ("Return inactive lifecycle status after successful enqueue", web/server.ts; fix 6 in the docs):
 // a successful merge response reports the pre-command readiness next to the now-active attempt.
 it.each([['queue enqueue', true, 'queued'], ['direct merge', false, 'merged']] as const)('answers a successful %s with an inactive lifecycle status', async (_kind, mergeQueue, state) => {
