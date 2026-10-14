@@ -229,6 +229,58 @@ it('answers an outcome another coordinator saved meanwhile, even when a timeout 
   } finally { store.close(); }
 });
 
+it('answers a success saved meanwhile after the click\'s own abort without loading the review or reading GitHub again', async () => {
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const store = new Store(':memory:');
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Merge', questions: [], items: [{ id: 'P1', title: 'Merge', intent: 'Merge safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const view = readyView({ expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } });
+  const gh = stoppingRun();
+  let laterCalls = 0, first = true;
+  // The click's first gh call is held until shutdown stops it; any later call (a replay's GitHub read) is counted.
+  const run: Run = (args, options) => {
+    if (first) { first = false; return gh.run(args, options); }
+    laterCalls++;
+    return Promise.reject(options?.signal?.reason ?? new Error('Unexpected gh call.'));
+  };
+  const load = vi.fn(() => view);
+  const coordinator = new MergeCoordinator({ store, config: { identity }, load } as unknown as ReviewService, new GhMergeGateway(config, run));
+  const actionId = randomUUID();
+  try {
+    const merging = coordinator.merge(view.token, actionId);
+    await gh.started;
+    // Another coordinator on this database merged the same click meanwhile.
+    store.userAction(identity, { actionId, kind: 'merge', request: { token: view.token } },
+      () => ({ attemptId: 'other', state: 'merged', reason: null, url: 'https://github.com/owner/repo/pull/7' }));
+    const loadsBefore = load.mock.calls.length;
+    const closing = coordinator.close(); // Shutdown aborts the click while its gh call runs.
+    await gh.stopped;
+    gh.release();
+    const answer = await merging;
+    await closing;
+    expect(answer.result).toEqual({ url: 'https://github.com/owner/repo/pull/7' });
+    expect(answer.status.blockers).toEqual([expect.objectContaining({ code: 'refresh' })]); // It asks for a refresh instead.
+    expect(load.mock.calls.length).toBe(loadsBefore);
+    expect(laterCalls).toBe(0);
+  } finally { store.close(); }
+});
+
+it('fails a command whose output passes its limit while its pipes drain after it exited', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'merge-stop-buffer-'));
+  const script = join(dir, 'gh.cjs');
+  // The command exits 0 at once; a grandchild that inherited its stdout writes past the limit 0.3 s later.
+  writeFileSync(script, `
+    const { spawn } = require('node:child_process');
+    spawn(process.execPath, ['-e', 'setTimeout(() => { process.stdout.write("x".repeat(4096)); }, 300)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true }).unref();
+  `);
+  try {
+    const started = Date.now();
+    const error = await runWithInput(process.execPath, [script], { maxBuffer: 1024, killGraceMs: 100, pipeGraceMs: 3_000 }).then(() => null, (failure: unknown) => failure);
+    expect((error as Error | null)?.message).toMatch(/exceeded its limit/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250); // The output came during the drain, after the exit.
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 10_000);
+
 it.each([
   ['refusal', 1], ['success', 0],
 ] as const)('gateway merge keeps GitHub\'s %s when the deadline fires after gh exited but before its pipes closed', async (answer, exitCode) => {

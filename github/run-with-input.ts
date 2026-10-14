@@ -26,7 +26,7 @@ export function ghAnswered(error: unknown): boolean {
  * still running, and the promise rejects once it has exited. If a process it started keeps the output pipes open after
  * it exits, the pipes are closed after `pipeGraceMs` so the promise still settles. Once its exit has been observed, the
  * exit status is the answer: a timeout or abort that fires while the pipes drain does not replace it (#48). Output past
- * `maxBuffer` and a late process error still fail it (traced, not tested).
+ * `maxBuffer` still fails it (tested), and so does a late process error (traced, not tested).
  */
 export function runWithInput(command: string, args: readonly string[], options: {
   input?: string; signal?: AbortSignal; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; killGraceMs?: number; pipeGraceMs?: number;

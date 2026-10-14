@@ -386,8 +386,8 @@ export class MergeCoordinator {
     // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after
     // it. A failed re-read is not answered with the older record: read() turns a storage error into "resend" (503).
     const current = () => read()?.response ?? saved.response;
-    // A click that is already aborted starts no GitHub read and joins none: it answers the saved outcome and asks for a
-    // refresh (#48; traced, not tested).
+    // A click that is already aborted loads no review and starts or joins no GitHub read: it answers the saved outcome and
+    // asks for a refresh (#48; test/merge-stop-reasons.test.ts).
     if (signal?.aborted) return Promise.resolve().then(() => answer(current(), unavailable(undefined)));
     // Every replay's read stops at shutdown, which awaits it. A click's replay also reads fresh under its own signal, so
     // its deadline bounds the read and no shared read (a page load's) inherits that signal (#48). Other replays keep the

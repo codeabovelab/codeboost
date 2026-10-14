@@ -167,6 +167,31 @@ describe('start (#91 part 2)', () => {
     expect(await second).toMatchObject({ status: 200, body: { result: accepted.body.result } });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it.each([false, true])('keeps a trust read\'s timeout when shutdown starts while gh stops (outcome saved meanwhile: %s)', async savedMeanwhile => {
+    const readStarted = Promise.withResolvers<void>(), releaseTimeout = Promise.withResolvers<void>();
+    const gateway: IssueTrustGateway = {
+      repository: 'owner/repo',
+      async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
+      // The read's own timeout fired; gh is still stopping when shutdown starts, and the timeout surfaces after that.
+      async issueAccess() { readStarted.resolve(); await releaseTimeout.promise; throw new RemoteTimeout('Issue retrieval timed out.'); },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, close, identity, store } = await serve({ issueGateway: gateway });
+    const { stateVersion, reviewVersion } = await view(app);
+    const actionId = randomUUID();
+    const response = act(app, 'start', { actionId, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion });
+    await readStarted.promise;
+    const saved = { outcome: 'started', item: 'P1' };
+    if (savedMeanwhile) store.userAction(identity, { actionId, kind: 'start', request: { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion } }, () => saved);
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 50)); // Shutdown has started and is draining this request.
+    releaseTimeout.resolve();
+    const answer = await response;
+    expect(store.getAttempts(identity)).toEqual([]);
+    await closing;
+    if (savedMeanwhile) expect(answer).toMatchObject({ status: 200, body: { result: saved } });
+    else expect(answer).toMatchObject({ status: 503, body: { error: 'Issue trust could not be verified: Issue retrieval timed out.' } });
+  });
   it('requires every item of the current plan revision to be approved before start', async () => {
     const { app, identity, store } = await serve({ approve: false });
     expect(await view(app)).toMatchObject({ startable: false });

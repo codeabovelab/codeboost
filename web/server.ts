@@ -344,14 +344,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (stopping || runner?.closing) throw new ShuttingDownError();
       try { access = await readIssueAccess(signal); }
       catch (error) {
-        if (stopping || runner?.closing || signal.aborted) throw new ShuttingDownError();
         // A trust read that ran out of time answered nothing: it is not this action's outcome, so it is not saved, the
         // answer is 503, and the same action ID reads trust again (#48). An outcome saved meanwhile is still the answer.
+        // Its timeout came first, so a shutdown that started while gh stopped does not replace it; nothing is admitted.
         if (timedOut(error)) {
           const saved = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request });
           if (saved) return saved.response;
           throw error;
         }
+        if (stopping || runner?.closing || signal.aborted) throw new ShuttingDownError();
         return service.store.userAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request }, () => { throw error; }).response;
       }
     }
