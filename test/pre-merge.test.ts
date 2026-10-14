@@ -423,7 +423,24 @@ it('refuses a review edit made during the review reload after the push, which aw
   expect(edited).toBe(true);
   expect(fixture.pushes).toHaveLength(1);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
   expect(fixture.checkedHeads).toEqual([]); // No command check ran under the stale approvals.
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when the task is reassigned during the review reload after a command check (#170)', async () => {
+  // A passing command check; the reload that follows it is the first load after the check settled.
+  let settledChecks = 0, changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringLoad(service) {
+    const identity = service.config.identity;
+    settledChecks = service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check' && attempt.state === 'completed').length;
+    if (settledChecks !== 1 || changed) return;
+    changed = true;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -469,9 +486,10 @@ it('refuses readiness when the task changes during the final review load', async
     },
   });
   expect(cancelled).toBe(true);
-  // Refused by the check after the final remote inspection, not earlier.
-  expect(inspected).toBe(3);
+  // Refused by the guard on the final review load itself, before the final remote inspection, and reported as stale.
+  expect(inspected).toBe(2);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/task or review changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -1644,6 +1662,7 @@ it.each([
   } });
   expect(changed).toBe(true);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
   expect(fixture.pushes).toEqual([]);
   expect(fixture.remote().head).not.toBe(fixture.rebased);
   expect(pushMarker(fixture)).toBeNull();
