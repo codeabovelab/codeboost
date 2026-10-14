@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { PlanIdentity } from '../core/identity.ts';
-import { ReviewService, type ReviewConfig } from '../runner/review.ts';
+import { ReviewService, type ReviewConfig, type ReviewView } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MERGE_OPERATION_TIMEOUT_MS, MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
@@ -140,8 +140,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }); }
     } catch (error) { service.close(); throw error; }
   }
-  const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
-  const load=async(signal?:AbortSignal)=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
+  // History reading and linking run in a worker (runner/history-job.ts); `signal` ends with the request at shutdown.
+  const loadReview=async(signal?:AbortSignal)=>{const view=await service.load({signal});return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
+  const load=async(signal?:AbortSignal)=>{const view=await loadReview(signal);return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
@@ -596,6 +597,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       res.writeHead(status, { 'Content-Type': contentType });
     };
     const json = (status: number, value: unknown) => { head(status, 'application/json'); res.end(JSON.stringify(value)); };
+    /** Whether this request's review command (or question retry) has been applied or replayed, so an abort after it leaves the outcome unknown. */
+    let applied = false;
     try {
       if (req.headers.host !== `127.0.0.1:${actualPort}` || (req.headers.origin && req.headers.origin !== origin)) { json(403, { error: 'Local origin required.' }); return; }
       const path = new URL(req.url ?? '/', origin).pathname;
@@ -678,8 +681,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(planningPath) { json(200, { result: await planningAction(path, input, requestAbort.signal) }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
-          const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
-          questions.start(input.id,view);json(200,await load(requestAbort.signal));return;
+          const view=await service.load({signal:requestAbort.signal});if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
+          questions.start(input.id,view);applied=true;json(200,await load(requestAbort.signal));return;
         }
         if(input.action==='merge') {
           // Every merge click carries its idempotency key; a request without one would bypass replay.
@@ -694,30 +697,47 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             if (error instanceof MergeOutcomeUnknown) { json(409,{error:error.message,outcomeUnknown:true}); return; }
             throw error;
           }
-          try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merges.statusAfterMerge(merged.status),queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
+          try { const mergeQueue=merges.queueSnapshot();json(200,{...await loadReview(requestAbort.signal),merge:{...merges.statusAfterMerge(merged.status),queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
           catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
         }
         // Feedback-producing actions need an actionId: the action and its feedback event share one transaction.
         const feedback = input.action==='accept' || input.action==='assign' || (input.action==='note' && input.kind==='change');
         if (feedback) requireAction(input);
-        let view: ReturnType<typeof service.act>, replayed = false;
+        // The command applies to a review loaded before it, synchronously (inside the recorded action when it has an
+        // action ID); its writes are guarded by that review's state. A saved action replays without loading a review
+        // to apply to, and a failed load before the command records nothing under its action ID.
+        let createdNoteId: string | undefined, replayed = false;
         if (input.actionId !== undefined) {
           const { actionId, ...request } = input;
-          const outcome = service.store.userAction(identity, { actionId, kind: `review-${String(input.action).replace(/[^a-z-]/g, '')}`, request }, () => {
-            const acted = service.act(input, actionId); return { createdNoteId: acted.createdNoteId ?? null };
-          });
-          replayed = outcome.replayed;
-          view = { ...service.load(), createdNoteId: outcome.response.createdNoteId ?? undefined };
-        } else view=service.act(input);
-        if(view.createdNoteId && input.kind==='question' && !replayed) {
-          try {questions.start(view.createdNoteId,view);} catch(error) {
-            // The saved question remains visible and retryable when capacity is reached. If shutdown began while this
-            // request was arriving, no agent starts; the question gets a retryable "Server stopped" answer instead.
-            if (questions.stopping) questions.markStopped(view.createdNoteId,service.load());
+          const action = { actionId, kind: `review-${String(input.action).replace(/[^a-z-]/g, '')}`, request };
+          const saved = service.store.savedAction<{ createdNoteId: string | null }>(identity, action);
+          const outcome = saved ? { response: saved.response, replayed: true } : await (async () => {
+            const current = await service.load({ signal: requestAbort.signal });
+            return service.store.userAction(identity, action, () => ({ createdNoteId: service.apply(current, input, actionId) ?? null }));
+          })();
+          replayed = outcome.replayed; createdNoteId = outcome.response.createdNoteId ?? undefined;
+        } else createdNoteId = service.apply(await service.load({ signal: requestAbort.signal }), input);
+        applied = true;
+        const asked = createdNoteId !== undefined && input.kind === 'question' && !replayed ? createdNoteId : null;
+        let answered = false;
+        try {
+          const view: ReviewView & { createdNoteId?: string | undefined } = { ...await service.load({ signal: requestAbort.signal }), createdNoteId };
+          if (asked) {
+            try { questions.start(asked, view); answered = true; } catch {
+              // The saved question remains visible and retryable when capacity is reached. If shutdown began while this
+              // request was arriving, no agent starts; the question gets a retryable "Server stopped" answer instead.
+              if (questions.stopping) { questions.markStopped(asked, view); answered = true; }
+            }
+          }
+          json(200,await load(requestAbort.signal));return;
+        } finally {
+          // Shutdown may stop the reload above before the question was started: it still gets its retryable answer.
+          if (asked && !answered && questions.stopping) {
+            try { questions.markStopped(asked); }
+            catch (error) { console.error(`Could not record the stopped answer of question ${asked}: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
           }
         }
-        json(200,await load(requestAbort.signal));return;
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
@@ -730,7 +750,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
       json(404, { error: 'Not found.' });
     } catch (error) {
-      if (error instanceof ShuttingDownError) { json(503, { error: error.message }); return; }
+      // A failure after a review command or question retry was applied or replayed (its reload failed, or shutdown
+      // aborted it) leaves the outcome unknown to the browser: only a command with an action ID is safe to resend.
+      const unknown = applied ? { outcomeUnknown: true } : {};
+      if (error instanceof ShuttingDownError) { json(503, { error: error.message, ...unknown }); return; }
       if ((error as { code?: string })?.code === 'ERR_SQLITE_ERROR') {
         json(503, { error: error instanceof Error ? error.message : 'Storage failed.', outcomeUnknown: true }); return;
       }
@@ -740,7 +763,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       // preparation and publishing keep it in their own background records).
       if (error instanceof UpstreamFailure && timedOut(error)) { json(503, { error: error.message }); return; }
       if (error instanceof UpstreamFailure) { json(502, { error: error.message }); return; }
-      json(409, { error: error instanceof Error ? error.message : 'Review failed.' });
+      json(409, { error: error instanceof Error ? error.message : 'Review failed.', ...unknown });
     }
     finally {
       activeRequests.delete(activeRequest);

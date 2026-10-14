@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openReview, reloadReview } from './review-page.ts';
 import { lstatSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -114,7 +115,7 @@ async function boot(config: ReviewConfig, observations: {
 }
 
 async function openPlans(page: Page) {
-  await page.goto(app!.url);
+  await openReview(page, app!.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
 }
 

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { openReview, reloadReview } from './review-page.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -36,7 +37,7 @@ const issueRows = (page: import('@playwright/test').Page) => page.locator('#issu
 test('ranks demo issues with visible reasons and trust, and keeps review input across navigation', async ({ page }) => {
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
   app = await startServer(createDemo(join(root, 'demo')), 0);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('heading', { name: 'Bound exponential retries' })).toBeVisible();
   await page.getByLabel('Question about this item').fill('Unsent question');
 
@@ -72,7 +73,7 @@ test('ranks demo issues with visible reasons and trust, and keeps review input a
   await expect(page.getByLabel('Question about this item')).toHaveValue('Unsent question');
 
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
-  await page.reload();
+  await reloadReview(page);
   await expect(page).toHaveURL(/\?view=issues$/);
   await expect(page.getByRole('link', { name: 'Issues', exact: true })).toHaveAttribute('aria-current', 'page');
   await expect(issueRows(page)).toHaveCount(5);
@@ -83,7 +84,7 @@ test('ranks demo issues with visible reasons and trust, and keeps review input a
 
 test('can explicitly trust a collaborator issue to include all comments, then remove that widening', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="17"]');
   await row.getByRole('button', { name: 'Trust all comments' }).click();
@@ -96,7 +97,7 @@ test('can explicitly trust a collaborator issue to include all comments, then re
 
 test('trusts and untrusts a demo issue without GitHub and keeps keyboard focus on the action', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]');
   const trust = row.getByRole('button', { name: 'Trust this issue' });
@@ -106,7 +107,7 @@ test('trusts and untrusts a demo issue without GitHub and keeps keyboard focus o
   const remove = row.getByRole('button', { name: 'Remove trust' });
   await expect(remove).toBeFocused();
   await expect(row.getByLabel(/trusted by you on/i)).toContainText('✓ Trusted by you on');
-  await page.reload();
+  await reloadReview(page);
   await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
   await row.getByRole('button', { name: 'Remove trust' }).focus();
   await page.keyboard.press('Enter');
@@ -123,7 +124,7 @@ test('keeps keyboard focus on an issue link when a pending trust response rerend
     if (body.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
     held = { route, response: await route.fetch() }; captured.resolve();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
   await captured.promise;
@@ -145,7 +146,7 @@ test('ignores an older trust response that returns after a newer action', async 
     first = { route, response: await route.fetch() };
     captured.resolve();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]'), button = row.locator('button.issue-trust');
   await button.click();
@@ -174,7 +175,7 @@ test('reuses the trust action ID after a lost response without overwriting a new
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]');
   await row.getByRole('button', { name: 'Trust this issue' }).click();
@@ -203,7 +204,7 @@ test('does not let an older same-author trust response overwrite a newer untrust
     if (body?.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
     held = { route, response: await route.fetch(), body }; captured.resolve();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]');
   await row.getByRole('button', { name: 'Trust this issue' }).click();
@@ -243,7 +244,7 @@ test('does not let an equal-version trust response overwrite refreshed collabora
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="17"]');
   await row.getByRole('button', { name: 'Trust all comments' }).click();
@@ -271,7 +272,7 @@ test('reuses the trust action ID after a retryable 503', async ({ page }) => {
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]');
   await row.getByRole('button', { name: 'Trust this issue' }).click();
@@ -294,7 +295,7 @@ test('keeps another issue disabled and focused when an overlapping trust request
     held = route;
     captured.resolve();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
   await captured.promise;
@@ -320,7 +321,7 @@ test('keeps one issue trust failure visible when another overlapping request suc
     if (body.number === 23 && !second) { second = { route, response: await route.fetch() }; secondCaptured.resolve(); return; }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
   await firstCaptured.promise;
@@ -347,7 +348,7 @@ test('keeps a refresh failure visible through trust rendering and clears it on t
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect(page.locator('#issues-status')).toContainText('✓ Current');
   failRefresh = true;
@@ -375,7 +376,7 @@ test('does not reconcile a trust failure that occurs after refresh starts', asyn
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect(page.locator('#issues-status')).toContainText('✓ Current');
   holdRefresh = true;
@@ -398,7 +399,7 @@ test('merges successful overlapping trust responses for different issues', async
     held = { route, response: await route.fetch() };
     captured.resolve();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
   await captured.promise;
@@ -426,7 +427,7 @@ test('does not let a refresh started during trust overwrite the committed decisi
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
   await trustCaptured.promise;
@@ -459,7 +460,7 @@ test('does not let an older trust response overwrite a refresh or trust an obsol
     }
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   const row = page.locator('tr[data-issue="21"]');
   await row.getByRole('button', { name: 'Trust this issue' }).click();
@@ -475,7 +476,7 @@ test('does not let an older trust response overwrite a refresh or trust an obsol
 test('shows unavailable, then current, then stale issue data with the retrieval error', async ({ page }) => {
   const { gateway, pending } = scriptedGateway();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Refreshing…' })).toHaveAttribute('aria-disabled', 'true');
   await expect.poll(() => pending.length).toBe(1);
@@ -501,7 +502,7 @@ test('shows unavailable, then current, then stale issue data with the retrieval 
 test('keyboard focus stays on Refresh issues through a refresh', async ({ page }) => {
   const { gateway, pending } = scriptedGateway();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect.poll(() => pending.length).toBe(1);
   pending[0]!.resolve(snapshot(['First']));
@@ -524,7 +525,7 @@ test('keyboard focus stays on Refresh issues through a refresh', async ({ page }
 test('a refresh that returns after the user leaves Issues does not pull them back', async ({ page }) => {
   const { gateway, pending } = scriptedGateway();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect.poll(() => pending.length).toBe(1);
   await page.getByRole('link', { name: 'Review', exact: true }).click();
@@ -542,7 +543,7 @@ test('a refresh that returns after the user leaves Issues does not pull them bac
 
 test('explains that issue ranking needs a GitHub repository', async ({ page }) => {
   app = await startServer({ ...createDemo(join(root, 'demo')), demo: false }, 0);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
   await expect(page.locator('#issues-status')).toHaveText(/^– Not configured\. Issue ranking needs a GitHub repository/);
   await expect(issueRows(page)).toHaveCount(0);

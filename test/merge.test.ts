@@ -7,7 +7,7 @@ import { Store, mergeActionResponse } from '../runner/store.ts';
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 
-type ReviewView = ReturnType<ReviewService['load']>;
+type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
 const sha = (digit: string) => digit.repeat(40);
 const xref = (number: number, willCloseTarget: boolean, over: Record<string, unknown> = {}) => ({ __typename: 'CrossReferencedEvent', willCloseTarget,
   source: { __typename: 'PullRequest', number, state: 'OPEN', isDraft: false, baseRefName: 'main', repository: { nameWithOwner: 'owner/repo' }, ...over } });
@@ -41,7 +41,7 @@ function readyView(): ReviewView {
     plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: 'snapshot', base: sha('a'), head: sha('b') }, token: 'review-token',
   } as unknown as ReviewView;
 }
-function serviceFor(view: ReviewView): ReviewService { return { load: vi.fn(() => view) } as unknown as ReviewService; }
+function serviceFor(view: ReviewView): ReviewService { return { load: vi.fn(async () => view) } as unknown as ReviewService; }
 
 function remote(view: ReviewView, change: Partial<RemoteMergeState> = {}): RemoteMergeState {
   return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false, ...change };
@@ -59,7 +59,7 @@ function queueHarness(observations: Array<MergeQueueObservation | Error>) {
   const context = { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] };
   store.createPlan(JSON.stringify(plan), 'json', context, sha('a'), sha('b'));
   let view = { ...readyView(), expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } } as ReviewView;
-  const service = { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
+  const service = { store, config: { identity }, load: vi.fn(async () => view) } as unknown as ReviewService;
   const merges: string[] = [];
   const client: MergeGateway & MergeQueueGateway = {
     inspect: vi.fn(async () => remote(view, { mergeQueue: true })),
@@ -124,14 +124,15 @@ it('does not report the issue as already fixed by another change once this PR ha
 it('blocks command acceptance that has no current passing runner result', async () => {
   const view = readyView();
   const changed = { ...view, items: view.items.map((item, index) => index ? item : { ...item, acceptance: [{ type: 'cmd' as const, text: 'npm test' }] }) };
-  const fakeService = { load: () => changed } as unknown as ReviewService;
+  const fakeService = { load: async () => changed } as unknown as ReviewService;
   const status = await new MergeCoordinator(fakeService, gateway([remote(view)])).status(changed);
   expect(status.blockers.map(blocker => blocker.code)).toContain('acceptance');
 });
 
 it('rechecks the exact base and head, then invokes the guarded head merge', async () => {
   const view = readyView(), service = serviceFor(view);
-  const client = gateway([remote(view), remote(view)]);
+  // Two validation passes, then one more inspection after the final review load.
+  const client = gateway([remote(view), remote(view), remote(view)]);
   const merged = await new MergeCoordinator(service, client).merge(view.token);
   expect(client.heads).toEqual([view.snapshot.head]);
   expect(merged.result.url).toContain('/pr/1');
@@ -172,7 +173,7 @@ it('refuses a requirement that changes after the initial validation', async () =
 it('revalidates the store generation after the final asynchronous status check', async () => {
   const view = readyView(), changed = { ...view, token: 'new-review-token' };
   let loads = 0;
-  const service = { load: vi.fn(() => ++loads < 3 ? view : changed) } as unknown as ReviewService;
+  const service = { load: vi.fn(async () => ++loads < 3 ? view : changed) } as unknown as ReviewService;
   const client = gateway([remote(view), remote(view)]);
   await expect(new MergeCoordinator(service, client).merge(view.token)).rejects.toThrow(/Review changed during merge validation/);
   expect(client.heads).toEqual([]);
@@ -285,7 +286,7 @@ it('returns a committed merge on replay even when the local review cannot be rel
   const actionId = randomUUID();
   try {
     await h.coordinator.merge(h.view().token, actionId);
-    vi.mocked(h.service.load).mockImplementation(() => { throw new Error('checkout unreadable'); });
+    vi.mocked(h.service.load).mockImplementation(async () => { throw new Error('checkout unreadable'); });
     const replay = await h.coordinator.merge(h.view().token, actionId);
     expect(replay.result).toEqual({ url: 'https://github.example/pr/1' });
     expect(replay.status).toMatchObject({ ready: false, blockers: [{ code: 'refresh' }] });
@@ -394,7 +395,7 @@ it('answers with the in-flight outcome another coordinator saved just before adm
   const inspect = h.client.inspect;
   let inspections = 0, armed = false, injected = false;
   h.client.inspect = vi.fn(async (...args: Parameters<typeof inspect>) => { if (++inspections === 3) armed = true; return inspect(...args); });
-  vi.mocked(h.service.load).mockImplementation(() => {
+  vi.mocked(h.service.load).mockImplementation(async () => {
     const view = h.view();
     if (armed) {
       armed = false; injected = true;
@@ -647,6 +648,27 @@ it('replays a saved merge click after shutdown has started', async () => {
     await h.coordinator.close();
     await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
     await expect(h.coordinator.merge(h.view().token, randomUUID())).rejects.toThrow(/shutting down/);
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('stops a replayed click\'s review load at shutdown and waits for it, still answering the committed merge', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    let signal: AbortSignal | undefined, loadSettled = false;
+    vi.mocked(h.service.load).mockImplementation(options => new Promise((_, reject) => {
+      signal = options?.signal;
+      // The load settles a little after its abort, as a worker does once its Git process has exited.
+      signal?.addEventListener('abort', () => setTimeout(() => { loadSettled = true; reject(signal!.reason); }, 50), { once: true });
+    }));
+    const replay = h.coordinator.merge(h.view().token, actionId);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await h.coordinator.close();
+    expect(loadSettled).toBe(true);
+    await expect(replay).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' }, status: { blockers: [{ code: 'refresh' }] } });
     expect(h.merges).toHaveLength(1);
   } finally { await h.coordinator.close(); h.store.close(); }
 });

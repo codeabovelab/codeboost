@@ -28,14 +28,14 @@ type App = Awaited<ReturnType<typeof startServer>>;
  * A server with a runner whose preparation always fails: an admitted item ends `failed` without an agent, which is
  * enough to see what start and resume admit. `before` shapes the Store before the runner exists, as recovery would.
  */
-async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void;
+async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void | Promise<void>; findings?: (findings: SafetyFindings, service: ReviewService) => void;
   issueGateway?: IssueTrustGateway } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-start-')); roots.push(root);
   const demo = createDemo(join(root, 'demo'));
   const config = options.issueGateway ? { ...demo, demo: false, github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1 } } : demo;
   const app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
-    if (options.approve !== false) approvePlan(service);
-    options.before?.(service);
+    if (options.approve !== false) await approvePlan(service);
+    await options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
@@ -58,8 +58,8 @@ async function act(app: App, action: string, request: { expectedStateVersion?: n
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
 
-function approvePlan(service: ReviewService) {
-  const view = service.load();
+async function approvePlan(service: ReviewService) {
+  const view = await service.load();
   service.store.saveReview(service.config.identity, view.expected,
     view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
 }
@@ -188,7 +188,7 @@ describe('start (#91 part 2)', () => {
     store.saveReview(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
       [{ key: 'later-choice', action: 'assign', item: plan.items[0]!.id }]);
     expect(await view(app)).toMatchObject({ startable: false });
-    approvePlan(app.service);
+    await approvePlan(app.service);
     expect(await view(app)).toMatchObject({ startable: true });
   });
   it('moves a task in review to queued and admits its first item, in one action', async () => {
@@ -477,7 +477,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
   });
   it('clears a recovery requeue when an amended suffix removes the interrupted final item', async () => {
-    const { app, identity, store } = await serve({ before: service => {
+    const { app, identity, store } = await serve({ before: async service => {
       const s = service.store, id = service.config.identity;
       const plan = s.getPlan(id), firstTwo = plan.items.slice(0, 2).map(item => item.id), firstSnapshot = s.getSnapshot(id);
       s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
@@ -497,7 +497,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
           amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare observed output' });
           s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
           const current = s.getPlan(id), snapshot = s.getSnapshot(id);
-          approvePlan(service);
+          await approvePlan(service);
           const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
           service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
           s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
@@ -513,7 +513,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       amended.items = amended.items.slice(0, 2);
       s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
       const current = s.getPlan(id), snapshot = s.getSnapshot(id);
-      approvePlan(service);
+      await approvePlan(service);
       const entries = checkpoint.baseEntries;
       const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
       service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });

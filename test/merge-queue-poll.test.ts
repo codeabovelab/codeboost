@@ -18,7 +18,7 @@ import { CommandFailed } from '../github/run-with-input.ts';
 // reason across a later shutdown, a merge click's answer is inactive after a submission, and a timed-out trust read
 // answers 503.
 
-type ReviewView = ReturnType<ReviewService['load']>;
+type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
 const sha = (digit: string) => digit.repeat(40);
 
 function deferred<T>() {
@@ -269,15 +269,15 @@ async function serveApproved(gateway: (app: () => Awaited<ReturnType<typeof star
   chmodSync(join(config.repository, 'run.sh'), 0o644); fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
   let app!: Awaited<ReturnType<typeof startServer>>;
   app = await startServer(config, 0, undefined, gateway(() => app), undefined, options.issues as never);
-  let view = app.service.load();
-  for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous')) view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
-  for (const item of view.items) view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  let view = await app.service.load();
+  for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous')) view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
+  for (const item of view.items) view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
   const click = JSON.stringify({ action: 'merge', token: view.token, actionId: randomUUID() });
   const send = () => fetch(new URL('/api/action', app.url), { method: 'POST', headers: { 'x-codeboost-token': app.token, 'Content-Type': 'application/json' }, body: click });
   return { app, send, remove: () => rmSync(root, { recursive: true, force: true }) };
 }
-const remoteFor = (app: Awaited<ReturnType<typeof startServer>>, mergeQueue: boolean): RemoteMergeState => {
-  const snapshot = app.service.load().snapshot;
+const remoteFor = async (app: Awaited<ReturnType<typeof startServer>>, mergeQueue: boolean): Promise<RemoteMergeState> => {
+  const snapshot = (await app.service.load()).snapshot;
   return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue,
     requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
 };

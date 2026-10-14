@@ -17,7 +17,7 @@ import { RemoteTimeout } from '../github/timeout.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import { Store } from '../runner/store.ts';
 
-type ReviewView = ReturnType<ReviewService['load']>;
+type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
 type Run = ConstructorParameters<typeof GhMergeGateway>[1];
 const sha = (digit: string) => digit.repeat(40);
 const config = { repository: 'owner/repo', pullRequest: 7, issue: 24 };
@@ -88,11 +88,12 @@ it('gateway merge never reports its own abort as GitHub\'s refusal, even when th
 
 /** A gh call whose answer (gh's own failure) is delivered only after its signal aborted: it answered before the abort. */
 function lateAnswerRun(answer: Error) {
-  const stopped = deferred(), release = deferred();
+  const started = deferred(), stopped = deferred(), release = deferred();
   const run: Run = (_args, options) => new Promise<string>((_, reject) => {
+    started.resolve();
     options?.signal?.addEventListener('abort', () => { stopped.resolve(); void release.promise.then(() => reject(answer)); }, { once: true });
   });
-  return { run, stopped: stopped.promise, release: () => release.resolve() };
+  return { run, started: started.promise, stopped: stopped.promise, release: () => release.resolve() };
 }
 it.each([
   ['queue watermark', (run: Run, signal: AbortSignal) => new GhMergeGateway(config, run).queueWatermark(sha('b'), { signal, timeoutMs: 1 })],
@@ -122,6 +123,7 @@ it('coordinator keeps gh\'s answer before admission when shutdown comes after it
   const actionId = randomUUID();
   try {
     const merging = coordinator.merge(view.token, actionId).catch((error: unknown) => error);
+    await gh.started; // Shutdown finds the click's gh call running.
     // The server's shutdown order: the Store's write gate closes, then the merge coordinator is aborted.
     store.closeWrites();
     const closing = coordinator.close();

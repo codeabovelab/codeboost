@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { openReview, reloadReview } from './review-page.ts';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -84,7 +85,7 @@ for (const fixture of [
   test(`displays the current plan and imports the next ${fixture.format} revision without losing a review draft`, async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto(app.url);
+    await openReview(page, app.url);
     await page.getByLabel('Question about this item').fill('Keep this unsent question.');
 
     await page.getByRole('link', { name: 'Plans', exact: true }).click();
@@ -111,7 +112,7 @@ for (const fixture of [
     await page.getByRole('link', { name: 'Review', exact: true }).click();
     await expect(page.getByLabel('Question about this item')).toHaveValue('Keep this unsent question.');
     await page.getByRole('link', { name: 'Plans', exact: true }).click();
-    await page.reload();
+    await reloadReview(page);
     await expect(page).toHaveURL(/\?view=plans$/);
     await expect(page.locator('#plans-revision')).toHaveText('r2');
     if (fixture.format === 'JSON') await page.screenshot({ path: 'test-results/plans-desktop.png', fullPage: true });
@@ -120,7 +121,7 @@ for (const fixture of [
 }
 
 test('shows a rejected import without replacing the current plan', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   const wrongIssue = JSON.stringify({ ...nextPlan, issue: 413 });
   await page.getByLabel('Plan file').setInputFiles({ name: 'wrong-issue.json', mimeType: 'application/json', buffer: Buffer.from(wrongIssue) });
@@ -131,7 +132,7 @@ test('shows a rejected import without replacing the current plan', async ({ page
 });
 
 test('keeps focus and a newly selected file when an older import response returns', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   const file = page.getByLabel('Plan file');
   await file.setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
@@ -159,7 +160,7 @@ test('keeps focus and a newly selected file when an older import response return
 });
 
 test('reuses the exact import action after an ambiguous response', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
   const sent: unknown[] = [];
@@ -177,7 +178,7 @@ test('reuses the exact import action after an ambiguous response', async ({ page
 });
 
 test('replays an ambiguous committed import after refresh without creating another revision', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
   const sent: unknown[] = [];
@@ -210,7 +211,7 @@ test('does not let a replayed import reload overwrite a newer terminal merge obs
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -220,7 +221,7 @@ test('does not let a replayed import reload overwrite a newer terminal merge obs
       enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
   const sent: unknown[] = [];
@@ -238,11 +239,11 @@ test('does not let a replayed import reload overwrite a newer terminal merge obs
   await page.locator('#plans-refresh').click();
   await expect(page.getByRole('status').filter({ hasText: 'Revision r2 is current.' })).toBeVisible();
 
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
   await page.getByRole('link', { name: 'Review', exact: true }).click();
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Merge PR', exact: true })).toBeEnabled();
@@ -299,7 +300,7 @@ test('does not let a replayed import reload overwrite a newer terminal merge obs
 });
 
 test('preserves an unresolved import retry while another file is definitely refused', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   const file = page.getByLabel('Plan file');
   const source = JSON.stringify(nextPlan);
@@ -333,7 +334,7 @@ test('preserves an unresolved import retry while another file is definitely refu
 });
 
 test('reports a committed import separately when reloading the plan fails', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
   await page.route('**/api/review', route => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Reload unavailable.' }) }));
@@ -344,7 +345,7 @@ test('reports a committed import separately when reloading the plan fails', asyn
 });
 
 test('does not let an older Review refresh overwrite a committed import', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   let release!: () => void, arrived!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   const captured = new Promise<void>(resolve => { arrived = resolve; });
@@ -378,7 +379,7 @@ test('does not let an older Review refresh overwrite a committed import', async 
 });
 
 test('clears stale Plans data when a Review refresh fails after navigation', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   let release!: () => void, arrived!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   const captured = new Promise<void>(resolve => { arrived = resolve; });
@@ -398,7 +399,7 @@ test('clears stale Plans data when a Review refresh fails after navigation', asy
 });
 
 test('updates a settled Plans revision status when Review refresh observes a newer plan', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.locator('#plans-refresh').click();
   await expect(page.getByRole('status').filter({ hasText: 'Revision r1 is current.' })).toBeVisible();
@@ -419,7 +420,7 @@ test('updates a settled Plans revision status when Review refresh observes a new
 });
 
 test('clears a Plans load-failure status when Review refresh recovers', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   let release!: () => void, arrived!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   const captured = new Promise<void>(resolve => { arrived = resolve; });
@@ -443,7 +444,7 @@ test('clears a Plans load-failure status when Review refresh recovers', async ({
 });
 
 test('does not let an older failed Review refresh replace newer Plans validation feedback', async ({ page }) => {
-  await page.goto(app.url);
+  await openReview(page, app.url);
   let release!: () => void, arrived!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   const captured = new Promise<void>(resolve => { arrived = resolve; });
@@ -472,7 +473,7 @@ test('does not let a question poll started during Plans refresh replace its comp
   const config = app.service.config;
   await app.close();
   app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByLabel('Question about this item').fill('Will this answer finish?');
   await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
   await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
@@ -521,7 +522,7 @@ test('does not let an older Plans refresh replace an answer completed while it w
   const config = app.service.config;
   await app.close();
   app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByLabel('Question about this item').fill('Did this finish during refresh?');
   await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
   await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
@@ -563,7 +564,7 @@ test('does not let an older Plans refresh replace an answer failure from the sam
   const config = app.service.config;
   await app.close();
   app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByLabel('Question about this item').fill('Will this failure stay visible?');
   await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
   await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
@@ -606,7 +607,7 @@ test('does not let an older Plans refresh restore cancellation activity after fa
   const config = app.service.config;
   await app.close();
   app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByLabel('Question about this item').fill('Did cancellation settle during refresh?');
   await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
   await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
@@ -658,19 +659,19 @@ test('does not let an older Plans refresh re-enable merge after it commits', asy
   fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
   const gateway: MergeGateway = {
     inspect: async () => {
-      const snapshot = app.service.load().snapshot;
+      const snapshot = (await app.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
     merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
   };
   app = await startServer(config, 0, undefined, gateway);
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
-  await page.goto(app.url);
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Merge PR', exact: true })).toBeEnabled();
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   let release!: () => void, arrived!: () => void;
@@ -712,7 +713,7 @@ test('does not let a merge poll started during a review action replace restored 
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -722,11 +723,11 @@ test('does not let a merge poll started during a review action replace restored 
       enqueuedAt: '2026-10-08T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
   app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
 
@@ -746,7 +747,7 @@ test('does not let a merge poll started during a review action replace restored 
     await heldPoll;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ queue: queued }) });
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
   app.service.store.finishMergeAttempt(config.identity, attempt.id, { state: 'removed', reason: 'Required check failed.' });
   const retryReview = await page.request.get(new URL('/api/review', app.url).toString(), {
@@ -793,7 +794,7 @@ test('lets a full refresh verify retry readiness after a matching terminal poll'
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -803,15 +804,15 @@ test('lets a full refresh verify retry readiness after a matching terminal poll'
       enqueuedAt: '2026-10-08T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
   app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
   app.service.store.finishMergeAttempt(config.identity, attempt.id, { state: 'removed', reason: 'Required check failed.' });
 
@@ -869,7 +870,7 @@ test('lets a terminal full response replace an active poll for the same merge at
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -879,15 +880,15 @@ test('lets a terminal full response replace an active poll for the same merge at
       enqueuedAt: '2026-10-08T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
   app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
   app.service.store.finishMergeAttempt(config.identity, attempt.id, { state: 'removed', reason: 'Required check failed.' });
 
@@ -942,7 +943,7 @@ test('lets a queued full response replace a stale submitting poll for the same m
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -952,14 +953,14 @@ test('lets a queued full response replace a stale submitting poll for the same m
       enqueuedAt: '2026-10-08T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Submitting…', exact: true })).toBeDisabled();
   app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
   app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_1', phase: 'QUEUED', position: 3 });
@@ -1028,7 +1029,7 @@ test('does not let an older review action response replace a newer queued observ
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1038,11 +1039,11 @@ test('does not let an older review action response replace a newer queued observ
       enqueuedAt: '2026-10-08T08:10:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
   app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
   app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_3', phase: 'QUEUED', position: 3 });
@@ -1077,7 +1078,7 @@ test('does not let an older review action response replace a newer queued observ
     await route.continue();
   });
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Request change', exact: true }).click();
   await page.getByLabel('Change to request').fill('Preserve queue progress after this response.');
@@ -1125,7 +1126,7 @@ for (const mismatch of [
     let appRef: typeof app;
     const gateway: MergeGateway & MergeQueueGateway = {
       inspect: async () => {
-        const snapshot = appRef.service.load().snapshot;
+        const snapshot = (await appRef.service.load()).snapshot;
         return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
           atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
       },
@@ -1135,11 +1136,11 @@ for (const mismatch of [
         enqueuedAt: '2026-10-08T08:15:00Z', queueHead: head }),
     };
     app = appRef = await startServer(config, 0, undefined, gateway);
-    let review = app.service.load();
+    let review = await app.service.load();
     for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-      review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+      review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
     for (const item of review.items)
-      review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+      review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
     const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
     app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
     app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_identity', phase: 'QUEUED', position: 3 });
@@ -1162,7 +1163,7 @@ for (const mismatch of [
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(actionResponse) });
     });
 
-    await page.goto(app.url);
+    await openReview(page, app.url);
     await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
     await page.getByRole('button', { name: 'Request change', exact: true }).click();
     const note = `Keep the action response for a different ${mismatch.label}.`;
@@ -1213,7 +1214,7 @@ test('does not let an older Plans refresh replace a confirmed queued merge with 
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1223,14 +1224,14 @@ test('does not let an older Plans refresh replace a confirmed queued merge with 
       enqueuedAt: '2026-10-08T08:05:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let review = app.service.load();
+  let review = await app.service.load();
   for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    review = await app.service.act({ action: 'accept', key: segment.key, token: review.token });
   for (const item of review.items)
-    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    review = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await expect(page.getByRole('button', { name: 'Submitting…', exact: true })).toBeDisabled();
   let releaseRefresh!: () => void, refreshArrived!: () => void;
   const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
@@ -1282,7 +1283,7 @@ test('does not let merge polls started during Review or Plans refresh overwrite 
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1292,13 +1293,13 @@ test('does not let merge polls started during Review or Plans refresh overwrite 
       enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   page.on('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
@@ -1385,7 +1386,7 @@ test('does not let an older Plans refresh overwrite a newer terminal merge obser
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1395,13 +1396,13 @@ test('does not let an older Plans refresh overwrite a newer terminal merge obser
       enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   page.on('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
@@ -1458,7 +1459,7 @@ test('does not let an older Review refresh overwrite a newer terminal merge obse
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1468,13 +1469,13 @@ test('does not let an older Review refresh overwrite a newer terminal merge obse
       enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
 
-  await page.goto(app.url);
+  await openReview(page, app.url);
   page.on('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
@@ -1530,7 +1531,7 @@ test('keeps merge-queue polling current across Plans refresh and import outcomes
   let appRef: typeof app;
   const gateway: MergeGateway & MergeQueueGateway = {
     inspect: async () => {
-      const snapshot = appRef.service.load().snapshot;
+      const snapshot = (await appRef.service.load()).snapshot;
       return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
         atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
     },
@@ -1540,11 +1541,11 @@ test('keeps merge-queue polling current across Plans refresh and import outcomes
       enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
-  let view = app.service.load();
+  let view = await app.service.load();
   for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
-    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+    view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
   for (const item of view.items)
-    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+    view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
 
   let release!: () => void, releaseNew!: () => void, arrived!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
@@ -1565,7 +1566,7 @@ test('keeps merge-queue polling current across Plans refresh and import outcomes
     await heldNew;
     await route.continue();
   });
-  await page.goto(app.url);
+  await openReview(page, app.url);
   page.on('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
   await captured;
