@@ -1,11 +1,12 @@
-import { readHistory } from '../git/history.ts';
+import type { History } from '../core/linking.ts';
+import { readHistoryInWorker } from './history-job.ts';
 import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MAX_REBASE_TIMEOUT_MS, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS,
   RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
-import type { ReviewService } from './review.ts';
+import type { ReviewService, ReviewView } from './review.ts';
 import { BranchPushRefused } from './branch-push.ts';
 import type { PreMergeReadiness, PushMarker, PushOutcome, RebaseMarker } from './store.ts';
 
@@ -216,12 +217,13 @@ export class PreMergeCoordinator {
     return { outcome, ...this.#finishPush(marker) };
   }
 
-  #refresh(pair: RemotePair, remaining: () => number, priorHead?: string) {
-    const historyOptions = () => ({ maxDurationMs: Math.min(30_000, remaining()) });
-    const view = this.service.load(historyOptions());
+  /** `beforeRecord` rechecks the caller's task and review generations, in the turn that records the refreshed pair. */
+  async #refresh(pair: RemotePair, remaining: () => number, signal: AbortSignal, beforeRecord: () => void, priorHead?: string) {
+    const historyOptions = () => ({ maxDurationMs: Math.min(30_000, remaining()), signal });
+    const view = await this.service.load(historyOptions());
     const repository = this.service.reviewRepository().path;
-    let history: ReturnType<typeof readHistory>;
-    try { history = readHistory(repository, pair.base, pair.head, historyOptions()); }
+    let history: History;
+    try { history = await readHistoryInWorker(repository, pair.base, pair.head, historyOptions()); }
     catch (error) {
       // A collaborator may push on the old remote head while the base moves (or while F5 retains an unpushed local
       // rebase). Review that head against the latest stored base it actually descended from; the next preparation can
@@ -229,11 +231,11 @@ export class PreMergeCoordinator {
       // remains fail-closed.
       if (!priorHead || !(error instanceof Error)
         || !/linear history descended from the base|base must be an ancestor of the head/i.test(error.message)) throw error;
-      let recovered: ReturnType<typeof readHistory> | null = null;
+      let recovered: History | null = null;
       for (const candidate of [priorHead, ...this.service.store.rewrittenAncestors(this.service.config.identity, priorHead)]) {
         const priorId = this.service.store.snapshotWithHead(this.service.config.identity, candidate);
         if (!priorId) continue;
-        try { recovered = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base,
+        try { recovered = await readHistoryInWorker(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base,
           pair.head, historyOptions()); break; }
         catch (fallback) {
           if (!(fallback instanceof Error)
@@ -243,10 +245,12 @@ export class PreMergeCoordinator {
       if (!recovered) throw error;
       history = recovered;
     }
+    // The reads above awaited workers; the task must still be the one the caller checked.
+    beforeRecord();
     this.service.store.recordHistory(this.service.config.identity, view.expected, history.base, history.head, []);
-    return this.service.load(historyOptions());
+    return await this.service.load(historyOptions());
   }
-  #reviewBlocker(view: ReturnType<ReviewService['load']>, requireChecks = false): string | null {
+  #reviewBlocker(view: ReviewView, requireChecks = false): string | null {
     const invalidCommand = view.items.find(item => item.checks.tests === '✕ Invalid command');
     if (invalidCommand) return `${invalidCommand.id} has an invalid command check; amend the plan before preparing the merge.`;
     const item = view.items.find(value => value.state !== 'approved' || value.outside.length);
@@ -295,7 +299,7 @@ export class PreMergeCoordinator {
    * first external write and cleared only after a read of the branch settles the outcome; when that read is impossible
    * (shutdown, or GitHub unreachable) the marker stays for the next preparation or startup.
    */
-  async #pushRewrite(remote: RemotePair, view: ReturnType<ReviewService['load']>, signal: AbortSignal, deadline: number,
+  async #pushRewrite(remote: RemotePair, view: ReviewView, signal: AbortSignal, deadline: number,
     authorize: () => Promise<PreMergeAuthorization | undefined>,
     bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => void):
     Promise<{ result: 'pushed' | 'refused' | 'moved'; stateVersion: number }> {
@@ -385,7 +389,7 @@ export class PreMergeCoordinator {
       await authorization.refresh(); authorization.validate(); signal.throwIfAborted(); remaining();
       return authorization;
     };
-    const track = <T extends ReturnType<ReviewService['load']>>(current: T): T => {
+    const track = <T extends ReviewView>(current: T): T => {
       onObserved({ pair: { base: current.snapshot.base, head: current.snapshot.head }, binding: {
         stateVersion: this.service.store.getTask(identity).stateVersion,
         reviewVersion: this.service.store.reviewVersion(identity), snapshotId: current.snapshot.id,
@@ -403,7 +407,7 @@ export class PreMergeCoordinator {
         } });
       } catch { /* An unbound failure is conservatively historical. */ }
     };
-    const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()) }));
+    const load = async () => track(await this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()), signal }));
     signal.throwIfAborted();
     if (this.runner.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     const runnerStatus = this.runner.status(identity);
@@ -423,7 +427,7 @@ export class PreMergeCoordinator {
       // Settling advanced task state. The caller's binding is stale now; it reloads and starts again.
       throw new GuardRefusal('An earlier push of the rewritten head was settled. Reload, then prepare the merge again.');
     }
-    let view = load(), task = this.service.store.getTask(identity);
+    let view = await load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
     if (!MERGEABLE_STATUSES.includes(task.status)) throw new GuardRefusal(`The task is ${task.status}; prepare it from review.`);
@@ -448,14 +452,16 @@ export class PreMergeCoordinator {
     const retainedRemoteHead = initial.head !== view.snapshot.head
       && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
     if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
-      view = track(this.#refresh(initial, reviewBudget, view.snapshot.head));
+      view = track(await this.#refresh(initial, reviewBudget, signal, () => assertCurrent(expected), view.snapshot.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
     }
     if (initial.base !== view.snapshot.base) {
       const repository = this.service.reviewRepository().path;
-      const old = readHistory(repository, view.snapshot.base, view.snapshot.head,
-        { maxDurationMs: Math.min(30_000, reviewBudget()) }).commits.map(commit => commit.sha);
+      const old = (await readHistoryInWorker(repository, view.snapshot.base, view.snapshot.head,
+        { maxDurationMs: Math.min(30_000, reviewBudget()), signal })).commits.map(commit => commit.sha);
+      // The read awaited a worker: the task the rebase binds to must still be the one checked above.
+      assertCurrent(expected);
       task = this.service.store.getTask(identity);
       const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
         reviewVersion: view.expected.reviewVersion! };
@@ -485,7 +491,7 @@ export class PreMergeCoordinator {
         bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
         throw error;
       }
-      view = load();
+      view = await load();
     }
     const blocker = this.#reviewBlocker(view);
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
@@ -508,7 +514,7 @@ export class PreMergeCoordinator {
         assertCurrent(binding);
         // Traced from the reviewed head and its rewrite lineage, nearest first. That lineage holds the pushed head, every
         // earlier rewrite codeboost may already have pushed, and the original head a collaborator may have built on.
-        view = track(this.#refresh(moved, reviewBudget, view.snapshot.head));
+        view = track(await this.#refresh(moved, reviewBudget, signal, () => assertCurrent(binding), view.snapshot.head));
         return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
           reason: pushed === 'pushed'
             ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
@@ -517,10 +523,13 @@ export class PreMergeCoordinator {
               : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
       }
       // Nothing but this push may have changed the task meanwhile: a plan revision or review edit applied while it was in
-      // flight would otherwise be adopted by the reload below and run checks under approvals it made stale.
-      assertCurrent({ stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+      // flight would otherwise be adopted by the reload below and run checks under approvals it made stale. The reload
+      // awaits a history worker (#170), so the same guard holds after it as well: an edit during the reload is refused.
+      const pushedBinding = { stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id };
+      assertCurrent(pushedBinding);
       initial = seen;
-      view = load();
+      view = await load();
+      assertCurrent(pushedBinding);
     }
     const checked: string[] = [];
     for (const item of view.items.filter(candidate => candidate.acceptance.some(check => check.type === 'cmd'))) {
@@ -562,7 +571,7 @@ export class PreMergeCoordinator {
         throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
-      checked.push(item.id); onChecked(checked); view = load();
+      checked.push(item.id); onChecked(checked); view = await load();
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
@@ -574,11 +583,11 @@ export class PreMergeCoordinator {
     assertCurrent(guarded);
     if (final.base !== initial.base || final.head !== initial.head) {
       await this.remote.fetch(final, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = track(this.#refresh(final, reviewBudget, initial.head));
+      view = track(await this.#refresh(final, reviewBudget, signal, () => assertCurrent(guarded), initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during preparation; attribution and approvals were refreshed.' };
     }
-    view = load();
+    view = await load();
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during preparation; reload it.' };
@@ -589,31 +598,25 @@ export class PreMergeCoordinator {
     // Authorization is asynchronous. A review edit during that read invalidates its result just as one during the
     // final remote inspection does; nothing may persist readiness from the pre-authorization view.
     assertCurrent(guarded);
-    view = load();
+    view = await load();
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during final authorization; reload it.' };
     const authorizedBlocker = this.#reviewBlocker(view, true);
     if (authorizedBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: authorizedBlocker };
-    // The authorization read above is asynchronous, so the PR may have moved after the earlier inspection. Reinspect
-    // it, then immediately recheck every local generation before recording readiness.
+    // The authorization read and the review load above are asynchronous, so the PR may have moved after the earlier
+    // inspection. Reinspect it as the last await, then recheck every local generation and local trust in this turn
+    // before recording readiness; the review loaded above stays current while the generations are unchanged.
     const authorizedRemote = await this.remote.inspect(signal); signal.throwIfAborted();
     assertCurrent(guarded);
     authorization?.validate();
     if (authorizedRemote.base !== initial.base || authorizedRemote.head !== initial.head) {
       await this.remote.fetch(authorizedRemote, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = track(this.#refresh(authorizedRemote, reviewBudget, initial.head));
+      view = track(await this.#refresh(authorizedRemote, reviewBudget, signal, () => assertCurrent(guarded), initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during final authorization; attribution and approvals were refreshed.' };
     }
-    view = load();
-    if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
-      return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
-        reason: 'The local review changed after final authorization; reload it.' };
-    const postAuthorizationBlocker = this.#reviewBlocker(view, true);
-    if (postAuthorizationBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
-      checked, reason: postAuthorizationBlocker };
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null,
       readiness: { stateVersion: this.service.store.getTask(identity).stateVersion,
         reviewVersion: this.service.store.reviewVersion(identity), snapshotId: view.snapshot.id,

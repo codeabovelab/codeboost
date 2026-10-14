@@ -24,6 +24,8 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -241,7 +243,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
-      const review = service.load();
+      const review = await service.load();
       service.store.saveReview(identity, review.expected,
         review.items.map(item => approveItem(review.plan, review.segments, item.id, identity, item.count === 0)), []);
     }
@@ -609,6 +611,31 @@ describe('publishing a finished task (#103)', () => {
     expect(w.github.calls).toEqual([]);
   });
 
+  it.each([
+    ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), /could not be verified: Issue retrieval timed out/],
+    ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', ''), /could not be verified: gh failed \(exit 1\): HTTP 404/],
+  ] as const)('records a publish whose issue-trust read %s before shutdown as failed with that answer, not stopped (#48)', async (_case, answer, expected) => {
+    const w = world(), reading = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let accessSignal: AbortSignal | undefined;
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      // The read answered (or ran out of time) before shutdown; its answer surfaces only after shutdown aborted it.
+      async issueAccess(_number, options = {}) { accessSignal = options.signal; reading.resolve(); await release.promise; throw answer(); },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, store, close } = await serve(w, { startup: false, issueGateway, before: completeAll });
+    const records = vi.spyOn(store, 'recordPublish');
+    app.publishOwed(() => undefined);
+    await reading.promise;
+    const closing = close();
+    await vi.waitFor(() => expect(accessSignal?.aborted).toBe(true));
+    release.resolve();
+    await closing;
+    expect(records.mock.calls.at(-1)?.[1]).toMatchObject({ outcome: 'failed', message: expect.stringMatching(expected) });
+    expect(w.github.calls).toEqual([]);
+  });
+
   it('closes the Store only after a publish stopped during its push has settled, and the next start publishes once', async () => {
     const w = world();
     let closedWhileBusy: boolean | undefined;
@@ -787,7 +814,7 @@ describe('publishing a finished task (#103)', () => {
     expect(w.github.head(branch)).toBe(head);
     expect(w.github.prs).toEqual([expect.objectContaining({ open: true, draft: false })]);
     // Review shows its change in the Unplanned row, and the merge gate blocks until a person assigns or accepts it.
-    const view = app.service.load();
+    const view = await app.service.load();
     expect(view.segments.filter(segment => segment.row === 'Unplanned').map(segment => segment.path)).toContain('debug.log');
     // The gate inspects the published PR (#121), which GitHub shows as the task's.
     const pr = store.taskPullRequests(identity).find(record => record.state === 'opened')!;

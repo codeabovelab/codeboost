@@ -14,6 +14,7 @@ import type { AttemptKind } from '../runner/lifecycle.ts';
 import { approveItem } from '../core/approvals.ts';
 import type { IssueTrustGateway } from '../github/issues.ts';
 import { fixtureGit } from './fixtures/git.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -27,14 +28,14 @@ type App = Awaited<ReturnType<typeof startServer>>;
  * A server with a runner whose preparation always fails: an admitted item ends `failed` without an agent, which is
  * enough to see what start and resume admit. `before` shapes the Store before the runner exists, as recovery would.
  */
-async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void;
+async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void | Promise<void>; findings?: (findings: SafetyFindings, service: ReviewService) => void;
   issueGateway?: IssueTrustGateway } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-start-')); roots.push(root);
   const demo = createDemo(join(root, 'demo'));
   const config = options.issueGateway ? { ...demo, demo: false, github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1 } } : demo;
   const app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
-    if (options.approve !== false) approvePlan(service);
-    options.before?.(service);
+    if (options.approve !== false) await approvePlan(service);
+    await options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
@@ -57,8 +58,8 @@ async function act(app: App, action: string, request: { expectedStateVersion?: n
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
 
-function approvePlan(service: ReviewService) {
-  const view = service.load();
+async function approvePlan(service: ReviewService) {
+  const view = await service.load();
   service.store.saveReview(service.config.identity, view.expected,
     view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
 }
@@ -131,7 +132,20 @@ describe('start (#91 part 2)', () => {
       body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
     expect(store.getAttempts(identity)).toEqual([]);
   });
-  it('returns the first durable success when an identical concurrent access read fails later', async () => {
+  it('does not record a collaborator read that timed out, so the same action ID reads trust again', async () => {
+    let result: ReturnType<Parameters<typeof trustGateway>[0]> = new RemoteTimeout('Issue retrieval timed out.');
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => result) });
+    const actionId = randomUUID();
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 503,
+      body: { error: 'Issue trust could not be verified: Issue retrieval timed out.' } });
+    expect(store.getAttempts(identity)).toEqual([]);
+    result = { authorLogin: 'member', collaborator: true };
+    expect((await act(app, 'start', { actionId })).body.result).toMatchObject({ outcome: 'started', item: 'P1' });
+  });
+  it.each([
+    ['fails', () => new Error('later GitHub failure')],
+    ['times out', () => new RemoteTimeout('Issue retrieval timed out.')],
+  ])('returns the first durable success when an identical concurrent access read %s later', async (_case, failure) => {
     const secondStarted = Promise.withResolvers<void>(), releaseFailure = Promise.withResolvers<void>();
     let reads = 0;
     const gateway: IssueTrustGateway = {
@@ -139,7 +153,7 @@ describe('start (#91 part 2)', () => {
       async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
       async issueAccess(number) {
         if (++reads === 1) { await secondStarted.promise; return { number, authorLogin: 'member', collaborator: true }; }
-        secondStarted.resolve(); await releaseFailure.promise; throw new Error('later GitHub failure');
+        secondStarted.resolve(); await releaseFailure.promise; throw failure();
       },
       async issueText(number) { return { number, title: '', body: '', comments: [] }; },
     };
@@ -152,6 +166,31 @@ describe('start (#91 part 2)', () => {
     releaseFailure.resolve();
     expect(await second).toMatchObject({ status: 200, body: { result: accepted.body.result } });
     expect(store.getAttempts(identity)).toHaveLength(1);
+  });
+  it.each([false, true])('keeps a trust read\'s timeout when shutdown starts while gh stops (outcome saved meanwhile: %s)', async savedMeanwhile => {
+    const readStarted = Promise.withResolvers<void>(), releaseTimeout = Promise.withResolvers<void>();
+    const gateway: IssueTrustGateway = {
+      repository: 'owner/repo',
+      async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
+      // The read's own timeout fired; gh is still stopping when shutdown starts, and the timeout surfaces after that.
+      async issueAccess() { readStarted.resolve(); await releaseTimeout.promise; throw new RemoteTimeout('Issue retrieval timed out.'); },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, close, identity, store } = await serve({ issueGateway: gateway });
+    const { stateVersion, reviewVersion } = await view(app);
+    const actionId = randomUUID();
+    const response = act(app, 'start', { actionId, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion });
+    await readStarted.promise;
+    // Distinct from what an admitted start answers, so the answer itself shows nothing was admitted.
+    const saved = { outcome: 'saved meanwhile' };
+    if (savedMeanwhile) store.userAction(identity, { actionId, kind: 'start', request: { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion } }, () => saved);
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 50)); // Shutdown has started and is draining this request.
+    releaseTimeout.resolve();
+    const answer = await response;
+    await closing;
+    if (savedMeanwhile) expect(answer).toMatchObject({ status: 200, body: { result: saved } });
+    else expect(answer).toMatchObject({ status: 503, body: { error: 'Issue trust could not be verified: Issue retrieval timed out.' } });
   });
   it('requires every item of the current plan revision to be approved before start', async () => {
     const { app, identity, store } = await serve({ approve: false });
@@ -174,7 +213,7 @@ describe('start (#91 part 2)', () => {
     store.saveReview(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
       [{ key: 'later-choice', action: 'assign', item: plan.items[0]!.id }]);
     expect(await view(app)).toMatchObject({ startable: false });
-    approvePlan(app.service);
+    await approvePlan(app.service);
     expect(await view(app)).toMatchObject({ startable: true });
   });
   it('moves a task in review to queued and admits its first item, in one action', async () => {
@@ -463,7 +502,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
   });
   it('clears a recovery requeue when an amended suffix removes the interrupted final item', async () => {
-    const { app, identity, store } = await serve({ before: service => {
+    const { app, identity, store } = await serve({ before: async service => {
       const s = service.store, id = service.config.identity;
       const plan = s.getPlan(id), firstTwo = plan.items.slice(0, 2).map(item => item.id), firstSnapshot = s.getSnapshot(id);
       s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
@@ -483,7 +522,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
           amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare observed output' });
           s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
           const current = s.getPlan(id), snapshot = s.getSnapshot(id);
-          approvePlan(service);
+          await approvePlan(service);
           const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
           service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
           s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
@@ -499,7 +538,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       amended.items = amended.items.slice(0, 2);
       s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
       const current = s.getPlan(id), snapshot = s.getSnapshot(id);
-      approvePlan(service);
+      await approvePlan(service);
       const entries = checkpoint.baseEntries;
       const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
       service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });

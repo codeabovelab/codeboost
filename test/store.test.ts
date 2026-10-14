@@ -359,7 +359,7 @@ it('preserves an approved checkpoint continuation across its validated rewrite l
   expect(progress).toMatchObject({ completed: ['P1'], head: oid(12), next: 'P2' });
   expect(store.continuationApproved(identity, progress!)).toBe(true);
 });
-it('feeds persisted remapped ownership into the linking engine on real Git history', () => {
+it('feeds persisted remapped ownership into the linking engine on real Git history', async () => {
   const dir = directory(); const git = (...args: string[]) => fixtureGit(dir, ...args);
   git('init', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');
   const commit = () => { git('add', 'a'); git('commit', '-m', 'Change'); return git('rev-parse', 'HEAD'); };
@@ -367,10 +367,10 @@ it('feeds persisted remapped ownership into the linking engine on real Git histo
   const store = open(join(directory(), 'state.sqlite')); store.createPlan(JSON.stringify(plan()), 'json', context, base, base);
   store.recordHistory(identity, state(store), base, base, [{ sha: oid(9), owner: 'P1', origin: 'owned', sourceSha: null }]);
   store.recordRebase(identity, state(store), base, head, [{ oldSha: oid(9), newSha: head }]);
-  const segments = linkHistory(store.getPlan(identity), readHistory(dir, base, head), store.ownership(identity), p => p);
+  const segments = linkHistory(store.getPlan(identity), await readHistory(dir, base, head), store.ownership(identity), p => p);
   expect(segments.length).toBeGreaterThan(0); expect(segments.every(s => s.row === 'P1')).toBe(true);
   const amended = plan(); amended.items[0]!.id = 'P2'; store.importRevision(JSON.stringify(amended), 'json', context, 1);
-  const afterRemoval = linkHistory(store.getPlan(identity), readHistory(dir, base, head), store.ownership(identity), p => p);
+  const afterRemoval = linkHistory(store.getPlan(identity), await readHistory(dir, base, head), store.ownership(identity), p => p);
   expect(afterRemoval.every(s => s.row === 'Unplanned')).toBe(true);
 });
 it('retains typed file-card approvals/choices while fingerprints detect later metadata and plan changes', () => {

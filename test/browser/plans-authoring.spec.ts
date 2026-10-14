@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { openReview, reloadReview } from './review-page.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,7 +39,7 @@ test.afterEach(async () => {
 
 async function openPlans(page: Page, deps: PlanningDeps) {
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, undefined, undefined, deps);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
 }
 
@@ -100,7 +101,7 @@ test('accepts complete payloads for every edit operation', async ({ page }) => {
   const { deps } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   const card = (op: EditReply['edits'][number]['op'], payload: Record<string, unknown> = {}, item = 'P1') => ({
     op, item, summary: `Exercise ${op}`, reason: `The ${op} payload is complete.`,
     field: null, value: null, file: null, check: null, check_index: null, depends_on: null, new_item: null, ...payload,
@@ -137,7 +138,7 @@ test('renders a whole next-revision draft without changing the current plan', as
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/drafts/*', async route => {
     reads++;
@@ -166,7 +167,7 @@ test('renders a whole next-revision draft without changing the current plan', as
 test('applies a draft once while preserving newer review text and its attachment', async ({ page }) => {
   const { deps, invocations } = planning();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, undefined, undefined, deps);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.locator('.added [data-line]').first().click();
   await page.getByRole('button', { name: 'Ask about selection', exact: true }).click();
   await page.getByLabel('Question about this item').fill('Before Apply');
@@ -386,6 +387,55 @@ test('replays an ambiguous suggestion Apply, stales siblings, and refreshes befo
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(3);
 });
 
+test('refuses an import during a Retry Apply made after the review failed, and keeps the Apply result', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  await page.getByLabel('Guidance').fill('Improve the retry item.');
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(1);
+
+  // The first Apply commits but its answer is lost, so the result stays Apply-uncertain.
+  let applies = 0, releaseRetry!: () => void, retryArrived!: () => void;
+  const heldRetry = new Promise<void>(resolve => { releaseRetry = resolve; });
+  const retryReached = new Promise<void>(resolve => { retryArrived = resolve; });
+  await page.route('**/api/plan/suggestions/*/apply', async route => {
+    applies++;
+    if (applies === 1) { await route.fetch(); await route.abort('failed'); return; }
+    retryArrived();
+    await heldRetry;
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply this edit' }).click();
+  await expect(page.getByRole('button', { name: 'Retry Apply', exact: true })).toBeVisible();
+
+  // A failed review refresh unloads the plan while Retry Apply stays available.
+  await page.route('**/api/review', route => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'History unavailable.' }) }), { times: 1 });
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.locator('#banner')).toContainText('Could not read this branch’s history.');
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.locator('#plans-summary')).toHaveText('Plan unavailable');
+
+  const imports: string[] = [];
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/plan/import') imports.push(request.method()); });
+  await page.getByRole('button', { name: 'Retry Apply', exact: true }).click();
+  await retryReached;
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from('{}') });
+  const importButton = page.getByRole('button', { name: 'Import next revision' });
+  await importButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#plans-status')).toHaveText('! Wait for the current review action before importing a plan.');
+
+  releaseRetry();
+  await expect(page.locator('#plans-status')).toHaveText('✓ Revision r2 is current.');
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  expect(imports).toEqual([]);
+  expect(applies).toBe(2);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+});
+
 test('retries an ambiguous suggestion start with the exact request', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
@@ -460,7 +510,7 @@ test('keeps ownership while a malformed status response is retried', async ({ pa
 test('rejects failed output and marks consumed output stale', async ({ page }) => {
   const { deps } = planning();
   await openPlans(page, deps);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0, starts = 0;
   let releaseConsumed!: () => void;
   const consumedHeld = new Promise<void>(resolve => { releaseConsumed = resolve; });
@@ -498,7 +548,7 @@ test('rejects a status response for the wrong planning operation', async ({ page
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
@@ -542,7 +592,7 @@ test('marks invalidated output stale when it moves into history', async ({ page 
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
@@ -595,7 +645,7 @@ test('rejects a status observation bound to another snapshot', async ({ page }) 
 test('rejects an operation-specific payload that is unsafe to render', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
