@@ -1624,6 +1624,32 @@ it('pushes nothing when the task is reassigned while the push authorization is r
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it.each([
+  ['reassigned', (service: ReviewService) => {
+    const identity = service.config.identity;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  }],
+  ['given a review edit', (service: ReviewService) => {
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'question', 'Asked during the reload after the rebase.');
+  }],
+] as const)('pushes nothing when the task is %s during the review reload after the rebase (#170)', async (_case, change) => {
+  // The first load sees the original head; the first one that sees another head is the reload after the rebase.
+  let firstHead: string | undefined, changed = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringLoad(service) {
+    const head = service.store.getSnapshot(service.config.identity).head;
+    firstHead ??= head;
+    if (head === firstHead || changed) return;
+    changed = true;
+    change(service);
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.pushes).toEqual([]);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('keeps the process-settlement reserve inside a settlement read\'s time limit', async () => {
   // Reserve plus 2 s left: the read may run for at most about 2 s, leaving the reserve for Git to settle.
   let startedAt = 0, failedAt = 0, pushedAt = 0;

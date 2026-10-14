@@ -308,7 +308,8 @@ export class PreMergeCoordinator {
     const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
       reviewVersion: view.expected.reviewVersion! };
     // Captured before the asynchronous authorization read: any task write that lands during it (a reassignment, a
-    // referenced-code change) must refuse the claim, not be adopted by it.
+    // referenced-code change) must refuse the claim, not be adopted by it. The caller has already checked that the
+    // review reload before this (after a rebase, it awaits a history worker) adopted nothing new.
     const admitted = this.service.store.getTask(identity).stateVersion;
     const authorization = await authorize();
     signal.throwIfAborted();
@@ -491,7 +492,12 @@ export class PreMergeCoordinator {
         bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
         throw error;
       }
+      // What the rebase left, read in the turn it committed. The reload awaits a history worker (#170): a reassignment or
+      // review edit that lands during it must refuse the push below, not become the state the push binds to.
+      const rebased = { stateVersion: this.service.store.getTask(identity).stateVersion,
+        reviewVersion: this.service.store.reviewVersion(identity), snapshotId: this.service.store.getSnapshot(identity).id };
       view = await load();
+      assertCurrent(rebased);
     }
     const blocker = this.#reviewBlocker(view);
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
