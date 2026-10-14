@@ -328,8 +328,8 @@ export class MergeCoordinator {
    * Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again.
    * Returns undefined when this refusal was saved (the caller answers with it). If another coordinator saved the
    * click first, its outcome is the answer: a saved success comes back as a replay (its status read bounded by
-   * `signal` when one is given), a saved refusal or a reused key is thrown. A refusal that cannot be saved (a storage error, or the write
-   * gate closed at shutdown) throws MergeNotApplied, keeping the refusal's text.
+   * `signal` when one is given), a saved refusal or a reused key is thrown. A refusal that cannot be saved (a storage
+   * error, or the write gate closed at shutdown) throws MergeNotApplied, keeping the refusal's text.
    */
   #recordRefusal(token: string, actionId: string, refusal: unknown, signal?: AbortSignal): ReturnType<MergeCoordinator['merge']> | undefined {
     if (!this.service.store || !this.service.config) return undefined;

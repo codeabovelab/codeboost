@@ -217,7 +217,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (based && result.outcome === 'found' && Array.isArray(result.matches) && result.matches.length) return { alreadyFixed: 'found', alreadyFixedDetail: describeMatches(result.matches) };
       return { alreadyFixed: 'unknown', alreadyFixedDetail: result.outcome === 'unknown' && typeof result.reason === 'string' ? result.reason.slice(0, 300) : 'The check returned an invalid result.' };
     } catch (error) {
-      if (signal?.aborted) throw error;
+      // After an abort, the check's own gh failure stays its result, as without the abort: an unknown blocker, which the
+      // inspection then discards for the abort (#48). Any other error is rethrown, including the abort's own reason; a
+      // failed stage's error is that reason, so a check it stopped rejects with that error, which changes no answer: the
+      // failed stage's own rejection is checked first.
+      if (signal?.aborted && (error === signal.reason || !ghAnswered(error))) throw error;
       return { alreadyFixed: 'unknown', alreadyFixedDetail: stop.signal.aborted ? 'The check did not finish in time.' : 'GitHub could not be read.' };
     } finally { clearTimeout(timer); }
   }
@@ -236,12 +240,15 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     // process they started outlives the inspection.
     const failed = new AbortController(), reads = signal ? AbortSignal.any([signal, failed.signal]) : failed.signal;
     const stopOthers = (error: unknown) => { failed.abort(error); throw error; };
-    const alreadyFixed = this.#alreadyFixed(target.ownPullRequests, pr.baseRefName, base, deadlineAt, reads);
+    // Handled from the start: a stopped check can settle before the other stages, and an unhandled rejection meanwhile
+    // would reach Node's process-wide handler (#48).
+    const alreadyFixed = this.#alreadyFixed(target.ownPullRequests, pr.baseRefName, base, deadlineAt, reads)
+      .catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
     const [ruleRead, listRead] = await Promise.allSettled([
       this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
       published ? this.#branchOpen(target.headBranch!, reads).catch(stopOthers) : undefined,
     ]);
-    const fixed = await alreadyFixed.catch(error => error instanceof Error ? error : new Error(String(error)));
+    const fixed = await alreadyFixed;
     for (const read of [ruleRead, listRead]) if (read.status === 'rejected') throw read.reason;
     if (fixed instanceof Error) throw fixed;
     const rules = (ruleRead as PromiseFulfilledResult<BranchRules>).value;
@@ -380,8 +387,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const attempt = this.#inspectNow(target, deadlineAt, signal).catch(error => {
       // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's; a stopped gh
       // call can settle after both have fired. A CommandFailed is a gh exit, reported as itself (#48): gh exited before
-      // the abort. (When one stage's gh exit stops the other stages, they settle with that same exit; traced, not tested.)
-      // A gh call that the abort stopped fails with the abort's reason instead.
+      // the abort. When one stage's gh exit stops the other stages, the inspection waits for every stage to settle and
+      // then reports that exit first, whatever the stopped stages settled with, even when its deadline fired meanwhile
+      // (test/merge-stop-reasons.test.ts). A gh call that the abort stopped fails with the abort's reason instead.
       if (signal.aborted && !ghAnswered(error)) throw signal.reason;
       throw error;
     }).then(state => {

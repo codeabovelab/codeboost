@@ -1,6 +1,8 @@
 // Issue #48: the original timeout/cancellation reason must survive gateway, coordinator, durable attempt and response.
 // Interleavings are ordered by deferred gates or observed process state. The two real-process tests also need the
 // command to start and exit well inside their timers (1.5 s and a 3 s pipe grace); under heavy load they can fail, not pass.
+// The parallelStages() tests use real 1 s inspection deadlines; the deadline test checks the order it relies on and fails,
+// not passes, if heavy load delays its stage failure past the deadline.
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,6 +14,7 @@ import { GhMergeGateway, MergeSubmissionError } from '../github/merge.ts';
 import { CommandFailed, runWithInput } from '../github/run-with-input.ts';
 import { GhIssueGateway, ISSUE_READ_ACTIVE_MS, withIssueReadDeadline } from '../github/issues.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
+import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import { Store } from '../runner/store.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -272,3 +275,130 @@ it('keeps a command\'s exit status when its own timeout fires after it exited, w
     rmSync(dir, { recursive: true, force: true });
   }
 }, 15_000);
+
+// Parallel inspection stages (#48): the branch's PR list fails with gh's own exit, which stops the other stages still
+// running (the rule read in flight, and the already-fixed check unless its own timer stopped it first). The inspection
+// settles only after every stage has settled, and it reports gh's exit. In production the check is stopped 0.65 s before
+// the inspection's deadline (0.35 s into the 1 s used here), and a stopped gh call settles within the runner's 0.4 s.
+function parallelStages(listFailsAt: 'once-running' | number) {
+  const answer = new CommandFailed('gh failed (exit 1): HTTP 502: Bad Gateway', 'HTTP 502: Bad Gateway', '');
+  const bothRunning = deferred(), bothStopped = deferred(), releaseRule = deferred(), releaseCheck = deferred();
+  let running = 0, stopped = 0;
+  const observed: { listFailedAfterMs?: number; ruleStopReason?: unknown; checkStopReason?: unknown } = {};
+  // A stage that runs until its signal aborts, then settles with that signal's reason when the test releases it.
+  const held = <T>(release: Promise<void>, signal?: AbortSignal, onStop?: () => void) => new Promise<T>((_, reject) => {
+    if (++running === 2) bothRunning.resolve();
+    signal?.addEventListener('abort', () => {
+      onStop?.();
+      if (++stopped === 2) bothStopped.resolve();
+      void release.then(() => reject(signal.reason));
+    }, { once: true });
+  });
+  const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  let started = 0; // Set once inspect() has armed its deadline timer, so that timer is due at or before started + 1 s.
+  const run: Run = async (args, options) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'task',
+      headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], body: '', isCrossRepository: false });
+    if (joined.includes('/pulls?')) {
+      // The already-fixed check starts only within the first 0.35 s (before its own stop); under extreme load it may not.
+      // Checked at 0.5 s, before the 1 s deadline, so the inspection reports this error rather than the deadline.
+      let premise: NodeJS.Timeout | undefined;
+      await Promise.race([bothRunning.promise, new Promise((_, reject) => {
+        premise = setTimeout(() => {
+          releaseRule.resolve(); releaseCheck.resolve(); // Let the stopped stages settle so the inspection reports this.
+          reject(new Error('Test premise failed: the rule read and the check did not both start.'));
+        }, 500);
+      })]).finally(() => clearTimeout(premise));
+      if (listFailsAt !== 'once-running') await pause(listFailsAt - (Date.now() - started));
+      observed.listFailedAfterMs = Date.now() - started;
+      throw answer;
+    }
+    // #rules reads one at a time; only the first starts.
+    return held<string>(releaseRule.promise, options?.signal, () => { observed.ruleStopReason = options?.signal?.reason; });
+  };
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => held(releaseCheck.promise, signal, () => { observed.checkStopReason = signal?.reason; }) };
+  const state = { settled: false };
+  const inspection = new GhMergeGateway(config, run, checks).inspect({ fresh: true, timeoutMs: 1_000, target: { pullRequest: 7, headBranch: 'task' } })
+    .then(() => null, (error: unknown) => error).finally(() => { state.settled = true; });
+  started = Date.now();
+  // Both stages stopped; an inspection that settles first (for example with the premise error above) fails the test with it.
+  const whenStopped = () => Promise.race([bothStopped.promise, inspection.then(error => {
+    throw error instanceof Error ? error : new Error('The inspection settled before both stages stopped.');
+  })]);
+  return { answer, whenStopped, releaseRule: () => releaseRule.resolve(), releaseCheck: () => releaseCheck.resolve(),
+    state, inspection, pause, started, observed };
+}
+
+it('merge-state inspection waits for a stopped already-fixed check before reporting a stage\'s gh exit', async () => {
+  const stages = parallelStages('once-running');
+  await stages.whenStopped();
+  expect(stages.observed.checkStopReason).toBe(stages.answer); // The list's exit, not the check's own timer, stopped it.
+  stages.releaseRule();
+  await stages.pause(50);
+  expect(stages.state.settled).toBe(false); // The already-fixed check is still settling.
+  stages.releaseCheck();
+  expect(await stages.inspection).toBe(stages.answer);
+});
+
+it('merge-state inspection handles a stopped already-fixed check that settles before the other stages', async () => {
+  const unhandled: unknown[] = [];
+  const record = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', record);
+  try {
+    const stages = parallelStages('once-running');
+    await stages.whenStopped();
+    expect(stages.observed.checkStopReason).toBe(stages.answer); // The list's exit, not the check's own timer, stopped it.
+    stages.releaseCheck(); // The check rejects with the list's exit while the rule read is still stopping.
+    await stages.pause(50);
+    expect(stages.state.settled).toBe(false);
+    stages.releaseRule();
+    expect(await stages.inspection).toBe(stages.answer);
+    await stages.pause(0);
+    expect(unhandled).toEqual([]);
+  } finally { process.off('unhandledRejection', record); }
+});
+
+it('merge-state inspection reports a stage\'s gh exit, not its deadline, when a stopped rule read settles after the deadline', async () => {
+  // The list fails 0.75 s in: after the check's own timer stopped it (0.35 s), within 0.4 s of the 1 s deadline.
+  const stages = parallelStages(750);
+  stages.releaseCheck();
+  await stages.whenStopped();
+  await stages.pause(1_050 - (Date.now() - stages.started));
+  // The order this test claims: the list failed before the deadline and stopped the rule read; then the deadline fired.
+  // (Under heavy load the list can fail late; these checks then fail rather than pass on a different interleaving.)
+  expect(stages.observed.listFailedAfterMs).toBeLessThan(1_000);
+  expect(stages.observed.ruleStopReason).toBe(stages.answer);
+  expect((stages.observed.checkStopReason as Error).message).toBe('The already-fixed check did not finish in time.'); // Its own timer.
+  expect(Date.now() - stages.started).toBeGreaterThanOrEqual(1_000); // The deadline has fired.
+  expect(stages.state.settled).toBe(false); // The rule read, stopped 0.3 s ago, is still settling.
+  stages.releaseRule();
+  expect(await stages.inspection).toBe(stages.answer);
+}, 10_000);
+
+it('merge-state inspection answers a caller abort, not the already-fixed check\'s own earlier gh failure', async () => {
+  // The check's gh call failed before the caller aborted; the failure surfaces only after the abort, while gh stops.
+  const own = new CommandFailed('gh failed (exit 1): HTTP 502: Bad Gateway', 'HTTP 502: Bad Gateway', '');
+  const caller = new AbortController(), reason = new Error('Merge cancelled during shutdown.');
+  const bothRunning = deferred();
+  let running = 0;
+  const afterAbort = <T>(signal: AbortSignal | undefined, settle: (reject: (error: unknown) => void) => void) => new Promise<T>((_, reject) => {
+    if (++running === 2) bothRunning.resolve();
+    signal?.addEventListener('abort', () => settle(reject), { once: true });
+  });
+  const run: Run = async (args, options) => {
+    if (args.join(' ').startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'),
+      headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    return afterAbort<string>(options?.signal, reject => reject(options!.signal!.reason)); // The rule read in flight.
+  };
+  let checkStopReason: unknown;
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => afterAbort(signal, reject => { checkStopReason = signal!.reason; reject(own); }) };
+  // The default 12 s inspection: the check's own stop timer (0.65 s before that) cannot fire first.
+  const inspection = new GhMergeGateway(config, run, checks).inspect({ fresh: true, signal: caller.signal })
+    .then(() => null, (error: unknown) => error);
+  await bothRunning.promise;
+  caller.abort(reason);
+  expect(checkStopReason).toBe(reason); // The caller's abort, not the check's own stop timer, stopped the check.
+  // Not the check's gh text: a blocker result that arrives after the abort is discarded, so the click may be resent.
+  expect(await inspection).toBe(reason);
+});
