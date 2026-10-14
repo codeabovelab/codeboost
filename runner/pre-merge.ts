@@ -3,7 +3,7 @@ import { readHistoryInWorker } from './history-job.ts';
 import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
-import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { GuardRefusal, MERGEABLE_STATUSES, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MAX_REBASE_TIMEOUT_MS, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS,
   RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService, ReviewView } from './review.ts';
@@ -571,10 +571,13 @@ export class PreMergeCoordinator {
       if (signal.aborted) stop();
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       // The check attempt itself advances task state even when it fails. Bind that owned transition without adopting a
-      // concurrent review edit or reassignment; either must leave the preparation historical and stale. A reassignment
-      // during the check settles it as stale.
-      if (this.service.store.reviewVersion(identity) === view.expected.reviewVersion
-        && this.service.store.getAttempt(identity, attempt.id).state !== 'stale') {
+      // concurrent review edit, reassignment or plan change; any of them must leave the preparation historical and stale.
+      // A change while the check ran settles it as stale; one after its terminal write, while the runner released its
+      // workspace, leaves its context different from the current one.
+      const settled = this.service.store.getAttempt(identity, attempt.id);
+      const owned = this.service.store.reviewVersion(identity) === view.expected.reviewVersion && settled.state !== 'stale'
+        && sameContext(settled.context, this.service.store.currentContext(identity));
+      if (owned) {
         const snapshot = this.service.store.getSnapshot(identity);
         onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
           stateVersion: this.service.store.getTask(identity).stateVersion,
@@ -582,12 +585,12 @@ export class PreMergeCoordinator {
         } });
       }
       signal.throwIfAborted();
-      const settled = this.service.store.getAttempt(identity, attempt.id);
       const runnerStatus = this.runner.status(identity);
       if (runnerStatus.unresolved || this.runner.unreleased)
         throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
+      if (!owned) throw new GuardRefusal('The task or review changed during preparation. Reload first.');
       checked.push(item.id); onChecked(checked);
       // The state the check left (its own attempt advanced the task), read in this turn: a reassignment or review edit
       // during the reload below must refuse, not be adopted into readiness.

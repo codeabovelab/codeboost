@@ -111,6 +111,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   actionId?: string;
   /** Runs while a command check runs (when its workspace is materialized). */
   duringCommand?: (service: ReviewService) => void;
+  /** Runs after a command check's terminal write, while the runner releases its workspace. */
+  duringRelease?: (service: ReviewService) => void;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -175,7 +177,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     },
     async snapshotDeclaredLinks() { throw new Error('not used'); }, async checkTree() { throw new Error('not used'); },
     async inspectChanges() { throw new Error('not used'); }, async commit() { throw new Error('not used'); },
-    async release() { if (options.releaseFails) throw new Error('cleanup failed'); },
+    async release() { options.duringRelease?.(service); if (options.releaseFails) throw new Error('cleanup failed'); },
   };
   const cancelReasons: string[] = [];
   const runner = new RunnerCoordinator(service.store, commandCheckDeps(service.store, workspace, input => {
@@ -230,7 +232,13 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }) : undefined);
   if (options.duringLoad) {
     const load = service.load.bind(service);
-    service.load = (loadOptions?: Parameters<ReviewService['load']>[0]) => { const loading = load(loadOptions); options.duringLoad!(service); return loading; };
+    service.load = (loadOptions?: Parameters<ReviewService['load']>[0]) => {
+      const loading = load(loadOptions);
+      // A hook that throws fails this load as a worker failure would: asynchronously, once the real load has settled.
+      try { options.duringLoad!(service); }
+      catch (error) { return loading.then(() => { throw error; }, () => { throw error; }); }
+      return loading;
+    };
   }
   coordinator = new PreMergeCoordinator(service,
     runner,
@@ -473,6 +481,22 @@ it('reports a command check stopped by a reassignment as stale, not as a current
   } });
   expect(changed).toBe(true);
   expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses, as stale, a reassignment after a command check\'s terminal write, while its workspace is released', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringRelease(service) {
+    if (changed) return;
+    changed = true;
+    const identity = service.config.identity;
+    // The check has already settled as completed; only the task's context changes now.
+    expect(service.store.getAttempts(identity).some(attempt => attempt.kind === 'check' && attempt.state === 'completed')).toBe(true);
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
   expect(fixture.coordinator.last?.stale).toBe(true);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
