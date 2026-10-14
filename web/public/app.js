@@ -1193,8 +1193,8 @@ function renderPlanFile() {
 async function importPlan(event) {
   event.preventDefault();
   if (planImportPending) return;
-  // Refusals while another operation runs keep that operation's status ownership: one that reports on this status line
-  // (an Apply, a review read) then replaces the refusal with its result instead of being hidden by it.
+  // These two refusals keep the current status ownership, so a running Apply, review read or Refresh plan replaces
+  // them with its result instead of being hidden by them. The file refusal below claims the line, like the import itself.
   if (busy && busyKind !== "read") {
     setPlanStatus(planStatusGeneration, "warn", "! Wait for the current review action before importing a plan.");
     return;
