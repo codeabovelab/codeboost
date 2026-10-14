@@ -387,6 +387,55 @@ test('replays an ambiguous suggestion Apply, stales siblings, and refreshes befo
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(3);
 });
 
+test('refuses an import during a Retry Apply made after the review failed, and keeps the Apply result', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  await page.getByLabel('Guidance').fill('Improve the retry item.');
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(1);
+
+  // The first Apply commits but its answer is lost, so the result stays Apply-uncertain.
+  let applies = 0, releaseRetry!: () => void, retryArrived!: () => void;
+  const heldRetry = new Promise<void>(resolve => { releaseRetry = resolve; });
+  const retryReached = new Promise<void>(resolve => { retryArrived = resolve; });
+  await page.route('**/api/plan/suggestions/*/apply', async route => {
+    applies++;
+    if (applies === 1) { await route.fetch(); await route.abort('failed'); return; }
+    retryArrived();
+    await heldRetry;
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply this edit' }).click();
+  await expect(page.getByRole('button', { name: 'Retry Apply', exact: true })).toBeVisible();
+
+  // A failed review refresh unloads the plan while Retry Apply stays available.
+  await page.route('**/api/review', route => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'History unavailable.' }) }), { times: 1 });
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.locator('#banner')).toContainText('Could not read this branch’s history.');
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.locator('#plans-summary')).toHaveText('Plan unavailable');
+
+  const imports: string[] = [];
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/plan/import') imports.push(request.method()); });
+  await page.getByRole('button', { name: 'Retry Apply', exact: true }).click();
+  await retryReached;
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from('{}') });
+  const importButton = page.getByRole('button', { name: 'Import next revision' });
+  await importButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#plans-status')).toHaveText('! Wait for the current review action before importing a plan.');
+
+  releaseRetry();
+  await expect(page.locator('#plans-status')).toHaveText('✓ Revision r2 is current.');
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  expect(imports).toEqual([]);
+  expect(applies).toBe(2);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+});
+
 test('retries an ambiguous suggestion start with the exact request', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
