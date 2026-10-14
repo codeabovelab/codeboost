@@ -35,6 +35,7 @@ This ordering is intentionally local-only. The push below extends the durable li
 ## Push of the rewritten head (F6a)
 
 `prepare-merge` pushes a rewritten head only when the refreshed review has no blocker: every item approved, no ambiguous or unplanned change, no open change request. A rewrite that made an approval stale stays local until a person reviews it; a later preparation recognizes the unpushed rewrite through the durable rewrite lineage.
+
 | Step | What happens |
 |---|---|
 | Admission | The task state version is captured, and issue trust is refreshed. `Store.beginPrePush` then records `{ attemptId, branch, from, to, snapshotId, startedAt }` in `tasks.push_in_progress` (schema v18) and advances the task state version. It requires that captured state version (a reassignment during the trust read refuses), a mergeable status, no cancel, no active attempt, merge, rebase or push, `to` equal to the snapshot head, and `from` a durable rewrite predecessor of `to`. |
