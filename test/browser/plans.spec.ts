@@ -120,6 +120,21 @@ for (const fixture of [
   });
 }
 
+test('explains an import pressed with no file chosen instead of leaving it to the browser', async ({ page }) => {
+  const imports: string[] = [];
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/plan/import') imports.push(request.method()); });
+  await openReview(page, app.url);
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.locator('#plans-revision')).toHaveText('r1');
+  const importButton = page.getByRole('button', { name: 'Import next revision' });
+  await importButton.click();
+  await expect(page.locator('#plans-status')).toHaveText('✕ Choose a JSON or YAML plan file.');
+  await expect(page.locator('#plans-status')).toHaveClass('bad');
+  await expect(importButton).toBeFocused();
+  expect(imports).toEqual([]);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
+});
+
 test('shows a rejected import without replacing the current plan', async ({ page }) => {
   await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
