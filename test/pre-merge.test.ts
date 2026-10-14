@@ -109,6 +109,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringPushRead?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
   /** Saves the preparation's outcome under this action ID, as the server's prepare-merge action does. */
   actionId?: string;
+  /** Runs while a command check runs (when its workspace is materialized). */
+  duringCommand?: (service: ReviewService) => void;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -168,6 +170,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const workspace: TaskWorkspace = {
     async materialize(attempt, checkedHead) {
       checkedHeads.push(checkedHead);
+      options.duringCommand?.(service);
       return { clone: { id: attempt.id, taskId: 'task', directory: repository, head: checkedHead }, storage: {} } as WorkspaceRef;
     },
     async snapshotDeclaredLinks() { throw new Error('not used'); }, async checkTree() { throw new Error('not used'); },
@@ -437,6 +440,49 @@ it('refuses readiness when the task is reassigned during the review reload after
     if (settledChecks !== 1 || changed) return;
     changed = true;
     service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports a failure of the review reload after the rebase itself as current, not stale', async () => {
+  let firstHead: string | undefined, failed = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringLoad(service) {
+    const head = service.store.getSnapshot(service.config.identity).head;
+    firstHead ??= head;
+    if (head === firstHead || failed) return;
+    failed = true;
+    throw new Error('History worker timed out.'); // The reload fails on its own; nothing else changed.
+  } });
+  expect(failed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'History worker timed out.' });
+  expect(fixture.coordinator.last?.stale).toBe(false);
+  expect(fixture.pushes).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports a command check stopped by a reassignment as stale, not as a current failure', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringCommand(service) {
+    if (changed) return;
+    changed = true;
+    const identity = service.config.identity;
+    service.store.setAssignment(identity, service.store.getTask(identity).stateVersion, 'someone-else', 'c'.repeat(40));
+  } });
+  expect(changed).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses, as stale, a change request added while a command check runs, instead of adopting it', async () => {
+  let changed = false;
+  const fixture = await rebaseFixture('feature\n', 0, { duringCommand(service) {
+    if (changed) return;
+    changed = true;
+    service.store.addReviewNote(service.config.identity, reviewState(service), 'P1', 'change', 'Requested during the check.');
   } });
   expect(changed).toBe(true);
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The task or review changed during preparation. Reload first.' });

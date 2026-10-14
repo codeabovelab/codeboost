@@ -504,6 +504,9 @@ export class PreMergeCoordinator {
       // review edit that lands during it must refuse the push below, not become the state the push binds to.
       const rebased = { stateVersion: this.service.store.getTask(identity).stateVersion,
         reviewVersion: this.service.store.reviewVersion(identity), snapshotId: this.service.store.getSnapshot(identity).id };
+      // Bind a failure of the reload itself (a worker timeout) to the state the rebase left: it is current, not stale.
+      const rebasedSnapshot = this.service.store.getSnapshot(identity);
+      bindRebaseFailure(rebased, { base: rebasedSnapshot.base, head: rebasedSnapshot.head }, rebased.stateVersion);
       view = await reload(rebased);
     }
     const blocker = this.#reviewBlocker(view);
@@ -568,8 +571,10 @@ export class PreMergeCoordinator {
       if (signal.aborted) stop();
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       // The check attempt itself advances task state even when it fails. Bind that owned transition without adopting a
-      // concurrent review edit; such an edit must leave the preparation historical and stale.
-      if (this.service.store.reviewVersion(identity) === view.expected.reviewVersion) {
+      // concurrent review edit or reassignment; either must leave the preparation historical and stale. A reassignment
+      // during the check settles it as stale.
+      if (this.service.store.reviewVersion(identity) === view.expected.reviewVersion
+        && this.service.store.getAttempt(identity, attempt.id).state !== 'stale') {
         const snapshot = this.service.store.getSnapshot(identity);
         onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
           stateVersion: this.service.store.getTask(identity).stateVersion,
