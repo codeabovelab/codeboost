@@ -548,10 +548,9 @@ export class MergeCoordinator {
       // A definite refusal before admission is this click's outcome; a resend replays it. A timeout, the deadline and
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
       // (A coordinator without a store, which only tests build, saves nothing: a gh answer then passes through as is.)
-      if (!queueAttempt && action && !(stopped && signal.aborted)) {
-        // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal or timeout. A
-        // timeout followed by this coordinator's own abort skips this: the click answers 503, and its resend replays
-        // that outcome. A gh answer followed by an abort still comes here.
+      if (!queueAttempt && action) {
+        // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal, timeout or
+        // abort. For an aborted click the replay reads nothing from GitHub. Only a refusal is recorded; a stop never is.
         const replay = this.#replay(token, action.actionId, signal) ?? (stopped ? undefined : this.#recordRefusal(token, action.actionId, error, signal));
         if (replay) return await replay;
       }

@@ -202,6 +202,32 @@ it.each([false, true])('a gateway inspection timeout before admission is resenda
   } finally { await coordinator.close(); store.close(); }
 });
 
+it('answers an outcome another coordinator saved meanwhile, even when a timeout is followed by this click\'s own abort', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const store = new Store(':memory:');
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Merge', questions: [], items: [{ id: 'P1', title: 'Merge', intent: 'Merge safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const view = readyView({ expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } });
+  const gh = stoppingRun();
+  const coordinator = new MergeCoordinator({ store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService, new GhMergeGateway(config, gh.run));
+  const actionId = randomUUID();
+  try {
+    const merging = coordinator.merge(view.token, actionId).catch((error: unknown) => error);
+    await gh.started;
+    store.userAction(identity, { actionId, kind: 'merge', request: { token: view.token } },
+      () => ({ attemptId: 'other', state: 'failed', reason: 'Required review is missing.', url: null }));
+    await vi.advanceTimersByTimeAsync(6_000); // The inspection's own timeout fires and gh starts stopping.
+    const closing = coordinator.close(); // Then this coordinator's shutdown aborts the click, before gh settles.
+    gh.release();
+    const error = await merging as Error;
+    await closing;
+    // The durable outcome, not a resendable 503 for the timeout.
+    expect(error).not.toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toBe('Required review is missing.');
+  } finally { store.close(); }
+});
+
 it.each([
   ['refusal', 1], ['success', 0],
 ] as const)('gateway merge keeps GitHub\'s %s when the deadline fires after gh exited but before its pipes closed', async (answer, exitCode) => {
