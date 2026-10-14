@@ -3,13 +3,18 @@ import { mergeActionResponse, type MergeAttempt } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type MergeTarget, type RemoteMergeState } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
+import { ghAnswered } from '../github/run-with-input.ts';
+import { timedOut } from '../github/timeout.ts';
 
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
-/** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (github/merge.ts). */
+/** The longest a merge click may run before it is aborted; the stop wait of the step it was in comes on top (a gh call: 0.4 s in github/merge.ts, 0.75 s for the issue-trust read in github/issues.ts; a review load: its history worker's 1 s grace, then termination, in runner/history-job.ts). */
 export const MERGE_OPERATION_TIMEOUT_MS = 14_000;
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
-/** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
+/** The blocker codes `#attemptBlocker` produces: what the merge attempt on record says. The Record type forces every code to be listed. */
+type AttemptBlockerCode = 'queue-active' | 'queue-merged' | 'queue-head';
+const ATTEMPT_BLOCKERS: Readonly<Record<AttemptBlockerCode, true>> = { 'queue-active': true, 'queue-merged': true, 'queue-head': true };
+/** The merge was not applied for a passing reason (deadline, shutdown, a remote read's own timeout); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
 /** A concurrent poll already committed this attempt's terminal failure; it is the answer, passed through as is. */
 class CommittedFailure extends Error {}
@@ -239,17 +244,36 @@ export class MergeCoordinator {
         this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'merged', ...(remote.url ? { url: remote.url } : {}) });
       attempt = this.#attempt();
     }
+    return { status: this.#withAttempt(attempt, blockers, remote), resolved };
+  }
+
+  /** The attempt on record decides readiness: an active or merged attempt blocks, and an ended one may offer a retry. */
+  #withAttempt(attempt: MergeAttempt | null, blockers: MergeBlocker[], remote: RemoteMergeState): MergeStatus {
     const queue = this.#queueStatus(attempt);
     const attemptBlocker = this.#attemptBlocker(attempt);
-    if (attemptBlocker) blockers.unshift(attemptBlocker);
+    const all = attemptBlocker ? [attemptBlocker, ...blockers] : blockers;
     const active = attempt?.state === 'submitting' || attempt?.state === 'queued' || attempt?.state === 'merged';
-    const retry = !!queue?.retryable;
-    const ready = !active && blockers.length === 0;
-    return { status: { available: true, ready, action: ready ? (retry ? 'retry' : 'merge') : null, blockers, remote, queue }, resolved };
+    const ready = !active && all.length === 0;
+    return { available: true, ready, action: ready ? (queue?.retryable ? 'retry' : 'merge') : null, blockers: all, remote, queue };
+  }
+
+  /**
+   * The status to answer a merge click with. The click's status was read before the command, so its readiness is
+   * recomputed from the attempt on record, which is active or merged after a submission (#48). That GitHub readiness
+   * is stale once the command ran: if the attempt has already ended (a queue poll during the server's review reload),
+   * the answer offers no action and asks for a refresh, so a retry is only offered from a fresh GitHub read.
+   */
+  statusAfterMerge(status: MergeStatus | MergeUnavailableStatus): MergeStatus | MergeUnavailableStatus {
+    // An unavailable status already offers nothing.
+    if (status.remote === null) return status;
+    const current = this.#withAttempt(this.#attempt(), status.blockers.filter(blocker => !Object.hasOwn(ATTEMPT_BLOCKERS, blocker.code)), status.remote);
+    if (!current.ready) return current;
+    return { ...current, ready: false, action: null,
+      blockers: [{ code: 'refresh', message: 'Refresh to read GitHub\'s current state before merging again.' }, ...current.blockers] };
   }
 
   /** What the merge attempt on record says, shown first. */
-  #attemptBlocker(attempt: MergeAttempt | null): MergeBlocker | null {
+  #attemptBlocker(attempt: MergeAttempt | null): (MergeBlocker & { code: AttemptBlockerCode }) | null {
     if (attempt?.state === 'submitting' || attempt?.state === 'queued') return { code: 'queue-active', message: attempt.state === 'submitting'
       ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
       : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' };
@@ -311,30 +335,34 @@ export class MergeCoordinator {
   /**
    * Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again.
    * Returns undefined when this refusal was saved (the caller answers with it). If another coordinator saved the
-   * click first, its outcome is the answer: a saved success comes back as a replay, a saved refusal or a reused key
-   * is thrown.
+   * click first, its outcome is the answer: a saved success comes back as a replay (its status read bounded by
+   * `signal` when one is given), a saved refusal or a reused key is thrown. A refusal that cannot be saved (a storage
+   * error, or the write gate closed at shutdown) throws MergeNotApplied, keeping the refusal's text.
    */
-  #recordRefusal(token: string, actionId: string, refusal: unknown): ReturnType<MergeCoordinator['merge']> | undefined {
+  #recordRefusal(token: string, actionId: string, refusal: unknown, signal?: AbortSignal): ReturnType<MergeCoordinator['merge']> | undefined {
     if (!this.service.store || !this.service.config) return undefined;
     const action = { actionId, kind: 'merge', request: { token } };
     try {
       // Returning normally means userAction replayed a success saved concurrently: answer from that record.
       this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; });
-      return this.#replay(token, actionId);
+      return this.#replay(token, actionId, signal);
     } catch (error) {
+      // An unsaved refusal keeps its own text in the resend answer (#48; AGENTS.md: do not replace an actionable error).
+      const reason = refusal instanceof Error ? ` ${refusal.message}` : '';
       // A storage error, whether it was the refusal itself or the failed save, recorded nothing: resend.
-      if (storageError(refusal) || storageError(error)) throw new MergeNotApplied('The merge outcome could not be saved. Try again.', { cause: error });
+      if (storageError(refusal) || storageError(error)) throw new MergeNotApplied(`The merge outcome could not be saved. Try again.${reason}`, { cause: error });
       // userAction re-raised this refusal after saving it.
       if (error === refusal) return undefined;
       // A refusal saved concurrently under this key, or the key reused for another request: that is the answer.
       if (error instanceof GuardRefusal) throw error;
-      // Anything else left the refusal unsaved: nothing was applied, so resend.
-      throw new MergeNotApplied('The merge refusal could not be saved. Try again.', { cause: error });
+      // Anything else (such as the write gate closed at shutdown) left the refusal unsaved: nothing was applied, so
+      // resend.
+      throw new MergeNotApplied(`The merge refusal could not be saved. Try again.${reason}`, { cause: error });
     }
   }
 
   /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */
-  #replay(token: string, actionId: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | undefined {
+  #replay(token: string, actionId: string, signal?: AbortSignal): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | undefined {
     if (!this.service.store || !this.service.config) return undefined;
     const { store, config } = this.service;
     const read = () => {
@@ -363,10 +391,19 @@ export class MergeCoordinator {
     // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after
     // it. A failed re-read is not answered with the older record: read() turns a storage error into "resend" (503).
     const current = () => read()?.response ?? saved.response;
-    const signal = this.#replayAbort.signal;
+    // A click that is already aborted loads no review and starts or joins no GitHub read: it answers the saved outcome and
+    // asks for a refresh (#48; test/merge-stop-reasons.test.ts).
+    if (signal?.aborted) return Promise.resolve().then(() => answer(current(), unavailable(undefined)));
+    // Every replay's read stops at shutdown, which awaits it. A click's replay also reads fresh under its own signal, so
+    // its deadline bounds the read and no shared read (a page load's) inherits that signal (#48). Other replays keep the
+    // shared display read.
+    const bound = signal ? AbortSignal.any([signal, this.#replayAbort.signal]) : this.#replayAbort.signal;
     const replayed = (async () => {
       let status: MergeStatus | MergeUnavailableStatus;
-      try { status = await this.displayStatus(await this.service.load({ signal }), signal); } catch (error) { status = unavailable(error); }
+      try {
+        const view = await this.service.load({ signal: bound });
+        status = signal ? await this.status(view, true, bound) : await this.displayStatus(view, bound);
+      } catch (error) { status = unavailable(error); }
       return answer(current(), status);
     })();
     const tracked = replayed.then(() => undefined, () => undefined);
@@ -503,20 +540,36 @@ export class MergeCoordinator {
           });
         } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, attempt.id, message);
       }); } catch {}
-      // A definite refusal before admission is this click's outcome; a resend replays it. Aborts, the deadline and
+      // Why the work stopped, if it stopped rather than being refused. A remote read that timed out (as itself, or
+      // wrapped as an upstream failure) reports its timeout: had this coordinator's abort come first, the read would
+      // have thrown that reason instead (#48). gh's own 30 s timeout (set by the merge gateway's runner; the issue
+      // gateway's runner sets none) is a plain error, but every read before admission has a shorter RemoteTimeout, so it
+      // cannot come first.
+      // gh's own answer (a CommandFailed) that came before the abort is not a stop: it is handled as it would be without
+      // the abort (AGENTS.md: keep the original reason; do not replace an actionable error with cancellation text).
+      const readTimedOut = timedOut(error), abortWins = signal.aborted && !readTimedOut && !ghAnswered(error);
+      const ownAbort = signal.reason instanceof Error ? signal.reason : new Error('Merge request stopped.', { cause: signal.reason });
+      const stopped = readTimedOut ? error as Error : abortWins ? ownAbort : null;
+      // A definite refusal before admission is this click's outcome; a resend replays it. A timeout, the deadline and
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
-      if (!queueAttempt && !signal.aborted && action) {
-        // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal.
-        const replay = this.#replay(token, action.actionId) ?? this.#recordRefusal(token, action.actionId, error);
+      // (A coordinator without a store, which only tests build, saves nothing: a gh answer then passes through as is.)
+      if (!queueAttempt && action) {
+        // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal, timeout or
+        // abort. For an aborted click the replay reads nothing from GitHub. Only a refusal is recorded; a stop never is.
+        const replay = this.#replay(token, action.actionId, signal) ?? (stopped ? undefined : this.#recordRefusal(token, action.actionId, error, signal));
         if (replay) return await replay;
       }
-      // Before admission an abort applied nothing, so the click may be resent (503). After admission the GitHub outcome
-      // is unknown: the durable attempt stays in flight and reconciles on refresh, so report the original error.
-      if (signal.aborted && !queueAttempt) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });
+      // Before admission an abort or a remote timeout applied nothing, so the click may be resent (503). After admission
+      // the attempt stays in flight unless GitHub's refusal was saved, and reconciles on refresh.
+      if (stopped && !queueAttempt) throw new MergeNotApplied(stopped.message, { cause: stopped });
       // After admission only GitHub's confirmed refusal, durably recorded, is definite (the attempt is now failed);
       // anything else, including a refusal whose failed state could not be saved, leaves the attempt in flight.
       const refused = error instanceof MergeSubmissionError && error.outcome === 'refused' && refusalSaved;
-      const failure = signal.aborted && signal.reason instanceof Error ? signal.reason : error;
+      // After admission, GitHub's refusal is its answer, though this coordinator's deadline or shutdown came later: the
+      // durable attempt records it (#48), and an unsaved one still carries GitHub's text, as an unknown outcome. Any
+      // other failure while aborted reports the abort, as an unknown outcome.
+      const ghRefused = error instanceof MergeSubmissionError && error.outcome === 'refused';
+      const failure = signal.aborted && signal.reason instanceof Error && !ghRefused && !ghAnswered(error) ? signal.reason : error;
       if (queueAttempt && !refused) throw new MergeOutcomeUnknown(failure instanceof Error ? failure.message : 'The merge outcome is unknown.', { cause: failure });
       throw failure;
     }
@@ -557,13 +610,17 @@ export class MergeCoordinator {
       return this.#queueStatus();
     } catch (error) {
       if (error instanceof ShuttingDownError) throw error;
-      if (signal.aborted) throw signal.reason;
+      // A queue read that timed out on its own, or that gh answered, keeps that reason, though shutdown came after (#48).
+      if (signal.aborted && !timedOut(error) && !ghAnswered(error)) throw signal.reason;
       const message = error instanceof Error ? error.message : 'Could not read the merge queue.';
       if (/head changed after review/i.test(message)) {
         this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'failed', reason: message, requiresFreshReview: true });
         return this.#queueStatus();
       }
-      return this.#queueStatus(attempt, message);
+      // Answer from the attempt on record, which may have moved on while GitHub was read (queued, or a retry). The
+      // failed read describes only the attempt it inspected (#48).
+      const current = this.#attempt();
+      return this.#queueStatus(current, current?.id === attempt.id ? message : undefined);
     }
   }
 

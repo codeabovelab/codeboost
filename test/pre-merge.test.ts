@@ -14,6 +14,9 @@ import { RunnerCoordinator } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationResult } from '../agents/contract.ts';
 import type { TaskWorkspace, WorkspaceRef } from '../runner/execution.ts';
 import { MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
+import { UpstreamFailure } from '../runner/lifecycle.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
 
 // A passthrough, so a test can act while a preparation's worker history read is in flight.
 const historyReads = vi.hoisted(() => ({ during: undefined as (() => void) | undefined }));
@@ -70,8 +73,11 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   rebaseCleanupFailure?: Error;
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
-  authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
+  /** The second argument lets an authorization stop the preparation while its read is settling. */
+  authorize?: (signal: AbortSignal, fixture: { coordinator: PreMergeCoordinator }) => Promise<PreMergeAuthorization>;
   reserves?: { processMs?: number; commandMs?: number };
+  /** Saves the preparation's outcome under this action ID, as the server's prepare-merge action does. */
+  actionId?: string;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -176,7 +182,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair = { base: onto, head };
   let authorizationChecks = 0;
-  const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
+  const authorize = options.authorize ? (signal: AbortSignal) => options.authorize!(signal, { coordinator }) : (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
     validate: () => { remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair; },
   }) : undefined);
@@ -200,9 +206,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     }) as RunnerCoordinator['start'];
   }
   const task = service.store.getTask(identity);
+  const actionRequest = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
+  if (options.actionId) service.store.userAction(identity, { actionId: options.actionId, kind: 'prepare-merge', request: actionRequest }, () => ({ outcome: 'preparing' }));
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
-  return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons,
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+    ...(options.actionId ? { actionId: options.actionId } : {}) });
+  return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, actionRequest,
     rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts, rebaseBudgets, abortBudgets };
 }
 
@@ -267,6 +276,28 @@ it('keeps a failed rebase bound to the review that started it when that review c
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it.each([
+  ['timed out', () => new RemoteTimeout('Issue retrieval timed out.')],
+  ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', '')],
+] as const)('saves a preparation whose issue-trust read %s before shutdown with that answer, not the shutdown (#48)', async (_case, answer) => {
+  const actionId = randomUUID();
+  let stoppedFirst = false;
+  const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
+  const fixture = await rebaseFixture('feature\n', undefined, { actionId, authorize: async (signal, { coordinator }) => {
+    // The read answered (or ran out of time) before shutdown, and surfaces while shutdown stops the preparation. This is
+    // the error the server's readIssueAccess builds then: its own answer, wrapped, with the answer as the cause.
+    void coordinator.close();
+    stoppedFirst = signal.aborted;
+    throw new UpstreamFailure(expected, { cause });
+  } });
+  expect(stoppedFirst).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expected });
+  expect(fixture.service.store.savedAction(fixture.service.config.identity, { actionId, kind: 'prepare-merge', request: fixture.actionRequest })?.response)
+    .toMatchObject({ outcome: 'failed', reason: expected });
+  expect(fixture.rebaseRuns()).toBe(0);
+  await fixture.runner.close();
 });
 
 it('revalidates authorization before starting the delayed local rebase', async () => {
