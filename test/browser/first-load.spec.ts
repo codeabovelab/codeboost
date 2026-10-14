@@ -134,12 +134,18 @@ test('refuses a plan import made before the first review load, says why, and imp
   await expect(page.locator('#plans-status')).toHaveText('Loading the current plan…');
   const importButton = page.getByRole('button', { name: 'Import next revision' });
   await expect(importButton).toHaveAttribute('aria-disabled', 'true');
-  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
-  // aria-disabled keeps the control reachable: keyboard activation must explain the refusal, not do nothing.
+  // aria-disabled keeps the control reachable: keyboard activation must explain the refusal, not do nothing. With no
+  // file chosen yet, the browser's own file check must not answer instead.
   await importButton.focus();
   await page.keyboard.press('Enter');
   await expect(page.locator('#plans-status')).toHaveText('! The plan is still loading. Nothing was imported. Import after it appears.');
   await expect(page.locator('#plans-status')).toHaveClass('warn');
+  await expect(importButton).toBeFocused();
+  await page.locator('#plans-status').evaluate(element => { element.textContent = ''; });
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
+  await importButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#plans-status')).toHaveText('! The plan is still loading. Nothing was imported. Import after it appears.');
   await expect(importButton).toBeFocused();
 
   release();
@@ -170,6 +176,12 @@ test('refuses a plan import after the first review load failed, and says why', a
 
   const importButton = page.getByRole('button', { name: 'Import next revision' });
   await expect(importButton).toHaveAttribute('aria-disabled', 'true');
+  await importButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#plans-status')).toHaveText('✕ No plan is loaded, so nothing was imported. Use Refresh plan, then import.');
+  await expect(page.locator('#plans-status')).toHaveClass('bad');
+  await expect(importButton).toBeFocused();
+  await page.locator('#plans-status').evaluate(element => { element.textContent = ''; });
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
   await importButton.focus();
   await page.keyboard.press('Enter');

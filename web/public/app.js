@@ -1174,7 +1174,8 @@ function renderPlans() {
 // A plan or review is being read: the page's review read, or Refresh plan, which reads without taking the busy flag.
 const reviewLoading = () => busyKind === "read" || planRefreshPending;
 // aria-disabled, not disabled: focus stays on the button, and a click with no plan loaded still reaches importPlan,
-// which says why nothing was imported. (During an import, the button's "Importing…" label shows the state.)
+// which says why nothing was imported. The form is novalidate so the browser's file check cannot answer first;
+// importPlan reports a missing file itself. (During an import, the button's "Importing…" label shows the state.)
 function renderPlanImport() {
   if (planImportPending || !data?.plan) $("plan-import").setAttribute("aria-disabled", "true");
   else $("plan-import").removeAttribute("aria-disabled");
