@@ -99,6 +99,31 @@ test('keeps question and change-request text typed before the first review load 
   expect(errors).toEqual([]);
 });
 
+test('keeps text typed before a failed first load and gives it to the first item when Refresh succeeds', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const release = await openWithHeldReview(page, app.url, 'fail');
+  await page.getByLabel('Question about this item').fill('Typed before the failed load.');
+  await page.getByRole('button', { name: 'Request change', exact: true }).click();
+  await page.getByLabel('Change to request').fill('Change typed before the failed load.');
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+
+  release();
+  await expect(page.locator('#banner')).toContainText('Could not read this branch’s history.');
+  await expect(page.getByLabel('Question about this item')).toBeDisabled();
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load.');
+
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.locator('[data-select="P1"]')).toHaveAttribute('aria-current', 'true', { timeout: 30_000 });
+  await expect(page.getByLabel('Question about this item')).toBeEnabled();
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed before the failed load.');
+  await expect(page.getByText('Retained draft')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Request change', exact: true }).click();
+  await expect(page.getByLabel('Change to request')).toHaveValue('Change typed before the failed load.');
+  expect(app.service.store.getReviewNotes(app.service.config.identity)).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
 test('refuses a plan import made before the first review load, says why, and imports once the plan appears', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
