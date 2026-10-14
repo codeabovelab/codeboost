@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { openReview, reloadReview } from './review-page.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,7 +39,7 @@ test.afterEach(async () => {
 
 async function openPlans(page: Page, deps: PlanningDeps) {
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, undefined, undefined, deps);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
 }
 
@@ -100,7 +101,7 @@ test('accepts complete payloads for every edit operation', async ({ page }) => {
   const { deps } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   const card = (op: EditReply['edits'][number]['op'], payload: Record<string, unknown> = {}, item = 'P1') => ({
     op, item, summary: `Exercise ${op}`, reason: `The ${op} payload is complete.`,
     field: null, value: null, file: null, check: null, check_index: null, depends_on: null, new_item: null, ...payload,
@@ -137,7 +138,7 @@ test('renders a whole next-revision draft without changing the current plan', as
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/drafts/*', async route => {
     reads++;
@@ -166,7 +167,7 @@ test('renders a whole next-revision draft without changing the current plan', as
 test('applies a draft once while preserving newer review text and its attachment', async ({ page }) => {
   const { deps, invocations } = planning();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, undefined, undefined, deps);
-  await page.goto(app.url);
+  await openReview(page, app.url);
   await page.locator('.added [data-line]').first().click();
   await page.getByRole('button', { name: 'Ask about selection', exact: true }).click();
   await page.getByLabel('Question about this item').fill('Before Apply');
@@ -460,7 +461,7 @@ test('keeps ownership while a malformed status response is retried', async ({ pa
 test('rejects failed output and marks consumed output stale', async ({ page }) => {
   const { deps } = planning();
   await openPlans(page, deps);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0, starts = 0;
   let releaseConsumed!: () => void;
   const consumedHeld = new Promise<void>(resolve => { releaseConsumed = resolve; });
@@ -498,7 +499,7 @@ test('rejects a status response for the wrong planning operation', async ({ page
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
@@ -542,7 +543,7 @@ test('marks invalidated output stale when it moves into history', async ({ page 
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
@@ -595,7 +596,7 @@ test('rejects a status observation bound to another snapshot', async ({ page }) 
 test('rejects an operation-specific payload that is unsafe to render', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
-  const snapshotId = app.service.load().snapshot.id;
+  const snapshotId = (await app.service.load()).snapshot.id;
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;

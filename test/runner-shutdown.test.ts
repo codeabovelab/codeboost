@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
-import { MAX_REQUEST_BYTES, RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
+import { MAX_REQUEST_BYTES, MAX_SHUTDOWN_DRAIN_MS, RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
@@ -86,7 +86,7 @@ describe('merge coordinator after the gate closes', () => {
     const store = new Store(':memory:'); cleanups.push(() => store.close());
     const plan = { schema_version: 1 as const, revision: 1, issue: 1, summary: 'M', questions: [], items: [{ id: 'P1', title: 'M', intent: 'M', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'M' }], acceptance: [{ type: 'check' as const, text: 'M' }], depends_on: [] }] };
     store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] }, oid(1), oid(2));
-    const view = { items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [], checks: {} }], plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: store.getSnapshot(identity).id, base: oid(1), head: oid(2) }, token: 't', expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } } as unknown as ReturnType<ReviewService['load']>;
+    const view = { items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [], checks: {} }], plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: store.getSnapshot(identity).id, base: oid(1), head: oid(2) }, token: 't', expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } } as unknown as Awaited<ReturnType<ReviewService['load']>>;
     const service = { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
     const state: RemoteMergeState = { base: oid(1), head: oid(2), pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false, ...remote };
     const gateway: MergeGateway & MergeQueueGateway = {
@@ -132,7 +132,9 @@ describe('merge coordinator after the gate closes', () => {
 // Each demo review action runs git and takes about a second, so these exceed Vitest's 5 s default under a full run.
 describe('server shutdown', { timeout: 15_000 }, () => {
   it('lets an admitted request finish during the drain (AGENTS.md: drain admitted requests)', async () => {
-    const { app, config, close } = await serve();
+    // Review loads no longer block the server, so the drain limit really ends the request: give it the production
+    // limit, which this request's two review loads fit inside even on a loaded machine.
+    const { app, config, close } = await serve(undefined, undefined, MAX_SHUTDOWN_DRAIN_MS);
     const view = (await api(app, 'GET', '/api/review')).body;
     const sent = partialPost(app, '/api/action', { action: 'note', kind: 'change', item: 'P1', text: 'admitted note', token: view.token, actionId: randomUUID() });
     await tick();

@@ -9,28 +9,28 @@ import { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import type { Plan } from '../core/plan.ts';
 const roots:string[]=[];afterEach(()=>roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true})));
-it('plants in an isolated clone, retains ledger attribution, and leaves source history unchanged',()=>{
+it('plants in an isolated clone, retains ledger attribution, and leaves source history unchanged',async()=>{
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-'));roots.push(root);const config=createDemo(join(root,'source'));
  config.github={repository:'owner/source',pullRequest:7,issue:3};
  config.allowedCommands=[['npm','test']];
  config.runnerRepository=config.repository;
  const head=()=>fixtureGit(config.repository,'rev-parse','HEAD');const before=head();
- const path=plant(config,join(root,'experiment'),{declaredText:'// planted extra behavior',undeclaredText:'unrelated diagnostic',undeclaredPath:'extra.txt'});
+ const path=await plant(config,join(root,'experiment'),{declaredText:'// planted extra behavior',undeclaredText:'unrelated diagnostic',undeclaredPath:'extra.txt'});
  expect(head()).toBe(before);const output=JSON.parse(readFileSync(path,'utf8'));expect(output.github).toBeUndefined();expect(output.allowedCommands).toBeUndefined();expect(output.runnerRepository).toBeUndefined();const service=new ReviewService(output);
- try {const view=service.load();expect(view.segments.some(s=>s.path==='extra.txt'&&s.scope==='out-of-scope')).toBe(true);expect(view.segments.some(s=>s.content.includes('// planted extra behavior')&&s.row.startsWith('P'))).toBe(true);}finally{service.close();}
+ try {const view=await service.load();expect(view.segments.some(s=>s.path==='extra.txt'&&s.scope==='out-of-scope')).toBe(true);expect(view.segments.some(s=>s.content.includes('// planted extra behavior')&&s.row.startsWith('P'))).toBe(true);}finally{service.close();}
  expect(JSON.parse(readFileSync(join(root,'experiment','sealed.json'),'utf8')).mappings).toHaveLength(3);
 },15000);
-it('refuses non-ASCII plants on case-insensitive filesystems pending an identity adapter', () => {
+it('refuses non-ASCII plants on case-insensitive filesystems pending an identity adapter', async () => {
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-path-'));roots.push(root);
  const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
- expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'café.txt'})).toThrow(/filesystem-specific identity adapter/);
+ await expect(plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'café.txt'})).rejects.toThrow(/filesystem-specific identity adapter/);
 },15000);
-it('rejects canonical declared and existing path collisions before creating a clone', () => {
+it('rejects canonical declared and existing path collisions before creating a clone', async () => {
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-collision-'));roots.push(root);
  const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
- for (const path of ['RETRY.TS','RUN.SH']) expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:path})).toThrow(/outside every declared file|already exists/);
+ for (const path of ['RETRY.TS','RUN.SH']) await expect(plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:path})).rejects.toThrow(/outside every declared file|already exists/);
 },15000);
-it('treats metacharacters literally when checking declared-file transitions',()=>{
+it('treats metacharacters literally when checking declared-file transitions',async()=>{
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-literal-'));roots.push(root);const repository=join(root,'source');mkdirSync(repository);
  const git=(...args:string[])=>fixtureGit(repository,...args);
  git('init','-b','main');git('config','user.name','Test');git('config','user.email','test@example.invalid');git('config','commit.gpgsign','false');
@@ -45,28 +45,28 @@ it('treats metacharacters literally when checking declared-file transitions',()=
  try{store.createPlan(JSON.stringify(plan),'json',{identity,issue:10,baseEntries:['*.txt','a.txt'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},base,head);store.recordHistory(identity,{revision:1,snapshotId:store.getSnapshot(identity).id},base,head,[{sha:owned,owner:'P1',origin:'owned',sourceSha:null}]);}finally{store.close();}
  expect(git('ls-tree','--name-only',head,'--','*.txt')).toBe('');
  expect(()=>git('ls-tree','--name-only',head,'--',':(glob)*.txt')).toThrow(/pathspec magic not supported/);
- expect(()=>plant(config,join(root,'experiment'),{declaredText:'planted',undeclaredText:'outside',undeclaredPath:'extra.txt'})).toThrow(/Declared plant needs a regular file retained/);
+ await expect(plant(config,join(root,'experiment'),{declaredText:'planted',undeclaredText:'outside',undeclaredPath:'extra.txt'})).rejects.toThrow(/Declared plant needs a regular file retained/);
 },15000);
 
-it('rejects experiment destinations inside the source, including symlink aliases', () => {
+it('rejects experiment destinations inside the source, including symlink aliases', async () => {
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-destination-'));roots.push(root);
  const config=createDemo(join(root,'source'));symlinkSync(config.repository,join(root,'alias'));
  for(const destination of [join(config.repository,'experiment'),join(config.repository,'.git','experiment'),join(root,'alias','nested','experiment')]) {
-   expect(()=>plant(config,destination,{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).toThrow(/outside the source repository/);
+   await expect(plant(config,destination,{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).rejects.toThrow(/outside the source repository/);
  }
 },15000);
-it('passes its isolated environment to every planting Git process', () => {
+it('passes its isolated environment to every planting Git process', async () => {
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-env-'));roots.push(root);
  const config=createDemo(join(root,'source'));
  vi.stubEnv('GIT_DIR',join(root,'outside.git'));vi.stubEnv('GIT_WORK_TREE',join(root,'outside'));
- try {expect(plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).toBe(join(root,'experiment','review.json'));}
+ try {expect(await plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).toBe(join(root,'experiment','review.json'));}
  finally {vi.unstubAllEnvs();}
 },15000);
-it('commits every plant even when an inherited user Git ignore file matches it', () => {
+it('commits every plant even when an inherited user Git ignore file matches it', async () => {
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-ignore-'));roots.push(root);
  const config=createDemo(join(root,'source'));const home=join(root,'home');mkdirSync(join(home,'git'),{recursive:true});writeFileSync(join(home,'git','ignore'),'extra.txt\n');
  vi.stubEnv('XDG_CONFIG_HOME',home);vi.stubEnv('HOME',root);
- try {plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'});}
+ try {await plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'});}
  finally {vi.unstubAllEnvs();}
  expect(fixtureGit(join(root,'experiment','repository'),'ls-tree','--name-only','HEAD').split('\n')).toContain('extra.txt');
 },15000);
