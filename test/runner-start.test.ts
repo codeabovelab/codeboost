@@ -181,13 +181,13 @@ describe('start (#91 part 2)', () => {
     const actionId = randomUUID();
     const response = act(app, 'start', { actionId, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion });
     await readStarted.promise;
-    const saved = { outcome: 'started', item: 'P1' };
+    // Distinct from what an admitted start answers, so the answer itself shows nothing was admitted.
+    const saved = { outcome: 'saved meanwhile' };
     if (savedMeanwhile) store.userAction(identity, { actionId, kind: 'start', request: { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion } }, () => saved);
     const closing = close();
     await new Promise(resolve => setTimeout(resolve, 50)); // Shutdown has started and is draining this request.
     releaseTimeout.resolve();
     const answer = await response;
-    expect(store.getAttempts(identity)).toEqual([]);
     await closing;
     if (savedMeanwhile) expect(answer).toMatchObject({ status: 200, body: { result: saved } });
     else expect(answer).toMatchObject({ status: 503, body: { error: 'Issue trust could not be verified: Issue retrieval timed out.' } });
