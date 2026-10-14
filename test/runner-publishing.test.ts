@@ -241,7 +241,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
-      const review = service.load();
+      const review = await service.load();
       service.store.saveReview(identity, review.expected,
         review.items.map(item => approveItem(review.plan, review.segments, item.id, identity, item.count === 0)), []);
     }
@@ -787,7 +787,7 @@ describe('publishing a finished task (#103)', () => {
     expect(w.github.head(branch)).toBe(head);
     expect(w.github.prs).toEqual([expect.objectContaining({ open: true, draft: false })]);
     // Review shows its change in the Unplanned row, and the merge gate blocks until a person assigns or accepts it.
-    const view = app.service.load();
+    const view = await app.service.load();
     expect(view.segments.filter(segment => segment.row === 'Unplanned').map(segment => segment.path)).toContain('debug.log');
     // The gate inspects the published PR (#121), which GitHub shows as the task's.
     const pr = store.taskPullRequests(identity).find(record => record.state === 'opened')!;

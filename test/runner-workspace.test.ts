@@ -98,7 +98,7 @@ describe('real task workspace (#87)', () => {
     const review = new ReviewService({ database: join(s.root, 'state.sqlite'), repository: s.source, runnerRepository: s.repository.path,
       identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
     try {
-      const view = review.load();
+      const view = await review.load();
       expect(view.snapshot.head).toBe(two);
       // a.ts's lines are P1's own runner commit's.
       expect(view.segments.filter(segment => segment.path === 'a.ts').map(segment => [segment.row, segment.operation]))
@@ -108,7 +108,7 @@ describe('real task workspace (#87)', () => {
     // Without the runner-owned repository it fails rather than read the user's.
     const unconfigured = new ReviewService({ database: join(s.root, 'state.sqlite'), repository: s.source, identity,
       pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
-    try { expect(() => unconfigured.load()).toThrow('needs the runner-owned repository'); } finally { unconfigured.close(); }
+    try { await expect(unconfigured.load()).rejects.toThrow('needs the runner-owned repository'); } finally { unconfigured.close(); }
   }, 600_000);
 
   it('sends a file the repository ignores to needs human, and keeps no commit of it', async () => {
@@ -133,7 +133,7 @@ describe('real task workspace (#87)', () => {
     // The review load reads the runner commit at the recorded head: it does not replace the checkpoint's snapshot.
     const review = new ReviewService({ database: join(s.root, 'state.sqlite'), repository: s.source, runnerRepository: s.repository.path,
       identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
-    expect(review.load().snapshot.id).toBe(checkpoint.snapshotId);
+    expect((await review.load()).snapshot.id).toBe(checkpoint.snapshotId);
     // A person amends the plan to declare the extra file, then approves continuing from the audited checkpoint.
     const amended = { ...plan, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add' as const, renamed_from: null, change: 'z' }] }, plan.items[1]!] };
     s.store.importRevision(JSON.stringify(amended), 'json', { identity, issue: 1, pathKey: p => p, allowedCommands: [],

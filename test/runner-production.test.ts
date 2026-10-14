@@ -114,7 +114,7 @@ describe('runner startup', () => {
     for (const commit of new Set([snapshot.base, snapshot.head]))
       expect(existsSync(join(service.config.runnerRepository!, 'refs', 'codeboost', 'remote-commits', commit))).toBe(true);
     // Selecting a freshly-created runner repository must not make the initial review unreadable before any attempt runs.
-    expect(service.load().snapshot).toMatchObject({ base: snapshot.base, head: snapshot.head });
+    expect((await service.load()).snapshot).toMatchObject({ base: snapshot.base, head: snapshot.head });
     // Per database, under its runner token: another database sharing the root keeps its own folder.
     expect(statSync(join(root, 'runner', assembly.deps.runnerOwner, 'diagnostics')).mode & 0o777).toBe(0o700);
     expect(existsSync(join(root, 'runner', 'diagnostics'))).toBe(false);

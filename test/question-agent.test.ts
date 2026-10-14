@@ -357,7 +357,7 @@ it('does not start an Ask for a question whose request finishes arriving after s
   const root = mkdtempSync(join(tmpdir(), 'ask-shutdown-')); roots.push(root);
   let asked = 0;
   const app = await startServer(createDemo(join(root, 'demo')), 0, async () => { asked++; return 'Answer'; });
-  const view = app.service.load();
+  const view = await app.service.load();
   const body = JSON.stringify({ action: 'note', item: view.items[0]!.id, kind: 'question', text: 'Why?', token: view.token });
   const completed = new Promise<number>((resolve, reject) => {
     const req = request(new URL('/api/action', app.url), { method: 'POST', headers: { 'x-codeboost-token': app.token,
