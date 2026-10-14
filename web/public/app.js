@@ -28,7 +28,11 @@ let mergeGeneration = 0,
   mergeObservationGeneration = 0,
   mergePollTimer = null,
   mergePollState = null,
-  mergePollDelay = 2000;
+  mergePollDelay = 2000,
+  // One merge poll chain at a time (#48): the poll in flight, by generation and sequence. A render while it runs does not
+  // start another, and only the latest poll's answer or error is applied.
+  mergePollSequence = 0,
+  mergePollInFlight = null;
 const mergePollMaximumDelay = 30000;
 const drafts = new Map();
 const attachments = new Map();
@@ -196,6 +200,8 @@ function renderMerge() {
   scheduleMergePoll();
 }
 function scheduleMergePoll() {
+  // The poll in flight reschedules itself when it settles; a second chain could apply an older answer after a newer one.
+  if (mergePollInFlight?.generation === mergeGeneration) return;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
   const queue = data?.merge?.queue;
@@ -217,9 +223,23 @@ function backOffMergePoll() {
   mergePollDelay = Math.min(mergePollDelay * 2, mergePollMaximumDelay);
 }
 async function pollMergeQueue(generation) {
+  mergePollTimer = null;
+  const sequence = ++mergePollSequence;
+  mergePollInFlight = { generation, sequence };
+  // Settles this poll's ownership and says whether its result may still be applied: only the latest poll's, and only
+  // while its generation is current.
+  const settle = () => {
+    const latest = mergePollInFlight?.sequence === sequence;
+    if (latest) mergePollInFlight = null;
+    return latest && generation === mergeGeneration && !!data?.merge?.available;
+  };
+  // Decided once, when the request settles: an error thrown while applying a current answer is still reported, and
+  // polling still continues.
+  let current;
   try {
     const update = await api("/api/merge");
-    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    current = settle();
+    if (!current) return;
     if (data.merge.job?.state === "running") {
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
       // a background reload would erase the person's selection and input; Refresh shows the outcome.
@@ -246,7 +266,8 @@ async function pollMergeQueue(generation) {
     if (queue?.state === mergePollState) backOffMergePoll();
     renderMerge();
   } catch (error) {
-    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    current ??= settle();
+    if (!current) return;
     $("banner").textContent = `Could not refresh merge status. ${error.message}`;
     backOffMergePoll();
     scheduleMergePoll();
@@ -592,6 +613,8 @@ $("merge").onclick = async () => {
   const busyOwner = beginBusy("write");
   reviewGeneration++;
   mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   mergePollState = null;
   mergePollDelay = 2000;
   // With merge jobs, the click returns at once and the focused control must keep focus: mark it, do not disable it.
