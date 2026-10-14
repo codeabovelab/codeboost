@@ -217,7 +217,8 @@ it('answers an outcome another coordinator saved meanwhile, even when a timeout 
     await gh.started;
     store.userAction(identity, { actionId, kind: 'merge', request: { token: view.token } },
       () => ({ attemptId: 'other', state: 'failed', reason: 'Required review is missing.', url: null }));
-    await vi.advanceTimersByTimeAsync(6_000); // The inspection's own timeout fires and gh starts stopping.
+    await vi.advanceTimersByTimeAsync(6_000);
+    await gh.stopped; // Before close(), only the inspection's own timeout can have stopped gh.
     const closing = coordinator.close(); // Then this coordinator's shutdown aborts the click, before gh settles.
     gh.release();
     const error = await merging as Error;
