@@ -269,7 +269,7 @@ export class MergeCoordinator {
     const current = this.#withAttempt(this.#attempt(), status.blockers.filter(blocker => !Object.hasOwn(ATTEMPT_BLOCKERS, blocker.code)), status.remote);
     if (!current.ready) return current;
     return { ...current, ready: false, action: null,
-      blockers: [{ code: 'refresh', message: 'The merge attempt ended. Refresh to read GitHub\'s current state before trying again.' }, ...current.blockers] };
+      blockers: [{ code: 'refresh', message: 'Refresh to read GitHub\'s current state before merging again.' }, ...current.blockers] };
   }
 
   /** What the merge attempt on record says, shown first. */
