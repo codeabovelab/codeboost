@@ -3,21 +3,25 @@ import { basename } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
-import { readHistory } from '../git/history.ts';
 import { execFileSync } from 'node:child_process';
 import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import { commandArgv, PlanError, type BaseEntry, type PlanContext } from '../core/plan.ts';
-import { linkHistory } from '../core/linking.ts';
+import { pathKeyFor, validPathIdentity, type PathIdentity } from '../core/path-identity.ts';
+import { runHistoryJob } from './history-job.ts';
+import type { Segment } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 import { GuardRefusal } from './lifecycle.ts';
 import { commandDigest } from './checks.ts';
 
+/** How many times one load reads the history when the Store keeps changing while its worker runs. */
+export const LOAD_ATTEMPTS = 3;
+
 export interface ReviewConfig { database: string; repository: string;
   /** The runner-owned repository (#87) holding the production task branch, including its original imported head. */
   runnerRepository?: string;
-  identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig;
+  identity: PlanIdentity; pathIdentity: PathIdentity; demo?: boolean; github?: GhMergeConfig;
   /** Exact complete argv arrays a stored plan may execute as `cmd:` acceptance checks. */
   allowedCommands?: readonly (readonly string[])[];
   /** The runner block, parsed by `parseRunnerConfig`. Its presence also makes the merge target the task's published PR (#121). */
@@ -32,17 +36,13 @@ export class ReviewService {
   #baseEntries: { base: string; entries: readonly BaseEntry[] } | null = null;
   #pathKey: (path: string) => string;
   constructor(config: ReviewConfig) {
-    if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
+    if (!validPathIdentity(config.pathIdentity)) throw new Error('Known checkout path identity is required.');
     this.config = config;
     if (config.allowedCommands !== undefined && (!Array.isArray(config.allowedCommands)
       || config.allowedCommands.some(argv => !Array.isArray(argv) || argv.length === 0
         || argv.some(arg => typeof arg !== 'string' || !arg.isWellFormed() || arg.includes('\0')))))
       throw new Error('allowedCommands must contain complete literal argv arrays.');
-    this.#pathKey = path => {
-      if (!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
-      const normalized = config.pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
-      return config.pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
-    };
+    this.#pathKey = pathKeyFor(config.pathIdentity);
     this.store = new Store(config.database, this.#pathKey);
   }
   /** Stable binding for preparation evidence; a restart with a different command policy invalidates old readiness. */
@@ -59,31 +59,45 @@ export class ReviewService {
       throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
     return { path: this.config.repository, runnerOwned: false };
   }
-  load(options: { maxDurationMs?: number } = {}) {
+  /**
+   * The review as the page shows it. History reading and linking run in a worker thread (history-job.ts) within one
+   * overall deadline; `signal` stops that work and rejects with its reason. Store reads and writes, and the work on the
+   * linked segments (choices, approval states, hashes), stay on this thread. If the Store moved on while the worker ran
+   * (another load observed a new HEAD, or a write landed), the history is read again from the current state, in at most
+   * LOAD_ATTEMPTS reads in all within the deadline, so a load returns the review as it is when it finishes.
+   */
+  async load(options: { maxDurationMs?: number; signal?: AbortSignal } = {}) {
     const maxDurationMs = options.maxDurationMs ?? 30_000;
     if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1 || maxDurationMs > 30_000)
       throw new Error('Review duration budget must be a positive integer no larger than 30000 ms.');
+    options.signal?.throwIfAborted();
     const deadline = performance.now() + maxDurationMs;
-    const remaining = () => {
-      const ms = deadline - performance.now();
-      if (ms <= 0) throw new Error('Review load exceeded its overall deadline.');
-      return Math.max(1, Math.ceil(ms));
-    };
     const { identity } = this.config;
-    const reviewVersion = this.store.reviewVersion(identity);
-    const plan = this.store.getPlan(identity);
-    let snapshot = this.store.getSnapshot(identity);
-    const reviewed = this.reviewRepository();
-    // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
-    // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
-    // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
-    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD',
-      { maxDurationMs: remaining() });
+    let reviewVersion!: number, plan!: ReturnType<Store['getPlan']>, snapshot!: ReturnType<Store['getSnapshot']>;
+    let history!: Awaited<ReturnType<typeof runHistoryJob>>['history'], raw!: Segment[];
+    for (let attempt = 1; ; attempt++) {
+      reviewVersion = this.store.reviewVersion(identity);
+      plan = this.store.getPlan(identity);
+      snapshot = this.store.getSnapshot(identity);
+      const reviewed = this.reviewRepository();
+      const ownership = [...this.store.ownership(identity, plan.revision)];
+      const resolvedConflicts = this.store.getLedger(identity).filter(entry => entry.conflictResolved).map(entry => entry.sha);
+      // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
+      // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
+      // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
+      const job = await runHistoryJob({ repository: reviewed.path, base: snapshot.base,
+        head: reviewed.runnerOwned ? snapshot.head : 'HEAD', budgetMs: Math.max(1, Math.ceil(deadline - performance.now())),
+        link: { plan, ownership, pathIdentity: this.config.pathIdentity, resolvedConflicts } }, options.signal);
+      // The worker linked the inputs read above. Every ledger write records a new snapshot in its transaction, so an
+      // unchanged review version, plan revision and snapshot mean every input is still current; everything from here
+      // on runs in this one turn.
+      if (this.store.reviewVersion(identity) === reviewVersion && this.store.getPlan(identity).revision === plan.revision
+        && this.store.getSnapshot(identity).id === snapshot.id) { history = job.history; raw = job.segments!; break; }
+      if (performance.now() >= deadline) throw new Error('Review load exceeded its overall deadline.');
+      if (attempt === LOAD_ATTEMPTS) throw new Error('Stale review state. Reload before writing.');
+    }
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = this.#pathKey;
-    const ledger = this.store.getLedger(identity);
-    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, { maxDurationMs: remaining() },
-      new Set(ledger.filter(entry => entry.conflictResolved).map(entry => entry.sha)));
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
     let previewBudget = 6 * 1024 * 1024;
@@ -186,7 +200,7 @@ export class ReviewService {
       };
     });
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
-    remaining();
+    if (performance.now() >= deadline) throw new Error('Review load exceeded its overall deadline.');
     return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
   /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
@@ -236,11 +250,19 @@ export class ReviewService {
       continuationContext: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed, ownerItem: checkpoint.item,
         outOfScopePaths: checkpoint.outOfScopePaths } };
   }
-  /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
-  act(input: unknown, actionId?: string) {
+  /** Loads the review, applies one review command to it and loads the result. */
+  async act(input: unknown, options: { signal?: AbortSignal } = {}) {
+    const createdNoteId = this.apply(await this.load(options), input);
+    return { ...await this.load(options), createdNoteId };
+  }
+  /**
+   * Applies one review command to `view`, synchronously, so a caller can run it inside Store.userAction. With an
+   * actionId, feedback-producing actions record their event in the same transaction. Every write is guarded by the
+   * view's expected review state, so a view the Store has moved past is refused.
+   */
+  apply(view: ReviewView, input: unknown, actionId?: string): string | undefined {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');
     const command = input as Record<string, unknown>;
-    const view = this.load();
     let createdNoteId: string | undefined;
     if (command.token !== view.token) throw new Error('Stale review state. Reload before writing.');
     const { identity } = this.config;
@@ -278,6 +300,7 @@ export class ReviewService {
       createdNoteId = this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference).id;
       if (actionId && command.kind === 'change') this.store.recordFeedback(identity, actionId, { kind: 'change-request', item: command.item, text: command.text.trim(), sourceRef: createdNoteId });
     } else throw new Error('Unknown review command.');
-    return { ...this.load(), createdNoteId };
+    return createdNoteId;
   }
 }
+export type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
