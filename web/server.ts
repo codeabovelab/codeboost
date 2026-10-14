@@ -697,7 +697,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             if (error instanceof MergeOutcomeUnknown) { json(409,{error:error.message,outcomeUnknown:true}); return; }
             throw error;
           }
-          try { const mergeQueue=merges.queueSnapshot();json(200,{...await loadReview(requestAbort.signal),merge:{...merges.statusAfterMerge(merged.status),queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
+          // The queue snapshot and the attempt's status are read together, after the review load, so they agree.
+          try { const review=await loadReview(requestAbort.signal),mergeQueue=merges.queueSnapshot();json(200,{...review,merge:{...merges.statusAfterMerge(merged.status),queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
           catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
         }
