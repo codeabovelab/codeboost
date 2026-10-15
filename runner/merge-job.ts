@@ -139,7 +139,12 @@ export class MergeJobCoordinator {
 
   #finish(id: string, state: Exclude<MergeJobState, 'running'>, reason: string | null = null, url: string | null = null): void {
     try { this.settle(() => this.service.store.finishMergeJob(this.service.config.identity, id, { state, reason, url })); }
-    catch { /* Startup settles a job that could not be ended now. */ }
+    catch (error) { this.#unended(id, error); }
+  }
+
+  /** Startup settles a job that could not be ended now; until then it shows as running and a new click is refused. */
+  #unended(id: string, error: unknown): void {
+    if (!this.#closing) console.error(`Could not end merge job ${id}; it shows as running until the server restarts: ${(error as Error)?.message ?? String(error)}`);
   }
 
   async #run(job: MergeJob, signal: AbortSignal): Promise<void> {
@@ -219,7 +224,7 @@ export class MergeJobCoordinator {
   #block(job: MergeJob, reason: string, whileReady = false): void {
     const readyFor = whileReady ? { commandPolicyDigest: this.service.commandPolicyDigest() } : undefined;
     try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason, readyFor)); }
-    catch { /* Startup settles a job that could not be ended now. */ }
+    catch (error) { this.#unended(job.id, error); }
   }
 
   async #awaitChecks(job: MergeJob, signal: AbortSignal): Promise<CheckVerdict> {
