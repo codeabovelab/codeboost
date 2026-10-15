@@ -656,7 +656,7 @@ test('shows only the outcome once a polled merge job ends, not the blockers it r
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[])=>({id:'0f6b0000-0000-4000-8000-0000000000f1',state,step,reason:null,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[])=>({id:'0f6b0000-0000-4000-8000-0000000000f1',state,step,reason:null,checks,url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('merged',null)];let polls=0;
  // As a runner server answers: Merge PR is offered while only job-resolved blockers remain, and the click's review,
  // reloaded while the job prepares, still lists them.
@@ -685,7 +685,7 @@ test('keeps every blocker when the click is answered with a job that ended witho
  // is still pending; the job settled neither.
  const head={code:'head',message:'The pull request head moved after review.'};
  const conflict={code:'mergeable',message:'GitHub reports a merge conflict.'};
- const failed={id:'0f6b0000-0000-4000-8000-0000000000f2',state:'failed',step:null,reason:head.message,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const failed={id:'0f6b0000-0000-4000-8000-0000000000f2',state:'failed',step:null,reason:head.message,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  let polls=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
@@ -709,7 +709,7 @@ test('names a failed merge-job poll as a merge-status failure (F6b)',async({page
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const running={id:'0f6b0000-0000-4000-8000-000000000001',state:'running',step:'checks',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const running={id:'0f6b0000-0000-4000-8000-000000000001',state:'running',step:'checks',reason:null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running},job:running})});});
@@ -726,7 +726,7 @@ test('keeps a draft typed while a merge-job click is in flight (F6b)',async({pag
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   await held;const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json(),running=job(body.actionId,'running','preparing');
@@ -749,7 +749,7 @@ test('starts a new action for Retry merge once the job its retained key started 
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const clicks:string[]=[];let first:string|null=null;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
   if(clicks.length===1){first=body.actionId;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'The review server is shutting down.'})});return;}
@@ -775,7 +775,7 @@ test('starts a new action once another job became the latest after a retained ke
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(id:string,state:string,step:string|null)=>({id,state,step,reason:state==='blocked'?'Required check failed: ci.':null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const clicks:string[]=[];let first:string|null=null;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
   if(clicks.length===1){first=body.actionId;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'The review server is shutting down.'})});return;}
@@ -801,7 +801,7 @@ test('resends the same action for Retry merge after a retry failed while an earl
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const blocked={id:'0f6b0000-0000-4000-8000-0000000000a1',state:'blocked',step:null,reason:'Required check failed: ci.',checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const blocked={id:'0f6b0000-0000-4000-8000-0000000000a1',state:'blocked',step:null,reason:'Required check failed: ci.',checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  // Every retry answers 503: nothing was applied, so the click is unresolved and its key must be resent.
  const clicks:string[]=[];
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
@@ -824,13 +824,16 @@ test('resends the same action for Retry merge after a retry failed while an earl
  expect(confirms).toEqual([retry,retry]);
 });
 
-test('keeps a merge-job outcome a poll saw while an older Refresh response was held (F6b)',async({page})=>{
+// The server orders records of one job by revision, never clock time: the held running record's update time may equal or
+// follow the outcome's (two saves in one clock tick, or a clock step back between them).
+for(const clock of [{name:'',runningAt:'2026-10-11T00:00:00Z'},{name:' with the same update time',runningAt:'2026-10-11T00:05:00Z'},{name:' with a later update time',runningAt:'2026-10-11T00:09:00Z'}])
+test(`keeps a merge-job outcome a poll saw while an older Refresh response was held${clock.name} (F6b)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
- const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',updatedAt:'2026-10-11T00:05:00Z'};
+ const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:clock.runningAt};
+ const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:2,updatedAt:'2026-10-11T00:05:00Z'};
  let ended=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
  const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
  await page.route('**/api/merge',route=>{polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:ended?merged:running})});});
@@ -868,8 +871,8 @@ test('keeps a newer merge job a poll saw while a held Refresh response shows an 
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  // Job A runs in this tab. Another tab's click starts job B after A ends; B's record is later than any of A's (sequence),
  // while its clock times are earlier, as after a clock step back.
- const jobA={id:'0f6b0000-0000-4000-8000-0000000000e1',state:'running',step:'preparing',reason:null,checks:[],url:null,sequence:1,startedAt:'2026-10-11T00:10:00Z',updatedAt:'2026-10-11T00:10:00Z'};
- const blockedA={...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',updatedAt:'2026-10-11T00:20:00Z'};
+ const jobA={id:'0f6b0000-0000-4000-8000-0000000000e1',state:'running',step:'preparing',reason:null,checks:[],url:null,sequence:1,revision:1,startedAt:'2026-10-11T00:10:00Z',updatedAt:'2026-10-11T00:10:00Z'};
+ const blockedA={...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',revision:2,updatedAt:'2026-10-11T00:20:00Z'};
  const jobB={...jobA,id:'0f6b0000-0000-4000-8000-0000000000e2',step:'checks',sequence:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  let started=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
  const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
@@ -917,8 +920,8 @@ async function mergeJobOutcomeRace(page:import('@playwright/test').Page,planning
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway,undefined,undefined,undefined,planning);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
- const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',updatedAt:'2026-10-11T00:05:00Z'};
+ const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:2,updatedAt:'2026-10-11T00:05:00Z'};
  const race={ended:false,polls:0,hold:false,config,release:()=>{},held:Promise.resolve()};
  let holding!:()=>void;race.held=new Promise<void>(resolve=>{holding=resolve;});
  const released=new Promise<void>(resolve=>{race.release=resolve;});
@@ -1008,7 +1011,7 @@ test('keeps the Merge button pending while its click is in flight, across a rend
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const running={id:'0f6b0000-0000-4000-8000-0000000000d1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const running={id:'0f6b0000-0000-4000-8000-0000000000d1',state:'running',step:'preparing',reason:null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  let release!:()=>void,arrived!:()=>void;const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{arrived=resolve;});
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
@@ -1062,7 +1065,7 @@ test('follows the running merge job when a click from an older review is refused
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[])=>({id:'0f6b0000-0000-4000-8000-0000000000b1',state,step,reason:null,checks,url:null,sequence:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[])=>({id:'0f6b0000-0000-4000-8000-0000000000b1',state,step,reason:null,checks,url:null,sequence:1,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('merged',null)];let polls=0,mergeClicks=0;
  // This tab read its review before another tab's click started a job; the server refuses this click and, as
  // web/server.ts does, carries the task's running job.
@@ -1081,10 +1084,10 @@ test('follows the running merge job when a click from an older review is refused
 });
 // A refused click's job is followed only when it is running and later than the job this page shows (web/public/app.js):
 // the server attaches the task's latest job to every merge-job refusal (web/server.ts), so an ended or older one comes too.
-const shownJob={id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:'Required check failed: ci.',checks:[],url:null,sequence:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:05Z'};
+const shownJob={id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:'Required check failed: ci.',checks:[],url:null,sequence:2,revision:3,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:05Z'};
 for(const refusal of [
- {name:'an ended job',shown:null,button:'Merge PR',job:{id:'0f6b0000-0000-4000-8000-0000000000c1',state:'failed',step:null,reason:'The server restarted before the merge finished.',checks:[],url:null,sequence:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'}},
- {name:'an older running job',shown:shownJob,button:'Retry merge',job:{id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}],url:null,sequence:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:09Z'}},
+ {name:'an ended job',shown:null,button:'Merge PR',job:{id:'0f6b0000-0000-4000-8000-0000000000c1',state:'failed',step:null,reason:'The server restarted before the merge finished.',checks:[],url:null,sequence:1,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'}},
+ {name:'an older running job',shown:shownJob,button:'Retry merge',job:{id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}],url:null,sequence:1,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:09Z'}},
  {name:'a running record no later than the job shown',shown:shownJob,button:'Retry merge',job:{...shownJob,state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}]}},
 ]){
  test(`asks for a refresh, not following it, when a refused merge click carries ${refusal.name} (F6b)`,async({page})=>{
@@ -1116,7 +1119,7 @@ test('states the next step a blocked merge job names, once (F6b)',async({page})=
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  // The reason runner/merge-job.ts saves when the 30-minute wait ends: nothing failed, so the step is to wait.
  const reason='Required checks did not pass within 30 minutes: ci is pending. Wait for the checks to pass, then Retry merge.';
- const blocked={id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const blocked={id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:blocked,mergeRefreshRequired:true})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
@@ -1129,7 +1132,7 @@ test('asks for a refresh when the click is answered with a merge job that has al
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  let polls=0;
  // The job failed before the click was answered (its review load failed as the click's reload did).
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
@@ -1154,7 +1157,7 @@ test('follows a started merge job when the server could not reload the review af
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('merged',null)];
  let polls=0,reviews=0;
  // The click's job started, but its review reload failed: the server answers only the job and asks for a refresh.
@@ -1184,7 +1187,7 @@ test('follows a one-click merge job from preparation through the required-check 
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('running','merging'),job('merged',null)];
  let polls=0,reviews=0,mergeClicks=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}mergeClicks++;

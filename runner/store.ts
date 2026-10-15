@@ -156,6 +156,11 @@ export interface MergeJob {
    * browser orders records of different jobs by it, since wall-clock times can step back.
    */
   sequence: number;
+  /**
+   * The record's version, from 1: every saved change to the job adds one. The browser orders records of the same job by
+   * it, since two saves can share an update time or the clock can step back between them.
+   */
+  revision: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -2147,7 +2152,7 @@ export class Store {
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
-        url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now };
+        url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return { job, resent: false };
     });
@@ -2170,7 +2175,7 @@ export class Store {
       }
       const now = new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'failed', step: null,
-        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now, refused: true };
+        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now, refused: true };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return job;
     });
@@ -2237,7 +2242,8 @@ export class Store {
       if (!row) throw new Error('Unknown merge job.');
       const next = change(decode<MergeJob>(row.data));
       if (!next) return null;
-      const job = { ...next, updatedAt: new Date().toISOString() };
+      // Each saved change is strictly later than the one before, whatever the clock says.
+      const job = { ...next, revision: (Number.isSafeInteger(next.revision) ? next.revision : 1) + 1, updatedAt: new Date().toISOString() };
       this.#run('UPDATE merge_jobs SET data=? WHERE id=?', encode(job), id);
       return job;
     });

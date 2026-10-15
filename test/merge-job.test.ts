@@ -720,6 +720,41 @@ it('numbers each job and refused click after the task\'s earlier ones, so the br
   f.store.finishMergeJob(identity, second.id, { state: 'failed' });
 });
 
+it('makes every saved change to a job a later revision, even when the clock ties or steps back', () => {
+  const store = publishedTask();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    const at = (time: string) => vi.setSystemTime(new Date(time));
+    at('2026-10-11T00:00:00.000Z');
+    const refusal = store.recordMergeJobRefusal(identity, { actionId: randomUUID(), token: 'review-token', reason: 'Refused.' });
+    expect(refusal.revision).toBe(1);
+    const id = randomUUID(), records = [store.beginMergeJob(identity, { actionId: id, token: 'review-token' }).job];
+    // Same clock tick as admission, then the same tick again, then a clock step back, then the block that ends it.
+    records.push(store.updateMergeJob(identity, id, { step: 'checks' })!);
+    records.push(store.updateMergeJob(identity, id, { checks: [{ context: 'ci', state: 'pending' }] })!);
+    at('2026-10-10T23:00:00.000Z');
+    records.push(store.updateMergeJob(identity, id, { mergeActionId: randomUUID() })!);
+    at('2026-10-10T22:00:00.000Z');
+    expect(store.blockMergeJob(identity, id, 'Required check failed: ci.')).toBe(true);
+    records.push(store.getMergeJob(identity, id)!);
+    // The interleaving happened: update times tied and then stepped back.
+    expect(records.map(job => job.updatedAt)).toEqual(['2026-10-11T00:00:00.000Z', '2026-10-11T00:00:00.000Z', '2026-10-11T00:00:00.000Z',
+      '2026-10-10T23:00:00.000Z', '2026-10-10T22:00:00.000Z']);
+    expect(records.map(job => job.revision)).toEqual([1, 2, 3, 4, 5]);
+    expect(records.at(-1)!.state).toBe('blocked');
+    // Startup settlement and finishing are saved changes too.
+    const next = randomUUID();
+    const begun = store.beginMergeJob(identity, { actionId: next, token: 'review-token' }).job;
+    store.settleInterruptedMergeJobs(identity);
+    const settledJob = store.getMergeJob(identity, next)!;
+    expect(settledJob.updatedAt).toBe(begun.updatedAt);
+    expect([begun.revision, settledJob.revision]).toEqual([1, 2]);
+    // An ended job is left unchanged: no save, no new revision.
+    expect(store.finishMergeJob(identity, next, { state: 'failed' })).toBe(false);
+    expect(store.getMergeJob(identity, next)!.revision).toBe(2);
+  } finally { vi.useRealTimers(); }
+});
+
 // Since #170 a click's admission awaits the review load; these pin what may happen while it does.
 it('gives a resend of the same click, during the first send\'s review load, the same job', async () => {
   const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);

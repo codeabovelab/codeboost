@@ -996,7 +996,7 @@ function preserveSettledQuestionAnswers(updated) {
 }
 /**
  * A poll's record of the task's latest job, when the poll saw it later than a full response read before it. Records of
- * one job order by update time; a later job (another tab's click) outranks any record of an earlier one, by the
+ * one job order by the server's per-job revision; a later job (another tab's click) outranks any record of an earlier one, by the
  * server's per-task job sequence, never by clock time.
  */
 function newerMergeJob(updated, observationOwner) {
@@ -1004,10 +1004,13 @@ function newerMergeJob(updated, observationOwner) {
   if (observationOwner === mergeObservationGeneration || !newer || !older) return null;
   return laterMergeJob(newer, older) ? newer : null;
 }
-/** Whether `newer` is a later record than `older` (none counts as earliest): by update time within a job, else by sequence. */
+/**
+ * Whether `newer` is a later record than `older` (none counts as earliest): by revision within a job, else by sequence.
+ * Never by clock time: two saves can share an update time, and the clock can step back between them.
+ */
 function laterMergeJob(newer, older) {
   if (!older) return true;
-  return newer.id === older.id ? newer.updatedAt > older.updatedAt
+  return newer.id === older.id ? Number.isSafeInteger(newer.revision) && Number.isSafeInteger(older.revision) && newer.revision > older.revision
     : Number.isSafeInteger(newer.sequence) && Number.isSafeInteger(older.sequence) && newer.sequence > older.sequence;
 }
 function mergeJobBanner(job) {
