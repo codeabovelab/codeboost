@@ -322,7 +322,10 @@ export class PreMergeCoordinator {
     const owned = (cleared: { before: number; after: number }) => cleared.before === binding ? cleared.after : binding;
     try {
       await this.remote.push({ branch: marker.branch, from: marker.from, to: marker.to, beforePush: () => {
-        // The last local checks before the external write: trust, and no task or review change since the claim.
+        // The last local checks before the external write: shutdown, trust, and no task or review change since the
+        // claim. Shutdown sets the runner's admission flag first and closes this coordinator only after the HTTP drain,
+        // so between the two only the runner's flag shows that shutdown began.
+        if (this.runner.closing) throw new GuardRefusal('The server is shutting down.');
         authorization?.validate();
         const task = this.service.store.getTask(identity);
         if (task.stateVersion !== binding || task.cancelRequested !== null
@@ -333,14 +336,15 @@ export class PreMergeCoordinator {
       } }, signal);
     } catch (error) {
       if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
-      // Shutdown: no new GitHub read may start; startup settles the marker. Otherwise one read, within what is left of
+      // Shutdown (from its first step, when the runner stops admission): no new GitHub read may start; startup settles
+      // the marker. Otherwise one read, within what is left of
       // the preparation's deadline with Git's settlement reserve kept inside it (except for a process that stays in
       // Git's group after Git exits, which is waited for; see #settlePush), settles it; a cancel does not stop that
       // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
       // the marker stays, as for an unreadable branch.
       let settled = binding, outcome: PushOutcome | null = null;
       const left = Math.floor(deadline - performance.now());
-      if (!this.#closing && left >= 1) {
+      if (!this.#closing && !this.runner.closing && left >= 1) {
         try { const read = await this.#settlePush(marker, left); settled = owned(read); outcome = read.outcome; }
         catch { /* The marker stays; the next preparation or startup reads the branch again. */ }
       }
