@@ -737,3 +737,19 @@ it('ends the job cancelled when the task is cancelled during the job\'s own revi
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
   expect(f.gh.merged).toEqual([]);
 });
+it('doubles the wait between required-check inspections from the first delay up to the maximum', async () => {
+  // Required checks stay pending long enough for the wait to reach its maximum; only the sleeps between inspections count.
+  const f = setup({ checks: n => (n <= 6 ? [pending()] : [passing()]) });
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 60_000, firstDelayMs: 3, maxDelayMs: 20 }); jobs.push(coordinator);
+  const waits: number[] = [];
+  const timer = setTimeout, spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number, ...args: unknown[]) => {
+    // Record the wait only while the job is between inspections of its required checks.
+    if (coordinator.latest()?.step === 'checks') waits.push(ms ?? 0);
+    return timer(handler, ms, ...args);
+  }) as typeof setTimeout);
+  try {
+    await coordinator.start('review-token', randomUUID());
+    expect(await settled(coordinator)).toMatchObject({ state: 'merged' });
+  } finally { spy.mockRestore(); }
+  expect(waits).toEqual([3, 6, 12, 20, 20, 20]);
+});
