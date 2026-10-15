@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import { MergeOutcomeUnknown, type MergeCoordinator, type MergeStatus } from './merge.ts';
+import { MergeBlocked, MergeOutcomeUnknown, PUSH_UNSETTLED, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
 import { FIX_THEN_RETRY, type MergeJob, type MergeJobState } from './store.ts';
@@ -209,7 +209,8 @@ export class MergeJobCoordinator {
       if (error instanceof MergeOutcomeUnknown) return this.#finish(job.id, 'submitted', reason);
       // A cancel or shutdown, whichever way the merge reported it (stopped, or refused because the task was cancelled).
       if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
-      this.#finish(job.id, 'failed', reason);
+      // The guarded merge's own refusal asks the person to rebase or prepare; the job's reason says what merging does.
+      this.#finish(job.id, 'failed', error instanceof MergeBlocked && error.blocker ? `${error.prefix}${inJobTerms(error.blocker).message}` : reason);
     }
   }
 
@@ -283,8 +284,10 @@ const JOB_WORDING: Readonly<Record<string, string>> = Object.freeze({
   base: 'The base branch moved; merging rebases onto it and prepares again, so the result may need review.',
   preparation: 'The merge has not been prepared for the current review; merging prepares it.',
 });
+/** An unsettled push is a preparation blocker too, but its own: merging reads the push's outcome before it prepares. */
+const PUSH_UNSETTLED_JOB = 'A push of the rewritten head has not settled; merging reads its outcome and prepares again.';
 export function inJobTerms<T extends { code: string; message: string }>(blocker: T): T {
-  const message = JOB_WORDING[blocker.code];
+  const message = blocker.code === 'preparation' && blocker.message === PUSH_UNSETTLED ? PUSH_UNSETTLED_JOB : JOB_WORDING[blocker.code];
   return message === undefined ? blocker : { ...blocker, message };
 }
 

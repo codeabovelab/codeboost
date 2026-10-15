@@ -815,3 +815,33 @@ it('doubles the wait between required-check inspections from the first delay up 
   } finally { spy.mockRestore(); }
   expect(waits).toEqual([3, 6, 12, 20, 20, 20]);
 });
+
+it('words the guarded merge\'s refusal as what merging does when the base moves after the job\'s last ready inspection', async () => {
+  // Inspection 1 is the job's wait (ready); a push to the base lands before inspection 2, the guarded merge's first.
+  const f = setup({ change: n => (n >= 2 ? { base: oid(5) } : {}) });
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  // The interleaving happened: the wait's one inspection was ready, and the guarded merge's first (the moved base) refused.
+  expect(f.gh.inspections()).toBe(2);
+  expect(f.store.getMergeAttempt(identity)).toBeNull();
+  expect(done).toMatchObject({ state: 'failed',
+    reason: 'The base branch moved; merging rebases onto it and prepares again, so the result may need review.' });
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('in review');
+  // The direct path keeps the guarded merge's own wording.
+  await expect(f.merges.merge('review-token', randomUUID())).rejects.toThrow('The base branch moved. Rebase and review the resulting snapshot.');
+});
+
+it('keeps the unsettled push in the job\'s wording of the preparation blocker', async () => {
+  const store = publishedTask(), gh = github(store);
+  const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+  // A preparation rebased and began pushing; the push's outcome is not known yet (as test/merge-task-pr.test.ts sets up).
+  store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+  store.beginPrePush(identity, reviewed(), store.getTask(identity).stateVersion, { branch: BRANCH, from: oid(2), to: oid(12) });
+  const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+  const status = await merges.status();
+  expect(status.blockers.filter(blocker => blocker.code === 'preparation')).toEqual([{ code: 'preparation',
+    message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' }]);
+  expect(withMergeJob(status as Parameters<typeof withMergeJob>[0], null, 'in review').blockers.filter(blocker => blocker.code === 'preparation')).toEqual([{ code: 'preparation',
+    message: 'A push of the rewritten head has not settled; merging reads its outcome and prepares again.' }]);
+});
