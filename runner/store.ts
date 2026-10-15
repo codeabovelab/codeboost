@@ -149,6 +149,11 @@ export interface MergeJob {
   /** Required checks that have not succeeded yet, as the last inspection read them. */
   checks: { context: string; state: string }[];
   url: string | null;
+  /**
+   * The job's place among the task's jobs and refused clicks, starting at 1: a later click has a higher number. The
+   * browser orders records of different jobs by it, since wall-clock times can step back.
+   */
+  sequence: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -2140,7 +2145,7 @@ export class Store {
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
-        url: null, startedAt: now, updatedAt: now };
+        url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return { job, resent: false };
     });
@@ -2163,10 +2168,15 @@ export class Store {
       }
       const now = new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'failed', step: null,
-        reason: input.reason.slice(0, 2_000), checks: [], url: null, startedAt: now, updatedAt: now, refused: true };
+        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now, refused: true };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return job;
     });
+  }
+  /** One more than the task's highest job sequence; rows in `merge_jobs` are never deleted, so it only grows. */
+  #nextMergeJobSequence(key: string): number {
+    const row = this.#get(`SELECT COALESCE(MAX(json_extract(data,'$.sequence')),0) AS n FROM merge_jobs WHERE plan_key=?`, key) as { n: number };
+    return row.n + 1;
   }
   /** Move a running job to another step or record what it waits for. A job no longer running is left unchanged. */
   updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[];

@@ -248,7 +248,9 @@ export class MergeJobCoordinator {
       try { status = await this.merges.status(undefined, true, AbortSignal.any([signal, limit])); }
       catch (error) {
         if (signal.aborted) return { kind: 'cancelled' };
-        if (limit.aborted) return timedOut();
+        // Only the limit's own abort is the wait's timeout: every layer below rejects with that reason, unchanged. A
+        // failure that came first (a GitHub stage failing while its stopped peers settle past the limit) keeps its error.
+        if (limit.aborted && error === limit.reason) return timedOut();
         return { kind: 'failed', reason: error instanceof Error ? error.message : String(error) };
       }
       const verdict = classify(status);

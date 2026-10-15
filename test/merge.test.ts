@@ -940,6 +940,58 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(pullReads).toBe(2);
 });
 
+/** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
+async function requiredTestState(statusCheckRollup: unknown[]) {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: null }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(true);
+  return state.requiredChecks.map(check => check.state);
+}
+
+it.each([
+  ['SUCCESS', 'success'], ['NEUTRAL', 'success'], ['SKIPPED', 'success'],
+  ['FAILURE', 'failure'], ['CANCELLED', 'failure'], ['TIMED_OUT', 'failure'], ['ACTION_REQUIRED', 'failure'], ['STARTUP_FAILURE', 'failure'], ['STALE', 'failure'],
+] as const)('reads a required check run that completed %s as %s, as GitHub does for required checks', async (conclusion, expected) => {
+  expect(await requiredTestState([{ name: 'test', status: 'COMPLETED', conclusion, startedAt: '2026-10-11T00:00:00Z' }])).toEqual([expected]);
+});
+
+it.each([
+  ['a newer pending re-run over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z', completedAt: '2026-10-11T00:01:00Z' },
+    { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:05:00Z', completedAt: '0001-01-01T00:00:00Z' },
+  ], 'pending'],
+  ['a newer passing re-run over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['a newer failure over an older pass, listed first', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+  ], 'failure'],
+  ['a queued re-run that has not started (zero time) over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' },
+  ], 'pending'],
+  ['the run that passes least when two started at once', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+  ], 'failure'],
+  ['a newer commit status over an older failed one', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+] as const)('counts the latest observation of a required check: %s', async (_case, rollup, expected) => {
+  expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
 it('rejects an unsupported runtime merge method', () => {
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21, method: 'typo' as 'merge' })).toThrow(/merge method/i);
 });

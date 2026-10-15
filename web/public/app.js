@@ -40,6 +40,9 @@ let snippetSelection = null;
 // Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
 // The key travels with the exact request it was made for: a later Refresh changes data.token, not this request.
 let mergeAction = null;
+// True while a Merge PR click's request is in flight: a render meanwhile (selecting an item, a plan reload) keeps the
+// control marked and labelled as pending instead of offering it again from `merge.ready`.
+let mergeClickPending = false;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -191,6 +194,14 @@ function renderMerge() {
   } else {
     $("merge").disabled = !merge.ready;
     $("merge").removeAttribute("aria-disabled");
+  }
+  if (mergeClickPending) {
+    if ("job" in merge) $("merge").setAttribute("aria-disabled", "true");
+    else $("merge").disabled = true;
+    $("merge").textContent = "Requesting merge…";
+    $("merge-details").textContent = merge.queue ? "Merge status" : "Review blockers";
+    scheduleMergePoll();
+    return;
   }
   const job = merge.job;
   if (job?.state === "running") {
@@ -645,10 +656,13 @@ $("merge").onclick = async () => {
   // With merge jobs, the click returns at once and the focused control must keep focus: mark it, do not disable it.
   if (data.merge && "job" in data.merge) $("merge").setAttribute("aria-disabled", "true");
   else $("merge").disabled = true;
+  mergeClickPending = true;
+  $("merge").textContent = "Requesting merge…";
   try {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token, jobBefore: data.merge.job?.id ?? null };
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
+    mergeClickPending = false;
     // The composer stayed editable while the request was in flight: keep what the person typed meanwhile.
     rememberDraft();
     mergeAction = null;
@@ -680,6 +694,7 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
+    mergeClickPending = false;
     rememberDraft();
     // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
     // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
@@ -955,19 +970,28 @@ function preserveSettledQuestionAnswers(updated) {
       : note;
   }) };
 }
-/** A poll's record of the job a full response also carries, when the poll saw it later than that response did. */
+/**
+ * A poll's record of the task's latest job, when the poll saw it later than a full response read before it. Records of
+ * one job order by update time; a later job (another tab's click) outranks any record of an earlier one, by the
+ * server's per-task job sequence, never by clock time.
+ */
 function newerMergeJob(updated, observationOwner) {
   const newer = data?.merge?.job, older = updated.merge?.job;
-  return observationOwner !== mergeObservationGeneration && newer && older && newer.id === older.id && newer.updatedAt > older.updatedAt
-    ? newer
-    : null;
+  if (observationOwner === mergeObservationGeneration || !newer || !older) return null;
+  const later = newer.id === older.id ? newer.updatedAt > older.updatedAt
+    : Number.isSafeInteger(newer.sequence) && Number.isSafeInteger(older.sequence) && newer.sequence > older.sequence;
+  return later ? newer : null;
 }
 function mergeJobBanner(job) {
   return job.state === "running" ? mergeJobText(job) : `${mergeJobText(job)} Refresh to see the result.`;
 }
-/** The view with a newer observation of its job: an ended job asks for a refresh, as the job poll shows it. */
+/**
+ * The view with a newer observation of its job, as the job poll shows it: a running job is not ready to merge (the
+ * full response may offer Retry for an earlier job), and an ended job asks for a refresh.
+ */
 function withMergeJobObservation(view, job) {
-  if (job.state === "running") return { ...view, merge: { ...view.merge, job } };
+  if (job.state === "running") return { ...view, merge: { ...view.merge, ready: false, action: null, job,
+    blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
   return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: mergeJobBanner(job) }, ...blockers] } };
 }
