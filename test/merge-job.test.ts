@@ -566,7 +566,7 @@ it('starts no inspection after the wait limit and stops one that runs into it', 
     return inspect(request);
   }) as typeof inspect;
   const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 400, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
-  coordinator.start('review-token', randomUUID());
+  await coordinator.start('review-token', randomUUID());
   await vi.waitFor(() => expect(coordinator.latest()?.step).toBe('checks'));
   hang = true;
   const started = Date.now();
