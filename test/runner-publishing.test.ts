@@ -24,7 +24,7 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
-import { MergeJobCoordinator, type MergeJobTiming } from '../runner/merge-job.ts';
+import { MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, type MergeJobTiming } from '../runner/merge-job.ts';
 import type { RemoteMergeState, RequiredCheck } from '../github/merge.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
 import { CommandFailed } from '../github/run-with-input.ts';
@@ -1828,6 +1828,8 @@ describe('the one-click merge job (F6b of #22)', () => {
     const before = await review(served.app);
     // Not prepared yet, and a required check pends: both are the job's to resolve.
     expect(before.merge.blockers.map((blocker: { code: string }) => blocker.code)).toEqual(expect.arrayContaining(['preparation', 'check']));
+    // A runner server sends the codes a job settles before it merges, which the page drops once a job reached the merge.
+    expect(before.merge.settledBeforeJobMerge).toEqual([...SETTLED_BEFORE_JOB_MERGE]);
     expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
     const started = await merge(served.app, before.token);
     expect(started.status).toBe(200);

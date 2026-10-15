@@ -696,9 +696,9 @@ test('keeps every blocker when the click is answered with a job that ended witho
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  const answered=page.waitForResponse(response=>response.url().endsWith('/api/action'));
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
- // The answer names the conflict and the check among the codes a job settles before it merges; this job never merged.
- const settled=(await (await answered).json()).merge.settledBeforeJobMerge;
- expect(settled).toEqual(expect.arrayContaining(['mergeable','check','preparation']));
+ // This job never merged, so the codes it would have settled (served by the review, pinned in test/runner-publishing.test.ts)
+ // stay listed.
+ await answered;
  const ended=`Merge stopped. ${head.message} Merge again when ready. Refresh to see the result.`;
  await expect(page.locator('#banner')).toHaveText(ended);
  await expectEndedMergeJob(page,'Merge stopped',ended,[head.message,conflict.message,...jobResolvedBlockers.map(blocker=>blocker.message)]);
