@@ -400,10 +400,15 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       });
       if (!matches.length) return { ...required, state: 'missing' as const };
       // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
-      // does not outrank a newer pending or passing run.
-      const latest = matches.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check) }))
-        .reduce((best, next) => next.at > best.at || (next.at === best.at && checkStateRank[next.state] < checkStateRank[best.state]) ? next : best);
-      return { ...required, state: latest.state };
+      // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not
+      // re-runs of each other: GitHub requires both to pass. So the latest of each kind counts, and the one that passes
+      // least decides.
+      const latestOfKind = (kind: Record<string, unknown>[]) => kind.length === 0 ? null
+        : kind.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check) }))
+          .reduce((best, next) => next.at > best.at || (next.at === best.at && checkStateRank[next.state] < checkStateRank[best.state]) ? next : best).state;
+      const states = [latestOfKind(matches.filter(check => typeof check.name === 'string')), latestOfKind(matches.filter(check => typeof check.name !== 'string'))]
+        .filter(state => state !== null);
+      return { ...required, state: states.reduce((worst, next) => checkStateRank[next] < checkStateRank[worst] ? next : worst) };
     });
     return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }

@@ -941,11 +941,11 @@ it('parses required checks from both rule sources and pins the gh merge head', a
 });
 
 /** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
-async function requiredTestState(statusCheckRollup: unknown[]) {
+async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup });
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: null }] } }]]);
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: appId }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
@@ -990,6 +990,48 @@ it.each([
   ], 'success'],
 ] as const)('counts the latest observation of a required check: %s', async (_case, rollup, expected) => {
   expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+// GitHub: "If a check and a commit status have the same name, both must pass when that name is required." The latest
+// of each kind counts, and the one that passes least decides; a newer observation of one kind never replaces the other.
+it.each([
+  ['a newer passing status does not hide a failed check run', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a newer passing status does not hide a pending check run', [
+    { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'pending'],
+  ['a newer passing check run does not hide a failed status', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failure outranks a pending of the other kind', [
+    { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' },
+    { context: 'test', state: 'ERROR', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['both kinds passing', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['each kind re-run: the latest of each passes', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:01:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:02:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'success'],
+  ['only a check run', [{ name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' }], 'pending'],
+  ['only a commit status', [{ context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' }], 'failure'],
+] as const)('requires both a check run and a commit status with the required name: %s', async (_case, rollup, expected) => {
+  expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
+  expect(await requiredTestState([
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z', app: { databaseId: 10 } },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 10)).toEqual(['success']);
 });
 
 it('rejects an unsupported runtime merge method', () => {
