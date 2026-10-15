@@ -2352,9 +2352,9 @@ export class Store {
     return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
   }
   /**
-   * The task's first already-fixed check that found nothing: the scan start for an opening recorded before schema v19,
-   * which did not record its own check. A compare range excludes its start commit, so only a scan from this check's tip
-   * onward is provably continuous with what was scanned before.
+   * The task's already-fixed check with this ID, or null if it has none with that ID. The guarded merge reads the check the
+   * task's first opening into the base branch recorded (`task_pull_requests.check_id`, schema v19) to decide where its
+   * already-fixed scan starts.
    */
   getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
     const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? AND id=?', identityKey(identity), id);

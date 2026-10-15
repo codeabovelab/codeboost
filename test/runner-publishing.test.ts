@@ -1844,6 +1844,103 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(served.store.getTask(served.identity).status).toBe('merged');
    }, 60_000);
 
+  it('refuses start and resume while a merge job waits, even after a new plan revision is imported and approved; the import only ends the job failed', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    const base = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
+    // The job's fresh inspections after its first are held until the test releases them (or the job's signal stops them),
+    // so the job is still waiting for checks at every step below, whatever the machine's speed.
+    let fresh = 0, release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const gh: MergeGateway = { merge: base.merge, inspect: async request => {
+      if (request?.fresh && ++fresh > 1) await new Promise<void>((resolve, reject) => {
+        void released.then(resolve);
+        request.signal?.addEventListener('abort', () => reject(request.signal!.reason), { once: true });
+      });
+      return base.inspect(request);
+    } };
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    // The first inspection has answered (its pending check is recorded) and the second is held.
+    await vi.waitFor(async () => {
+      expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'checks', checks: [{ context: 'ci', state: 'pending' }] });
+      expect(fresh).toBe(2);
+    }, { timeout: 10_000 });
+    // As a person would: import a new revision of the plan (plan import has no task-status guard), then approve it all.
+    const plan = served.store.getPlan(served.identity);
+    const imported = await fetch(`${new URL(served.app.url).origin}/api/plan/import`, { method: 'POST', headers: { 'x-codeboost-token': served.app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ source: JSON.stringify(plan), format: 'json', expectedRevision: plan.revision, actionId: randomUUID() }) });
+    expect(imported.status).toBe(200);
+    expect(served.store.getPlan(served.identity).revision).toBe(plan.revision + 1);
+    await acceptAndApprove(served.app.service);
+    expect(served.store.unapprovedExecutionItems(served.identity, plan.revision + 1)).toEqual([]);
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    const calls = [...w.github.calls], branchHead = w.github.head(served.branch), attempts = served.store.recentAttempts(served.identity, 50).length;
+    // Neither is offered, and both are refused, while the job runs.
+    expect(await view(served.app)).toMatchObject({ startable: false, resumable: false });
+    for (const action of ['start', 'resume']) {
+      const id = randomUUID(), refused = await act(served.app, action, id);
+      expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+      // Saved like other refusals: the same action ID replays it.
+      expect(await act(served.app, action, id)).toMatchObject({ status: 409, body: { error: refused.body.error } });
+    }
+    expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'checks' });
+    expect(fresh).toBe(2);
+    // What the import itself does to the job: the readiness it prepared is for the old review, so its next inspection
+    // ends it failed, and nothing is merged, run, pushed or published.
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'failed',
+      reason: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' }), { timeout: 10_000 });
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
+    expect(served.app.publishing!.busy(served.identity)).toBe(false);
+    expect(w.github.calls).toEqual(calls);
+    expect(w.github.head(served.branch)).toBe(branchHead);
+    expect(base.merged).toEqual([]);
+   }, 60_000);
+
+  it('refuses start while a merge job prepares, even after a new plan revision is imported and approved', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, release!: () => void, preparing = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, mergeGateway: gh, runnerPublished: true,
+      // A preparation held until the test releases it; it then fails, as a real one does once the review changed under it.
+      preMerge: service => ({
+        get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
+        cancelTask: () => 'closed' as const, close: async () => undefined,
+        start: async (expected: { actionId: string }) => {
+          preparing = true;
+          await held;
+          preparing = false;
+          const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
+          return service.store.settlePreMergeAction(identity, expected.actionId,
+            { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'The review changed during preparation.' }, null);
+        },
+      } as unknown as PreMergeCoordinator) });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => { expect(preparing).toBe(true); expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'preparing' }); }, { timeout: 10_000 });
+    const plan = served.store.getPlan(served.identity);
+    const imported = await fetch(`${new URL(served.app.url).origin}/api/plan/import`, { method: 'POST', headers: { 'x-codeboost-token': served.app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ source: JSON.stringify(plan), format: 'json', expectedRevision: plan.revision, actionId: randomUUID() }) });
+    expect(imported.status).toBe(200);
+    await acceptAndApprove(served.app.service);
+    const calls = [...w.github.calls], attempts = served.store.recentAttempts(served.identity, 50).length;
+    expect(await view(served.app)).toMatchObject({ startable: false });
+    expect(await act(served.app, 'start')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'failed' }), { timeout: 10_000 });
+    expect(w.github.calls).toEqual(calls);
+    expect(gh.merged).toEqual([]);
+   }, 60_000);
+
   it('admits issue trust before a merge job starts: an untrusted click is refused and replayed, a failed read saves nothing', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, access: 'untrusted' | 'unreadable' | 'trusted' = 'trusted', reads = 0, prepared = 0;
