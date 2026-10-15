@@ -1920,7 +1920,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
   }, 60_000);
 
-  it('answers 503 when a started job\'s click cannot reload the review, and the resent click returns the job', async () => {
+  it('answers the started job when its click cannot reload the review, and the resent click returns the job', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => []);
@@ -1941,8 +1941,10 @@ describe('the one-click merge job (F6b of #22)', () => {
     };
     const clicked = await merge(served.app, token, id);
     expect(failed).toBe(true);
-    expect(clicked).toMatchObject({ status: 503, body: { error: expect.stringMatching(/merge started, but the review could not be reloaded: History worker timed out/) } });
-    expect(served.store.getMergeJob(served.identity, id)).not.toBeNull(); // The click's job was saved and started.
+    const saved = served.store.getMergeJob(served.identity, id);
+    expect(saved).not.toBeNull(); // The click's job was saved and started.
+    // The job itself, so the page follows it, and a request to refresh the review.
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id: saved!.id }, mergeRefreshRequired: true } });
     // The same click, sent again, replays its job.
     const resent = await merge(served.app, token, id);
     expect(resent).toMatchObject({ status: 200, body: { job: { id: served.store.getMergeJob(served.identity, id)!.id } } });

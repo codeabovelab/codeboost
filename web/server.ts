@@ -737,14 +737,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
               ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
             const running=mergeJobs.current;
             if(running)void running.finally(()=>{ if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); });
-            // The job is saved, so its click is settled: a reload that fails, however it fails, answers 503, and the resent
-            // click replays the job. The reload awaits a history worker (#170) while the job's preparation writes, so it can
-            // fail without anything being wrong with the job.
+            // The job is saved, so its click is settled. The reload awaits a history worker (#170) while the job's preparation
+            // writes, so it can fail without anything being wrong with the job: answer the job, and the page follows it and
+            // asks for a refresh (as after a direct merge whose reload fails). A reload stopped by shutdown answers 503, and
+            // the resent click replays the job.
             let loaded: Awaited<ReturnType<typeof load>>;
             try { loaded=await load(requestAbort.signal); }
             catch (error) {
               if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError();
-              json(503,{error:`The merge started, but the review could not be reloaded: ${error instanceof Error?error.message:String(error)} Send the click again to follow it.`});return;
+              const latest=mergeJobs.latest();
+              json(200,{job:latest?.id===job.id?latest:job,mergeRefreshRequired:true});return;
             }
             // The job may have moved on (or ended) while the review reloaded: answer its latest record, not the admission's.
             const latest=mergeJobs.latest();

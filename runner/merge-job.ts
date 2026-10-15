@@ -141,12 +141,19 @@ export class MergeJobCoordinator {
     const { store, config } = this.service, identity = config.identity;
     // 1. Prepare: refresh, rebase, review check, push, cmd: checks.
     let view = await this.service.load({ signal });
-    const prepareId = randomUUID(), task = store.getTask(identity);
+    // The load awaited a history worker (#170). A cancel or shutdown during it ends here; otherwise the preparation is
+    // bound to the task and review as they are now, all read in this turn (the preparation refuses if they move).
+    if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
+    const prepareId = randomUUID(), task = store.getTask(identity), snapshot = store.getSnapshot(identity);
+    const reviewVersion = store.reviewVersion(identity);
+    // Refused here, before the placeholder below is saved, if a preparation cannot start now (the preparation's own check
+    // repeats it in this turn).
+    this.preMerge.assertStartable();
     store.userAction(identity, { actionId: prepareId, kind: 'prepare-merge',
-      request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion, mergeJob: job.id } },
+      request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: reviewVersion, mergeJob: job.id } },
     () => ({ outcome: 'preparing' }));
-    const prepared = await this.preMerge.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-      snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head, actionId: prepareId });
+    const prepared = await this.preMerge.start({ stateVersion: task.stateVersion, reviewVersion,
+      snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, actionId: prepareId });
     if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
     if (prepared.state !== 'ready')
       return this.#finish(job.id, prepared.state === 'review-required' ? 'review-required' : 'failed', prepared.reason);

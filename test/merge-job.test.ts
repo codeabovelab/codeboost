@@ -631,6 +631,8 @@ it('ends the job cancelled when the task is cancelled during the job\'s own revi
   const held = holdNextLoad(f.review as never);
   await f.coordinator.start('review-token', id);
   await held.loading;
+  // As the cancel route does: the task's cancel commits, then the job is told.
+  f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID());
   f.coordinator.cancel();
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
   expect(f.gh.merged).toEqual([]);

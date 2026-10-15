@@ -622,8 +622,11 @@ $("merge").onclick = async () => {
     rememberDraft();
     mergeAction = null;
     if (updated.job) {
-      // A merge job runs in the background (F6b); the page follows it.
-      data = { ...updated, merge: { ...updated.merge, job: updated.job } };
+      // A merge job runs in the background (F6b); the page follows it. When the server could not reload the review after
+      // starting the job, it answers only the job: keep the page's review and follow the job on it.
+      data = updated.mergeRefreshRequired
+        ? { ...data, merge: { ...data.merge, ready: false, action: null, job: updated.job } }
+        : { ...updated, merge: { ...updated.merge, job: updated.job } };
       render();
       $("banner").textContent = mergeJobText(updated.job);
       return;
