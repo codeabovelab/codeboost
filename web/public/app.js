@@ -298,18 +298,18 @@ function mergeJobText(job) {
   }[job.state] ?? job.state;
 }
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
-/**
- * Blockers a merge job settles itself (runner/merge-job.ts JOB_RESOLVES: it prepares, rebases, pushes, runs `cmd:` checks
- * and waits for required checks), plus mergeability, which its own inspections read again. A review read before or during
- * the job still lists them; once the job has ended they describe a state the job already moved past.
- */
-const mergeJobResolvedBlockers = new Set(["preparation", "base", "acceptance", "check", "mergeable"]);
+/** Outcomes of a job that asked GitHub to merge, which it does only once no blocker remains. */
+const mergeJobReachedMerge = new Set(["merged", "queued", "submitted"]);
 /**
  * The view once the page learns its merge job ended, without a reload: the job's outcome and "Refresh to see the
- * result", plus only the blockers the job did not resolve. The control reads the outcome, as it does after a queue merge.
+ * result". A job that reached the merge (merged, queued or submitted) settled the blockers the server lists in
+ * `settledBeforeJobMerge` (preparation, a moved base, `cmd:` checks, required checks, mergeability), so a review read
+ * before or during it no longer lists them. Any other outcome keeps every blocker the page last read: a blocked job's
+ * failing check still fails, and Refresh shows what still applies. The control reads the outcome, as after a queue merge.
  */
 function withEndedMergeJob(view, job, message) {
-  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !mergeJobResolvedBlockers.has(blocker.code));
+  const settled = new Set(mergeJobReachedMerge.has(job.state) ? view.merge.settledBeforeJobMerge ?? [] : []);
+  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !settled.has(blocker.code));
   return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message }, ...blockers] } };
 }
 /** The merge control's label for a job the page saw end: its outcome, as the control reads a queue merge's. */

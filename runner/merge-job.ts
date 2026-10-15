@@ -267,15 +267,23 @@ export class MergeJobCoordinator {
 }
 
 /** Blockers the merge job resolves itself: it prepares (rebase, push, cmd: checks) and waits for required checks. */
-const JOB_RESOLVES = new Set(['preparation', 'base', 'acceptance', 'check']);
+export const JOB_RESOLVES: ReadonlySet<string> = new Set(['preparation', 'base', 'acceptance', 'check']);
+
+/**
+ * Blockers settled by the time a job asks GitHub to merge: the job's resolved blockers, and mergeability, since the
+ * guarded merge starts only after `classify` found no blocker at all. A job that ended `merged`, `queued` or `submitted`
+ * got that far; the browser drops these from the review it read before or during that job. Any other outcome settled
+ * none of them for certain.
+ */
+export const SETTLED_BEFORE_JOB_MERGE: readonly string[] = Object.freeze([...JOB_RESOLVES, 'mergeable']);
 
 /**
  * The merge status the browser sees when merging runs as a job: ready when only blockers the job resolves remain (or
  * GitHub is still computing mergeability), and never while a job or merge attempt is in flight. After a blocked job the
- * action is a retry. The latest job rides along.
+ * action is a retry. The latest job rides along, with the blockers a job that reached the merge has settled.
  */
 export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retry' | null; blockers: { code: string; message: string }[];
-  remote: { mergeable: string } | null; queue: { state: string } | null }>(status: T, job: MergeJobView | null, taskStatus: string): T & { job: MergeJobView | null } {
+  remote: { mergeable: string } | null; queue: { state: string } | null }>(status: T, job: MergeJobView | null, taskStatus: string): T & { job: MergeJobView | null; settledBeforeJobMerge: readonly string[] } {
   const running = job?.state === 'running';
   const attempt = status.queue?.state === 'submitting' || status.queue?.state === 'queued' || status.queue?.state === 'merged';
   const computing = status.remote?.mergeable === 'UNKNOWN';
@@ -286,7 +294,8 @@ export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retr
   // offered Merge PR, even if that inspection had no task blocker.
   const ready = !running && !attempt && status.remote !== null && personal.length === 0
     && MERGEABLE_STATUSES.includes(taskStatus as (typeof MERGEABLE_STATUSES)[number]);
-  return { ...status, ready, action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job };
+  return { ...status, ready, action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job,
+    settledBeforeJobMerge: SETTLED_BEFORE_JOB_MERGE };
 }
 
 /**
