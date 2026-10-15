@@ -344,6 +344,7 @@ it.each([false, true])('ends submitted, not merged or queued, when GitHub accept
 it.each(['finish', 'block'] as const)('reports a job it could not end (%s), which stays running and refuses a new click until startup settles it', async kind => {
   const f = setup(kind === 'block' ? { checks: () => [{ context: 'build', appId: null, state: 'failure' }] } : {});
   const fail = vi.fn(() => { throw new Error('disk full'); });
+  const { blockMergeJob, finishMergeJob } = f.store;
   // The finish case ends `submitted` (its attempt's outcome was not saved either), so the task stays in review and a new
   // click reaches the running-job check.
   if (kind === 'block') f.store.blockMergeJob = fail;
@@ -353,10 +354,34 @@ it.each(['finish', 'block'] as const)('reports a job it could not end (%s), whic
     const started = await f.coordinator.start('review-token', randomUUID());
     await f.coordinator.current;
     expect(fail).toHaveBeenCalledTimes(1);
-    expect(logged).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`Could not end merge job ${started.id}; it shows as running until the server restarts: disk full`)));
+    expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "disk full"`);
     expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
     await expect(f.coordinator.start('review-token', randomUUID())).rejects.toThrow(/already running/);
+    // The next start settles it (runner/production.ts), once the store writes again.
+    Object.assign(f.store, { blockMergeJob, finishMergeJob });
+    f.store.settleInterruptedMergeJobs(identity);
+    expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: kind === 'block' ? 'failed' : 'submitted' });
   } finally { logged.mockRestore(); }
+});
+
+it('keeps a job running and reports it when even reading the task fails after the job failed', async () => {
+  const f = setup();
+  const admission = holdNextLoad(f.review), run = holdNextLoad(f.review);
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const getTask = f.store.getTask.bind(f.store);
+  try {
+    const starting = f.coordinator.start('review-token', randomUUID());
+    await admission.loading; admission.release();
+    const started = await starting;
+    await run.loading;
+    f.store.getTask = () => { throw new Error('database is locked'); };
+    run.fail(new Error('History worker crashed.'));
+    // The job's promise settles without rejecting, so the server's `.finally` and `close()` see no rejection.
+    await expect(f.coordinator.current).resolves.toBeUndefined();
+    f.store.getTask = getTask;
+    expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "database is locked"`);
+    expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
+  } finally { f.store.getTask = getTask; logged.mockRestore(); }
 });
 
 it('leaves the task approved, merge blocked when a retried job is queued', async () => {

@@ -96,10 +96,13 @@ export class MergeJobCoordinator {
     const abort = new AbortController(); this.#abort = abort;
     const run = Promise.resolve().then(() => this.#run(job, abort.signal)).catch(error => {
       // Anything unexpected ends the job, unless shutdown stopped it (startup then settles it) or the task was cancelled
-      // (a cancel during one of the job's own review loads, which await a history worker since #170).
-      if (abort.signal.aborted && this.#closing) return;
-      if ((abort.signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled()) return this.#end(job, abort.signal);
-      this.#finish(job.id, 'failed', error instanceof Error ? error.message : String(error));
+      // (a cancel during one of the job's own review loads, which await a history worker since #170). Never rejects: if
+      // even reading the task fails here, the job stays running for startup, as when ending it fails.
+      try {
+        if (abort.signal.aborted && this.#closing) return;
+        if ((abort.signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled()) return this.#end(job, abort.signal);
+        this.#finish(job.id, 'failed', error instanceof Error ? error.message : String(error));
+      } catch (unended) { this.#unended(job.id, unended); }
     }).finally(() => { if (this.#active === run) { this.#active = null; this.#abort = null; } });
     this.#active = run;
     return mergeJobView(job);
@@ -144,7 +147,7 @@ export class MergeJobCoordinator {
 
   /** Startup settles a job that could not be ended now; until then it shows as running and a new click is refused. */
   #unended(id: string, error: unknown): void {
-    if (!this.#closing) console.error(`Could not end merge job ${id}; it shows as running until the server restarts: ${(error as Error)?.message ?? String(error)}`);
+    console.error(`Could not end merge job ${id}; it shows as running until the server restarts: ${JSON.stringify((error as Error)?.message ?? String(error))}`);
   }
 
   async #run(job: MergeJob, signal: AbortSignal): Promise<void> {
