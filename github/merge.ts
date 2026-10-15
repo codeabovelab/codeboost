@@ -150,6 +150,33 @@ function timestamp(value: unknown, label: string): string {
 }
 
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
+/**
+ * The state GitHub gives one observed required check. A check run that completed SUCCESS, NEUTRAL or SKIPPED passes, as
+ * GitHub treats those conclusions for required checks; a commit status passes only with SUCCESS.
+ */
+function observedCheckState(check: Record<string, unknown>): 'success' | 'pending' | 'failure' {
+  if (typeof check.name === 'string') {
+    const status = String(check.status ?? '').toUpperCase();
+    const conclusion = String(check.conclusion ?? '').toUpperCase();
+    if (['QUEUED','IN_PROGRESS','WAITING','PENDING','REQUESTED'].includes(status)) return 'pending';
+    if (status === 'COMPLETED') return ['SUCCESS','NEUTRAL','SKIPPED'].includes(conclusion) ? 'success' : 'failure';
+    return 'failure';
+  }
+  const status = String(check.state ?? '').toUpperCase();
+  return status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
+}
+/**
+ * When an observed check run or status started, to pick the latest of several with one name. gh reports a run that has
+ * not started yet with no time or the zero time (year 1); such a run was queued after every started one, so it counts
+ * as the latest.
+ */
+function observedCheckStart(check: Record<string, unknown>): number {
+  const at = typeof check.startedAt === 'string' ? Date.parse(check.startedAt) : NaN;
+  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : Number.POSITIVE_INFINITY;
+}
+/** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
+const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
+
 export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
@@ -366,24 +393,17 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
     }
     const requiredChecks = [...requirements.values()].map(required => {
-      const match = observed.find(check => {
+      const matches = observed.filter(check => {
         const context = typeof check.name === 'string' ? check.name : check.context;
         const app = check.app && typeof check.app === 'object' ? (check.app as { databaseId?: unknown }).databaseId : null;
         return context === required.context && (required.appId === null || app === required.appId);
       });
-      if (!match) return { ...required, state: 'missing' as const };
-      let state: RequiredCheck['state'];
-      if (typeof match.name === 'string') {
-        const status = String(match.status ?? '').toUpperCase();
-        const conclusion = String(match.conclusion ?? '').toUpperCase();
-        if (['QUEUED','IN_PROGRESS','WAITING','PENDING','REQUESTED'].includes(status)) state = 'pending';
-        else if (status === 'COMPLETED') state = conclusion === 'SUCCESS' ? 'success' : 'failure';
-        else state = 'failure';
-      } else {
-        const status = String(match.state ?? '').toUpperCase();
-        state = status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
-      }
-      return { ...required, state };
+      if (!matches.length) return { ...required, state: 'missing' as const };
+      // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
+      // does not outrank a newer pending or passing run.
+      const latest = matches.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check) }))
+        .reduce((best, next) => next.at > best.at || (next.at === best.at && checkStateRank[next.state] < checkStateRank[best.state]) ? next : best);
+      return { ...required, state: latest.state };
     });
     return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }
