@@ -112,7 +112,9 @@ test('an older generation poll returning late neither applies nor lets a re-rend
   await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
   await page.waitForTimeout(3000);
   expect(polls).toBe(2);
-  // Still not applied, however late the old answer arrived.
+  // Still not applied, however late the old answer arrived. The re-render cleared the banner, so the control is the
+  // evidence: an applied "merged" answer would show "Merged".
+  await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();
   await expect(page.locator('#banner')).not.toContainText('confirmed the reviewed head was merged');
   releases[1]!();
   await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();
