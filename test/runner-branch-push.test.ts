@@ -333,8 +333,10 @@ describe('GitBranchPusher', () => {
     mkdirSync(bin);
     // Git's place on PATH: other commands succeed at once with no output; `cat-file` leaves a process in a new session
     // holding its output.
+    // Each cat-file call leaves its own process, so every PID is appended and every one is killed afterwards.
     const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`
-      + `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`;
+      + `require('node:fs').appendFileSync(${JSON.stringify(pidFile)}, c.pid + '\\n'); c.unref();`;
+    const escaped = () => { try { return readFileSync(pidFile, 'utf8').split('\n').filter(Boolean).map(Number); } catch { return []; } };
     writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase " $* " in *" cat-file "*) exec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(escape)} ;; esac\nexit 0\n`, { mode: 0o755 });
     try {
       const began = performance.now();
@@ -343,8 +345,10 @@ describe('GitBranchPusher', () => {
       // A push checks its head with cat-file before anything is written: that read is bounded the same way.
       await expect(instance.push(IDENTITY, { head: s.base, branch: BRANCH })).rejects.toThrow(/outside its group still holds its output/);
       expect(performance.now() - began).toBeLessThan(30_000);
+      // One holder per cat-file call: both are recorded, so the cleanup below reaches both.
+      expect(escaped()).toHaveLength(2);
     } finally {
-      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      for (const pid of escaped()) try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     }
   }, 40_000);
 

@@ -1476,6 +1476,24 @@ it('keeps waiting while GitHub still reports the pre-push head, even if the base
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('pushes nothing when shutdown begins while the push reads the remote, before this coordinator is closed', async () => {
+  let closingAtBoundary: boolean | null = null;
+  const fixture = await rebaseFixture('feature\n', undefined, { duringPushRead(_service, coordinator) {
+    // Server shutdown step 1 stops runner admission; the coordinator's own close waits for the HTTP drain (step 2).
+    coordinator.runner.rejectAdmission();
+    closingAtBoundary = coordinator.runner.closing;
+    // The coordinator itself is still open: a new preparation would be refused only as already running.
+    expect(() => coordinator.assertStartable()).toThrow(/already running/);
+  } });
+  expect(closingAtBoundary).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'The server is shutting down.' });
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  // Shutdown starts no new GitHub read: the marker waits for startup.
+  expect(fixture.branchReads()).toBe(0);
+  expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('pushes nothing when a cancel is committed while the push reads the remote, and closes the task once the outcome is read', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { duringPushRead(service, coordinator) {
     // The production route: the coordinator cancels the task and aborts this preparation after the cancel commits.
