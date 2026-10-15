@@ -784,6 +784,55 @@ test('keeps a merge-job outcome a poll saw while an older Refresh response was h
  await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveCount(0);
 });
 
+test('keeps a newer merge job a poll saw while a held Refresh response shows an earlier job ended (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ // Job A runs in this tab. Another tab's click starts job B after A ends; B's record is later than any of A's (sequence),
+ // while its clock times are earlier, as after a clock step back.
+ const jobA={id:'0f6b0000-0000-4000-8000-0000000000e1',state:'running',step:'preparing',reason:null,checks:[],url:null,sequence:1,startedAt:'2026-10-11T00:10:00Z',updatedAt:'2026-10-11T00:10:00Z'};
+ const blockedA={...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',updatedAt:'2026-10-11T00:20:00Z'};
+ const jobB={...jobA,id:'0f6b0000-0000-4000-8000-0000000000e2',step:'checks',sequence:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ let started=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
+ const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
+ await page.route('**/api/merge',route=>{polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:started?jobB:jobA})});});
+ // The page loads with A running. The held Refresh response was read after A ended (blocked, Retry offered) and before B
+ // started; it is answered only after the poll has seen B running.
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  if(hold){hold=false;body.merge={...body.merge,ready:true,action:'retry',job:blockedA};holding();await released;}
+  else body.merge={...body.merge,ready:false,action:null,job:jobA};
+  await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toBeVisible();
+ hold=true;
+ const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await held;
+ // Selecting an item while Refresh waits renders the merge control, which schedules a poll; that poll sees job B running.
+ started=true;
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toBeVisible({timeout:10_000});
+ await expect(page.locator('#banner')).toHaveText('Waiting for required checks.');
+ release();
+ const answer=await (await refreshed).json();
+ // The interleaving happened: the Refresh answer showed job A ended with Retry offered, after the poll saw B.
+ expect(answer.merge).toMatchObject({ready:true,action:'retry',job:{id:blockedA.id,state:'blocked'}});
+ // The older Refresh response does not restore job A: B stays followed, not ready, and its poll keeps running (2 s).
+ const seen=polls;
+ await page.waitForTimeout(3_000);
+ expect(polls).toBeGreaterThan(seen);
+ const merge=page.locator('#merge');
+ await expect(merge).toHaveText('Waiting for checks…');
+ await expect(merge).toHaveAttribute('aria-disabled','true');
+ await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);
+ // Not ready while B runs: activating the control sends no merge request.
+ let actions=0,dialogs=0;page.on('request',request=>{if(request.url().endsWith('/api/action'))actions++;});
+ page.on('dialog',dialog=>{dialogs++;void dialog.accept();});
+ await merge.dispatchEvent('click');await page.waitForTimeout(500);
+ expect(dialogs).toBe(0);expect(actions).toBe(0);
+ await expect(page.locator('#banner')).toHaveText('Waiting for required checks.');
+});
+
 /** A runner server whose every full review shows a running merge job (each was read while it ran); the job poll reports
  * it merged once `ended` is set. Used to hold one full response while a poll sees the job end. */
 async function mergeJobOutcomeRace(page:import('@playwright/test').Page,planning?:PlanningDeps){

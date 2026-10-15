@@ -947,19 +947,28 @@ function preserveSettledQuestionAnswers(updated) {
       : note;
   }) };
 }
-/** A poll's record of the job a full response also carries, when the poll saw it later than that response did. */
+/**
+ * A poll's record of the task's latest job, when the poll saw it later than a full response read before it. Records of
+ * one job order by update time; a later job (another tab's click) outranks any record of an earlier one, by the
+ * server's per-task job sequence, never by clock time.
+ */
 function newerMergeJob(updated, observationOwner) {
   const newer = data?.merge?.job, older = updated.merge?.job;
-  return observationOwner !== mergeObservationGeneration && newer && older && newer.id === older.id && newer.updatedAt > older.updatedAt
-    ? newer
-    : null;
+  if (observationOwner === mergeObservationGeneration || !newer || !older) return null;
+  const later = newer.id === older.id ? newer.updatedAt > older.updatedAt
+    : Number.isSafeInteger(newer.sequence) && Number.isSafeInteger(older.sequence) && newer.sequence > older.sequence;
+  return later ? newer : null;
 }
 function mergeJobBanner(job) {
   return job.state === "running" ? mergeJobText(job) : `${mergeJobText(job)} Refresh to see the result.`;
 }
-/** The view with a newer observation of its job: an ended job asks for a refresh, as the job poll shows it. */
+/**
+ * The view with a newer observation of its job, as the job poll shows it: a running job is not ready to merge (the
+ * full response may offer Retry for an earlier job), and an ended job asks for a refresh.
+ */
 function withMergeJobObservation(view, job) {
-  if (job.state === "running") return { ...view, merge: { ...view.merge, job } };
+  if (job.state === "running") return { ...view, merge: { ...view.merge, ready: false, action: null, job,
+    blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
   return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: mergeJobBanner(job) }, ...blockers] } };
 }

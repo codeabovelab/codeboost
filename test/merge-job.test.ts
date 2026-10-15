@@ -681,6 +681,18 @@ it('keeps a GitHub failure that came before the wait limit, even when the inspec
   expect(f.gh.merged).toEqual([]);
 });
 
+it('numbers each job and refused click after the task\'s earlier ones, so the browser can order jobs without clocks', async () => {
+  const f = setup({ prepare: () => 'failed' });
+  const first = await f.coordinator.start('review-token', randomUUID());
+  await settled(f.coordinator);
+  const refusal = f.store.recordMergeJobRefusal(identity, { actionId: randomUUID(), token: 'review-token', reason: 'Refused.' });
+  // A later click keeps a higher number even when the clock stepped back.
+  const second = f.store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token', now: '2000-01-01T00:00:00.000Z' }).job;
+  expect([first.sequence, refusal.sequence, second.sequence]).toEqual([1, 2, 3]);
+  expect(f.coordinator.latest()).toMatchObject({ id: second.id, sequence: 3 });
+  f.store.finishMergeJob(identity, second.id, { state: 'failed' });
+});
+
 // Since #170 a click's admission awaits the review load; these pin what may happen while it does.
 it('gives a resend of the same click, during the first send\'s review load, the same job', async () => {
   const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
