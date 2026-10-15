@@ -341,6 +341,24 @@ it.each([false, true])('ends submitted, not merged or queued, when GitHub accept
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it.each(['finish', 'block'] as const)('reports a job it could not end (%s), which stays running and refuses a new click until startup settles it', async kind => {
+  const f = setup(kind === 'block' ? { checks: () => [{ context: 'build', appId: null, state: 'failure' }] } : {});
+  const fail = vi.fn(() => { throw new Error('disk full'); });
+  // The finish case ends `submitted` (its attempt's outcome was not saved either), so the task stays in review and a new
+  // click reaches the running-job check.
+  if (kind === 'block') f.store.blockMergeJob = fail;
+  else { f.store.finishMergeJob = fail; f.store.finishMergeAttempt = () => { throw new Error('local refresh failed'); }; }
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const started = await f.coordinator.start('review-token', randomUUID());
+    await f.coordinator.current;
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`Could not end merge job ${started.id}; it shows as running until the server restarts: disk full`)));
+    expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
+    await expect(f.coordinator.start('review-token', randomUUID())).rejects.toThrow(/already running/);
+  } finally { logged.mockRestore(); }
+});
+
 it('leaves the task approved, merge blocked when a retried job is queued', async () => {
   const f = setup({ queue: true, checks: n => (n === 1 ? [{ context: 'build', appId: null, state: 'failure' }] : []) });
   await f.coordinator.start('review-token', randomUUID());
