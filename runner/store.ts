@@ -92,7 +92,7 @@ export function preMergeActionResponse(result: PreMergeActionResult) {
 }
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
-  currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
+  currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; pushInProgress: PushMarker | null; budgetDeadline: number | null;
   createdAt: string; updatedAt: string;
 }
 export interface RebaseMarker {
@@ -111,6 +111,24 @@ export interface RebaseMarker {
   conflict: { attemptId: string; allocationId: string; networkAllocationId: string; source: string } | null;
   processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
 }
+/**
+ * A pre-merge push of the rewritten head (F6 of #22), recorded before the push's first external write. While it exists,
+ * GitHub may or may not hold `to`: nothing irreversible starts until a read of the branch settles the outcome.
+ */
+export interface PushMarker {
+  attemptId: string;
+  /** The task's PR branch on GitHub (`codeboost/...`). */
+  branch: string;
+  /** The exact remote head read before the push; the push is leased to it. */
+  from: string;
+  /** The reviewed, rewritten head being pushed. */
+  to: string;
+  /** The snapshot whose head is `to`. */
+  snapshotId: string;
+  startedAt: number;
+}
+/** What a read of the branch showed after a push: `to`, still `from`, or anything else. */
+export type PushOutcome = 'pushed' | 'not-pushed' | 'moved';
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
   firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
@@ -188,8 +206,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 17) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 18) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -304,6 +322,12 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN prompt_comments TEXT');
           this.#db.exec('PRAGMA user_version=17');
+        }
+        // The durable marker of a pre-merge push of the rewritten head (F6 of #22).
+        if (version < 18) {
+          if (!this.#db.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'push_in_progress'))
+            this.#db.exec('ALTER TABLE tasks ADD COLUMN push_in_progress TEXT');
+          this.#db.exec('PRAGMA user_version=18');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -533,7 +557,7 @@ export class Store {
       const task = this.#task(key);
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
@@ -760,6 +784,7 @@ export class Store {
       this.#expect(key, expected);
       this.#assertContextWritable(key);
       if (this.#task(key).rebase_in_progress !== null) throw new GuardRefusal('A claimed rebase is in progress; wait for it to settle.');
+      if (this.#task(key).push_in_progress !== null) throw new GuardRefusal('A push of the rewritten head is in progress; wait for it to settle.');
       return this.#applyRebase(identity, key, base, head, mappings);
     });
   }
@@ -791,6 +816,7 @@ export class Store {
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be rebased.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
       if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is already in progress for this task.');
+      if (task.push_in_progress !== null) throw new GuardRefusal('A push of the rewritten head is in progress for this task.');
       const snapshot = this.getSnapshot(identity);
       if (snapshot.base !== input.oldBase || snapshot.head !== input.oldHead)
         throw new GuardRefusal('The reviewed base or head changed before the rebase started.');
@@ -965,6 +991,62 @@ export class Store {
       this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=?', key);
       return snapshot;
     });
+  }
+  /**
+   * Claim the push of the reviewed, rewritten head before its first external write. `from` is the exact remote head
+   * read for the lease; it must be a durable rewrite predecessor of `to`, and `to` must be the current snapshot head.
+   */
+  beginPrePush(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,
+    input: { branch: string; from: string; to: string; attemptId?: string; startedAt?: number }): PushMarker {
+    sha(input.from); sha(input.to);
+    if (!/^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.branch) || input.branch.length > 255)
+      throw new Error('Only a codeboost/ task branch can be pushed.');
+    if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for pushing.');
+    if (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0) throw new Error('Invalid expected task state version.');
+    const attemptId = input.attemptId ?? randomUUID(), startedAt = input.startedAt ?? Date.now();
+    assertUuidV4(attemptId, 'Push attempt ID');
+    if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid push start time.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      const task = this.#task(key);
+      if (task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be pushed.`);
+      if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; push it from review.`);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be pushed.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be pushed.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      this.#assertNoRewriteInFlight(task);
+      const snapshot = this.getSnapshot(identity);
+      if (snapshot.head !== input.to) throw new GuardRefusal('The reviewed head changed before the push started.');
+      if (!this.isRewrittenHead(identity, input.from, input.to))
+        throw new GuardRefusal('The pull request head is not a rewrite predecessor of the reviewed head.');
+      const marker: PushMarker = { attemptId, branch: input.branch, from: input.from, to: input.to, snapshotId: snapshot.id, startedAt };
+      this.#run('UPDATE tasks SET push_in_progress=? WHERE plan_key=?', encode(marker), key);
+      this.#touch(key);
+      return marker;
+    });
+  }
+  /**
+   * Clear the matching push once a read of the branch settled its outcome. A cancel requested while the push ran closes
+   * the task now, as a settled rebase does.
+   */
+  finishPrePush(planKey: string, attemptId: string): boolean {
+    assertUuidV4(attemptId, 'Push attempt ID');
+    return this.#transaction(() => {
+      const task = this.#task(planKey);
+      const encoded = task.push_in_progress as string | null | undefined;
+      if (encoded === null || encoded === undefined || decode<PushMarker>(encoded).attemptId !== attemptId) return false;
+      if (this.#run('UPDATE tasks SET push_in_progress=NULL WHERE plan_key=? AND push_in_progress=?', planKey, encoded).changes !== 1) return false;
+      if (task.cancel_requested !== null && !this.#closed(task.status as TaskStatus)) this.#closeTask(planKey, 'cancelled', task.cancel_requested as string);
+      else this.#touch(planKey);
+      return true;
+    });
+  }
+  /** Pushes whose outcome no read has settled yet (a crash or shutdown during the push). */
+  pushesInProgress(): { planKey: string; marker: PushMarker }[] {
+    return this.#db.prepare('SELECT plan_key, push_in_progress FROM tasks WHERE push_in_progress IS NOT NULL').all()
+      .map(row => ({ planKey: row.plan_key as string, marker: decode<PushMarker>(row.push_in_progress) }));
   }
   /** Clear only the matching rebase, after the live operation settles or recovery removes its resources. */
   abortRebase(planKey: string, attemptId: string): boolean {
@@ -1389,7 +1471,7 @@ export class Store {
         status TEXT NOT NULL CHECK (status IN (${list(TASK_STATUSES)})),
         state_version INTEGER NOT NULL DEFAULT 0, context_generation INTEGER NOT NULL DEFAULT 0,
         assignment_id TEXT NOT NULL, referenced_code_hash TEXT NOT NULL,
-        current_attempt_id TEXT, requeue_pending INTEGER NOT NULL DEFAULT 0, cancel_requested TEXT, rebase_in_progress TEXT,
+        current_attempt_id TEXT, requeue_pending INTEGER NOT NULL DEFAULT 0, cancel_requested TEXT, rebase_in_progress TEXT, push_in_progress TEXT,
         budget_deadline INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         FOREIGN KEY (plan_key, current_attempt_id) REFERENCES attempts(plan_key, id));
       CREATE TABLE IF NOT EXISTS attempts (
@@ -1436,6 +1518,7 @@ export class Store {
       referencedCodeHash: row.referenced_code_hash as string, currentAttemptId: row.current_attempt_id as string | null,
       requeuePending: row.requeue_pending === 1, cancelRequested: row.cancel_requested as string | null,
       rebaseInProgress: row.rebase_in_progress === null ? null : decode(row.rebase_in_progress),
+      pushInProgress: row.push_in_progress === null || row.push_in_progress === undefined ? null : decode<PushMarker>(row.push_in_progress),
       budgetDeadline: row.budget_deadline as number | null, createdAt: row.created_at as string, updatedAt: row.updated_at as string,
     };
   }
@@ -1677,7 +1760,7 @@ export class Store {
       if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
       this.#bumpContext(key);
     });
@@ -1692,10 +1775,16 @@ export class Store {
       if (this.#closed(task.status)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       this.#run('UPDATE tasks SET status=? WHERE plan_key=?', to, key);
       this.#touch(key);
     });
+  }
+  /** A rebase still owns local resources, or a push of its result may still move the PR head on GitHub. */
+  #assertNoRewriteInFlight(task: Record<string, SQLOutputValue>): void {
+    if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+    if (task.push_in_progress !== null && task.push_in_progress !== undefined)
+      throw new GuardRefusal('A push of the rewritten head is in progress for this task.');
   }
   /** GitHub may still merge the reviewed head while the latest merge attempt is submitting or queued. */
   #activeMerge(key: string): boolean {
@@ -1736,7 +1825,7 @@ export class Store {
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-        if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+        this.#assertNoRewriteInFlight(task);
         // The code-writing task budget (null until execution starts) ends execution admission. Review checks have their
         // own exact-head deadline and must remain runnable after implementation ends.
         if (!reviewCheck && task.budget_deadline !== null && (task.budget_deadline as number) <= now)
@@ -1870,7 +1959,7 @@ export class Store {
       if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
         throw new GuardRefusal('A merge is in progress. Cancel the task after it finishes or fails.');
       const active = this.#activeAttempt(key);
-      if (task.rebase_in_progress !== null) {
+      if (task.rebase_in_progress !== null || task.push_in_progress !== null) {
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
         this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
         this.#touch(key);
