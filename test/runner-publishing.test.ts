@@ -1899,6 +1899,60 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
   }, 60_000);
 
+  it('answers a merge click whose trust read fails with the job a resend of the same click saved meanwhile', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, hold = false, fail!: (error: Error) => void, reading!: () => void;
+    const held = new Promise<void>(resolve => { reading = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number) {
+      // The first click's read is held until it fails; the resend's read (and the publish's before) answers at once.
+      if (hold) { hold = false; reading(); return new Promise((_resolve, reject) => { fail = reject; }); }
+      return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+    } };
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    hold = true;
+    const first = merge(served.app, token, id);
+    await held;
+    const second = await merge(served.app, token, id);
+    expect(second).toMatchObject({ status: 200, body: { job: { id } } });
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ id });
+    fail(new Error('GitHub returned HTTP 502'));
+    expect(await first).toMatchObject({ status: 200, body: { job: { id } } });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+  }, 60_000);
+
+  it.each([
+    ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), 503, 'Issue trust could not be verified: Issue retrieval timed out.'],
+    ['gh answered', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', '', ''), 502, 'Issue trust could not be verified: gh failed (exit 1): HTTP 404: Not Found'],
+  ] as const)('keeps a merge click\'s trust read failure (%s) when shutdown starts while gh stops, saving nothing', async (_name, failure, status, error) => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, hang = false, fail!: (error: Error) => void, reading!: () => void;
+    const held = new Promise<void>(resolve => { reading = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number) {
+      if (!hang) return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+      reading();
+      return new Promise((_resolve, reject) => { fail = reject; });
+    } };
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hang = true;
+    const clicked = merge(served.app, token, id);
+    await held;
+    // Shutdown's first step runs at once; the read then ends with its own failure, which happened first.
+    const closed = served.close();
+    fail(failure());
+    expect(await clicked).toMatchObject({ status, body: { error } });
+    await closed;
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
+  }, 60_000);
+
   it('answers 503 when shutdown stops the reload after a merge job was saved, keeping the saved job for a resend', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, hanging = false;

@@ -77,7 +77,12 @@ export class MergeJobCoordinator {
     // job's admission, runs in one turn. A load stopped by shutdown decides nothing, as above.
     let reviewToken: string;
     try { reviewToken = (await this.service.load({ signal })).token; }
-    catch (error) { if (this.#closing || signal?.aborted) throw new ShuttingDownError(); throw error; }
+    catch (error) {
+      // A resend of this click may have been admitted while this load was pending: its job is this click's answer.
+      if (store.getMergeJob(identity, actionId)) return replay();
+      if (this.#closing || signal?.aborted) throw new ShuttingDownError();
+      throw error;
+    }
     // A resend of this click, or shutdown, may have arrived while the review loaded.
     if (store.getMergeJob(identity, actionId)) return replay();
     if (this.#closing) throw new ShuttingDownError();
@@ -173,8 +178,12 @@ export class MergeJobCoordinator {
       // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
       // is applied; after, the outcome is unknown.
       const merged = await this.merges.merge(view.token, mergeId, signal);
+      // A fulfilled merge does not prove its outcome was saved: when saving it fails, the attempt stays submitting and
+      // reconciles from GitHub. Only this job's own attempt, in a settled state, ends the job merged or queued.
       const attempt = store.getMergeAttempt(identity);
-      this.#finish(job.id, attempt?.kind === 'queue' && attempt.state !== 'merged' ? 'queued' : 'merged', null, merged.result.url || null);
+      if (attempt?.actionId !== mergeId || (attempt.state !== 'merged' && attempt.state !== 'queued'))
+        return this.#finish(job.id, 'submitted', 'GitHub accepted the merge, but its outcome was not saved; it reconciles from GitHub.');
+      this.#finish(job.id, attempt.state, null, merged.result.url || attempt.url || null);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       // Once this job's merge attempt exists, GitHub was asked: its recorded state is the answer, whatever else (a cancel,
