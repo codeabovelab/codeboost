@@ -36,6 +36,9 @@ let snippetSelection = null;
 // Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
 // The key travels with the exact request it was made for: a later Refresh changes data.token, not this request.
 let mergeAction = null;
+// True while a Merge PR click's request is in flight: a render meanwhile (selecting an item, a plan reload) keeps the
+// control marked and labelled as pending instead of offering it again from `merge.ready`.
+let mergeClickPending = false;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -187,6 +190,14 @@ function renderMerge() {
   } else {
     $("merge").disabled = !merge.ready;
     $("merge").removeAttribute("aria-disabled");
+  }
+  if (mergeClickPending) {
+    if ("job" in merge) $("merge").setAttribute("aria-disabled", "true");
+    else $("merge").disabled = true;
+    $("merge").textContent = "Requesting merge…";
+    $("merge-details").textContent = merge.queue ? "Merge status" : "Review blockers";
+    scheduleMergePoll();
+    return;
   }
   const job = merge.job;
   if (job?.state === "running") {
@@ -622,10 +633,13 @@ $("merge").onclick = async () => {
   // With merge jobs, the click returns at once and the focused control must keep focus: mark it, do not disable it.
   if (data.merge && "job" in data.merge) $("merge").setAttribute("aria-disabled", "true");
   else $("merge").disabled = true;
+  mergeClickPending = true;
+  $("merge").textContent = "Requesting merge…";
   try {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token, jobBefore: data.merge.job?.id ?? null };
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
+    mergeClickPending = false;
     // The composer stayed editable while the request was in flight: keep what the person typed meanwhile.
     rememberDraft();
     mergeAction = null;
@@ -657,6 +671,7 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
+    mergeClickPending = false;
     rememberDraft();
     // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
     // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.

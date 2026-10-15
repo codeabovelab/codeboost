@@ -8,7 +8,7 @@ import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { createDemo } from '../../scripts/demo.ts';
 import { choiceKeys } from '../../core/approvals.ts';
 import { ReviewService } from '../../runner/review.ts';
-import { startServer } from '../../web/server.ts';
+import { startServer, type PlanningDeps } from '../../web/server.ts';
 import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
 import { fixtureGit } from '../fixtures/git.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
@@ -784,6 +784,126 @@ test('keeps a merge-job outcome a poll saw while an older Refresh response was h
  await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveCount(0);
 });
 
+/** A runner server whose every full review shows a running merge job (each was read while it ran); the job poll reports
+ * it merged once `ended` is set. Used to hold one full response while a poll sees the job end. */
+async function mergeJobOutcomeRace(page:import('@playwright/test').Page,planning?:PlanningDeps){
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway,undefined,undefined,undefined,planning);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',updatedAt:'2026-10-11T00:05:00Z'};
+ const race={ended:false,polls:0,hold:false,config,release:()=>{},held:Promise.resolve()};
+ let holding!:()=>void;race.held=new Promise<void>(resolve=>{holding=resolve;});
+ const released=new Promise<void>(resolve=>{race.release=resolve;});
+ await page.route('**/api/merge',route=>{race.polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:race.ended?merged:running})});});
+ // A full response (review or action) read while the job ran. The one marked held waits, and the job ends meanwhile.
+ const answer=async(route:import('@playwright/test').Route)=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:false,action:null,job:running};
+  if(race.hold){race.hold=false;race.ended=true;holding();await released;}
+  await route.fulfill({response,json:body});};
+ await page.route('**/api/review',answer);
+ await page.route('**/api/action',answer);
+ await page.goto(app.url);
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toBeVisible();
+ /** The poll saw the job end while the full response was held; release it and show it does not restore the running job. */
+ const settle=async(response:Promise<unknown>)=>{
+  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.',{timeout:10_000});
+  const seen=race.polls;
+  race.release();await response;
+  // No poll restarts (the poll interval is 2 s), and the page still shows the outcome.
+  await page.waitForTimeout(3_000);
+  expect(race.polls).toBe(seen);
+  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
+  await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveCount(0);
+ };
+ return {race,settle};
+}
+
+test('keeps a merge-job outcome a poll saw while an older review action response was held (F6b)',async({page})=>{
+ const {race,settle}=await mergeJobOutcomeRace(page);
+ await page.getByRole('button',{name:'Request change',exact:true}).click();
+ await page.getByLabel('Change to request').fill('Keep the merge outcome.');
+ race.hold=true;
+ const answered=page.waitForResponse(response=>response.url().endsWith('/api/action'));
+ await page.getByRole('button',{name:'Save change request',exact:true}).click();await race.held;
+ // Selecting an item while the action waits renders the merge control, which schedules a poll; that poll sees the job end.
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await settle(answered);
+ await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();
+ await expect(page.getByText('Keep the merge outcome.',{exact:true})).toBeVisible();
+});
+
+test('keeps a merge-job outcome a poll saw while an older Plans refresh response was held (F6b)',async({page})=>{
+ const {race,settle}=await mergeJobOutcomeRace(page);
+ await page.getByRole('link',{name:'Plans',exact:true}).click();
+ race.hold=true;
+ const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#plans-refresh').click();await race.held;
+ await page.getByRole('link',{name:'Review',exact:true}).click();
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await settle(refreshed);
+ await expect(page.locator('#plans-status')).toHaveText('✓ Revision r1 is current.');
+});
+
+test('keeps a merge-job outcome a poll saw while an older plan-import reload was held (F6b)',async({page})=>{
+ const {race,settle}=await mergeJobOutcomeRace(page);
+ const current=app.service.store.getPlan(race.config.identity),next={...structuredClone(current),revision:current.revision+1,summary:'Make retry limits visible to operators'};
+ await page.getByRole('link',{name:'Plans',exact:true}).click();
+ await page.getByLabel('Plan file').setInputFiles({name:'plan.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(next))});
+ race.hold=true;
+ const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ // The import's success renders the merge control, which schedules a poll; the poll sees the job end during the reload.
+ await page.getByRole('button',{name:'Import next revision'}).click();await race.held;
+ await settle(reloaded);
+ await expect(page.locator('#plans-status')).toHaveText('✓ Revision r2 is current.');
+});
+
+test('keeps a merge-job outcome a poll saw while an older Apply draft reload was held (F6b)',async({page})=>{
+ let plan:unknown;
+ const planning:PlanningDeps={provider:{invoke:async()=>JSON.stringify(plan)},describe:()=>({repo:{name:'retry-service',baseRef:'main'},issue:{number:3,title:'Retries',body:'',comments:[]},approvedLessons:[],validate:()=>undefined})};
+ const {race,settle}=await mergeJobOutcomeRace(page,planning);
+ const current=app.service.store.getPlan(race.config.identity);
+ plan={...structuredClone(current),revision:current.revision+1,summary:'Make retry limits visible to operators'};
+ await page.getByRole('link',{name:'Plans',exact:true}).click();
+ await page.getByRole('button',{name:'Draft next revision'}).click();
+ const apply=page.getByRole('button',{name:'Apply draft',exact:true});
+ await expect(apply).toBeVisible();
+ race.hold=true;
+ const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ // Apply's success renders the merge control, which schedules a poll; the poll sees the job end during the reload.
+ await apply.click();await race.held;
+ await settle(reloaded);
+ await expect(page.locator('#plans-status')).toHaveText('✓ Revision r2 is current.');
+});
+
+test('keeps the Merge button pending while its click is in flight, across a render (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const running={id:'0f6b0000-0000-4000-8000-0000000000d1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ let release!:()=>void,arrived!:()=>void;const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{arrived=resolve;});
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
+  arrived();await released;
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running},job:running})});});
+ await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:running})}));
+ // A runner server reports merging as a job (its merge status carries `job`).
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ const button=page.locator('#merge');
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await held;
+ await expect(button).toHaveAttribute('aria-disabled','true');await expect(button).toHaveText('Requesting merge…');
+ // Selecting an item renders the page, merge control included, while the click's request is still in flight.
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await expect(page.getByRole('button',{name:/P2 Document retry behavior/})).toHaveAttribute('aria-current','true');
+ await expect(button).toHaveAttribute('aria-disabled','true');await expect(button).toHaveText('Requesting merge…');
+ await expect(button).toHaveJSProperty('disabled',false);
+ release();
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveAttribute('aria-disabled','true');
+});
+
 test('keeps focus on the Merge button when a merge-job click is refused (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -860,6 +980,8 @@ test('follows a started merge job when the server could not reload the review af
  await expect(page.locator('#banner')).toContainText('Preparing the merge');
  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.',{timeout:15000});
  expect(polls).toBeGreaterThanOrEqual(2);
+ // Give a background reload started by the job's end time to reach the route before counting.
+ await page.waitForTimeout(2500);
  expect(reviews).toBe(reloadsBefore);
  expect(await page.locator('#items button').count()).toBe(items);
 });
@@ -901,6 +1023,8 @@ test('follows a one-click merge job from preparation through the required-check 
  // The job's end updates only the merge control (AGENTS.md, Async review UI): no background reload erases the
  // person's selection or input.
  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
+ // Give a background reload started by the job's end time to reach the route before counting.
+ await page.waitForTimeout(2500);
  expect(reviews).toBe(reloadsBeforeEnd);
  await expect(button).toHaveAttribute('aria-disabled','true');await expect(button).toHaveJSProperty('disabled',false);
  expect(polls).toBe(3);
