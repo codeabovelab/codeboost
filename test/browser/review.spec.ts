@@ -726,6 +726,64 @@ test('starts a new action once another job became the latest after a retained ke
  expect(clicks[1]).not.toBe(clicks[0]);
 });
 
+test('resends the same action for Retry merge after a retry failed while an earlier job is shown (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const blocked={id:'0f6b0000-0000-4000-8000-0000000000a1',state:'blocked',step:null,reason:'Required check failed: ci.',checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ // Every retry answers 503: nothing was applied, so the click is unresolved and its key must be resent.
+ const clicks:string[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
+  await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'The review server is shutting down.'})});});
+ // An earlier job ended blocked: the review offers Retry merge, and keeps showing that job.
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,job:blocked,ready:true,action:'retry'};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();
+ await expect(page.locator('#banner')).toContainText('Merge blocked. The review server is shutting down.');
+ const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await reloaded;
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();
+ await expect.poll(()=>clicks.length).toBe(2);
+ // The earlier job is not this click's: the unresolved click is resent with its own key.
+ expect(clicks[1]).toBe(clicks[0]);
+});
+
+test('keeps a merge-job outcome a poll saw while an older Refresh response was held (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const running={id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',reason:null,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ const merged={...running,state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',updatedAt:'2026-10-11T00:05:00Z'};
+ let ended=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
+ const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
+ await page.route('**/api/merge',route=>{polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:ended?merged:running})});});
+ // Every review response was read while the job ran; the Refresh response is held until the poll has seen it end.
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:false,action:null,job:running};
+  if(hold){hold=false;holding();await released;}
+  await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toBeVisible();
+ hold=true;
+ const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await held;
+ // Selecting an item while Refresh waits renders the merge control, which schedules a poll; that poll sees the job end.
+ ended=true;
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.',{timeout:10_000});
+ const seen=polls;
+ release();await refreshed;
+ // The older Refresh response does not restore the running job: no poll restarts (the poll interval is 2 s), and the
+ // page still shows the outcome.
+ await page.waitForTimeout(3_000);
+ expect(polls).toBe(seen);
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
+ await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveCount(0);
+});
+
 test('keeps focus on the Merge button when a merge-job click is refused (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};

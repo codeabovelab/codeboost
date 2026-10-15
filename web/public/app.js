@@ -149,11 +149,13 @@ async function refresh() {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+    if (newerJob) data = withMergeJobObservation(data, newerJob);
     snippetSelection = null;
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
+    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -175,9 +177,11 @@ function renderMerge() {
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
-  // Likewise once the merge job this key started has ended (a job is saved under its click's action ID), or another job is
-  // the latest: one job runs at a time, so this key's job has ended or never started. Either way a click is a new action.
-  if (mergeAction && merge.job && !(merge.job.id === mergeAction.actionId && merge.job.state === "running")) mergeAction = null;
+  // Likewise once the merge job this key started has ended (a job is saved under its click's action ID), or a job newer
+  // than the one shown when the key was made is the latest: one job runs at a time, so this key's job has ended or never
+  // started. Either way a click is a new action. The job shown when the key was made says nothing about its click.
+  if (mergeAction && merge.job && (merge.job.id === mergeAction.actionId ? merge.job.state !== "running" : merge.job.id !== mergeAction.jobBefore))
+    mergeAction = null;
   // With merge jobs (their status carries `job`), a click's answer arrives while the control may hold focus, so it is
   // marked, never disabled; activation is ignored while the merge is not ready.
   if ("job" in merge) {
@@ -254,6 +258,8 @@ async function pollMergeQueue(generation) {
     current = settle();
     if (!current) return;
     if (data.merge.job?.state === "running") {
+      // A full review response read before this observation must not restore an older record of this job.
+      mergeObservationGeneration++;
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
       // a background reload would erase the person's selection and input; Refresh shows the outcome.
       const job = update.job;
@@ -343,10 +349,12 @@ async function act(command) {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
     data = newerQueue ? withMergeQueue(updated, newerQueue) : updated;
+    if (newerJob) data = withMergeJobObservation(data, newerJob);
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
+    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
     return true;
   } catch (error) {
     if (generation !== reviewGeneration) return false;
@@ -639,7 +647,7 @@ $("merge").onclick = async () => {
   else $("merge").disabled = true;
   try {
     rememberDraft();
-    mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };
+    mergeAction ??= { actionId: crypto.randomUUID(), token: data.token, jobBefore: data.merge.job?.id ?? null };
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
     // The composer stayed editable while the request was in flight: keep what the person typed meanwhile.
     rememberDraft();
@@ -946,6 +954,22 @@ function preserveSettledQuestionAnswers(updated) {
       ? { ...note, answer: newer.answer, answerActive: newer.answerActive }
       : note;
   }) };
+}
+/** A poll's record of the job a full response also carries, when the poll saw it later than that response did. */
+function newerMergeJob(updated, observationOwner) {
+  const newer = data?.merge?.job, older = updated.merge?.job;
+  return observationOwner !== mergeObservationGeneration && newer && older && newer.id === older.id && newer.updatedAt > older.updatedAt
+    ? newer
+    : null;
+}
+function mergeJobBanner(job) {
+  return job.state === "running" ? mergeJobText(job) : `${mergeJobText(job)} Refresh to see the result.`;
+}
+/** The view with a newer observation of its job: an ended job asks for a refresh, as the job poll shows it. */
+function withMergeJobObservation(view, job) {
+  if (job.state === "running") return { ...view, merge: { ...view.merge, job } };
+  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+  return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: mergeJobBanner(job) }, ...blockers] } };
 }
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
@@ -1369,10 +1393,12 @@ async function importPlan(event) {
       mergePollState = null;
       mergePollDelay = 2000;
       rememberDraft();
-      const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+      const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
       data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+      if (newerJob) data = withMergeJobObservation(data, newerJob);
       render();
       if (newerQueue) showMergeQueueStatus(newerQueue);
+      if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
       if ($("plan-file").files[0] === file) $("plan-file").value = "";
       renderPlanFile();
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
@@ -1555,10 +1581,12 @@ async function applyPlanAuthor(index) {
       mergePollTimer = null;
       mergePollState = null;
       mergePollDelay = 2000;
-      const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+      const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
       data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+      if (newerJob) data = withMergeJobObservation(data, newerJob);
       render();
       if (newerQueue) showMergeQueueStatus(newerQueue);
+      if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     } catch (error) {
       request.observationError = `Revision r${revision} was applied, but the current plan could not reload. ${error.message}`;
@@ -1817,10 +1845,12 @@ $("plans-refresh").onclick = async () => {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+    if (newerJob) data = withMergeJobObservation(data, newerJob);
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
+    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;

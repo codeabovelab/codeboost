@@ -327,6 +327,20 @@ it('ends queued when the merge queue accepted the head', async () => {
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it.each([false, true])('ends submitted, not merged or queued, when GitHub accepted the merge but saving its outcome failed (queue: %s)', async queue => {
+  const f = setup({ queue });
+  // MergeCoordinator resolves after GitHub accepted the command even when saving the outcome fails (test/merge.test.ts).
+  const fail = vi.fn(() => { throw new Error('local refresh failed'); });
+  if (queue) f.store.queueMergeAttempt = fail; else f.store.finishMergeAttempt = fail;
+  await f.coordinator.start('review-token', randomUUID());
+  const job = await settled(f.coordinator);
+  expect(fail).toHaveBeenCalledTimes(1);
+  expect(f.gh.merged).toEqual([oid(2)]);
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ actionId: job.mergeActionId, state: 'submitting' });
+  expect(job).toMatchObject({ state: 'submitted', reason: expect.stringContaining('reconciles from GitHub') });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
 it('leaves the task approved, merge blocked when a retried job is queued', async () => {
   const f = setup({ queue: true, checks: n => (n === 1 ? [{ context: 'build', appId: null, state: 'failure' }] : []) });
   await f.coordinator.start('review-token', randomUUID());
@@ -590,6 +604,27 @@ it('gives a resend of the same click, during the first send\'s review load, the 
   expect(firstAnswer.id).toBe(second.id);
   expect(f.store.getMergeJob(identity, id)?.refused).toBeFalsy(); // Not saved as an "already running" refusal.
   await settled(f.coordinator);
+});
+
+it('answers the resent click\'s job when the first send\'s admission load fails after the resend was admitted', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
+  const first = f.coordinator.start('review-token', id);
+  await held.loading;
+  const second = await f.coordinator.start('review-token', id); // Its own load is not held: it admits the job.
+  expect(f.store.getMergeJob(identity, id)).not.toBeNull();
+  held.fail(new Error('History worker timed out.'));
+  expect((await first).id).toBe(second.id);
+  await settled(f.coordinator);
+});
+
+it('answers the resent click\'s job when shutdown stops the first send\'s admission load after the resend was admitted', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never), request = new AbortController();
+  const first = f.coordinator.start('review-token', id, () => null, request.signal);
+  await held.loading;
+  const second = await f.coordinator.start('review-token', id);
+  f.coordinator.stop();
+  request.abort(new Error('Request cancelled during shutdown.'));
+  expect((await first).id).toBe(second.id);
 });
 
 it('admits nothing and saves nothing when shutdown starts during the admission load', async () => {

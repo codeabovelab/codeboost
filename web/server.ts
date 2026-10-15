@@ -727,11 +727,18 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             let untrusted: string|null=null;
             if(config.github&&!mergeJobs.saved(input.actionId)) {
               if(stopping||runner?.closing)throw new ShuttingDownError();
-              let access: IssueAccess;
-              // A read stopped by shutdown decides nothing: 503, and the browser resends the same click.
+              let access: IssueAccess|null=null;
               try { access=await readIssueAccess(requestAbort.signal); }
-              catch (error) { if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError(); throw error; }
-              try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
+              catch (error) {
+                // A resend of this click may have saved its job while this read ran: that job is the answer (start replays it).
+                if(!mergeJobs.saved(input.actionId)) {
+                  // The read's own timeout, or gh's answer, came first: a shutdown that started while gh stopped does not
+                  // replace it. Otherwise a read stopped by shutdown decides nothing: 503, and the browser resends the click.
+                  if(!timedOut(error)&&!ghAnswered(error)&&(stopping||runner?.closing||requestAbort.signal.aborted))throw new ShuttingDownError();
+                  throw error;
+                }
+              }
+              if(access) try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
             }
             const job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
               ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
