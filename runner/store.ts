@@ -2356,10 +2356,6 @@ export class Store {
    * which did not record its own check. A compare range excludes its start commit, so only a scan from this check's tip
    * onward is provably continuous with what was scanned before.
    */
-  oldestClearAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
-    const row = this.#get(`SELECT * FROM already_fixed_checks WHERE plan_key=? AND outcome='clear' ORDER BY rowid ASC LIMIT 1`, identityKey(identity));
-    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
-  }
   getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
     const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? AND id=?', identityKey(identity), id);
     return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
