@@ -90,8 +90,11 @@ export class MergeJobCoordinator {
     const { job } = store.beginMergeJob(identity, { actionId, token: token as string });
     const abort = new AbortController(); this.#abort = abort;
     const run = Promise.resolve().then(() => this.#run(job, abort.signal)).catch(error => {
-      // Anything unexpected ends the job, unless shutdown stopped it: startup then settles it.
-      if (!abort.signal.aborted || !this.#closing) this.#finish(job.id, 'failed', error instanceof Error ? error.message : String(error));
+      // Anything unexpected ends the job, unless shutdown stopped it (startup then settles it) or the task was cancelled
+      // (a cancel during one of the job's own review loads, which await a history worker since #170).
+      if (abort.signal.aborted && this.#closing) return;
+      if ((abort.signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled()) return this.#end(job, abort.signal);
+      this.#finish(job.id, 'failed', error instanceof Error ? error.message : String(error));
     }).finally(() => { if (this.#active === run) { this.#active = null; this.#abort = null; } });
     this.#active = run;
     return mergeJobView(job);

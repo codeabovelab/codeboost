@@ -46,7 +46,8 @@ function service(store: Store) {
       expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
     };
   };
-  return { store, config: { identity }, load: vi.fn(view), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService;
+  // Asynchronous, as since #170 (the review load awaits a history worker).
+  return { store, config: { identity }, view, load: vi.fn(async () => view()), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService & { view: () => unknown };
 }
 /** Preparation as F5/F6a end it: `ready` records exact readiness on the job's own prepare-merge action. */
 function preparation(store: Store, result: (call: number) => PreMergeResult['state'] | Error = () => 'ready') {
@@ -102,6 +103,21 @@ function setup(options: Parameters<typeof github>[1] & { prepare?: Parameters<ty
   return { store, review, gh, merges, prep, coordinator };
 }
 const settled = async (coordinator: MergeJobCoordinator) => { await coordinator.current; return coordinator.latest()!; };
+/** Holds the next review load until released or failed; a load whose signal aborts rejects with the abort's reason. */
+function holdNextLoad(review: ReviewService & { view: () => unknown }) {
+  let release!: () => void, fail!: (error: Error) => void, started!: (signal?: AbortSignal) => void;
+  const gate = new Promise<void>((resolve, reject) => { release = resolve; fail = reject; });
+  const loading = new Promise<AbortSignal | undefined>(resolve => { started = resolve; });
+  (review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async (options?: { signal?: AbortSignal }) => {
+    started(options?.signal);
+    await new Promise<void>((resolve, reject) => {
+      gate.then(resolve, reject);
+      options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true });
+    });
+    return review.view();
+  });
+  return { release, fail, loading };
+}
 const pending = (context = 'ci'): RequiredCheck => ({ context, appId: null, state: 'pending' });
 const passing = (context = 'ci'): RequiredCheck => ({ context, appId: null, state: 'success' });
 
@@ -560,5 +576,62 @@ it('starts no inspection after the wait limit and stops one that runs into it', 
   const after = inspections;
   await new Promise(resolve => setTimeout(resolve, 100));
   expect(inspections).toBe(after);
+  expect(f.gh.merged).toEqual([]);
+});
+
+// Since #170 a click's admission awaits the review load; these pin what may happen while it does.
+it('gives a resend of the same click, during the first send\'s review load, the same job', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
+  const first = f.coordinator.start('review-token', id);
+  await held.loading;
+  const second = await f.coordinator.start('review-token', id); // Its own load is not held: it admits the job.
+  held.release();
+  const firstAnswer = await first;
+  expect(firstAnswer.id).toBe(second.id);
+  expect(f.store.getMergeJob(identity, id)?.refused).toBeFalsy(); // Not saved as an "already running" refusal.
+  await settled(f.coordinator);
+});
+
+it('admits nothing and saves nothing when shutdown starts during the admission load', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
+  const starting = f.coordinator.start('review-token', id);
+  await held.loading;
+  f.coordinator.stop();
+  held.release();
+  await expect(starting).rejects.toBeInstanceOf(ShuttingDownError);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+  expect(f.coordinator.current).toBeNull();
+});
+
+it('answers an admission load stopped by shutdown as not applied, saving nothing', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never), request = new AbortController();
+  const starting = f.coordinator.start('review-token', id, () => null, request.signal);
+  await held.loading;
+  request.abort(new Error('Request cancelled during shutdown.'));
+  await expect(starting).rejects.toBeInstanceOf(ShuttingDownError);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+});
+
+it('saves nothing when the admission load fails for another reason, so the click may be sent again', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
+  const starting = f.coordinator.start('review-token', id);
+  await held.loading;
+  held.fail(new Error('History worker timed out.'));
+  await expect(starting).rejects.toThrow('History worker timed out.');
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+  // The same click, sent again, starts the job.
+  expect(await f.coordinator.start('review-token', id)).toMatchObject({ state: 'running' });
+  await settled(f.coordinator);
+});
+
+it('ends the job cancelled when the task is cancelled during the job\'s own review load', async () => {
+  const f = setup(), id = randomUUID();
+  // The admission's load passes; the job's own first load (its first step) is held.
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  const held = holdNextLoad(f.review as never);
+  await f.coordinator.start('review-token', id);
+  await held.loading;
+  f.coordinator.cancel();
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
   expect(f.gh.merged).toEqual([]);
 });

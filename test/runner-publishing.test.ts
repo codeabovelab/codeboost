@@ -1920,6 +1920,34 @@ describe('the one-click merge job (F6b of #22)', () => {
     try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
   }, 60_000);
 
+  it('answers 503 when a started job\'s click cannot reload the review, and the resent click returns the job', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // The click's own reload after its job was saved fails once (as a history worker timing out would). The admission load
+    // and the reload share the request's signal; the job's loads carry the job's own signal.
+    const service = served.app.service, realLoad = service.load.bind(service), requestSignals = new Set<AbortSignal>();
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      const signal = options?.signal;
+      if (signal && !failed && requestSignals.has(signal)) { failed = true; throw new Error('History worker timed out.'); }
+      if (signal) requestSignals.add(signal);
+      return realLoad(options);
+    };
+    const clicked = await merge(served.app, token, id);
+    expect(failed).toBe(true);
+    expect(clicked).toMatchObject({ status: 503, body: { error: expect.stringMatching(/merge started, but the review could not be reloaded: History worker timed out/) } });
+    expect(served.store.getMergeJob(served.identity, id)).not.toBeNull(); // The click's job was saved and started.
+    // The same click, sent again, replays its job.
+    const resent = await merge(served.app, token, id);
+    expect(resent).toMatchObject({ status: 200, body: { job: { id: served.store.getMergeJob(served.identity, id)!.id } } });
+  }, 60_000);
+
   it('answers a merge click with the job\'s latest record when it ended during the click\'s reload', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, slow = false;
