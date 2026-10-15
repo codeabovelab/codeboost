@@ -1817,7 +1817,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   };
   const mergeState = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/merge`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
 
-  it('offers Merge PR while only blockers the job resolves remain, then waits for checks and merges, refusing prepare-merge meanwhile', async () => {
+  it('offers Merge PR while only blockers the job resolves remain, then waits for checks and merges, refusing prepare-merge and publish meanwhile', async () => {
     const w = world(); mergeable(w);
     let checks: RequiredCheck[] = [{ context: 'ci', appId: null, state: 'pending' }], storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => checks);
@@ -1835,6 +1835,9 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(started.body.merge).toMatchObject({ ready: false, job: { state: 'running' } });
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }), { timeout: 10_000 });
     expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/merge is running/) } });
+    // A publish cannot begin a refresh of the PR the job waits on: publishing refuses a task in review.
+    expect(await act(served.app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
+    expect(served.store.taskPullRequests(served.identity).every(pr => pr.refresh === null)).toBe(true);
     checks = [{ context: 'ci', appId: null, state: 'success' }];
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
     expect(gh.merged).toEqual([served.store.getSnapshot(served.identity).head]);

@@ -436,7 +436,7 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 8, alreadyFixedSince: oid(9) });
   });
 
-  it('scans from the oldest clear check for a PR opened before schema v19, whatever later checks found', async () => {
+  it('scans from the task\'s original base for a PR opened before schema v19, whatever later checks found', async () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-v19-')); roots.push(root);
     const path = join(root, 'state.sqlite');
     const { store } = published(path);
@@ -459,7 +459,34 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(reopened);
     const merges = new MergeCoordinator(service(reopened), gh.client, undefined, undefined, PUBLISHED);
     await merges.status(undefined, true);
-    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(9) });
+    // No record shows which base branch an older check scanned, so none stands in: the scan covers every base commit.
+    expect(gh.targets.at(-1)).toMatchObject({ alreadyFixedSince: oid(1) });
+  });
+
+  it('scans from the task\'s original base, not another base branch\'s check, for a PR opened before schema v19', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-v19-')); roots.push(root);
+    const path = join(root, 'state.sqlite');
+    // PR 7 went into main after a clear check that scanned main from the original base oid(1) to oid(9). github.baseBranch
+    // then became release: the person closed PR 7 and published again, into release, after a check that scanned release
+    // to oid(29). Both openings were recorded before v19, so neither names its check; main's oid(9) says nothing about
+    // release.
+    const { store } = published(path);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id,
+      reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(29) } });
+    const release = store.beginPullRequest(identity, { checkId: check.id, repository: 'owner/repo', base: 'release', headBranch: BRANCH, headSha: oid(2), draft: false });
+    opened(store, release.openingId, 8, false);
+    toReview(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const raw = new DatabaseSync(path); raw.exec('UPDATE task_pull_requests SET check_id=NULL'); raw.close();
+    const reopened = new Store(path); stores.push(reopened);
+    expect(reopened.taskPullRequests(identity).map(pr => [pr.base, pr.checkId])).toEqual([['main', null], ['release', null]]);
+    const gh = github(reopened);
+    await new MergeCoordinator(service(reopened), gh.client, undefined, undefined, { ...PUBLISHED, baseBranch: 'release' }).status(undefined, true);
+    expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 8, alreadyFixedSince: oid(1) });
   });
 
   it('scans from the first opening into the current base branch after the base branch setting changed', async () => {
