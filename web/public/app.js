@@ -213,7 +213,11 @@ function renderMerge() {
     scheduleMergePoll();
     return;
   }
-  $("merge").textContent = merge.action === "retry"
+  // The page saw its job end and has not reloaded: name the outcome, not the blockers the job already resolved.
+  const jobEnded = merge.blockers.some(blocker => blocker.code === "job-refresh");
+  $("merge").textContent = jobEnded
+    ? endedMergeJobLabel(job)
+    : merge.action === "retry"
     ? "Retry merge"
     : merge.queue?.state === "submitting"
       ? "Submitting…"
@@ -224,7 +228,7 @@ function renderMerge() {
           : merge.ready
             ? "Merge PR"
             : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
-  $("merge-details").textContent = merge.queue ? "Merge status" : "Review blockers";
+  $("merge-details").textContent = merge.queue || jobEnded ? "Merge status" : "Review blockers";
   scheduleMergePoll();
 }
 function scheduleMergePoll() {
@@ -283,8 +287,7 @@ async function pollMergeQueue(generation) {
         return;
       }
       const ended = `${job ? mergeJobText(job) : "The merge job ended."} Refresh to see the result.`;
-      const blockers = data.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
-      data = { ...data, merge: { ...data.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: ended }, ...blockers] } };
+      data = withEndedMergeJob(data, job, ended);
       $("banner").textContent = ended;
       renderMerge();
       return;
@@ -316,6 +319,25 @@ function mergeJobText(job) {
   }[job.state] ?? job.state;
 }
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
+/**
+ * Blockers a merge job settles itself (runner/merge-job.ts JOB_RESOLVES: it prepares, rebases, pushes, runs `cmd:` checks
+ * and waits for required checks), plus mergeability, which its own inspections read again. A review read before or during
+ * the job still lists them; once the job has ended they describe a state the job already moved past.
+ */
+const mergeJobResolvedBlockers = new Set(["preparation", "base", "acceptance", "check", "mergeable"]);
+/**
+ * The view once the page learns its merge job ended, without a reload: the job's outcome and "Refresh to see the
+ * result", plus only the blockers the job did not resolve. The control reads the outcome, as it does after a queue merge.
+ */
+function withEndedMergeJob(view, job, message) {
+  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !mergeJobResolvedBlockers.has(blocker.code));
+  return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message }, ...blockers] } };
+}
+/** The merge control's label for a job the page saw end: its outcome, as the control reads a queue merge's. */
+function endedMergeJobLabel(job) {
+  return { merged: "Merged", queued: "Merge queued", submitted: "Merge submitted", blocked: "Merge blocked", "review-required": "Review needed",
+    failed: "Merge stopped", cancelled: "Merge cancelled" }[job?.state] ?? "Merge ended";
+}
 function withMergeQueue(view, queue) {
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
   if (queue?.state === "merged")
@@ -639,12 +661,23 @@ $("merge-details").onclick = () => {
       ? `<ul>${job.checks.map(check => `<li>${esc(check.context)}: ${esc(check.state)}</li>`).join("")}</ul>` : ""}`);
     return;
   }
+  const jobEnded = data.merge.blockers.some(blocker => blocker.code === "job-refresh");
   showDialog(
-    `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
+    `<h2>${queue || jobEnded ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
 };
+/**
+ * The merge click's confirmation. A direct retry merges the exact reviewed head again; a merge job's retry prepares
+ * again first, and a rebase there makes a new head and snapshot (docs/implementation/merge-handoff.md, Outcomes).
+ */
+function mergeConfirmText(merge) {
+  if (merge.action !== "retry") return "Merge this reviewed pull request?";
+  return "job" in merge
+    ? "Retry the merge? It prepares the merge again, which may rebase onto the current base and need a new review."
+    : "Retry merging this exact reviewed head?";
+}
 $("merge").onclick = async () => {
-  if (busy || planImportPending || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
+  if (busy || planImportPending || !data?.merge?.ready || !window.confirm(mergeConfirmText(data.merge))) return;
   supersedePlanRefresh();
   const busyOwner = beginBusy("write");
   reviewGeneration++;
@@ -676,8 +709,7 @@ $("merge").onclick = async () => {
         // The job had already ended when the click was answered: nothing to follow, so say how to see its result, as the
         // job poll does when a job ends.
         const ended = `${mergeJobText(updated.job)} Refresh to see the result.`;
-        const blockers = data.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
-        data = { ...data, merge: { ...data.merge, ready: false, action: null, blockers: [{ code: "job-refresh", message: ended }, ...blockers] } };
+        data = withEndedMergeJob(data, updated.job, ended);
         render();
         $("banner").textContent = ended;
         return;
@@ -992,8 +1024,7 @@ function mergeJobBanner(job) {
 function withMergeJobObservation(view, job) {
   if (job.state === "running") return { ...view, merge: { ...view.merge, ready: false, action: null, job,
     blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
-  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
-  return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message: mergeJobBanner(job) }, ...blockers] } };
+  return withEndedMergeJob(view, job, mergeJobBanner(job));
 }
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
