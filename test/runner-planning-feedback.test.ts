@@ -66,7 +66,7 @@ describe('feedback from review actions', () => {
   });
   it('records a segment choice with a fixed-size source, and links a later choice for the same source', async () => {
     const { app, config, close } = await serve();
-    const loaded = app.service.load(), index = loaded.segments.findIndex(s => s.row === 'Unplanned');
+    const loaded = await app.service.load(), index = loaded.segments.findIndex(s => s.row === 'Unplanned');
     const sourceRef = `choice:${createHash('sha256').update(choiceKeys(loaded.segments, config.identity)[index]!).digest('hex')}`;
     const accepted = await api(app, 'POST', '/api/action', { action: 'accept', key: loaded.segments[index]!.key, token: loaded.token, actionId: randomUUID() });
     expect(accepted.status).toBe(200);

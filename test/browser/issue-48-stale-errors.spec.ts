@@ -18,12 +18,12 @@ test.afterEach(async () => { await app.close(); rmSync(root,{recursive:true,forc
 test('a held merge-poll error starts no second poll chain, and polling recovers after it',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,phase:'queued'|'merged'='queued';
  const gateway:MergeGateway&MergeQueueGateway={
-  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
+  inspect:async()=>{const snapshot=(await appRef.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
   queueWatermark:async()=>null,
   merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
   inspectQueue:async head=>phase==='queued'?{state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'AWAITING_CHECKS',position:2,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head}:{state:'merged',reviewedHead:head,mergedAt:'2026-09-24T08:10:00Z'},
  };
- app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ app=appRef=await startServer(config,0,undefined,gateway);let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>release=resolve),firstPollStarted=new Promise<void>(resolve=>arrived=resolve);let polls=0;
  await page.route('**/api/merge',async route=>{polls++;
   if(polls===1){arrived();await held;await route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({error:'Stale poll failure.'})});return;}
@@ -53,12 +53,12 @@ test('a held merge-poll error starts no second poll chain, and polling recovers 
 test('reports an unusable current merge-poll answer and keeps polling',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
  const gateway:MergeGateway&MergeQueueGateway={
-  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
+  inspect:async()=>{const snapshot=(await appRef.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
   queueWatermark:async()=>null,
   merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
   inspectQueue:async head=>({state:'merged',reviewedHead:head,mergedAt:'2026-09-24T08:10:00Z'}),
  };
- app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ app=appRef=await startServer(config,0,undefined,gateway);let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  let polls=0;
  // Poll 1 answers 200 with a null body, which the page cannot apply; later polls pass.
  await page.route('**/api/merge',async route=>{if(++polls===1){await route.fulfill({status:200,contentType:'application/json',body:'null'});return;}await route.continue();});

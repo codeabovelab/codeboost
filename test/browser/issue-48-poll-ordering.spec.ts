@@ -20,14 +20,14 @@ test('a re-render while a merge-queue poll is held starts no second poll chain, 
  chmodSync(join(config.repository,'run.sh'),0o644);fixtureGit(config.repository,'commit','-am','Restore declared scope');
  let appRef:typeof app,phase:'queued'|'merged'='queued';
  const gateway:MergeGateway&MergeQueueGateway={
-  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
+  inspect:async()=>{const snapshot=(await appRef.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
   queueWatermark:async()=>null,
   merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
   inspectQueue:async head=>phase==='merged'?{state:'merged',reviewedHead:head,mergedAt:'2026-09-24T08:10:00Z'}:{state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'QUEUED',position:1,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head},
  };
- app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
- for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
- for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ app=appRef=await startServer(config,0,undefined,gateway);let view=await app.service.load();
+ for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});
+ for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
 
  // Poll 1: the server answers (queued) at once, but delivery of that answer to the page is held. Later polls pass.
  let release!:()=>void,arrived!:()=>void;
@@ -70,14 +70,14 @@ test('an older generation poll returning late neither applies nor lets a re-rend
  chmodSync(join(config.repository,'run.sh'),0o644);fixtureGit(config.repository,'commit','-am','Restore declared scope');
  let appRef:typeof app;
  const gateway:MergeGateway&MergeQueueGateway={
-  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
+  inspect:async()=>{const snapshot=(await appRef.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
   queueWatermark:async()=>null,
   merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
   inspectQueue:async head=>({state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'QUEUED',position:1,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head}),
  };
- app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
- for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
- for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ app=appRef=await startServer(config,0,undefined,gateway);let view=await app.service.load();
+ for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});
+ for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  // Polls 1 (old generation) and 2 (new generation) are held; any later poll is counted and passes.
  const releases:Array<()=>void>=[],started:Array<()=>void>=[];
  const starts=[0,1].map(index=>new Promise<void>(resolve=>started[index]=resolve));

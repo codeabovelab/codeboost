@@ -72,8 +72,16 @@ async function api(path, body) {
   if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status, outcomeUnknown: value.outcomeUnknown === true });
   return value;
 }
+// Before the first review load no item is selected; text typed then is kept under "" until render() selects an item.
 function rememberDraft() {
-  if (selected) drafts.set(`${selected}:${mode}`, $("message").value);
+  drafts.set(`${selected ?? ""}:${mode}`, $("message").value);
+}
+function adoptUnselectedDrafts() {
+  for (const kind of ["question", "change"]) {
+    const text = drafts.get(`:${kind}`);
+    drafts.delete(`:${kind}`);
+    if (text) drafts.set(`${selected}:${kind}`, text);
+  }
 }
 function showFailure(message, planStatusOwner) {
   mergeGeneration++;
@@ -127,6 +135,10 @@ async function refresh() {
   mergePollDelay = 2000;
   renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
+  if (!data) {
+    setPlanStatus(planStatusOwner, "neutral", "Loading the current plan…");
+    renderPlans();
+  }
   try {
     rememberDraft();
     const updated = await api("/api/review");
@@ -140,7 +152,6 @@ async function refresh() {
     const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     snippetSelection = null;
-    selected ??= data.items[0]?.id || "Unplanned";
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
@@ -153,6 +164,8 @@ async function refresh() {
     );
   } finally {
     endBusy(busyOwner);
+    // showFailure rendered the Plans screen while this read still counted as loading.
+    if (!data) renderPlans();
   }
 }
 function renderMerge() {
@@ -356,6 +369,10 @@ function select(id) {
   render();
 }
 function render() {
+  if (selected === undefined) {
+    selected = data.items[0]?.id || "Unplanned";
+    adoptUnselectedDrafts();
+  }
   const item = data.items.find((item) => item.id === selected);
   const retainedItems = [...new Set([
     ...[...drafts].filter(([, text]) => text.length).map(([key]) => key.split(":")[0]),
@@ -574,7 +591,7 @@ function setMode(value) {
     mode === "change" ? "Change to request" : "Question about this item";
   $("save-note").textContent =
     mode === "change" ? "Save change request" : "Ask agent";
-  $("message").value = drafts.get(`${selected}:${mode}`) || "";
+  $("message").value = drafts.get(`${selected ?? ""}:${mode}`) || "";
   renderAttachment();
 }
 function showDialog(html) {
@@ -628,8 +645,21 @@ $("merge").onclick = async () => {
     rememberDraft();
     mergeAction = null;
     if (updated.job) {
-      // A merge job runs in the background (F6b); the page follows it.
-      data = { ...updated, merge: { ...updated.merge, job: updated.job } };
+      // A merge job runs in the background (F6b); the page follows it. When the server could not reload the review after
+      // starting the job, it answers only the job: keep the page's review and follow the job on it.
+      data = updated.mergeRefreshRequired
+        ? { ...data, merge: { ...data.merge, ready: false, action: null, job: updated.job } }
+        : { ...updated, merge: { ...updated.merge, job: updated.job } };
+      if (updated.job.state !== "running") {
+        // The job had already ended when the click was answered: nothing to follow, so say how to see its result, as the
+        // job poll does when a job ends.
+        const ended = `${mergeJobText(updated.job)} Refresh to see the result.`;
+        const blockers = data.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+        data = { ...data, merge: { ...data.merge, ready: false, action: null, blockers: [{ code: "job-refresh", message: ended }, ...blockers] } };
+        render();
+        $("banner").textContent = ended;
+        return;
+      }
       render();
       $("banner").textContent = mergeJobText(updated.job);
       return;
@@ -1189,7 +1219,8 @@ function renderPlanAuthor() {
   }
   if (!request) {
     $("plan-author-status").className = "neutral";
-    $("plan-author-status").textContent = unavailable ? "Load a plan before asking the agent." : "";
+    $("plan-author-status").textContent = !unavailable ? "" : reviewLoading()
+      ? "The plan is still loading. Ask the agent after it appears." : "Load a plan before asking the agent.";
     $("plan-author-result").innerHTML = "";
     return;
   }
@@ -1219,8 +1250,9 @@ function renderPlanAuthor() {
   else if (restoreApplyFocus) ($(restoreApplyFocus) ?? $("plan-author-refresh-suggestions") ?? $("plans-refresh"))?.focus();
 }
 function renderPlans() {
+  renderPlanImport();
   if (!data?.plan) {
-    $("plans-summary").textContent = "Plan unavailable";
+    $("plans-summary").textContent = reviewLoading() ? "Loading plan…" : "Plan unavailable";
     $("plans-revision").textContent = "";
     $("plans-items").innerHTML = "";
     $("plans-questions").innerHTML = "";
@@ -1246,6 +1278,15 @@ function renderPlans() {
     </article>`).join("");
   renderPlanAuthor();
 }
+// A plan or review is being read: the page's review read, or Refresh plan, which reads without taking the busy flag.
+const reviewLoading = () => busyKind === "read" || planRefreshPending;
+// aria-disabled, not disabled: focus stays on the button, and a click with no plan loaded still reaches importPlan,
+// which says why nothing was imported. The form is novalidate so the browser's file check cannot answer first;
+// importPlan reports a missing file itself. (During an import, the button's "Importing…" label shows the state.)
+function renderPlanImport() {
+  if (planImportPending || !data?.plan) $("plan-import").setAttribute("aria-disabled", "true");
+  else $("plan-import").removeAttribute("aria-disabled");
+}
 function planFileFormat(name) {
   return /\.ya?ml$/i.test(name) ? "yaml" : /\.json$/i.test(name) ? "json" : null;
 }
@@ -1258,9 +1299,18 @@ function renderPlanFile() {
 }
 async function importPlan(event) {
   event.preventDefault();
-  if (planImportPending || !data?.plan) return;
+  if (planImportPending) return;
+  // The busy refusal and the "still loading" refusal keep the current status ownership, so a running Apply, review read
+  // or Refresh plan replaces them with its result instead of being hidden by them. The "no plan" refusal claims the line
+  // only when nothing is running. The file refusal below always claims it, like the import itself: feedback on the
+  // file just chosen is newer than any read already running, so that read's result must not replace it.
   if (busy && busyKind !== "read") {
-    claimPlanStatus("warn", "! Wait for the current review action before importing a plan.");
+    setPlanStatus(planStatusGeneration, "warn", "! Wait for the current review action before importing a plan.");
+    return;
+  }
+  if (!data?.plan) {
+    if (reviewLoading()) setPlanStatus(planStatusGeneration, "warn", "! The plan is still loading. Nothing was imported. Import after it appears.");
+    else claimPlanStatus("bad", "✕ No plan is loaded, so nothing was imported. Use Refresh plan, then import.");
     return;
   }
   const file = $("plan-file").files[0], format = file && planFileFormat(file.name);
@@ -1287,7 +1337,7 @@ async function importPlan(event) {
   } catch (error) {
     planImportPending = false;
     endBusy(busyOwner);
-    $("plan-import").removeAttribute("aria-disabled");
+    renderPlanImport();
     $("plan-import").textContent = "Import next revision";
     setPlanStatus(statusOwner, "bad", `✕ Could not read the plan file. ${error.message}`);
     renderMerge();
@@ -1340,7 +1390,7 @@ async function importPlan(event) {
   } finally {
     planImportPending = false;
     endBusy(busyOwner);
-    $("plan-import").removeAttribute("aria-disabled");
+    renderPlanImport();
     $("plan-import").textContent = "Import next revision";
   }
 }
@@ -1755,6 +1805,7 @@ $("plans-refresh").onclick = async () => {
   $("plans-refresh").setAttribute("aria-disabled", "true");
   $("plans-refresh").textContent = "Refreshing…";
   const statusOwner = claimPlanStatus("neutral", "Refreshing the current plan…");
+  if (!data) renderPlans();
   try {
     rememberDraft();
     const updated = await api("/api/review");
@@ -1783,6 +1834,7 @@ $("plans-refresh").onclick = async () => {
       planRefreshPending = false;
       $("plans-refresh").removeAttribute("aria-disabled");
       $("plans-refresh").textContent = "Refresh plan";
+      if (!data) renderPlans();
     }
   }
 };

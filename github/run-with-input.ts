@@ -10,11 +10,23 @@ export class CommandFailed extends Error {
 }
 
 /**
+ * Whether `error`, or an error it was caused by, is gh's own exit (a CommandFailed): an answer to report as it is, never
+ * to replace with a later abort's reason (#48).
+ */
+export function ghAnswered(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 8; current = current.cause, depth++)
+    if (current instanceof CommandFailed) return true;
+  return false;
+}
+
+/**
  * Runs a command with literal argv and writes `input` to its stdin, so large text never travels as an OS argument
  * (Linux limits one argument to 128 KiB, and a NUL cannot be passed at all). Settles only after the process closed:
  * a timeout, an abort or an output past `maxBuffer` sends SIGTERM, then SIGKILL after `killGraceMs` if the process is
  * still running, and the promise rejects once it has exited. If a process it started keeps the output pipes open after
- * it exits, the pipes are closed after `pipeGraceMs` so the promise still settles.
+ * it exits, the pipes are closed after `pipeGraceMs` so the promise still settles. Once its exit has been observed, the
+ * exit status is the answer: a timeout or abort that fires while the pipes drain does not replace it (#48). Output past
+ * `maxBuffer` still fails it (tested), and so does a late process error (traced, not tested).
  */
 export function runWithInput(command: string, args: readonly string[], options: {
   input?: string; signal?: AbortSignal; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; killGraceMs?: number; pipeGraceMs?: number;
@@ -23,15 +35,15 @@ export function runWithInput(command: string, args: readonly string[], options: 
     if (options.signal?.aborted) { reject(options.signal.reason ?? new Error('Aborted.')); return; }
     const child = spawn(command, [...args], { env: options.env, stdio: ['pipe', 'pipe', 'pipe'] });
     const out: Buffer[] = [], err: Buffer[] = [];
-    let size = 0, failure: Error | null = null;
+    let size = 0, failure: Error | null = null, exited = false;
     let escalation: NodeJS.Timeout | null = null;
     const stop = (error: Error) => {
       failure ??= error;
       child.kill('SIGTERM');
       escalation ??= setTimeout(() => child.kill('SIGKILL'), options.killGraceMs ?? 5_000);
     };
-    const timer = options.timeout ? setTimeout(() => stop(new Error(`${command} timed out.`)), options.timeout) : null;
-    const onAbort = () => stop(options.signal?.reason instanceof Error ? options.signal.reason : new Error('Aborted.'));
+    const timer = options.timeout ? setTimeout(() => { if (!exited) stop(new Error(`${command} timed out.`)); }, options.timeout) : null;
+    const onAbort = () => { if (!exited) stop(options.signal?.reason instanceof Error ? options.signal.reason : new Error('Aborted.')); };
     options.signal?.addEventListener('abort', onAbort, { once: true });
     const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
       size += chunk.length;
@@ -61,6 +73,7 @@ export function runWithInput(command: string, args: readonly string[], options: 
     child.on('close', finish);
     // 'close' also waits for the pipes; a grandchild that inherited them can hold them open after this process exits.
     child.on('exit', (code, signal) => {
+      exited = true;
       pipes = setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); finish(code, signal); }, options.pipeGraceMs ?? 1_000);
     });
   });
