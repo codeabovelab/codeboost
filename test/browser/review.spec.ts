@@ -738,6 +738,8 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  const button=page.locator('#merge');
+ // The review loads asynchronously (#170); press only once the page offers the merge.
+ await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();
  await button.focus();await button.press('Enter');
  await expect(page.locator('#banner')).toHaveText(/^Merge blocked\. Issue #1 is not trusted/);
  // The refusal leaves the control marked, not disabled, and focused (AGENTS.md, Async review UI).
