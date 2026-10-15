@@ -749,6 +749,28 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  await button.press('Enter');
  expect(mergeClicks).toBe(1);
 });
+test('asks for a refresh when the click is answered with a merge job that has already ended (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[],reason:string|null=null)=>({id:'0f6b0000-0000-4000-8000-000000000000',state,step,reason,checks,url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ let polls=0;
+ // The job failed before the click was answered (its review load failed as the click's reload did).
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:job('failed',null,[],'History worker timed out.'),mergeRefreshRequired:true})});});
+ await page.route('**/api/merge',async route=>{polls++;await route.continue();});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#banner')).toContainText('Refresh to see the result.');
+ await expect(page.locator('#merge')).toHaveAttribute('aria-disabled','true');
+ await page.locator('#merge-details').click();
+ await expect(page.locator('dialog')).toContainText('Refresh to see the result.');
+ await page.keyboard.press('Escape');
+ await page.waitForTimeout(2500); // Past the first poll delay: an ended job is not polled.
+ expect(polls).toBe(0);
+});
+
 test('follows a started merge job when the server could not reload the review after the click (F6b, #170)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};

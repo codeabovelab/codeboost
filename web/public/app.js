@@ -627,6 +627,16 @@ $("merge").onclick = async () => {
       data = updated.mergeRefreshRequired
         ? { ...data, merge: { ...data.merge, ready: false, action: null, job: updated.job } }
         : { ...updated, merge: { ...updated.merge, job: updated.job } };
+      if (updated.job.state !== "running") {
+        // The job had already ended when the click was answered: nothing to follow, so say how to see its result, as the
+        // job poll does when a job ends.
+        const ended = `${mergeJobText(updated.job)} Refresh to see the result.`;
+        const blockers = data.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+        data = { ...data, merge: { ...data.merge, ready: false, action: null, blockers: [{ code: "job-refresh", message: ended }, ...blockers] } };
+        render();
+        $("banner").textContent = ended;
+        return;
+      }
       render();
       $("banner").textContent = mergeJobText(updated.job);
       return;
