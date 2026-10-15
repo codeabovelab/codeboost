@@ -743,7 +743,12 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             const job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
               ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
             const running=mergeJobs.current;
-            if(running)void running.finally(()=>{ if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); });
+            // The job's run never rejects, but this callback's own promise would: it must not throw (an unhandled rejection
+            // exits the server), so a failed read or close start is logged instead.
+            if(running)void running.finally(()=>{
+              try { if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); }
+              catch (error) { console.error(`Could not close the cancelled task's pull requests after its merge job: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
+            });
             // The job is saved, so its click is settled. The reload awaits a history worker (#170) while the job's preparation
             // writes, so it can fail without anything being wrong with the job: answer the job, and the page follows it and
             // asks for a refresh (as after a direct merge whose reload fails). A reload stopped by shutdown answers 503, and

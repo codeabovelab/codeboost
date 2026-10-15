@@ -376,7 +376,8 @@ it('keeps a job running and reports it when even reading the task fails after th
     await run.loading;
     f.store.getTask = () => { throw new Error('database is locked'); };
     run.fail(new Error('History worker crashed.'));
-    // The job's promise settles without rejecting, so the server's `.finally` and `close()` see no rejection.
+    // The job's promise settles without rejecting, so `close()` and the server's `.finally` (whose callback catches its own
+    // errors) see no rejection.
     await expect(f.coordinator.current).resolves.toBeUndefined();
     f.store.getTask = getTask;
     expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "database is locked"`);
@@ -495,6 +496,27 @@ it('ends blocked when GitHub refuses the merge while shutdown stops the job', as
   await f.coordinator.current;
   expect(f.coordinator.latest()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
+it.each(['submitted', 'blocked'] as const)('reports a job it could not end during shutdown (%s), after GitHub was asked to merge', async kind => {
+  // Shutdown's first step (stop) has run, but GitHub was already asked, so the job still ends through its ending write.
+  let coordinatorRef: MergeJobCoordinator | null = null;
+  const f = setup({ merge: kind === 'blocked'
+    ? async () => { coordinatorRef!.stop(); throw new MergeSubmissionError('Base branch was modified.', 'refused'); }
+    : signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
+  coordinatorRef = f.coordinator;
+  const fail = vi.fn(() => { throw new Error('disk full'); });
+  const { blockMergeJob, finishMergeJob } = f.store;
+  if (kind === 'blocked') f.store.blockMergeJob = fail; else f.store.finishMergeJob = fail;
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const started = await f.coordinator.start('review-token', randomUUID());
+    if (kind === 'submitted') { await vi.waitFor(() => expect(f.gh.merged).toHaveLength(1)); await f.coordinator.close(); }
+    else await f.coordinator.current;
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "disk full"`);
+    expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
+  } finally { Object.assign(f.store, { blockMergeJob, finishMergeJob }); logged.mockRestore(); }
 });
 
 it('settles a job a crash left in its merge step from its merge attempt at startup', async () => {
