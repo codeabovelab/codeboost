@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
-import { MergeJobCoordinator, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
+import { JOB_RESOLVES, MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
 import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
 import type { ReviewService } from '../runner/review.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type RemoteMergeState, type RequiredCheck } from '../github/merge.ts';
@@ -468,6 +468,19 @@ it('offers Merge PR while only blockers the job resolves remain, and a retry aft
   // A conflict after the base moved is the job's rebase to resolve; a conflict on its own is a person's.
   expect(withMergeJob(status(['base', 'mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: true });
   expect(withMergeJob(status(['mergeable'], { remote: { mergeable: 'CONFLICTING' } }), null, 'in review')).toMatchObject({ ready: false });
+});
+
+it('sends the blockers a job settles before it merges: the ones it resolves, plus mergeability', () => {
+  const status = (codes: string[], mergeable = 'MERGEABLE') =>
+    ({ ready: false, action: null, blockers: codes.map(code => ({ code, message: code })), remote: { mergeable }, queue: null }) as Parameters<typeof withMergeJob>[0];
+  const field = withMergeJob(status([]), null, 'in review').settledBeforeJobMerge;
+  // Pinned to the job's own set: a code added to or removed from JOB_RESOLVES, or from the field, fails here.
+  expect(field).toEqual(['preparation', 'base', 'acceptance', 'check', 'mergeable']);
+  expect(field).toEqual([...JOB_RESOLVES, 'mergeable']);
+  expect(SETTLED_BEFORE_JOB_MERGE).toBe(field);
+  // Every code but mergeability is one Merge PR is offered over, because the job resolves it.
+  for (const code of field.filter(code => code !== 'mergeable'))
+    expect(withMergeJob(status([code]), null, 'in review')).toMatchObject({ ready: true, settledBeforeJobMerge: field });
 });
 
 it('ends as failed, not blocked, when checks fail on a head that moved while waiting', async () => {
