@@ -658,6 +658,29 @@ it('starts no inspection after the wait limit and stops one that runs into it', 
   expect(f.gh.merged).toEqual([]);
 });
 
+it('keeps a GitHub failure that came before the wait limit, even when the inspection settles after it', async () => {
+  let inspections = 0, abortedFirst: unknown = null;
+  const f = setup({ checks: () => [pending()] });
+  const inspect = f.gh.client.inspect;
+  f.gh.client.inspect = (async (request: Parameters<typeof inspect>[0]) => {
+    if (++inspections < 2) return inspect(request);
+    // A stage fails at once; its stopped peers settle only after the wait's limit, and the gateway then reports the
+    // stage's own error (github/merge.ts inspect), not the abort.
+    const failure = new Error('gh: HTTP 502 from the rules read');
+    await new Promise(resolve => request!.signal!.addEventListener('abort', resolve, { once: true }));
+    abortedFirst = request!.signal!.reason;
+    throw failure;
+  }) as typeof inspect;
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 300, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
+  await coordinator.start('review-token', randomUUID());
+  const done = await settled(coordinator);
+  // The interleaving happened: the wait's limit (a timeout, not a cancel) fired before the failed inspection settled.
+  expect((abortedFirst as Error | null)?.name).toBe('TimeoutError');
+  expect(done).toMatchObject({ state: 'failed', reason: 'gh: HTTP 502 from the rules read' });
+  expect(f.store.getTask(identity).status).toBe('in review');
+  expect(f.gh.merged).toEqual([]);
+});
+
 // Since #170 a click's admission awaits the review load; these pin what may happen while it does.
 it('gives a resend of the same click, during the first send\'s review load, the same job', async () => {
   const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
