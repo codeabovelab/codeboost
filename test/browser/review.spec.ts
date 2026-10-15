@@ -760,9 +760,12 @@ test('asks for a refresh when the click is answered with a merge job that has al
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:job('failed',null,[],'History worker timed out.'),mergeRefreshRequired:true})});});
  await page.route('**/api/merge',async route=>{polls++;await route.continue();});
+ // A runner server reports merging as a job (its merge status carries `job`), as production does.
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
  await expect(page.locator('#banner')).toContainText('Refresh to see the result.');
+ await expect(page.locator('#merge')).toHaveJSProperty('disabled',false); // Marked, not disabled: it keeps focus.
  await expect(page.locator('#merge')).toHaveAttribute('aria-disabled','true');
  await page.locator('#merge-details').click();
  await expect(page.locator('dialog')).toContainText('Refresh to see the result.');
