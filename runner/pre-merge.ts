@@ -336,9 +336,8 @@ export class PreMergeCoordinator {
       } }, signal);
     } catch (error) {
       if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
-      // Shutdown (from its first step, when the runner stops admission): no new GitHub read may start; startup settles
-      // the marker. Otherwise one read, within what is left of
-      // the preparation's deadline with Git's settlement reserve kept inside it (except for a process that stays in
+      // Shutdown (from its first step, when the runner stops admission): this failure path starts no settlement read;
+      // startup settles the marker. Otherwise one read, within what is left of the preparation's deadline with Git's settlement reserve kept inside it (except for a process that stays in
       // Git's group after Git exits, which is waited for; see #settlePush), settles it; a cancel does not stop that
       // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
       // the marker stays, as for an unreadable branch.
