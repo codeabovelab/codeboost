@@ -68,7 +68,8 @@ async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const value = await response.json();
-  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status, outcomeUnknown: value.outcomeUnknown === true });
+  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status, outcomeUnknown: value.outcomeUnknown === true,
+    ...(value.job && typeof value.job === "object" ? { job: value.job } : {}) });
   return value;
 }
 // Before the first review load no item is selected; text typed then is kept under "" until render() selects an item.
@@ -203,7 +204,7 @@ function renderMerge() {
   if (job?.state === "running") {
     // Keep the control focusable while its job runs; repeat activation is ignored because the merge is not ready.
     $("merge").setAttribute("aria-disabled", "true");
-    $("merge").textContent = { preparing: "Preparing…", checks: "Waiting for checks…", merging: "Merging…" }[job.step] ?? "Merging…";
+    $("merge").textContent = mergeJobStepLabel(job);
     $("merge-details").hidden = false;
     $("merge-details").textContent = "Merge status";
     scheduleMergePoll();
@@ -292,10 +293,16 @@ function mergeJobText(job) {
   return {
     merged: "Merged.", queued: "Merge queued. Waiting for GitHub to confirm the outcome.",
     submitted: `Merge submitted; GitHub's outcome is not confirmed yet. ${job.reason ?? ""}`.trim(),
-    blocked: `Approved, merge blocked. ${job.reason ?? ""} Fix it, then Retry merge.`.trim(),
+    // The server's reason ends with the next step, which depends on the cause (a timeout waits; a failing check is fixed).
+    blocked: `Approved, merge blocked. ${job.reason ?? "Retry merge when ready."}`,
     "review-required": `Review needed before merging. ${job.reason ?? ""}`.trim(),
-    failed: `Merge stopped. ${job.reason ?? ""} Merge again when ready.`.trim(), cancelled: "Merge cancelled.",
+    // A failed job's reason says why (and anything to do first); the next step is always to merge again, said once here.
+    failed: `Merge stopped.${job.reason ? ` ${job.reason}` : ""} Merge again when ready.`, cancelled: "Merge cancelled.",
   }[job.state] ?? job.state;
+}
+/** The running job's step, as the Merge control and its status dialog name it. */
+function mergeJobStepLabel(job) {
+  return { preparing: "Preparing…", checks: "Waiting for checks…", merging: "Merging…" }[job.step] ?? "Merging…";
 }
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
 /** Outcomes of a job that asked GitHub to merge, which it does only once no blocker remains. */
@@ -636,7 +643,7 @@ $("merge-details").onclick = () => {
   if (!data?.merge?.available) return;
   const queue = data.merge.queue, job = data.merge.job;
   if (job?.state === "running") {
-    showDialog(`<h2>Merge status</h2><p><strong>${esc(job.step ?? job.state)}</strong></p><p>${esc(mergeJobText(job))}</p>${job.checks.length
+    showDialog(`<h2>Merge status</h2><p><strong>${esc(mergeJobStepLabel(job))}</strong></p><p>${esc(mergeJobText(job))}</p>${job.checks.length
       ? `<ul>${job.checks.map(check => `<li>${esc(check.context)}: ${esc(check.state)}</li>`).join("")}</ul>` : ""}`);
     return;
   }
@@ -708,6 +715,14 @@ $("merge").onclick = async () => {
     // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
     // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
     if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeAction = null;
+    // A merge-job refusal carries the task's latest job. When that is a running job later than the one this page shows
+    // (another tab's click started it), follow it as the poll would, instead of asking for a refresh.
+    if (error.job?.state === "running" && data.merge && "job" in data.merge && laterMergeJob(error.job, data.merge.job)) {
+      data = withMergeJobObservation(data, error.job);
+      render();
+      $("banner").textContent = `${error.message} ${mergeJobText(error.job)}`;
+      return;
+    }
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
@@ -987,9 +1002,13 @@ function preserveSettledQuestionAnswers(updated) {
 function newerMergeJob(updated, observationOwner) {
   const newer = data?.merge?.job, older = updated.merge?.job;
   if (observationOwner === mergeObservationGeneration || !newer || !older) return null;
-  const later = newer.id === older.id ? newer.updatedAt > older.updatedAt
+  return laterMergeJob(newer, older) ? newer : null;
+}
+/** Whether `newer` is a later record than `older` (none counts as earliest): by update time within a job, else by sequence. */
+function laterMergeJob(newer, older) {
+  if (!older) return true;
+  return newer.id === older.id ? newer.updatedAt > older.updatedAt
     : Number.isSafeInteger(newer.sequence) && Number.isSafeInteger(older.sequence) && newer.sequence > older.sequence;
-  return later ? newer : null;
 }
 function mergeJobBanner(job) {
   return job.state === "running" ? mergeJobText(job) : `${mergeJobText(job)} Refresh to see the result.`;

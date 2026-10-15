@@ -743,8 +743,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
               }
               if(access) try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
             }
-            const job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
-              ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
+            let job: Awaited<ReturnType<MergeJobCoordinator['start']>>;
+            try {
+              job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
+                ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
+            } catch (error) {
+              // A refusal (new or replayed) carries the task's latest job, so a page holding an older review, such as a
+              // second tab, follows the job another click started. A saved refusal is still never shown as a job.
+              if(error instanceof GuardRefusal) { json(409,{error:error.message,job:mergeJobs.latest()}); return; }
+              throw error;
+            }
             const running=mergeJobs.current;
             // The job's run never rejects, but this callback's own promise would: it must not throw (an unhandled rejection
             // exits the server), so a failed read or close start is logged instead.

@@ -88,6 +88,8 @@ export interface PreMergeReadiness {
   stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; commandPolicyDigest: string;
 }
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
+/** The next step after a failing required check or GitHub's refusal blocks a merge job (docs/implementation/merge-handoff.md). */
+export const FIX_THEN_RETRY = 'Fix it, then Retry merge.';
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
@@ -2188,9 +2190,10 @@ export class Store {
    * so the job and the task cannot disagree after a crash. A task that moved meanwhile keeps its status.
    * With `readyFor`, the block applies only while the preparation's readiness still holds (checked in the same
    * transaction): a check result that arrived after a review edit or another task change says nothing about the
-   * changed review, so the job then ends `failed` and the task keeps its status.
+   * changed review, so the job then ends `failed` and the task keeps its status. `next`, the person's next step, follows
+   * the reason only when the job ends `blocked`: a `failed` end says why, and the page adds "Merge again when ready."
    */
-  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }): boolean {
+  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }, next?: string): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
       const job = this.getMergeJob(identity, id);
@@ -2203,7 +2206,7 @@ export class Store {
         if (!this.preMergeReady(identity, { stateVersion: task.state_version as number, reviewVersion: this.#current(key).review_version as number,
           snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: readyFor.commandPolicyDigest }))
           return this.finishMergeJob(identity, id, { state: 'failed',
-            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies. Merge again.' });
+            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies.' });
       }
       // GitHub refused the job's own merge attempt: the block applies only to the review that attempt was admitted for.
       // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is.
@@ -2212,14 +2215,14 @@ export class Store {
         const plan = this.#current(key);
         if (plan.revision !== attempt.revision || plan.snapshot_id !== attempt.snapshotId || plan.review_version !== attempt.reviewVersion)
           return this.finishMergeJob(identity, id, { state: 'failed',
-            reason: `${reason} The review changed while GitHub was asked to merge; review it, then merge again.` });
+            reason: `${reason} The review changed while GitHub was asked to merge; review it first.` });
       }
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);
         this.#touch(key);
       }
-      return this.finishMergeJob(identity, id, { state: 'blocked', reason });
+      return this.finishMergeJob(identity, id, { state: 'blocked', reason: next ? `${reason} ${next}` : reason });
     });
   }
   /** End a running job. Returns false when it had already ended. */
@@ -2264,7 +2267,7 @@ export class Store {
     if (!running) return;
     const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
     if (!attempt || attempt.actionId !== running.mergeActionId) {
-      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished. Merge again.' });
+      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
       return;
     }
     if (attempt.state === 'merged' || attempt.state === 'queued') {
@@ -2279,10 +2282,10 @@ export class Store {
     if (attempt.requiresFreshReview) {
       // The head changed: the task needs a fresh review, so it is not moved to approved, merge blocked.
       this.finishMergeJob(identity, running.id, { state: 'failed',
-        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head, then merge again.` });
+        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head first.` });
       return;
     }
-    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`);
+    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`, undefined, FIX_THEN_RETRY);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {

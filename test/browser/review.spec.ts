@@ -640,7 +640,7 @@ const looksInactive=(locator:import('@playwright/test').Locator)=>locator.evalua
  const surface=getComputedStyle(probe).backgroundColor;probe.remove();return getComputedStyle(el).backgroundColor===surface;});
 /** The blockers a runner server's review lists while a merge job prepares (runner/merge.ts): preparation has not completed
  * for the review, and a required check is pending. The job resolves both. */
-const jobResolvedBlockers=[{code:'preparation',message:'Pre-merge preparation has not completed for the current review. Prepare the merge again.'},{code:'check',message:'ci is pending.'}];
+const jobResolvedBlockers=[{code:'preparation',message:'The merge has not been prepared for the current review; merging prepares it.'},{code:'check',message:'ci is pending.'}];
 /** The merge control and its dialog once the page saw its job end: the outcome, the refresh request, and only `others`. */
 async function expectEndedMergeJob(page:import('@playwright/test').Page,label:string,ended:string,others:string[]=[]){
  await expect(page.locator('#merge')).toHaveText(label);
@@ -1057,6 +1057,43 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  await page.waitForTimeout(1000);
  expect(mergeClicks).toBe(1);
 });
+test('follows the running merge job when a click from an older review is refused because another tab started it (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const job=(state:string,step:string|null,checks:Array<{context:string;state:string}>=[])=>({id:'0f6b0000-0000-4000-8000-0000000000b1',state,step,reason:null,checks,url:null,sequence:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const steps=[job('running','checks',[{context:'ci',state:'pending'}]),job('merged',null)];let polls=0,mergeClicks=0;
+ // This tab read its review before another tab's click started a job; the server refuses this click and, as
+ // web/server.ts does, carries the task's running job.
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}mergeClicks++;
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'A merge is already running for this task.',job:job('running','checks',[{context:'ci',state:'pending'}])})});});
+ await page.route('**/api/merge',async route=>{const next=steps[Math.min(polls,steps.length-1)];polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:next})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,ready:true,action:'merge',job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ // The page follows the other tab's job, as its poll would, rather than asking for a refresh.
+ await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toHaveAttribute('aria-disabled','true');
+ await expect(page.locator('#banner')).toHaveText('A merge is already running for this task. Waiting for required checks: ci is pending.');
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.',{timeout:15_000});
+ expect(polls).toBeGreaterThanOrEqual(2);
+ expect(mergeClicks).toBe(1);
+});
+test('states the next step a blocked merge job names, once (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ // The reason runner/merge-job.ts saves when the 30-minute wait ends: nothing failed, so the step is to wait.
+ const reason='Required checks did not pass within 30 minutes: ci is pending. Wait for the checks to pass, then Retry merge.';
+ const blocked={id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,checks:[],url:null,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:blocked,mergeRefreshRequired:true})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#banner')).toHaveText(`Approved, merge blocked. ${reason} Refresh to see the result.`);
+});
 test('asks for a refresh when the click is answered with a merge job that has already ended (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -1141,6 +1178,8 @@ test('follows a one-click merge job from preparation through the required-check 
  // A repeat activation while the job runs starts nothing.
  await button.press('Enter');
  await page.getByRole('button',{name:'Merge status',exact:true}).click();
+ // The dialog names the step as the control does, not the job's raw step value.
+ await expect(page.locator('dialog strong')).toHaveText('Waiting for checks…');
  await expect(page.locator('dialog')).toContainText('ci: pending');
  await page.keyboard.press('Escape');
  await expect(page.getByRole('button',{name:'Merging…',exact:true})).toHaveAttribute('aria-disabled','true');

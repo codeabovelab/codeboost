@@ -3,7 +3,7 @@ import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, settleWith, type S
 import { MergeOutcomeUnknown, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
-import type { MergeJob, MergeJobState } from './store.ts';
+import { FIX_THEN_RETRY, type MergeJob, type MergeJobState } from './store.ts';
 
 /** How long a job waits for GitHub's required checks on the pushed head (docs/implementation/merge-handoff.md). */
 export const REQUIRED_CHECK_WAIT_MS = 30 * 60_000;
@@ -19,7 +19,7 @@ export interface MergeJobTiming { checkWaitMs?: number; firstDelayMs?: number; m
 
 /** Why the wait for required checks ended. */
 type CheckVerdict = { kind: 'ready' } | { kind: 'wait'; checks: { context: string; state: string }[] }
-  | { kind: 'blocked'; reason: string } | { kind: 'failed'; reason: string } | { kind: 'cancelled' };
+  | { kind: 'blocked'; reason: string; next: string } | { kind: 'failed'; reason: string } | { kind: 'cancelled' };
 
 /**
  * The one-click merge (F6b of #22): preparation, the wait for GitHub's required checks on the pushed head, then the
@@ -175,7 +175,7 @@ export class MergeJobCoordinator {
     const verdict = await this.#awaitChecks(job, signal);
     if (verdict.kind === 'cancelled') return this.#end(job, signal);
     // A failing or slow check blocks only while the readiness it was read for still holds (in the block's transaction).
-    if (verdict.kind === 'blocked') return this.#block(job, verdict.reason, true);
+    if (verdict.kind === 'blocked') return this.#block(job, verdict.reason, verdict.next, true);
     if (verdict.kind === 'failed') return this.#finish(job.id, 'failed', verdict.reason);
     // 3. Merge through the guarded merge, which re-validates everything and reruns the already-fixed check.
     // The merge's action ID is saved first: after a restart, the attempt carrying it gives the job's outcome.
@@ -200,8 +200,8 @@ export class MergeJobCoordinator {
       if (attempt?.actionId === mergeId) {
         // A refusal because the head changed needs a fresh review, not a retry: the task is not "approved" any more.
         if ((attempt.state === 'failed' || attempt.state === 'removed') && attempt.requiresFreshReview)
-          return this.#finish(job.id, 'failed', `GitHub refused the merge: ${attempt.reason ?? reason} Review the new head, then merge again.`);
-        if (attempt.state === 'failed' || attempt.state === 'removed') return this.#block(job, `GitHub refused the merge: ${attempt.reason ?? reason}`);
+          return this.#finish(job.id, 'failed', `GitHub refused the merge: ${attempt.reason ?? reason} Review the new head first.`);
+        if (attempt.state === 'failed' || attempt.state === 'removed') return this.#block(job, `GitHub refused the merge: ${attempt.reason ?? reason}`, FIX_THEN_RETRY);
         if (attempt.state === 'merged') return this.#finish(job.id, 'merged', null, attempt.url);
         if (attempt.state === 'queued') return this.#finish(job.id, 'queued', null, attempt.url);
         return this.#finish(job.id, 'submitted', reason);
@@ -223,10 +223,13 @@ export class MergeJobCoordinator {
       this.#finish(job.id, 'cancelled', 'Task cancelled.');
   }
 
-  /** Approved, merge blocked: the task's next merge prepares again from the start. One Store transaction. */
-  #block(job: MergeJob, reason: string, whileReady = false): void {
+  /**
+   * Approved, merge blocked: the task's next merge prepares again from the start. One Store transaction. `next` is the
+   * person's next step, saved after the reason only when the job ends blocked.
+   */
+  #block(job: MergeJob, reason: string, next: string, whileReady = false): void {
     const readyFor = whileReady ? { commandPolicyDigest: this.service.commandPolicyDigest() } : undefined;
-    try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason, readyFor)); }
+    try { this.settle(() => this.service.store.blockMergeJob(this.service.config.identity, job.id, reason, readyFor, next)); }
     catch (error) { this.#unended(job.id, error); }
   }
 
@@ -234,8 +237,10 @@ export class MergeJobCoordinator {
     const { store, config } = this.service, identity = config.identity;
     const until = performance.now() + this.checkWaitMs;
     let delay = this.firstDelayMs, waiting: { context: string; state: string }[] = [];
+    // Nothing failed: the person waits for the checks (or GitHub) rather than fixing anything.
     const timedOut = (): CheckVerdict => ({ kind: 'blocked', reason: `Required checks did not pass within ${Math.round(this.checkWaitMs / 60_000)} minutes: ${
-      waiting.length ? waiting.map(check => `${check.context} is ${check.state}`).join(', ') : 'GitHub has not determined mergeability'}.` });
+      waiting.length ? waiting.map(check => `${check.context} is ${check.state}`).join(', ') : 'GitHub has not determined mergeability'}.`,
+    next: waiting.length ? 'Wait for the checks to pass, then Retry merge.' : 'Wait for GitHub to determine mergeability, then Retry merge.' });
     for (;;) {
       if (signal.aborted) return { kind: 'cancelled' };
       const task = store.getTask(identity);
@@ -270,6 +275,20 @@ export class MergeJobCoordinator {
 export const JOB_RESOLVES: ReadonlySet<string> = new Set(['preparation', 'base', 'acceptance', 'check']);
 
 /**
+ * How a job-resolved blocker reads when merging runs as a job. The guarded merge's own wording asks the person to rebase
+ * or prepare, but the job's screen offers neither: merging does both (docs/implementation/merge-handoff.md). Used for
+ * the merge status the browser sees and for the reason a job ends `failed` with, so both say the same.
+ */
+const JOB_WORDING: Readonly<Record<string, string>> = Object.freeze({
+  base: 'The base branch moved; merging rebases onto it and prepares again, so the result may need review.',
+  preparation: 'The merge has not been prepared for the current review; merging prepares it.',
+});
+export function inJobTerms<T extends { code: string; message: string }>(blocker: T): T {
+  const message = JOB_WORDING[blocker.code];
+  return message === undefined ? blocker : { ...blocker, message };
+}
+
+/**
  * Blockers settled by the time a job asks GitHub to merge: the job's resolved blockers, and mergeability, since the
  * guarded merge starts only after `classify` found no blocker at all. A job that ended `merged`, `queued` or `submitted`
  * got that far; the browser drops these from the review it read before or during that job. Any other outcome settled
@@ -294,7 +313,8 @@ export function withMergeJob<T extends { ready: boolean; action: 'merge' | 'retr
   // offered Merge PR, even if that inspection had no task blocker.
   const ready = !running && !attempt && status.remote !== null && personal.length === 0
     && MERGEABLE_STATUSES.includes(taskStatus as (typeof MERGEABLE_STATUSES)[number]);
-  return { ...status, ready, action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job,
+  return { ...status, blockers: status.blockers.map(inJobTerms), ready,
+    action: ready ? (taskStatus === 'approved but merge blocked' || status.action === 'retry' ? 'retry' : 'merge') : null, job,
     settledBeforeJobMerge: SETTLED_BEFORE_JOB_MERGE };
 }
 
@@ -308,13 +328,14 @@ export function classify(status: MergeStatus): CheckVerdict {
   // review, so the job ends for a person to look, rather than blocking on those checks.
   const computing = status.remote.mergeable === 'UNKNOWN';
   const other = status.blockers.filter(blocker => blocker.code !== 'check' && !(blocker.code === 'mergeable' && computing));
-  if (other.length) return { kind: 'failed', reason: other[0]!.message };
+  if (other.length) return { kind: 'failed', reason: inJobTerms(other[0]!).message };
   const failing = status.remote.requiredChecks.filter(check => check.state === 'failure');
-  if (failing.length) return { kind: 'blocked', reason: `Required check${failing.length === 1 ? '' : 's'} failed: ${failing.map(check => check.context).join(', ')}.` };
+  if (failing.length) return { kind: 'blocked', reason: `Required check${failing.length === 1 ? '' : 's'} failed: ${failing.map(check => check.context).join(', ')}.`,
+    next: failing.length === 1 ? FIX_THEN_RETRY : 'Fix them, then Retry merge.' };
   const waiting = status.remote.requiredChecks.filter(check => check.state !== 'success')
     .map(check => ({ context: check.context, state: check.state }));
   if (waiting.length || computing) return { kind: 'wait', checks: waiting };
-  return status.ready ? { kind: 'ready' } : { kind: 'failed', reason: status.blockers[0]?.message ?? 'Merge is blocked.' };
+  return status.ready ? { kind: 'ready' } : { kind: 'failed', reason: status.blockers[0] ? inJobTerms(status.blockers[0]).message : 'Merge is blocked.' };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

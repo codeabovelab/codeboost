@@ -1828,6 +1828,9 @@ describe('the one-click merge job (F6b of #22)', () => {
     const before = await review(served.app);
     // Not prepared yet, and a required check pends: both are the job's to resolve.
     expect(before.merge.blockers.map((blocker: { code: string }) => blocker.code)).toEqual(expect.arrayContaining(['preparation', 'check']));
+    // Worded as what Merge PR does: the screen has no Prepare control.
+    expect(before.merge.blockers.find((blocker: { code: string }) => blocker.code === 'preparation').message)
+      .toBe('The merge has not been prepared for the current review; merging prepares it.');
     // A runner server sends the codes a job settles before it merges, which the page drops once a job reached the merge.
     expect(before.merge.settledBeforeJobMerge).toEqual([...SETTLED_BEFORE_JOB_MERGE]);
     expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
@@ -1836,6 +1839,12 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(started.body.job).toMatchObject({ state: 'running' });
     expect(started.body.merge).toMatchObject({ ready: false, job: { state: 'running' } });
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }), { timeout: 10_000 });
+    // A second tab still holds the review read before the click: its click is refused, and the refusal carries the
+    // running job so that page follows it. A resend replays the refusal with the task's latest job, still never as a job.
+    const secondTab = randomUUID(), refused = await merge(served.app, before.token, secondTab);
+    expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is already running for this task.', job: { id: started.body.job.id, state: 'running', step: 'checks' } } });
+    expect(await merge(served.app, before.token, secondTab)).toMatchObject({ status: 409, body: { error: refused.body.error, job: { id: started.body.job.id } } });
+    expect((await mergeState(served.app)).job).toMatchObject({ id: started.body.job.id });
     expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/merge is running/) } });
     // A publish cannot begin a refresh of the PR the job waits on: publishing refuses a task in review.
     expect(await act(served.app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
@@ -1895,7 +1904,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     // ends it failed, and nothing is merged, run, pushed or published.
     release();
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'failed',
-      reason: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' }), { timeout: 10_000 });
+      reason: 'The merge has not been prepared for the current review; merging prepares it.' }), { timeout: 10_000 });
     expect(served.store.getTask(served.identity).status).toBe('in review');
     expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
     expect(served.app.publishing!.busy(served.identity)).toBe(false);
