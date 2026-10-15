@@ -312,10 +312,11 @@ const mergeJobReachedMerge = new Set(["merged", "queued", "submitted"]);
  * result". A job that reached the merge (merged, queued or submitted) settled the blockers the server lists in
  * `settledBeforeJobMerge` (preparation, a moved base, `cmd:` checks, required checks, mergeability), so a review read
  * before or during it no longer lists them. Any other outcome keeps every blocker the page last read: a blocked job's
- * failing check still fails, and Refresh shows what still applies. The control reads the outcome, as after a queue merge.
+ * failing check still fails, and Refresh shows what still applies. A job the poll no longer reports (`job` null) is
+ * not known to have reached the merge, so it also keeps every blocker. The control reads the outcome, as after a queue merge.
  */
 function withEndedMergeJob(view, job, message) {
-  const settled = new Set(mergeJobReachedMerge.has(job.state) ? view.merge.settledBeforeJobMerge ?? [] : []);
+  const settled = new Set(mergeJobReachedMerge.has(job?.state) ? view.merge.settledBeforeJobMerge ?? [] : []);
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !settled.has(blocker.code));
   return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message }, ...blockers] } };
 }

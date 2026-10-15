@@ -721,6 +721,35 @@ test('names a failed merge-job poll as a merge-status failure (F6b)',async({page
  await expect(page.locator('#banner')).toHaveText(/^Could not refresh merge status\. GitHub returned HTTP 502\./,{timeout:15_000});
 });
 
+test('ends a running merge job the poll no longer reports, keeping every blocker (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const running={id:'0f6b0000-0000-4000-8000-0000000000f3',state:'running',step:'checks',reason:null,checks:[],url:null,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'};
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running,blockers:[...review.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE},job:running})});});
+ // The job is no longer reported (no job record and no merge queue): the page cannot tell whether it reached the merge.
+ let polls=0;
+ await page.route('**/api/merge',async route=>{polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:null})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:true,action:'merge',job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toBeVisible({timeout:10_000});
+ const ended='The merge job ended. Refresh to see the result.';
+ await expect(page.locator('#banner')).toHaveText(ended,{timeout:15_000});
+ await expect(page.getByText('Could not refresh merge status')).toHaveCount(0);
+ // A job not known to have merged settled nothing, so every blocker the page last read stays listed.
+ await expectEndedMergeJob(page,'Merge ended',ended,jobResolvedBlockers.map(blocker=>blocker.message));
+ const seen=polls;expect(seen).toBe(1);
+ // Past the 2 s poll delay (and its first back-off), no further status poll runs.
+ await page.waitForTimeout(5_000);
+ expect(polls).toBe(seen);
+ await expect(page.locator('#banner')).toHaveText(ended);
+});
+
 test('keeps a draft typed while a merge-job click is in flight (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
