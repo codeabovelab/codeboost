@@ -747,8 +747,10 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
  // It is drawn as a control that cannot act, as a disabled one is.
  await expect.poll(()=>looksInactive(button)).toBe(true);
- // Activating it again starts nothing: the merge is not ready.
+ // Activating it again starts nothing: the merge is not ready. A request would reach the
+ // route only after the confirm and the fetch, so give one time to arrive before counting.
  await button.press('Enter');
+ await page.waitForTimeout(1000);
  expect(mergeClicks).toBe(1);
 });
 test('asks for a refresh when the click is answered with a merge job that has already ended (F6b)',async({page})=>{
