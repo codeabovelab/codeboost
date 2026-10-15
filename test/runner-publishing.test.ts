@@ -2147,4 +2147,41 @@ describe('the one-click merge job (F6b of #22)', () => {
     await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
     expect(gh.merged).toEqual([]);
    }, 60_000);
+
+  it('logs, and does not reject, when reading the task fails as the server follows a settled merge job', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null, release!: () => void;
+    const answered = new Promise<void>(resolve => { release = resolve; });
+    const base = gateway(() => storeRef!, () => []);
+    // GitHub answers the merge only once the click was answered, so the job settles after the click's own review reload.
+    const gh: MergeGateway = { inspect: base.inspect, merge: async () => { await answered; return { url: 'https://github.com/acme/app/pull/100' }; } };
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const unhandled: unknown[] = [], onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    const logged = vi.spyOn(console, 'error');
+    // The first task read after the job's ending write fails: that is the server's `.finally` following the job.
+    let failNext = false;
+    const getTask = served.store.getTask.bind(served.store), finishMergeJob = served.store.finishMergeJob.bind(served.store);
+    served.store.finishMergeJob = ((...args: Parameters<Store['finishMergeJob']>) => { const ended = finishMergeJob(...args); failNext = true; return ended; }) as Store['finishMergeJob'];
+    served.store.getTask = ((identity: PlanIdentity) => {
+      if (failNext) { failNext = false; throw new Error('database is locked'); }
+      return getTask(identity);
+    }) as Store['getTask'];
+    try {
+      expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+      release();
+      await vi.waitFor(() => expect(served.store.latestMergeJob(served.identity)).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+      // The server's callback runs a few microtasks after the ending write; an unhandled rejection is reported after them.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(failNext).toBe(false);
+      expect(unhandled).toEqual([]);
+      expect(logged).toHaveBeenCalledWith('Could not close the cancelled task\'s pull requests after its merge job: "database is locked"');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      served.store.getTask = getTask; served.store.finishMergeJob = finishMergeJob; logged.mockRestore();
+    }
+  }, 60_000);
 });
