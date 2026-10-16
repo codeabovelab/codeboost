@@ -843,6 +843,52 @@ test('keeps a draft typed while a merge-job click is in flight (F6b)',async({pag
  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed while the merge request was in flight.');
 });
 
+for(const refusal of [{name:'refused',status:409,error:'Issue #1 is not trusted for its current author.'},{name:'not applied',status:503,error:'The server is shutting down.'}])
+test(`keeps a draft typed while a merge-job click is in flight and then ${refusal.name} (F6b)`,async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  await held;await route.fulfill({status:refusal.status,contentType:'application/json',body:JSON.stringify({error:refusal.error})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await page.getByLabel('Question about this item').fill('Before the click.');
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ // The person keeps typing while the click's request is in flight; the click then fails.
+ await page.getByLabel('Question about this item').fill('Typed while the merge request was in flight.');
+ release();
+ await expect(page.locator('#banner')).toContainText(refusal.error);
+ await expect(page.getByLabel('Question about this item')).toHaveValue('Typed while the merge request was in flight.');
+});
+
+test('backs off the merge-job poll while the job does not change, and polls soon again once its step changes (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const checks=[{context:'ci',state:'pending'}],waiting=mergeJobRecord({state:'running',step:'checks',checks});
+ // Poll 1 sees the same record as the click (no change); poll 2 a new step; poll 3 that step again; poll 4 the end.
+ const steps=[waiting,mergeJobRecord({state:'running',step:'merging',checks}),mergeJobRecord({state:'running',step:'merging',checks}),mergeJobRecord({state:'merged',step:null})];
+ const polledAt:number[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:waiting},job:waiting})});});
+ await page.route('**/api/merge',async route=>{const next=steps[Math.min(polledAt.length,steps.length-1)];polledAt.push(Date.now());await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:next})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.',{timeout:30_000});
+ expect(polledAt).toHaveLength(4);
+ const intervals=polledAt.slice(1).map((at,index)=>at-polledAt[index]!);
+ // 2 s doubled to 4 s after the unchanged poll; back to 2 s after the step changed; doubled again after the next unchanged one.
+ expect(intervals[0]).toBeGreaterThanOrEqual(3500);
+ expect(intervals[1]).toBeLessThan(3000);
+ expect(intervals[2]).toBeGreaterThanOrEqual(3500);
+});
+
 test('starts a new action for Retry merge once the job its retained key started has ended (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -1309,7 +1355,7 @@ test('follows a one-click merge job from preparation through the required-check 
  // Not disabled in the DOM (Playwright's toBeEnabled counts aria-disabled as disabled), and still focused.
  await expect(button).toHaveJSProperty('disabled',false);await expect(button).toBeFocused();
  await expect.poll(()=>looksInactive(button)).toBe(true);
- await expect(page.locator('#banner')).toContainText('Preparing the merge');
+ await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
  await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toHaveAttribute('aria-disabled','true');
  await expect(button).toBeFocused();
  await expect(page.locator('#banner')).toContainText('Waiting for required checks: ci is pending.');
