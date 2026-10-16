@@ -720,6 +720,52 @@ test('keeps every blocker when the click is answered with a job that ended witho
  await expectEndedMergeJob(page,'Merge stopped',ended,[head.message,conflict.message,...jobResolvedBlockers.map(blocker=>blocker.message)]);
  expect(polls).toBe(0);
 });
+/** Ended jobs with the course production runs before each outcome and the reason it saves (runner/merge-job.ts). */
+const endedMergeJobs:{state:MergeJobView['state'];course:MergeJobView[];reason:string;label:string;banner:string}[]=[
+ // GitHub refused the job's merge: the job blocks with the refusal and FIX_THEN_RETRY (#endAsAttempt).
+ {state:'blocked',course:[mergeJobRecord({step:'merging'})],reason:'GitHub refused the merge: Required status check "ci" is expected. Fix it, then Retry merge.',label:'Merge blocked',
+  banner:'Approved, merge blocked. GitHub refused the merge: Required status check "ci" is expected. Fix it, then Retry merge.'},
+ // The preparation's rebase made an approval stale (runner/pre-merge.ts): the job ends from its preparing step.
+ {state:'review-required',course:[],reason:'P1 requires refreshed attribution or approval.',label:'Review needed',
+  banner:'Review needed before merging. P1 requires refreshed attribution or approval.'},
+ // GitHub accepted the merge, but saving its outcome failed.
+ {state:'submitted',course:[mergeJobRecord({step:'merging'})],reason:'GitHub accepted the merge, but its outcome was not saved; it reconciles from GitHub.',label:'Merge submitted',
+  banner:'Merge submitted; GitHub\'s outcome is not confirmed yet. GitHub accepted the merge, but its outcome was not saved; it reconciles from GitHub.'},
+ // The task was cancelled while the job waited for checks.
+ {state:'cancelled',course:[mergeJobRecord({step:'checks',checks:[{context:'ci',state:'pending'}]})],reason:'Task cancelled.',label:'Merge cancelled',banner:'Merge cancelled.'},
+];
+for(const variant of endedMergeJobs)test(`names a merge job that ended ${variant.state} on its control and banner (F6b)`,async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ // Each saved change adds one to the revision: preparing 1, then the course, then the end. A job past preparing has
+ // checked (revision 2) before it waits (3) or merges (4); the course's records carry those defaults.
+ const lastRevision=variant.course.at(-1)?.revision??1;
+ const ended=mergeJobRecord({state:variant.state,step:null,reason:variant.reason,revision:lastRevision+1,
+  mergeActionId:variant.course.some(job=>job.step==='merging')?'0f6b0000-0000-4000-8000-00000000ac01':null});
+ const running=mergeJobRecord({step:'preparing'});
+ let polls=0,released=false;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running,blockers:[...review.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE},job:running})});});
+ // The merging step is held until the test has read its banner.
+ await page.route('**/api/merge',async route=>{const next=polls<variant.course.length?variant.course[polls]!:ended;if(next.step!=='merging'||released)polls++;
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:next})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:true,action:'merge',job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ if(variant.course.some(job=>job.step==='merging')){
+  await expect(page.getByRole('button',{name:'Merging…',exact:true})).toHaveAttribute('aria-disabled','true',{timeout:10_000});
+  await expect(page.locator('#banner')).toHaveText('Merging the reviewed head.');
+  released=true;
+ }
+ const banner=`${variant.banner} Refresh to see the result.`;
+ await expect(page.locator('#banner')).toHaveText(banner,{timeout:15_000});
+ // Only a job that asked GitHub to merge and was accepted (submitted) settled the blockers it resolves.
+ await expectEndedMergeJob(page,variant.label,banner,variant.state==='submitted'?[]:jobResolvedBlockers.map(blocker=>blocker.message));
+});
 test('names a failed merge-job poll as a merge-status failure (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
