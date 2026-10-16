@@ -163,6 +163,14 @@ it('stops at once when a required check fails, without waiting for the time limi
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
 });
 
+it('names every failing required check, and the plural next step, when several fail', async () => {
+  const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }, pending('lint'), { context: 'deploy', appId: null, state: 'failure' }] });
+  await f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'blocked', reason: 'Required checks failed: build, deploy. Fix them, then Retry merge.' });
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
 it('ends failed, without merging, when GitHub cannot be read while waiting for checks', async () => {
   const f = setup({ checks: () => [pending()], unreadable: n => n === 2 });
   await f.coordinator.start('review-token', randomUUID());
