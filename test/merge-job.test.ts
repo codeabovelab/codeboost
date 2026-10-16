@@ -1076,3 +1076,72 @@ it('keeps a failing check found by an inspection that finishes after the wait li
     expect(await settled(coordinator)).toMatchObject({ state: 'blocked', reason: 'Required check failed: build. Fix it, then Retry merge.' });
   } finally { clock.mockRestore(); }
 });
+
+it('leaves the job running, with no ending write, when shutdown stops the job\'s own first review load', async () => {
+  const f = setup(), id = randomUUID();
+  // The admission's load passes; the job's own first load is held and rejects on the shutdown abort, as a stopped load does.
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  const held = holdNextLoad(f.review as never);
+  const finish = vi.spyOn(f.store, 'finishMergeJob');
+  const started = await f.coordinator.start('review-token', id);
+  const signal = (await held.loading)!;
+  f.coordinator.stop();
+  expect(signal.aborted).toBe(true); // The load was pending when shutdown aborted it.
+  await f.coordinator.current;
+  expect(finish).not.toHaveBeenCalled();
+  expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running', step: 'preparing', reason: null });
+  expect(f.prep.calls).toEqual([]);
+});
+
+it.each(['rejects', 'resolves failed'] as const)('leaves the job running, with no ending write, when its preparation %s after shutdown stopped it', async ending => {
+  const f = setup();
+  // The preparation is held until shutdown aborts it, then rejects or resolves `failed` with shutdown's reason.
+  let started!: () => void;
+  const preparing = new Promise<void>(resolve => { started = resolve; });
+  const stopped: { end?: () => void } = {};
+  (f.prep.fake as unknown as { start: (expected: { actionId: string }) => Promise<PreMergeResult> }).start = expected => {
+    f.prep.calls.push(expected.actionId); started();
+    return new Promise((resolve, reject) => {
+      stopped.end = () => {
+        const snapshot = f.store.getSnapshot(identity);
+        if (ending === 'rejects') reject(new Error('Server shutdown.'));
+        else resolve({ state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'Server shutdown.' });
+      };
+    });
+  };
+  const finish = vi.spyOn(f.store, 'finishMergeJob'), update = vi.spyOn(f.store, 'updateMergeJob');
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await preparing;
+  f.coordinator.stop();
+  stopped.end!();
+  await f.coordinator.current;
+  expect(f.prep.calls).toHaveLength(1);
+  expect(finish).not.toHaveBeenCalled();
+  expect(update).not.toHaveBeenCalled();
+  expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'running', step: 'preparing', reason: null });
+  expect(f.gh.merged).toEqual([]);
+});
+
+it('starts no preparation when shutdown began while the job\'s first review load was finishing and the load still resolved', async () => {
+  const f = setup();
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  // The job's first load ignores the abort and resolves when released (a load past its last abort check).
+  let release!: () => void, started!: (signal?: AbortSignal) => void;
+  const loading = new Promise<AbortSignal | undefined>(resolve => { started = resolve; });
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((options?: { signal?: AbortSignal }) => {
+    started(options?.signal);
+    return new Promise(resolve => { release = () => resolve((f.review as never as { view: () => unknown }).view()); });
+  });
+  const userAction = vi.spyOn(f.store, 'userAction'), finish = vi.spyOn(f.store, 'finishMergeJob');
+  const job = await f.coordinator.start('review-token', randomUUID());
+  const signal = (await loading)!;
+  f.coordinator.stop();
+  // The interleaving happened: the signal was aborted while the load was still pending, and the load then resolved.
+  expect(signal.aborted).toBe(true);
+  release();
+  await f.coordinator.current;
+  expect(f.prep.calls).toEqual([]);
+  expect(userAction.mock.calls.filter(([, action]) => (action as { kind: string }).kind === 'prepare-merge')).toEqual([]);
+  expect(finish).not.toHaveBeenCalled();
+  expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'running', step: 'preparing', reason: null });
+});
