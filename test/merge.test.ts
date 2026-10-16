@@ -984,11 +984,11 @@ it.each([
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
   ], 'failure'],
-  ['a newer started failure over a completed skip with the zero start time', [
+  ['a started failure beside a completed skip with only zero times (a tie: the failure counts)', [
     { name: 'test', status: 'COMPLETED', conclusion: 'SKIPPED', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
   ], 'failure'],
-  ['a newer started failure over a completed neutral run with no start time', [
+  ['a started failure beside a completed neutral run with no time (a tie: the failure counts)', [
     { name: 'test', status: 'COMPLETED', conclusion: 'NEUTRAL' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
   ], 'failure'],
@@ -1008,11 +1008,27 @@ it.each([
     { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
     { context: 'test', state: 'PENDING' },
   ], 'pending'],
-  ['a newer started passing commit status over a failed one with no start time', [
+  ['a failed commit status with no time beside a started passing one (a tie: the failure counts)', [
     { context: 'test', state: 'FAILURE' },
     { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
-  ], 'success'],
-  ['an older started failed commit status over a passing one with no start time (the oldest)', [
+  ], 'failure'],
+  ['an errored commit status with no time beside a started passing one (a tie: the error counts)', [
+    { context: 'test', state: 'ERROR' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing commit status with no time beside a started failed one (a tie: the failure counts)', [
+    { context: 'test', state: 'SUCCESS' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no time beside a started failed one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failed run with no time beside a started passing one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a started failed commit status beside a passing one with no time (a tie: the failure counts)', [
     { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
     { context: 'test', state: 'SUCCESS' },
   ], 'failure'],
