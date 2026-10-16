@@ -1004,6 +1004,18 @@ it.each([
     { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
     { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
   ], 'success'],
+  ['a pending commit status with no start time over a started passing one', [
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+    { context: 'test', state: 'PENDING' },
+  ], 'pending'],
+  ['a newer started passing commit status over a failed one with no start time', [
+    { context: 'test', state: 'FAILURE' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['an older started failed commit status over a passing one with no start time (the oldest)', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS' },
+  ], 'failure'],
 ] as const)('counts the latest observation of a required check: %s', async (_case, rollup, expected) => {
   expect(await requiredTestState([...rollup])).toEqual([expected]);
 });

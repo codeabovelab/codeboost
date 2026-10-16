@@ -170,10 +170,10 @@ function observedTime(value: unknown): number {
   return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : NaN;
 }
 /**
- * When an observed check run or status started, to pick the latest of several with one name. A run not yet completed
- * (queued, in progress, pending) with no start time was queued after every started one, so it counts as the latest. A
- * completed run with no start time is placed at its completion time, or else counts as the oldest, so it never outranks
- * a run that started (fail closed).
+ * When an observed check run or status started, to pick the latest of several with one name. A run or commit status not
+ * yet completed (queued, in progress, pending) with no start time was queued after every started one, so it counts as
+ * the latest. A completed run, or a commit status in state SUCCESS, FAILURE or ERROR, with no start time is placed at its
+ * completion time, or else counts as the oldest, so it never outranks one that started (fail closed).
  */
 function observedCheckStart(check: Record<string, unknown>): number {
   const started = observedTime(check.startedAt);

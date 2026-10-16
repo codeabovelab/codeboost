@@ -1051,6 +1051,8 @@ function laterMergeJob(newer, older) {
  * full response may offer Retry for an earlier job), and an ended job asks for a refresh, with its own attempt `queue`.
  */
 function withMergeJobObservation(view, job, queue = null) {
+  // Removing `job-refresh` here is defensive: the server never sends it, and the page adds it only once it saw a job
+  // end, after which nothing makes the merge ready again (so no refused click carries a running job) until Refresh.
   if (job.state === "running") return { ...view, merge: { ...view.merge, ready: false, action: null, job,
     blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
   return withEndedJobAndAttempt(view, job, queue);
