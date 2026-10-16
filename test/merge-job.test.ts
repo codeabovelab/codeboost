@@ -950,7 +950,8 @@ it('times out, without merging, when a ready inspection finishes after the wait 
     const done = await settled(coordinator);
     // The interleaving happened: the ready inspection's signal had not been stopped by the limit when it answered.
     expect(limitAbortedAtReady).toBe(false);
-    expect(done).toMatchObject({ state: 'blocked', reason: 'Required checks did not pass within 1 minutes: ci is pending. Wait for the checks to pass, then Retry merge.' });
+    // GitHub reported the checks passing, so neither the reason nor the record names the earlier pending check.
+    expect(done).toMatchObject({ state: 'blocked', reason: 'Required checks passed only after the 1-minute limit. Retry merge.', checks: [] });
     expect(f.gh.merged).toEqual([]);
     expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
   } finally { clock.mockRestore(); }

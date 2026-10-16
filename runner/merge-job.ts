@@ -274,7 +274,11 @@ export class MergeJobCoordinator {
       const verdict = classify(status);
       // Only checks seen passing within the limit count. Work at the end of an inspection can cross the limit before
       // its timer runs, so a ready answer is checked against the clock too; a failing check or other blocker stands.
-      if (verdict.kind === 'ready' && performance.now() >= until) return timedOut();
+      // The checks did pass, so the reason says so rather than naming the last wait, and the record drops its waiting list.
+      if (verdict.kind === 'ready' && performance.now() >= until) {
+        this.settle(() => store.updateMergeJob(identity, job.id, { checks: [] }));
+        return { kind: 'blocked', reason: `Required checks passed only after the ${Math.round(this.checkWaitMs / 60_000)}-minute limit.`, next: 'Retry merge.' };
+      }
       if (verdict.kind !== 'wait') return verdict;
       waiting = verdict.checks; waited = true;
       this.settle(() => store.updateMergeJob(identity, job.id, { checks: waiting }));
