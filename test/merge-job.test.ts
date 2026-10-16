@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
+import { ActionIdReused, GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
 import { JOB_RESOLVES, MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
 import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
@@ -640,6 +640,20 @@ it('settles a job a crash left in its merge step from its merge attempt at start
     if (expected === 'blocked') expect(reason).toBe('GitHub refused the merge: Base branch was modified. Fix it, then Retry merge.');
     if (expected === 'failed') expect(reason).not.toMatch(/merge again/i);
   }
+});
+
+it('refuses a merge job for a closed task in the store itself', () => {
+  const store = publishedTask();
+  expect(store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
+  expect(() => store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' }))
+    .toThrow(new GuardRefusal('The task is cancelled; it cannot be merged.'));
+});
+
+it('returns a saved refusal to a resend of the same click and refuses its ID for another request', () => {
+  const store = publishedTask(), id = randomUUID();
+  const saved = store.recordMergeJobRefusal(identity, { actionId: id, token: 'review-token', reason: 'The runner is busy.' });
+  expect(store.recordMergeJobRefusal(identity, { actionId: id, token: 'review-token', reason: 'Something else.' })).toEqual(saved);
+  expect(() => store.recordMergeJobRefusal(identity, { actionId: id, token: 'other-token', reason: 'The runner is busy.' })).toThrow(ActionIdReused);
 });
 
 it('leaves a job that is no longer running unchanged when asked to update it', () => {

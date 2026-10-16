@@ -59,8 +59,9 @@ export class MergeJobCoordinator {
 
   /**
    * Admit the click and start its job after the caller's transaction commits. A resend of the same click returns its
-   * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend; only a
-   * refusal during shutdown saves nothing, so that click may be sent again.
+   * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend. A
+   * refusal during shutdown saves nothing, so that click may be sent again, and neither does one for a click without a
+   * usable review token (nothing to save it under; it is refused as stale every time).
    */
   async start(token: unknown, actionId: string, busy: () => string | null = () => null, signal?: AbortSignal): Promise<MergeJobView> {
     const { store, config } = this.service, identity = config.identity;
@@ -95,8 +96,9 @@ export class MergeJobCoordinator {
     let job: MergeJob;
     try { ({ job } = store.beginMergeJob(identity, { actionId, token: token as string })); }
     catch (error) {
-      // The store's own refusal (a job still running on disk after its ending write failed, or a closed task) is
-      // definite too: saved and replayed like the refusals above.
+      // The store's own refusal (a job still running on disk after its ending write failed) is definite too: saved and
+      // replayed like the refusals above. Its closed-task refusal is defensive here: admission refused that task above,
+      // in this same turn.
       if (error instanceof GuardRefusal && !(error instanceof ActionIdReused))
         store.recordMergeJobRefusal(identity, { actionId, token: token as string, reason: error.message });
       throw error;
