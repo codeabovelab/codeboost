@@ -154,6 +154,7 @@ export class MergeCoordinator {
     const first = here.find(pr => pr.base === base);
     const check = first?.checkId ? store.getAlreadyFixed(identity, first.checkId) : null;
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
+    // The outcome term is defensive: beginPullRequest saves a check ID only for a clear check (#assertCheckedHead).
     if (check?.result.outcome !== 'clear') return { alreadyFixedSince: original, ownCommits };
     let scannedFrom: string | null = null;
     try { scannedFrom = store.getSnapshot(identity, check.snapshotId).base; } catch { /* unknown: scan from the original base */ }
