@@ -239,12 +239,16 @@ it('ends failed, leaving the task in review, when the review changed while GitHu
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
-it('ends failed, leaving the task in review, when a new snapshot was observed while GitHub was asked to merge and refused', async () => {
+// Defensive pin. Production cannot reach this for a merge job: jobs exist only with a runner, setUpRunner sets
+// review.runnerRepository before the server listens, and ReviewService.load then reads the recorded snapshot head, not
+// HEAD, so the HEAD observation that records this snapshot never runs. The test keeps blockMergeJob's snapshot term
+// honest should another snapshot writer become reachable during a merge.
+it('(defensive) ends failed, leaving the task in review, when a new snapshot was recorded while GitHub was asked to merge and refused', async () => {
   let storeRef: Store | null = null, before = '';
   const f = setup({ merge: async () => {
-    // The review screen's HEAD observation (no ledger entries) may run during a merge; it saves a new snapshot.
+    // Records a new snapshot with no ledger entries, as the HEAD observation of a server without a runner does.
     const store = storeRef!, snapshot = store.getSnapshot(identity);
-    // As production's load does, only for a HEAD that moved from the snapshot's (the user's checkout moved on).
+    // As that load does, only for a HEAD that moved from the snapshot's (the user's checkout moved on).
     store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, oid(1), oid(3), []);
     throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
   } });
@@ -1121,10 +1125,13 @@ it('words the guarded merge\'s refusal as what merging does when the base moves 
 });
 
 /**
- * Another page's review load observes a local HEAD the pull request does not have (runner/review.ts records it as a new
- * snapshot with no ledger entries, which a merge job does not refuse). The task's state version advances, so the job's
- * preparation no longer applies; GitHub's head is unchanged. The guarded merge's later passes that reuse the review it
- * loaded see only that lost readiness: the reloads before the second pass and the final check see a new review token.
+ * Records a new snapshot (head oid(3), no ledger entries) through Store.recordHistory, as runner/review.ts's HEAD
+ * observation does on a server without a runner. That advances the task's state version, so the job's preparation no
+ * longer applies; GitHub's head is unchanged. The fake review service's token does not change, so the guarded merge's
+ * reloads pass and only the later passes' readiness check sees the change.
+ *
+ * Not a production path for a merge job: a runner server sets review.runnerRepository before it listens, so its review
+ * load reads the recorded snapshot head and never records a HEAD observation. The tests that use this are defensive.
  */
 function observeLocalHead(store: Store): void {
   const snapshot = store.getSnapshot(identity);
@@ -1136,7 +1143,9 @@ for (const { pass, at, prefix } of [
   { pass: 'the queue-correlation check', at: 3, prefix: 'Merge requirements changed after queue correlation. ' },
   { pass: 'the queue-boundary check', at: 4, prefix: 'Merge requirements changed after queue correlation. ' },
 ] as const) {
-  it(`words the guarded merge's refusal at ${pass} as what merging does when preparation no longer applies`, async () => {
+  // Defensive pin (see observeLocalHead): in job mode production cannot change the state version during the guarded
+  // merge, so this later pass's job wording is unreachable there; the test keeps the wording right if that changes.
+  it(`(defensive) words the guarded merge's refusal at ${pass} as what merging does when preparation no longer applies`, async () => {
     // Inspections: 1 the job's wait, 2 and 3 the guarded merge's validation passes, 4 the queue-correlation check,
     // 5 the queue-boundary check. The observation lands while inspection `at` reads GitHub; the next one refuses.
     const observed: number[] = [];
@@ -1156,7 +1165,8 @@ for (const { pass, at, prefix } of [
   });
 }
 
-it('words the guarded merge\'s refusal at the authorization check as what merging does when preparation no longer applies', async () => {
+// Defensive pin (see observeLocalHead): unreachable in production for a merge job, kept for the wording.
+it('(defensive) words the guarded merge\'s refusal at the authorization check as what merging does when preparation no longer applies', async () => {
   // Inspections: 1 the job's wait, 2 and 3 the guarded merge's validation passes, 4 the check after authorization.
   const calls: string[] = [];
   const f = setup({ change: () => ({ head: oid(2) }) });

@@ -491,6 +491,9 @@ export class MergeCoordinator {
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head || !samePullRequest({ status: finalStatus, resolved: finalTarget }))
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
+      // From here on, a MergeBlocked's job wording (runner/merge-job.ts inJobTerms) is defensive in job mode: nothing changes
+      // the state version during a job, the reloads catch a changed token first, and a moved base trips the PR identity
+      // check first. Defensive tests in test/merge-job.test.ts pin it.
       if (!finalStatus.ready) throw new MergeBlocked('Merge requirements changed during validation. ', finalStatus.blockers[0]);
       let commandStatus = finalStatus;
       let queueWatermark: string | null = null;
