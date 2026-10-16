@@ -2161,6 +2161,38 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(resent).toMatchObject({ status: 200, body: { job: { id: served.store.getMergeJob(served.identity, id)!.id } } });
   }, 60_000);
 
+  it('replays a click\'s own job on resend after that job ended and another click started a later job', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    // A failing required check ends each job blocked, which leaves the task mergeable again (Retry merge).
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const first = await review(served.app), clickA = randomUUID();
+    expect((await merge(served.app, first.token, clickA)).body.job).toMatchObject({ id: clickA });
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, clickA)).toMatchObject({ state: 'blocked' }), { timeout: 10_000 });
+    // Another tab reads the review again and clicks Retry merge: job B is now the task's latest job.
+    const clickB = randomUUID();
+    expect((await merge(served.app, (await review(served.app)).token, clickB)).body.job).toMatchObject({ id: clickB });
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, clickB)).toMatchObject({ state: 'blocked' }), { timeout: 10_000 });
+    expect(served.store.latestMergeJob(served.identity)).toMatchObject({ id: clickB });
+    // Click A, resent (its answer was lost): the answer is job A, not the task's latest job.
+    expect(await merge(served.app, first.token, clickA)).toMatchObject({ status: 200, body: { job: { id: clickA, state: 'blocked' } } });
+    // The same when the resend's reload fails: both jobs have ended, so the only review load now is that reload.
+    const service = served.app.service, realLoad = service.load.bind(service);
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      if (!failed) { failed = true; throw new Error('History work exceeded its overall deadline.'); }
+      return realLoad(options);
+    };
+    try {
+      expect(await merge(served.app, first.token, clickA)).toMatchObject({ status: 200, body: { job: { id: clickA, state: 'blocked' }, mergeRefreshRequired: true } });
+      expect(failed).toBe(true);
+    } finally { service.load = realLoad; }
+  }, 60_000);
+
   it('answers a merge click with the job\'s latest record when it ended during the click\'s reload', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, slow = false;
