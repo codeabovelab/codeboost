@@ -149,7 +149,6 @@ function timestamp(value: unknown, label: string): string {
   return value;
 }
 
-/** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 /**
  * The state GitHub gives one observed required check. A check run that completed SUCCESS, NEUTRAL or SKIPPED passes, as
  * GitHub treats those conclusions for required checks; a commit status passes only with SUCCESS.
@@ -177,6 +176,7 @@ function observedCheckStart(check: Record<string, unknown>): number {
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
 
+/** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
