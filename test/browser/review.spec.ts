@@ -643,11 +643,14 @@ const looksInactive=(locator:import('@playwright/test').Locator)=>locator.evalua
 const jobResolvedBlockers=[{code:'preparation',message:'The merge has not been prepared for the current review; merging prepares it.'},{code:'check',message:'ci is pending.'}];
 /** A merge job record with every field the server sends (runner/merge-job.ts mergeJobView: the store's record without its
  * token), `fields` overriding the defaults. A job saves its merge action ID before the guarded merge, so one in that step or
- * past it (merged, queued, submitted) carries one by default. */
+ * past it (merged, queued, submitted) carries one by default. Every saved change adds one to a job's revision
+ * (runner/store.ts), so by default a record later in the job's course (preparing, checks, merging, then ended) carries a
+ * higher revision than an earlier one; a test that sends an older record on purpose passes its revision. */
 const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  const state=fields.state??'running',step=fields.step===undefined?(state==='running'?'preparing':null):fields.step;
  const mergeActionId=step==='merging'||['merged','queued','submitted'].includes(state)?'0f6b0000-0000-4000-8000-00000000ac01':null;
- return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision:1,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
+ const revision=state==='running'?({preparing:1,checks:2,merging:3} as Record<string,number>)[step??'']??1:4;
+ return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
 };
 /** The merge control and its dialog once the page saw its job end: the outcome, the refresh request, and only `others`. */
 async function expectEndedMergeJob(page:import('@playwright/test').Page,label:string,ended:string,others:string[]=[]){
