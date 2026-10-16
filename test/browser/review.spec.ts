@@ -1378,22 +1378,25 @@ async function endedJobQueueServer(page:import('@playwright/test').Page,answer:(
  return race;
 }
 
-for(const variant of [{name:'merged',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.'},{name:'still queued',label:'Merge queued',banner:'Merge queued at position 1. Waiting for GitHub.'}])
-test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, while an older Refresh response was held (F6b)`,async({page})=>{
+for(const variant of [{name:'merged',site:'Refresh',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.'},{name:'still queued',site:'Refresh',label:'Merge queued',banner:'Merge queued at position 1. Waiting for GitHub.'},
+ {name:'merged',site:'Plans refresh',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.'}])
+test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, while an older ${variant.site} response was held (F6b)`,async({page})=>{
  let ended=false;
  // Before the job ends the poll sees it merging; then it ends `queued` with its attempt queued, and GitHub's queue
  // merges it on the next poll (or still holds it).
  const race=await endedJobQueueServer(page,(polls,{job,queue})=>!ended?{queue:null,job:job('running',2)}
   :{queue:queue(variant.name==='merged'&&race.answered.filter(answer=>answer.startsWith('queued')).length>0?'merged':'queued'),job:job('queued',3)});
  race.hold=true;
+ if(variant.site==='Plans refresh')await page.getByRole('link',{name:'Plans',exact:true}).click();
  const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
- await page.locator('#review-link').click();await race.held;
- // Selecting an item while Refresh waits renders the merge control, which schedules a poll; it sees the job end.
+ if(variant.site==='Plans refresh'){await page.locator('#plans-refresh').click();await race.held;await page.getByRole('link',{name:'Review',exact:true}).click();}
+ else{await page.locator('#review-link').click();await race.held;}
+ // Selecting an item while the reload waits renders the merge control, which schedules a poll; it sees the job end.
  ended=true;
  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
  await expect(page.locator('#merge')).toHaveText(variant.label,{timeout:15_000});
  await expect(page.locator('#banner')).toHaveText(variant.banner);
- // The interleaving: before the held Refresh response was released, the poll saw the job end queued and followed its attempt.
+ // The interleaving: before the held response was released, the poll saw the job end queued and followed its attempt.
  const afterEnd=race.answered.filter(answer=>answer!=='running/none');
  if(variant.name==='merged')expect(afterEnd).toEqual(['queued/queued','queued/merged']);
  else{expect(afterEnd.length).toBeGreaterThan(0);expect([...new Set(afterEnd)]).toEqual(['queued/queued']);}
@@ -1446,4 +1449,57 @@ test(`shows at once a job's attempt already ${variant.state} when the poll sees 
  // Polling stops (the poll interval is 2 s).
  await page.waitForTimeout(3_000);
  expect(race.answered).toHaveLength(2);
+});
+
+for(const variant of [{state:'merged',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.',status:'GitHub confirmed that the reviewed head was merged.'},
+ {state:'removed',label:'1 blocker',banner:'Removed from merge queue. Required check failed. Refresh to verify retry readiness.',status:'Required check failed. Refresh to verify retry readiness.'},
+ {state:'queued',label:'Merge queued',banner:'Merge queued at position 1. Waiting for GitHub.',status:'Merge queued. Waiting for GitHub to confirm the outcome. Refresh to see the result.'}])
+test(`shows the job's own attempt, ${variant.state}, when the click is answered with a job that ended queued (F6b)`,async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const head=view.snapshot.head,mergeActionId='0f6b0000-0000-4000-8000-0000000000e9';
+ // Shapes as runner/merge-job.ts (mergeJobView) and runner/merge.ts (#queueStatus, #attemptBlocker) send them.
+ const queued=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e1',mergeActionId,state:'queued',step:null});
+ const queue=(state:string)=>({kind:'queue',state,reviewedHead:head,url:'https://github.com/example/repo/pull/7',reason:state==='removed'?'Required check failed.':null,phase:state==='queued'?'AWAITING_CHECKS':null,position:state==='queued'?1:null,occurredAt:state==='merged'||state==='removed'?'2026-10-11T00:10:00Z':null,actionId:mergeActionId,retryable:state==='removed'});
+ const attemptBlocker={merged:[{code:'queue-merged',message:'GitHub confirmed that the reviewed head was merged.'}],queued:[{code:'queue-active',message:'The reviewed head is queued. Waiting for GitHub to confirm the outcome.'}]}[variant.state]??[];
+ const polls:string[]=[];
+ // Another client's poll saw the job end queued, and its attempt reach `variant.state`, before this click's review reload
+ // read them: the click's answer carries both.
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,queue:queue(variant.state),job:queued,blockers:[...attemptBlocker,...review.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE},job:queued})});});
+ // A later poll sees GitHub merge an attempt that was still queued.
+ await page.route('**/api/merge',async route=>{const next={queue:queue(polls.length===0&&variant.state==='queued'?'queued':'merged'),job:queued};polls.push(`${next.job.state}/${next.queue.state}`);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(next)});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:true,action:'merge',queue:null,job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ const clicked=page.waitForResponse(response=>response.url().endsWith('/api/action'));
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ // The interleaving: the click's answer already holds the ended job and its attempt in `variant.state`; this page had polled nothing.
+ const answer=await (await clicked).json();
+ expect(answer.job).toMatchObject({state:'queued',mergeActionId});
+ expect(answer.merge.queue).toMatchObject({state:variant.state,actionId:mergeActionId});
+ expect(polls).toEqual([]);
+ await expect(page.locator('#merge')).toHaveText(variant.label);
+ await expect(page.locator('#banner')).toHaveText(variant.banner);
+ await expect(page.locator('#merge')).toHaveAttribute('aria-disabled','true');
+ await page.locator('#merge-details').click();
+ await expect(page.locator('dialog h2')).toHaveText('Merge status');
+ await expect(page.locator('dialog li')).toHaveText([variant.status]);
+ await page.keyboard.press('Escape');
+ if(variant.state==='queued'){
+  // The attempt is still in GitHub's queue: the queue poll follows it until GitHub merges it.
+  await expect(page.locator('#merge')).toHaveText('Merged',{timeout:15_000});
+  expect(polls.slice(0,2)).toEqual(['queued/queued','queued/merged']);
+  await expect(page.locator('#banner')).toHaveText('GitHub confirmed the reviewed head was merged.');
+ }else{
+  // An ended attempt is not polled (the poll interval is 2 s), so its outcome stays without a Refresh.
+  await page.waitForTimeout(3_000);
+  expect(polls).toEqual([]);
+  await expect(page.locator('#merge')).toHaveText(variant.label);
+  await expect(page.locator('#banner')).toHaveText(variant.banner);
+ }
 });

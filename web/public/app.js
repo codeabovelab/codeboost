@@ -265,15 +265,9 @@ async function pollMergeQueue(generation) {
         renderMerge();
         return;
       }
-      const ended = `${job ? mergeJobText(job) : "The merge job ended."} Refresh to see the result.`;
-      data = withEndedMergeJob(data, job, ended);
-      $("banner").textContent = ended;
       // A job that ended `queued` left its attempt in GitHub's queue: follow it, as after a click answered with it.
-      const followed = withEndedJobQueue(data, job, update.queue);
-      if (followed !== data) {
-        data = followed;
-        showMergeQueueStatus(update.queue);
-      }
+      data = withEndedJobAndAttempt(data, job, update.queue);
+      showEndedJobAndAttempt(job, update.queue);
       renderMerge();
       return;
     }
@@ -346,8 +340,29 @@ function withMergeQueue(view, queue) {
  * banner read that, as they do for a queue merge. Any other job or attempt leaves the view unchanged.
  */
 function withEndedJobQueue(view, job, queue) {
-  if (job?.state !== "queued" || !queue?.actionId || queue.actionId !== job.mergeActionId) return view;
+  if (!isEndedJobQueue(job, queue)) return view;
   return ["submitting", "queued"].includes(queue.state) ? { ...view, merge: { ...view.merge, queue } } : withMergeQueue(view, queue);
+}
+/** Whether `queue` is the merge attempt a job that ended `queued` left in GitHub's queue (its action ID is the job's `mergeActionId`). */
+function isEndedJobQueue(job, queue) {
+  return job?.state === "queued" && Boolean(queue?.actionId) && queue.actionId === job.mergeActionId;
+}
+/** The banner text for a job the page saw end (`job` null: the poll no longer reports it). */
+function endedMergeJobText(job) {
+  return `${job ? mergeJobText(job) : "The merge job ended."} Refresh to see the result.`;
+}
+/**
+ * The view once the page learns its job ended, with the job's own attempt when `queue` is it. The job poll, the click's
+ * answer and a newer observation kept over a full response all present an ended job through this and
+ * showEndedJobAndAttempt, so an attempt GitHub already merged, removed or failed keeps its outcome and an active one is polled.
+ */
+function withEndedJobAndAttempt(view, job, queue) {
+  return withEndedJobQueue(withEndedMergeJob(view, job, endedMergeJobText(job)), job, queue);
+}
+/** The banner for withEndedJobAndAttempt: the job's outcome, then its own attempt's status, which takes precedence. */
+function showEndedJobAndAttempt(job, queue) {
+  $("banner").textContent = endedMergeJobText(job);
+  if (isEndedJobQueue(job, queue)) showMergeQueueStatus(queue);
 }
 function showMergeQueueStatus(queue) {
   if (queue?.state === "merged") {
@@ -706,12 +721,14 @@ $("merge").onclick = async () => {
         ? { ...data, merge: { ...data.merge, ready: false, action: null, job } }
         : { ...updated, merge: { ...updated.merge, job } };
       if (job.state !== "running") {
-        // The job had already ended when the click was answered: nothing to follow, so say how to see its result, as the
-        // job poll does when a job ends.
-        const ended = `${mergeJobText(job)} Refresh to see the result.`;
-        data = withEndedMergeJob(data, job, ended);
+        // The job had already ended when the click was answered: say how to see its result, as the job poll does when a
+        // job ends. A job that ended `queued` is shown with its own attempt, as the poll shows it: another client's poll
+        // may have seen that attempt merged, removed or failed before this click's review reload read it, or it is still
+        // queued and the queue poll follows it.
+        const queue = data.merge.queue;
+        data = withEndedJobAndAttempt(data, job, queue);
         render();
-        $("banner").textContent = ended;
+        showEndedJobAndAttempt(job, queue);
         return;
       }
       render();
@@ -1029,17 +1046,14 @@ function laterMergeJob(newer, older) {
   return newer.id === older.id ? Number.isSafeInteger(newer.revision) && Number.isSafeInteger(older.revision) && newer.revision > older.revision
     : Number.isSafeInteger(newer.sequence) && Number.isSafeInteger(older.sequence) && newer.sequence > older.sequence;
 }
-function mergeJobBanner(job) {
-  return job.state === "running" ? mergeJobText(job) : `${mergeJobText(job)} Refresh to see the result.`;
-}
 /**
  * The view with a newer observation of its job, as the job poll shows it: a running job is not ready to merge (the
- * full response may offer Retry for an earlier job), and an ended job asks for a refresh.
+ * full response may offer Retry for an earlier job), and an ended job asks for a refresh, with its own attempt `queue`.
  */
-function withMergeJobObservation(view, job) {
+function withMergeJobObservation(view, job, queue = null) {
   if (job.state === "running") return { ...view, merge: { ...view.merge, ready: false, action: null, job,
     blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
-  return withEndedMergeJob(view, job, mergeJobBanner(job));
+  return withEndedJobAndAttempt(view, job, queue);
 }
 /**
  * The poll's observations that a full response read before them must keep: the merge attempt (`queue`), the task's latest
@@ -1049,20 +1063,19 @@ function withMergeJobObservation(view, job) {
  */
 function newerMergeObservations(updated, observationOwner) {
   const queue = newerMergeQueue(updated, observationOwner), job = newerMergeJob(updated, observationOwner), followed = data?.merge?.queue;
-  const jobQueue = job?.state === "queued" && followed?.actionId && followed.actionId === job.mergeActionId ? followed : null;
+  const jobQueue = isEndedJobQueue(job, followed) ? followed : null;
   return { queue, job, jobQueue };
 }
 /** The full response `view` with the newer observations kept, as the poll presented them. */
 function withNewerMergeObservations(view, { queue, job, jobQueue }) {
-  let kept = queue ? withMergeQueue(view, queue) : view;
-  if (job) kept = withMergeJobObservation(kept, job);
-  return jobQueue ? withEndedJobQueue(kept, job, jobQueue) : kept;
+  const kept = queue ? withMergeQueue(view, queue) : view;
+  return job ? withMergeJobObservation(kept, job, jobQueue) : kept;
 }
 /** The banner for the newer observations kept, as the poll showed them; call after render. */
 function showNewerMergeObservations({ queue, job, jobQueue }) {
   if (queue) showMergeQueueStatus(queue);
-  if (job) $("banner").textContent = mergeJobBanner(job);
-  if (jobQueue) showMergeQueueStatus(jobQueue);
+  if (job?.state === "running") $("banner").textContent = mergeJobText(job);
+  else if (job) showEndedJobAndAttempt(job, jobQueue);
 }
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
