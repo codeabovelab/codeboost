@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { Store } from '../runner/store.ts';
+import { MAX_MERGE_JOB_TOKEN_LENGTH, Store } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
 import { JOB_RESOLVES, MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
@@ -1215,13 +1215,13 @@ it('answers shutdown, not the load\'s own error, when the admission load fails f
   expect(f.store.getMergeJob(identity, id)).toBeNull();
 });
 
-it.each([['an empty', ''], ['a non-string', 42]] as const)('refuses a click with %s token as stale, saving nothing, and refuses its resend the same way', async (_kind, token) => {
+it.each([['an empty', ''], ['a non-string', 42], ['a too long', 'a'.repeat(MAX_MERGE_JOB_TOKEN_LENGTH + 1)]] as const)('refuses a click with %s token as stale, saving nothing, and refuses its resend the same way', async (_kind, token) => {
   const f = setup(), id = randomUUID();
   for (let send = 0; send < 2; send++) {
     const refused = await f.coordinator.start(token, id).then(() => null, (error: unknown) => error);
     expect(refused).toBeInstanceOf(GuardRefusal);
     expect((refused as Error).message).toBe('Stale review state. Refresh before merging.');
-    // A refusal is saved under the click's token, so a click with none has nothing to save it under.
+    // A refusal is saved under the click's token, so a click without a usable one has nothing to save it under.
     expect(f.store.getMergeJob(identity, id)).toBeNull();
   }
   expect(f.prep.calls).toEqual([]);

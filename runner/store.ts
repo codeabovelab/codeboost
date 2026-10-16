@@ -90,6 +90,8 @@ export interface PreMergeReadiness {
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
 /** The next step after a failing required check or GitHub's refusal blocks a merge job (docs/implementation/merge-handoff.md). */
 export const FIX_THEN_RETRY = 'Fix it, then Retry merge.';
+/** The longest review token a merge job or its saved refusal is saved under. */
+export const MAX_MERGE_JOB_TOKEN_LENGTH = 512;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
@@ -2137,7 +2139,7 @@ export class Store {
    */
   beginMergeJob(identity: PlanIdentity, input: { actionId: string; token: string; now?: string }): { job: MergeJob; resent: boolean } {
     assertUuidV4(input.actionId, 'Action ID');
-    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       const task = this.#task(key);
@@ -2163,7 +2165,7 @@ export class Store {
    */
   recordMergeJobRefusal(identity: PlanIdentity, input: { actionId: string; token: string; reason: string }): MergeJob {
     assertUuidV4(input.actionId, 'Action ID');
-    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#task(key);

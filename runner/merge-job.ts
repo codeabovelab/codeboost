@@ -3,7 +3,7 @@ import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, se
 import { MergeBlocked, MergeOutcomeUnknown, PUSH_UNSETTLED, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
-import { FIX_THEN_RETRY, type MergeAttempt, type MergeJob, type MergeJobState } from './store.ts';
+import { FIX_THEN_RETRY, MAX_MERGE_JOB_TOKEN_LENGTH, type MergeAttempt, type MergeJob, type MergeJobState } from './store.ts';
 
 /** How long a job waits for GitHub's required checks on the pushed head (docs/implementation/merge-handoff.md). */
 export const REQUIRED_CHECK_WAIT_MS = 30 * 60_000;
@@ -61,7 +61,8 @@ export class MergeJobCoordinator {
    * Admit the click and start its job after the caller's transaction commits. A resend of the same click returns its
    * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend. A
    * refusal during shutdown saves nothing, so that click may be sent again, and neither does one for a click without a
-   * usable review token (it is refused, as stale or because a job runs, and nothing is saved).
+   * usable review token (missing, not a string, or too long): it is refused, as stale or because a job runs, and nothing
+   * is saved, since the store saves a refusal only under a usable token.
    */
   async start(token: unknown, actionId: string, busy: () => string | null = () => null, signal?: AbortSignal): Promise<MergeJobView> {
     const { store, config } = this.service, identity = config.identity;
@@ -90,7 +91,7 @@ export class MergeJobCoordinator {
     const refusal = this.#admissionRefusal(token, reviewToken, busy);
     if (refusal !== null) {
       // A definite refusal is this click's outcome; a resend replays it (as the guarded merge does).
-      if (typeof token === 'string' && token) store.recordMergeJobRefusal(identity, { actionId, token, reason: refusal });
+      if (typeof token === 'string' && token && token.length <= MAX_MERGE_JOB_TOKEN_LENGTH) store.recordMergeJobRefusal(identity, { actionId, token, reason: refusal });
       throw new GuardRefusal(refusal);
     }
     let job: MergeJob;
