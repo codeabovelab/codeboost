@@ -1302,11 +1302,11 @@ test('asks for a refresh when the click is answered with a merge job that has al
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(state:MergeJobView['state'],step:MergeJobView['step'],checks:MergeJobView['checks']=[],reason:string|null=null)=>mergeJobRecord({state,step,checks,reason});
  let polls=0;
- // The job failed before the click was answered (its review load failed as the click's reload did).
+ // The job failed before the click was answered: its first review load failed, as the click's reload did, so it was saved
+ // twice (preparing at revision 1, failed at revision 2) and never reached the merge (no merge action ID).
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
-  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:job('failed',null,[],'History work exceeded its overall deadline.'),mergeRefreshRequired:true})});});
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:mergeJobRecord({state:'failed',step:null,reason:'History work exceeded its overall deadline.',revision:2}),mergeRefreshRequired:true})});});
  await page.route('**/api/merge',async route=>{polls++;await route.continue();});
  // A runner server reports merging as a job (its merge status carries `job`), as production does.
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
