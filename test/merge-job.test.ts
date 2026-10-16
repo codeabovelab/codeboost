@@ -1145,3 +1145,49 @@ it('starts no preparation when shutdown began while the job\'s first review load
   expect(finish).not.toHaveBeenCalled();
   expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'running', step: 'preparing', reason: null });
 });
+
+it('answers shutdown, not the load\'s own error, when the admission load fails for another reason after shutdown began', async () => {
+  const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
+  const starting = f.coordinator.start('review-token', id);
+  await held.loading;
+  f.coordinator.stop();
+  // No request signal: only the coordinator's own shutdown flag says the load failed during shutdown.
+  held.fail(new Error('History work exceeded its overall deadline.'));
+  await expect(starting).rejects.toBeInstanceOf(ShuttingDownError);
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+});
+
+it.each([['an empty', ''], ['a non-string', 42]] as const)('refuses a click with %s token as stale, saving nothing, and refuses its resend the same way', async (_kind, token) => {
+  const f = setup(), id = randomUUID();
+  for (let send = 0; send < 2; send++) {
+    const refused = await f.coordinator.start(token, id).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(GuardRefusal);
+    expect((refused as Error).message).toBe('Stale review state. Refresh before merging.');
+    // A refusal is saved under the click's token, so a click with none has nothing to save it under.
+    expect(f.store.getMergeJob(identity, id)).toBeNull();
+  }
+  expect(f.prep.calls).toEqual([]);
+});
+
+it('saves no prepare-merge action when preparation can no longer start once the job\'s first review load resolves', async () => {
+  // Defensive at the coordinator's boundary (see #run): the server refuses a standalone preparation while a job runs and
+  // stops the job before preparation at shutdown, so the fake's startability changes directly.
+  const f = setup(), id = randomUUID();
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  const held = holdNextLoad(f.review as never);
+  const userAction = vi.spyOn(f.store, 'userAction');
+  await f.coordinator.start('review-token', id);
+  await held.loading;
+  (f.prep.fake as unknown as { assertStartable: () => void }).assertStartable = () => { throw new GuardRefusal('Pre-merge preparation is already running.'); };
+  held.release();
+  expect(await settled(f.coordinator)).toMatchObject({ id, state: 'failed', reason: 'Pre-merge preparation is already running.' });
+  expect(userAction.mock.calls.filter(([, action]) => (action as { kind: string }).kind === 'prepare-merge')).toEqual([]);
+  expect(f.prep.calls).toEqual([]);
+  expect(f.gh.merged).toEqual([]);
+});
+
+it('keeps the guarded merge\'s Retry merge for a task still in review', () => {
+  const status = { ready: true, action: 'retry', blockers: [{ code: 'preparation', message: 'preparation' }], remote: { mergeable: 'MERGEABLE' }, queue: null } as Parameters<typeof withMergeJob>[0];
+  expect(withMergeJob(status, null, 'in review')).toMatchObject({ ready: true, action: 'retry' });
+  expect(withMergeJob({ ...status, action: 'merge' }, null, 'in review')).toMatchObject({ ready: true, action: 'merge' });
+});

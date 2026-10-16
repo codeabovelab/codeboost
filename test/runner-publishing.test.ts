@@ -2183,6 +2183,56 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(clicked).toMatchObject({ status: 200, body: { job: { id, state: 'merged' } } });
   }, 60_000);
 
+  it('answers a merge click whose reload fails with the job\'s latest record, once the job ended during that reload', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // The admission load and the click's reload share the request's signal; the job's loads carry its own. The reload
+    // waits until the job has merged, then fails (as a history worker timing out would).
+    const service = served.app.service, realLoad = service.load.bind(service), requestSignals = new Set<AbortSignal>();
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      const signal = options?.signal;
+      if (signal && !failed && requestSignals.has(signal)) {
+        failed = true;
+        await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, id)?.state).toBe('merged'), { timeout: 40_000, interval: 50 });
+        throw new Error('History work exceeded its overall deadline.');
+      }
+      if (signal) requestSignals.add(signal);
+      return realLoad(options);
+    };
+    const clicked = await merge(served.app, token, id);
+    expect(failed).toBe(true);
+    // The admission's record said "running, preparing"; the answer is the job as it is now.
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id, state: 'merged' }, mergeRefreshRequired: true } });
+  }, 60_000);
+
+  it('offers Merge PR to a task in review and Retry merge once a job ended blocked, from the task\'s current status', async () => {
+    const w = world(); mergeable(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
+    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const before = await review(served.app);
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
+    const started = await merge(served.app, before.token);
+    expect(started.status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ id: started.body.job.id, state: 'blocked' }), { timeout: 10_000 });
+    expect(served.store.getTask(served.identity).status).toBe('approved but merge blocked');
+    const after = await review(served.app);
+    // The guarded merge has no attempt to retry, so only the task's status makes this a retry.
+    expect(after.merge.queue).toBeNull();
+    expect(after.merge).toMatchObject({ ready: true, action: 'retry', job: { id: started.body.job.id, state: 'blocked' } });
+  }, 60_000);
+
   it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
     const w = world(); mergeable(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;

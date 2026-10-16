@@ -170,7 +170,8 @@ export class MergeJobCoordinator {
     const prepareId = randomUUID(), task = store.getTask(identity), snapshot = store.getSnapshot(identity);
     const reviewVersion = store.reviewVersion(identity);
     // Refused here, before the placeholder below is saved, if a preparation cannot start now (the preparation's own check
-    // repeats it in this turn).
+    // repeats it in this turn). Defensive: admission checked it, the server refuses a standalone preparation while a job
+    // runs, and shutdown aborts the job (checked above) in the turn before it stops preparation.
     this.preMerge.assertStartable();
     store.userAction(identity, { actionId: prepareId, kind: 'prepare-merge',
       request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: reviewVersion, mergeJob: job.id } },
