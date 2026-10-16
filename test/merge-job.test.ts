@@ -880,3 +880,96 @@ it('keeps the unsettled push in the job\'s wording of the preparation blocker', 
   expect(withMergeJob(status as Parameters<typeof withMergeJob>[0], null, 'in review').blockers.filter(blocker => blocker.code === 'preparation')).toEqual([{ code: 'preparation',
     message: 'A push of the rewritten head has not settled; merging reads its outcome and prepares again.' }]);
 });
+
+it('ends the job cancelled when its own review load rejects only after the task was cancelled and shutdown began', async () => {
+  const f = setup(), id = randomUUID();
+  // The admission's load passes; the job's own first load is held, and rejects only when the test says so (not on abort).
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  let reject!: (error: unknown) => void, started!: (signal?: AbortSignal) => void;
+  const loading = new Promise<AbortSignal | undefined>(resolve => { started = resolve; });
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((options?: { signal?: AbortSignal }) => {
+    started(options?.signal);
+    return new Promise((_resolve, fail) => { reject = fail; });
+  });
+  await f.coordinator.start('review-token', id);
+  const signal = (await loading)!;
+  // As the cancel route does: the task's cancel commits, then the job is told. Then shutdown begins.
+  f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID());
+  f.coordinator.cancel();
+  f.coordinator.stop();
+  // The interleaving happened: the cancel aborted the job first (shutdown's abort came second and changed nothing),
+  // and the load is still pending when shutdown has begun.
+  expect((signal.reason as { code?: string }).code).toBe('CANCELLED');
+  expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
+  reject(signal.reason);
+  await f.coordinator.close();
+  expect(f.coordinator.latest()).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
+  expect(f.gh.merged).toEqual([]);
+});
+
+it.each(['removed', 'failed'] as const)('ends the job from its attempt when a queue poll records %s after the merge queued and before the job resumed', async state => {
+  const f = setup({ queue: true });
+  const inspectQueue = f.gh.client as unknown as { inspectQueue: ReturnType<typeof vi.fn> };
+  inspectQueue.inspectQueue.mockImplementationOnce(async (head: string) => state === 'removed'
+    ? { state: 'removed', reviewedHead: head, removedAt: '2026-10-11T00:01:00Z', reason: 'The merge queue removed it: checks failed.' }
+    : { state: 'failed', reviewedHead: head, entryId: 'E', reason: 'The merge queue failed it: checks failed.' });
+  // The guarded merge settles (attempt saved queued); a queue poll then ends the attempt before the job resumes.
+  const merge = f.merges.merge.bind(f.merges);
+  let queuedBeforePoll: string | undefined;
+  f.merges.merge = (async (...args: Parameters<typeof merge>) => {
+    const result = await merge(...args);
+    queuedBeforePoll = f.store.getMergeAttempt(identity)?.state;
+    await f.merges.pollQueue();
+    return result;
+  }) as typeof merge;
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  // The interleaving happened: the merge saved queued, and the poll ended this job's attempt before the job read it.
+  expect(queuedBeforePoll).toBe('queued');
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ actionId: done.mergeActionId, state, requiresFreshReview: false });
+  expect(done).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge: The merge queue .* it: checks failed\. Fix it, then Retry merge\.$/) });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
+it('times out, without merging, when a ready inspection finishes after the wait limit before its timer runs', async () => {
+  const f = setup({ checks: n => (n === 1 ? [pending()] : [passing()]) });
+  let offset = 0, limitAbortedAtReady: boolean | null = null;
+  const now = performance.now.bind(performance);
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() + offset);
+  const inspect = f.gh.client.inspect;
+  f.gh.client.inspect = (async (request: Parameters<typeof inspect>[0]) => {
+    const status = await inspect(request);
+    // The second inspection (all checks passing) ends after the limit: the clock crosses it, but the limit's timer has
+    // not run (it counts real time, far from the limit).
+    if ((inspect as ReturnType<typeof vi.fn>).mock.calls.length === 2) { offset += 120_000; limitAbortedAtReady = request?.signal?.aborted ?? null; }
+    return status;
+  }) as typeof inspect;
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 60_000, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
+  try {
+    await coordinator.start('review-token', randomUUID());
+    const done = await settled(coordinator);
+    // The interleaving happened: the ready inspection's signal had not been stopped by the limit when it answered.
+    expect(limitAbortedAtReady).toBe(false);
+    expect(done).toMatchObject({ state: 'blocked', reason: 'Required checks did not pass within 1 minutes: ci is pending. Wait for the checks to pass, then Retry merge.' });
+    expect(f.gh.merged).toEqual([]);
+    expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+  } finally { clock.mockRestore(); }
+});
+
+it('keeps a failing check found by an inspection that finishes after the wait limit', async () => {
+  const f = setup({ checks: n => (n === 1 ? [pending()] : [{ context: 'build', appId: null, state: 'failure' }]) });
+  let offset = 0;
+  const now = performance.now.bind(performance);
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() + offset);
+  const inspect = f.gh.client.inspect;
+  f.gh.client.inspect = (async (request: Parameters<typeof inspect>[0]) => {
+    const status = await inspect(request);
+    if ((inspect as ReturnType<typeof vi.fn>).mock.calls.length === 2) offset += 120_000;
+    return status;
+  }) as typeof inspect;
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 60_000, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
+  try {
+    await coordinator.start('review-token', randomUUID());
+    expect(await settled(coordinator)).toMatchObject({ state: 'blocked', reason: 'Required check failed: build. Fix it, then Retry merge.' });
+  } finally { clock.mockRestore(); }
+});
