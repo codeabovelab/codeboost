@@ -859,7 +859,7 @@ it('answers the resent click\'s job when the first send\'s admission load fails 
   await held.loading;
   const second = await f.coordinator.start('review-token', id); // Its own load is not held: it admits the job.
   expect(f.store.getMergeJob(identity, id)).not.toBeNull();
-  held.fail(new Error('History worker timed out.'));
+  held.fail(new Error('History work exceeded its overall deadline.'));
   expect((await first).id).toBe(second.id);
   await settled(f.coordinator);
 });
@@ -898,8 +898,8 @@ it('saves nothing when the admission load fails for another reason, so the click
   const f = setup(), id = randomUUID(), held = holdNextLoad(f.review as never);
   const starting = f.coordinator.start('review-token', id);
   await held.loading;
-  held.fail(new Error('History worker timed out.'));
-  await expect(starting).rejects.toThrow('History worker timed out.');
+  held.fail(new Error('History work exceeded its overall deadline.'));
+  await expect(starting).rejects.toThrow('History work exceeded its overall deadline.');
   expect(f.store.getMergeJob(identity, id)).toBeNull();
   // The same click, sent again, starts the job.
   expect(await f.coordinator.start('review-token', id)).toMatchObject({ state: 'running' });

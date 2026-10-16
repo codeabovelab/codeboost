@@ -2146,7 +2146,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     let failed = false;
     service.load = async (options?: Parameters<typeof realLoad>[0]) => {
       const signal = options?.signal;
-      if (signal && !failed && requestSignals.has(signal)) { failed = true; throw new Error('History worker timed out.'); }
+      if (signal && !failed && requestSignals.has(signal)) { failed = true; throw new Error('History work exceeded its overall deadline.'); }
       if (signal) requestSignals.add(signal);
       return realLoad(options);
     };

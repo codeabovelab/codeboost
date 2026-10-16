@@ -699,8 +699,8 @@ test('keeps every blocker when the click is answered with a job that ended witho
  // A collaborator pushed while the job waited: its inspection listed the moved head first, so the job failed with that
  // reason alone (classify reports the first blocker). The same inspection found a merge conflict, and a required check
  // is still pending; the job settled neither.
- const head={code:'head',message:'The pull request head moved after review.'};
- const conflict={code:'mergeable',message:'GitHub reports a merge conflict.'};
+ const head={code:'head',message:'The pull request head moved. Refresh the review.'};
+ const conflict={code:'mergeable',message:'The pull request has merge conflicts.'};
  const failed=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000f2',state:'failed',step:null,reason:head.message});
  let polls=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
@@ -1184,7 +1184,7 @@ test('asks for a refresh when the click is answered with a merge job that has al
  let polls=0;
  // The job failed before the click was answered (its review load failed as the click's reload did).
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
-  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:job('failed',null,[],'History worker timed out.'),mergeRefreshRequired:true})});});
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:job('failed',null,[],'History work exceeded its overall deadline.'),mergeRefreshRequired:true})});});
  await page.route('**/api/merge',async route=>{polls++;await route.continue();});
  // A runner server reports merging as a job (its merge status carries `job`), as production does.
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
