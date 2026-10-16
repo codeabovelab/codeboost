@@ -654,6 +654,9 @@ const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  const revision=state==='running'?(step==='checks'?((fields.checks??[]).length?3:2):({preparing:1,merging:4} as Record<string,number>)[step??'']??1):5;
  return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
 };
+/** A blocked job's reason as production saves it: one failing required check (runner/merge-job.ts classify), then the
+ * next step that blocking appends (FIX_THEN_RETRY in runner/store.ts). */
+const CHECK_FAILED_BLOCK='Required check failed: ci. Fix it, then Retry merge.';
 /** The merge control and its dialog once the page saw its job end: the outcome, the refresh request, and only `others`. */
 async function expectEndedMergeJob(page:import('@playwright/test').Page,label:string,ended:string,others:string[]=[]){
  await expect(page.locator('#merge')).toHaveText(label);
@@ -768,7 +771,7 @@ test('keeps a draft typed while a merge-job click is in flight (F6b)',async({pag
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?'Required check failed: ci.':null});
+ const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?CHECK_FAILED_BLOCK:null});
  let started:MergeJobView|null=null,release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   await held;const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json(),running=job(body.actionId,'running','preparing');started=running;
@@ -791,7 +794,7 @@ test('starts a new action for Retry merge once the job its retained key started 
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?'Required check failed: ci.':null});
+ const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?CHECK_FAILED_BLOCK:null});
  const clicks:string[]=[];let first:string|null=null,started:MergeJobView|null=null;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
   if(clicks.length===1){first=body.actionId;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'The review server is shutting down.'})});return;}
@@ -817,7 +820,7 @@ test('starts a new action once another job became the latest after a retained ke
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?'Required check failed: ci.':null});
+ const job=(id:string,state:MergeJobView['state'],step:MergeJobView['step'],sequence=1)=>mergeJobRecord({id,state,step,sequence,reason:state==='blocked'?CHECK_FAILED_BLOCK:null});
  const clicks:string[]=[];let first:string|null=null,started:MergeJobView|null=null;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
   if(clicks.length===1){first=body.actionId;await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'The review server is shutting down.'})});return;}
@@ -843,7 +846,7 @@ test('resends the same action for Retry merge after a retry failed while an earl
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const blocked=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000a1',state:'blocked',step:null,reason:'Required check failed: ci.'});
+ const blocked=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000a1',state:'blocked',step:null,reason:CHECK_FAILED_BLOCK});
  // Every retry answers 503: nothing was applied, so the click is unresolved and its key must be resent.
  const clicks:string[]=[];
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
@@ -914,7 +917,7 @@ test('keeps a newer merge job a poll saw while a held Refresh response shows an 
  // Job A runs in this tab. Another tab's click starts job B after A ends; B's record is later than any of A's (sequence),
  // while its clock times are earlier, as after a clock step back.
  const jobA=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e1',state:'running',step:'preparing',sequence:1,startedAt:'2026-10-11T00:10:00Z',updatedAt:'2026-10-11T00:10:00Z'});
- const blockedA=mergeJobRecord({...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',revision:3,updatedAt:'2026-10-11T00:20:00Z'});
+ const blockedA=mergeJobRecord({...jobA,state:'blocked',step:null,reason:CHECK_FAILED_BLOCK,revision:3,updatedAt:'2026-10-11T00:20:00Z'});
  const jobB=mergeJobRecord({...jobA,id:'0f6b0000-0000-4000-8000-0000000000e2',step:'checks',sequence:2,revision:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  let started=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
  const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
@@ -1126,7 +1129,7 @@ test('follows the running merge job when a click from an older review is refused
 });
 // A refused click's job is followed only when it is running and later than the job this page shows (web/public/app.js):
 // the server attaches the task's latest job to every merge-job refusal (web/server.ts), so an ended or older one comes too.
-const shownJob=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:'Required check failed: ci.',sequence:2,revision:4,updatedAt:'2026-10-11T00:00:05Z'});
+const shownJob=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:CHECK_FAILED_BLOCK,sequence:2,revision:4,updatedAt:'2026-10-11T00:00:05Z'});
 for(const refusal of [
  {name:'an ended job',shown:null,button:'Merge PR',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'failed',step:null,reason:'The server restarted before the merge finished.'})},
  {name:'an older running job',shown:shownJob,button:'Retry merge',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'checks',checks:[{context:'ci',state:'pending'}],updatedAt:'2026-10-11T00:00:09Z'})},
@@ -1323,13 +1326,13 @@ test('follows a later running merge job when a resent click replays its own ende
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  const record=(id:string,sequence:number,state:MergeJobView['state'],step:MergeJobView['step'],reason:string|null=null)=>mergeJobRecord({id,sequence,state,step,reason,checks:step==='checks'?[{context:'ci',state:'pending'}]:[]});
  // The review shows an earlier job that ended blocked, so it offers Retry merge.
- const shown=record('0f6b0000-0000-4000-8000-0000000000d0',1,'blocked',null,'Required check failed: ci.');
+ const shown=record('0f6b0000-0000-4000-8000-0000000000d0',1,'blocked',null,CHECK_FAILED_BLOCK);
  const clicks:string[]=[];let jobB:ReturnType<typeof record>|null=null,polls=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
   // The first answer is lost before the server admitted the click; the server then saves its job A, which ends blocked,
   // and another tab's retry starts job B.
   if(clicks.length===1){await route.abort('failed');return;}
-  const jobA=record(body.actionId,2,'blocked',null,'Required check failed: ci.');jobB=record('0f6b0000-0000-4000-8000-0000000000d3',3,'running','checks');
+  const jobA=record(body.actionId,2,'blocked',null,CHECK_FAILED_BLOCK);jobB=record('0f6b0000-0000-4000-8000-0000000000d3',3,'running','checks');
   // As web/server.ts answers a resend: the replayed job A, with the review reloaded meanwhile, whose job is the latest (B).
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:jobB},job:jobA})});});
