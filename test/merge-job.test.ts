@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { MAX_MERGE_JOB_TOKEN_LENGTH, Store } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
-import { JOB_RESOLVES, MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
+import { JOB_RESOLVES, MergeJobCoordinator, REVIEW_CHANGED_AFTER_CLICK, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
 import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
 import type { ReviewService } from '../runner/review.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type RemoteMergeState, type RequiredCheck } from '../github/merge.ts';
@@ -1197,6 +1197,30 @@ it('keeps the unsettled push in the job\'s wording of the preparation blocker', 
     message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' }]);
   expect(withMergeJob(status as Parameters<typeof withMergeJob>[0], null, 'in review').blockers.filter(blocker => blocker.code === 'preparation')).toEqual([{ code: 'preparation',
     message: 'A push of the rewritten head has not settled; merging reads its outcome and prepares again.' }]);
+});
+
+it('ends the job failed, preparing nothing, when the review changes between the click and the job\'s first review load', async () => {
+  const f = setup(), id = randomUUID();
+  // The token covers the plan, as the real review's does: a plan import from another tab makes a new token.
+  const view = f.review.view;
+  f.review.view = () => ({ ...(view() as object), token: f.store.getPlan(identity).revision === 1 ? 'review-token' : 'review-token-2' });
+  // The admission's load passes; the job's own first load is held.
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => f.review.view());
+  const held = holdNextLoad(f.review), actions = vi.spyOn(f.store, 'userAction');
+  expect(await f.coordinator.start('review-token', id)).toMatchObject({ state: 'running', step: 'preparing' });
+  await held.loading;
+  f.store.importRevision(JSON.stringify({ ...plan, revision: 2 }), 'json', context, 1);
+  // The interleaving happened: the click was admitted for the old review, and the review changed while the job's first
+  // load was pending, before it prepared anything.
+  expect(f.store.getPlan(identity).revision).toBe(2);
+  expect(f.coordinator.latest()).toMatchObject({ state: 'running', step: 'preparing' });
+  expect(f.prep.calls).toEqual([]);
+  held.release();
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: REVIEW_CHANGED_AFTER_CLICK });
+  expect(f.prep.calls).toEqual([]);
+  expect(actions.mock.calls.filter(([, action]) => action.kind === 'prepare-merge')).toEqual([]);
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('in review');
 });
 
 it('ends the job cancelled when its own review load rejects only after the task was cancelled and shutdown began', async () => {

@@ -11,6 +11,9 @@ export const REQUIRED_CHECK_WAIT_MS = 30 * 60_000;
 export const REQUIRED_CHECK_FIRST_DELAY_MS = 10_000;
 export const REQUIRED_CHECK_MAX_DELAY_MS = 60_000;
 
+/** Why a job ends when the review changed between the click's admission and the job's first review load. */
+export const REVIEW_CHANGED_AFTER_CLICK = 'The review changed after Merge PR was clicked. Refresh to see the change.';
+
 /** A job's answer to the browser: everything but the click's review token. */
 export type MergeJobView = Omit<MergeJob, 'token'>;
 export const mergeJobView = ({ token: _token, ...job }: MergeJob): MergeJobView => job;
@@ -171,6 +174,11 @@ export class MergeJobCoordinator {
     // The load awaited a history worker (#170). A cancel or shutdown during it ends here; otherwise the preparation is
     // bound to the task and review as they are now, all read in this turn (the preparation refuses if they move).
     if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
+    // The click was admitted for the review its token names. A review change that landed before this load finished (an
+    // approval, an accepted segment, or a plan import from another tab) is one the person never saw, so the job prepares
+    // nothing, as the direct merge refuses a review that changed during its validation. Readiness binds the review
+    // version from here on, so a later change is refused by the preparation, an inspection or the guarded merge.
+    if (view.token !== job.token) return this.#finish(job.id, 'failed', REVIEW_CHANGED_AFTER_CLICK);
     const prepareId = randomUUID(), task = store.getTask(identity), snapshot = store.getSnapshot(identity);
     const reviewVersion = store.reviewVersion(identity);
     // Refused here, before the placeholder below is saved, if a preparation cannot start now (the preparation's own check
@@ -197,6 +205,8 @@ export class MergeJobCoordinator {
     const mergeId = randomUUID();
     this.settle(() => store.updateMergeJob(identity, job.id, { step: 'merging', checks: [], mergeActionId: mergeId }));
     view = await this.service.load({ signal });
+    // The current token, not the click's: a rebase during preparation makes a new snapshot, and so a new token. The
+    // readiness the guarded merge requires binds the review version preparation read, so a review change since is refused.
     try {
       // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
       // is applied; after, the outcome is unknown.
