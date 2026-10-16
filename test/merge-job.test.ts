@@ -649,6 +649,13 @@ it('refuses a merge job for a closed task in the store itself', () => {
     .toThrow(new GuardRefusal('The task is cancelled; it cannot be merged.'));
 });
 
+it.each([['an empty', ''], ['a non-string', 42]] as const)('refuses a resend with %s token under a saved click as a reused ID', async (_kind, token) => {
+  const f = setup(), id = randomUUID();
+  await f.coordinator.start('review-token', id, () => 'The runner is busy.').catch(() => undefined);
+  expect(f.store.getMergeJob(identity, id)).toMatchObject({ refused: true });
+  await expect(f.coordinator.start(token, id)).rejects.toThrow(ActionIdReused);
+});
+
 it('returns a saved refusal to a resend of the same click and refuses its ID for another request', () => {
   const store = publishedTask(), id = randomUUID();
   const saved = store.recordMergeJobRefusal(identity, { actionId: id, token: 'review-token', reason: 'The runner is busy.' });
@@ -708,7 +715,7 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   // Retry: the guarded merge's second validation pass now sees a conflict, so it refuses before asking GitHub.
   refuse = false; conflictFrom = f.gh.inspections() + 3;
   await f.coordinator.start('review-token', randomUUID());
-  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/merge conflicts/) });
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: 'Merge requirements changed during validation. The pull request has merge conflicts.' });
   // At startup too: a job that saved its merge action ID but never got an attempt fails, whatever older attempts say.
   const crashed = randomUUID();
   f.store.beginMergeJob(identity, { actionId: crashed, token: 'review-token' });

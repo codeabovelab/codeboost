@@ -2139,10 +2139,11 @@ export class Store {
    */
   beginMergeJob(identity: PlanIdentity, input: { actionId: string; token: string; now?: string }): { job: MergeJob; resent: boolean } {
     assertUuidV4(input.actionId, 'Action ID');
-    if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       const task = this.#task(key);
+      // A saved click is looked up first, so a resend under its ID with any other token (unusable ones too) is refused
+      // as a reused ID, as a different usable one is.
       const existing = this.#get('SELECT data FROM merge_jobs WHERE id=?', input.actionId);
       if (existing) {
         const job = decode<MergeJob>(existing.data);
@@ -2150,6 +2151,7 @@ export class Store {
           throw new ActionIdReused('Action ID already used for a different request.');
         return { job, resent: true };
       }
+      if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
