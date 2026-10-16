@@ -644,12 +644,14 @@ const jobResolvedBlockers=[{code:'preparation',message:'The merge has not been p
 /** A merge job record with every field the server sends (runner/merge-job.ts mergeJobView: the store's record without its
  * token), `fields` overriding the defaults. A job saves its merge action ID before the guarded merge, so one in that step or
  * past it (merged, queued, submitted) carries one by default. Every saved change adds one to a job's revision
- * (runner/store.ts), so by default a record later in the job's course (preparing, checks, merging, then ended) carries a
- * higher revision than an earlier one; a test that sends an older record on purpose passes its revision. */
+ * (runner/store.ts #changeMergeJob): the job is saved at 1 while it prepares, moves to checks at 2 with no waiting checks,
+ * saves each inspection that finds checks waiting (runner/merge-job.ts), then moves to merging and ends with one more
+ * save each. By default a record follows the course preparing 1, checks 2 (none waiting) or 3 (first wait), merging 4,
+ * ended 5; a test that sends a further inspection, a shorter course, or an older record on purpose passes its revision. */
 const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  const state=fields.state??'running',step=fields.step===undefined?(state==='running'?'preparing':null):fields.step;
  const mergeActionId=step==='merging'||['merged','queued','submitted'].includes(state)?'0f6b0000-0000-4000-8000-00000000ac01':null;
- const revision=state==='running'?({preparing:1,checks:2,merging:3} as Record<string,number>)[step??'']??1:4;
+ const revision=state==='running'?(step==='checks'?((fields.checks??[]).length?3:2):({preparing:1,merging:4} as Record<string,number>)[step??'']??1):5;
  return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
 };
 /** The merge control and its dialog once the page saw its job end: the outcome, the refresh request, and only `others`. */
@@ -873,7 +875,7 @@ test(`keeps a merge-job outcome a poll saw while an older Refresh response was h
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  const running=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing',updatedAt:clock.runningAt});
- const merged=mergeJobRecord({...running,mergeActionId:'0f6b0000-0000-4000-8000-00000000ac01',state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:2,updatedAt:'2026-10-11T00:05:00Z'});
+ const merged=mergeJobRecord({...running,mergeActionId:'0f6b0000-0000-4000-8000-00000000ac01',state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:5,updatedAt:'2026-10-11T00:05:00Z'});
  let ended=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
  const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
  await page.route('**/api/merge',route=>{polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:ended?merged:running})});});
@@ -912,8 +914,8 @@ test('keeps a newer merge job a poll saw while a held Refresh response shows an 
  // Job A runs in this tab. Another tab's click starts job B after A ends; B's record is later than any of A's (sequence),
  // while its clock times are earlier, as after a clock step back.
  const jobA=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e1',state:'running',step:'preparing',sequence:1,startedAt:'2026-10-11T00:10:00Z',updatedAt:'2026-10-11T00:10:00Z'});
- const blockedA=mergeJobRecord({...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',revision:2,updatedAt:'2026-10-11T00:20:00Z'});
- const jobB=mergeJobRecord({...jobA,id:'0f6b0000-0000-4000-8000-0000000000e2',step:'checks',sequence:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const blockedA=mergeJobRecord({...jobA,state:'blocked',step:null,reason:'Required check failed: ci.',revision:3,updatedAt:'2026-10-11T00:20:00Z'});
+ const jobB=mergeJobRecord({...jobA,id:'0f6b0000-0000-4000-8000-0000000000e2',step:'checks',sequence:2,revision:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
  let started=false,hold=false,polls=0,release!:()=>void,holding!:()=>void;
  const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{holding=resolve;});
  await page.route('**/api/merge',route=>{polls++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:started?jobB:jobA})});});
@@ -961,7 +963,7 @@ async function mergeJobOutcomeRace(page:import('@playwright/test').Page,planning
  app=await startServer(config,0,undefined,gateway,undefined,undefined,undefined,planning);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  const running=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'preparing'});
- const merged=mergeJobRecord({...running,mergeActionId:'0f6b0000-0000-4000-8000-00000000ac01',state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:2,updatedAt:'2026-10-11T00:05:00Z'});
+ const merged=mergeJobRecord({...running,mergeActionId:'0f6b0000-0000-4000-8000-00000000ac01',state:'merged',step:null,url:'https://github.com/owner/repo/pull/7',revision:5,updatedAt:'2026-10-11T00:05:00Z'});
  const race={ended:false,polls:0,hold:false,config,release:()=>{},held:Promise.resolve()};
  let holding!:()=>void;race.held=new Promise<void>(resolve=>{holding=resolve;});
  const released=new Promise<void>(resolve=>{race.release=resolve;});
@@ -1124,11 +1126,11 @@ test('follows the running merge job when a click from an older review is refused
 });
 // A refused click's job is followed only when it is running and later than the job this page shows (web/public/app.js):
 // the server attaches the task's latest job to every merge-job refusal (web/server.ts), so an ended or older one comes too.
-const shownJob=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:'Required check failed: ci.',sequence:2,revision:3,updatedAt:'2026-10-11T00:00:05Z'});
+const shownJob=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:'Required check failed: ci.',sequence:2,revision:4,updatedAt:'2026-10-11T00:00:05Z'});
 for(const refusal of [
  {name:'an ended job',shown:null,button:'Merge PR',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'failed',step:null,reason:'The server restarted before the merge finished.'})},
  {name:'an older running job',shown:shownJob,button:'Retry merge',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'checks',checks:[{context:'ci',state:'pending'}],updatedAt:'2026-10-11T00:00:09Z'})},
- {name:'a running record no later than the job shown',shown:shownJob,button:'Retry merge',job:mergeJobRecord({...shownJob,state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}]})},
+ {name:'a running record no later than the job shown',shown:shownJob,button:'Retry merge',job:mergeJobRecord({...shownJob,state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}],revision:3})},
 ]){
  test(`asks for a refresh, not following it, when a refused merge click carries ${refusal.name} (F6b)`,async({page})=>{
   const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
@@ -1285,7 +1287,7 @@ test('follows the merge queue a polled job ended in, from a review with no queue
  const job=(state:MergeJobView['state'],step:MergeJobView['step'],revision:number)=>mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e1',mergeActionId:step==='preparing'?null:mergeActionId,state,step,revision});
  const queue=(state:string)=>({kind:'queue',state,reviewedHead:head,url:'https://github.com/example/repo/pull/7',reason:null,phase:state==='queued'?'AWAITING_CHECKS':null,position:state==='queued'?1:null,occurredAt:state==='merged'?'2026-10-11T00:10:00Z':null,actionId:mergeActionId,retryable:false});
  // The job ends queued; GitHub's queue merges two polls later.
- const steps=[{queue:null,job:job('running','merging',2)},{queue:queue('queued'),job:job('queued',null,3)},{queue:queue('queued'),job:job('queued',null,3)},{queue:queue('merged'),job:job('queued',null,3)}];
+ const steps=[{queue:null,job:job('running','merging',4)},{queue:queue('queued'),job:job('queued',null,5)},{queue:queue('queued'),job:job('queued',null,5)},{queue:queue('merged'),job:job('queued',null,5)}];
  const answered:Array<{queue:unknown;job:{state:string}}>=[];let reviews=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json(),running=job('running','preparing',1);
@@ -1316,7 +1318,7 @@ test('follows a later running merge job when a resent click replays its own ende
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const record=(id:string,sequence:number,state:MergeJobView['state'],step:MergeJobView['step'],reason:string|null=null)=>mergeJobRecord({id,sequence,state,step,reason,checks:step==='checks'?[{context:'ci',state:'pending'}]:[],revision:2});
+ const record=(id:string,sequence:number,state:MergeJobView['state'],step:MergeJobView['step'],reason:string|null=null)=>mergeJobRecord({id,sequence,state,step,reason,checks:step==='checks'?[{context:'ci',state:'pending'}]:[]});
  // The review shows an earlier job that ended blocked, so it offers Retry merge.
  const shown=record('0f6b0000-0000-4000-8000-0000000000d0',1,'blocked',null,'Required check failed: ci.');
  const clicks:string[]=[];let jobB:ReturnType<typeof record>|null=null,polls=0;
@@ -1384,8 +1386,8 @@ test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, whi
  let ended=false;
  // Before the job ends the poll sees it merging; then it ends `queued` with its attempt queued, and GitHub's queue
  // merges it on the next poll (or still holds it).
- const race=await endedJobQueueServer(page,(polls,{job,queue})=>!ended?{queue:null,job:job('running',2)}
-  :{queue:queue(variant.name==='merged'&&race.answered.filter(answer=>answer.startsWith('queued')).length>0?'merged':'queued'),job:job('queued',3)});
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>!ended?{queue:null,job:job('running',4)}
+  :{queue:queue(variant.name==='merged'&&race.answered.filter(answer=>answer.startsWith('queued')).length>0?'merged':'queued'),job:job('queued',5)});
  race.hold=true;
  if(variant.site==='Plans refresh')await page.getByRole('link',{name:'Plans',exact:true}).click();
  const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
@@ -1422,7 +1424,7 @@ test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, whi
 
 test('does not follow another attempt the poll answers beside a job that ended queued (F6b)',async({page})=>{
  // The job ended queued, but the poll's attempt is another one (its action ID is not the job's merge action ID).
- const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',2)}:{queue:queue('queued','0f6b0000-0000-4000-8000-0000000000ee'),job:job('queued',3)});
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',4)}:{queue:queue('queued','0f6b0000-0000-4000-8000-0000000000ee'),job:job('queued',5)});
  await expect(page.locator('#merge')).toHaveText('Merge queued',{timeout:15_000});
  const ended='Merge queued. Waiting for GitHub to confirm the outcome. Refresh to see the result.';
  await expect(page.locator('#banner')).toHaveText(ended);
@@ -1438,7 +1440,7 @@ for(const variant of [{state:'merged',label:'Merged',banner:'GitHub confirmed th
  {state:'removed',label:'1 blocker',banner:'Removed from merge queue. Required check failed. Refresh to verify retry readiness.',status:'Required check failed. Refresh to verify retry readiness.'}])
 test(`shows at once a job's attempt already ${variant.state} when the poll sees the job end queued (F6b)`,async({page})=>{
  // One poll answers the job ended queued and its attempt already ended.
- const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',2)}:{queue:queue(variant.state),job:job('queued',3)});
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',4)}:{queue:queue(variant.state),job:job('queued',5)});
  await expect(page.locator('#merge')).toHaveText(variant.label,{timeout:15_000});
  expect(race.answered).toEqual(['running/none',`queued/${variant.state}`]);
  await expect(page.locator('#banner')).toHaveText(variant.banner);
