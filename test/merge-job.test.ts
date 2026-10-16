@@ -517,6 +517,30 @@ it('asks GitHub to merge nothing once stopped, even if the checks pass meanwhile
   expect(f.coordinator.latest()).toMatchObject({ state: 'running' });
 });
 
+it('asks GitHub to merge nothing when shutdown stopped the job before the guarded merge was entered', async () => {
+  const f = setup();
+  // The step-3 review load (the job's step is `merging`) finishes even though shutdown aborted its signal, so the job
+  // reaches the guarded merge with a signal that is already aborted.
+  let release!: () => void, loaded!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), loading = new Promise<void>(resolve => { loaded = resolve; });
+  const load = f.review.load as unknown as ReturnType<typeof vi.fn>, view = load.getMockImplementation()!;
+  load.mockImplementation(async (...args: unknown[]) => {
+    if (f.coordinator.latest()?.step === 'merging') { loaded(); await gate; }
+    return view(...args);
+  });
+  const entered: boolean[] = [], merge = f.merges.merge.bind(f.merges);
+  f.merges.merge = ((token, actionId, caller) => { entered.push(caller?.aborted ?? false); return merge(token, actionId, caller); }) as typeof f.merges.merge;
+  const started = await f.coordinator.start('review-token', randomUUID());
+  await loading;
+  f.coordinator.stop();
+  release();
+  await f.coordinator.current;
+  expect(entered).toEqual([true]); // The guarded merge was entered, with the job's signal already aborted.
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getMergeAttempt(identity)).toBeNull(); // No attempt was begun.
+  expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running', step: 'merging' });
+});
+
 it('ends blocked when GitHub refuses the merge while shutdown stops the job', async () => {
   let coordinatorRef: MergeJobCoordinator | null = null;
   const f = setup({ merge: async () => { coordinatorRef!.stop(); throw new MergeSubmissionError('Base branch was modified.', 'refused'); } });
