@@ -724,6 +724,39 @@ it('starts no inspection after the wait limit and stops one that runs into it', 
   expect(f.gh.merged).toEqual([]);
 });
 
+it('ends blocked, waiting for GitHub, when mergeability is still being computed at the wait limit', async () => {
+  // No required checks wait: only GitHub's mergeability is unknown at every inspection.
+  const f = setup({ change: () => ({ mergeable: 'UNKNOWN' }), timing: { checkWaitMs: 300, firstDelayMs: 5, maxDelayMs: 5 } });
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(f.gh.inspections()).toBeGreaterThan(1);
+  // A 300 ms limit rounds to 0 minutes in the reason.
+  expect(done).toMatchObject({ state: 'blocked', checks: [],
+    reason: 'Required checks did not pass within 0 minutes: GitHub has not determined mergeability. Wait for GitHub to determine mergeability, then Retry merge.' });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+  expect(f.gh.merged).toEqual([]);
+});
+
+it('ends blocked, waiting for the checks, when no inspection answers before the wait limit', async () => {
+  let inspections = 0;
+  const f = setup({ checks: () => [pending()] });
+  const inspect = f.gh.client.inspect;
+  f.gh.client.inspect = (async (request: Parameters<typeof inspect>[0]) => {
+    inspections++;
+    // GitHub never answers; only the wait's limit ends the read.
+    await new Promise((_resolve, reject) => request!.signal!.addEventListener('abort', () => reject(request!.signal!.reason), { once: true }));
+    return inspect(request);
+  }) as typeof inspect;
+  const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 300, firstDelayMs: 5, maxDelayMs: 5 }); jobs.push(coordinator);
+  await coordinator.start('review-token', randomUUID());
+  const done = await settled(coordinator);
+  expect(inspections).toBe(1);
+  expect(done).toMatchObject({ state: 'blocked', checks: [],
+    reason: 'Required checks did not pass within 0 minutes: no inspection of them finished in time. Wait for the checks to pass, then Retry merge.' });
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+  expect(f.gh.merged).toEqual([]);
+});
+
 it('keeps a GitHub failure that came before the wait limit, even when the inspection settles after it', async () => {
   let inspections = 0, abortedFirst: unknown = null;
   const f = setup({ checks: () => [pending()] });
