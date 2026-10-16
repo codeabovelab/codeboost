@@ -221,6 +221,49 @@ it('ends failed, leaving the task in review, when the review changed while GitHu
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
+it('ends failed, leaving the task in review, when a new snapshot was observed while GitHub was asked to merge and refused', async () => {
+  let storeRef: Store | null = null, before = '';
+  const f = setup({ merge: async () => {
+    // The review screen's HEAD observation (no ledger entries) may run during a merge; it saves a new snapshot.
+    const store = storeRef!, snapshot = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, oid(1), oid(2), []);
+    throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
+  } });
+  storeRef = f.store; before = f.store.getSnapshot(identity).id;
+  const reviewVersion = f.store.reviewVersion(identity);
+  await f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/review changed while GitHub was asked to merge; review it first\.$/) });
+  // Only the snapshot changed: the plan revision and review version are those the attempt was admitted for.
+  expect(f.store.getSnapshot(identity).id).not.toBe(before);
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed', revision: 1, reviewVersion, snapshotId: before });
+  expect(f.store.reviewVersion(identity)).toBe(reviewVersion);
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('ends failed, leaving the task in review, when a plan revision lands after a queue poll removed the attempt and before the job resumed', async () => {
+  const f = setup({ queue: true });
+  const inspectQueue = f.gh.client as unknown as { inspectQueue: ReturnType<typeof vi.fn> };
+  inspectQueue.inspectQueue.mockImplementationOnce(async (head: string) =>
+    ({ state: 'removed', reviewedHead: head, removedAt: '2026-10-11T00:01:00Z', reason: 'The merge queue removed it: checks failed.' }));
+  const merge = f.merges.merge.bind(f.merges);
+  const reviewVersion = f.store.reviewVersion(identity), snapshotId = f.store.getSnapshot(identity).id;
+  f.merges.merge = (async (...args: Parameters<typeof merge>) => {
+    const result = await merge(...args);
+    await f.merges.pollQueue();
+    // The removed attempt no longer holds plan writes back, so a plan import lands before the job reads the attempt.
+    f.store.importRevision(JSON.stringify({ ...plan, revision: 2 }), 'json', context, 1);
+    return result;
+  }) as typeof merge;
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(f.store.getPlan(identity).revision).toBe(2);
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ actionId: done.mergeActionId, state: 'removed', revision: 1, snapshotId });
+  expect(f.store.reviewVersion(identity)).toBe(reviewVersion);
+  expect(f.store.getSnapshot(identity).id).toBe(snapshotId);
+  expect(done).toMatchObject({ state: 'failed', reason: expect.stringMatching(/review changed while GitHub was asked to merge; review it first\.$/) });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
 it('ends failed, leaving the task in review, when a failing check arrives after the review changed', async () => {
   let storeRef: Store | null = null;
   const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }], during: () => {
