@@ -1120,6 +1120,61 @@ it('words the guarded merge\'s refusal as what merging does when the base moves 
   await expect(f.merges.merge('review-token', randomUUID())).rejects.toThrow('The base branch moved. Rebase and review the resulting snapshot.');
 });
 
+/**
+ * Another page's review load observes a local HEAD the pull request does not have (runner/review.ts records it as a new
+ * snapshot with no ledger entries, which a merge job does not refuse). The task's state version advances, so the job's
+ * preparation no longer applies; GitHub's head is unchanged. The guarded merge's later passes that reuse the review it
+ * loaded see only that lost readiness: the reloads before the second pass and the final check see a new review token.
+ */
+function observeLocalHead(store: Store): void {
+  const snapshot = store.getSnapshot(identity);
+  store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, snapshot.base, oid(3), []);
+}
+const UNPREPARED_IN_JOB = 'The merge has not been prepared for the current review; merging prepares it.';
+
+for (const { pass, at, prefix } of [
+  { pass: 'the queue-correlation check', at: 3, prefix: 'Merge requirements changed after queue correlation. ' },
+  { pass: 'the queue-boundary check', at: 4, prefix: 'Merge requirements changed after queue correlation. ' },
+] as const) {
+  it(`words the guarded merge's refusal at ${pass} as what merging does when preparation no longer applies`, async () => {
+    // Inspections: 1 the job's wait, 2 and 3 the guarded merge's validation passes, 4 the queue-correlation check,
+    // 5 the queue-boundary check. The observation lands while inspection `at` reads GitHub; the next one refuses.
+    const observed: number[] = [];
+    let storeRef: Store | null = null;
+    const f = setup({ queue: true, change: () => ({ head: oid(2) }),
+      during: n => { if (n === at) { observeLocalHead(storeRef!); observed.push(n); } } });
+    storeRef = f.store;
+    await f.coordinator.start('review-token', randomUUID());
+    const done = await settled(f.coordinator);
+    // The interleaving happened: the inspection after the observation was the guarded merge's last.
+    expect(observed).toEqual([at]);
+    expect(f.gh.inspections()).toBe(at + 1);
+    expect(f.store.getMergeAttempt(identity)).toBeNull();
+    expect(done).toMatchObject({ state: 'failed', reason: `${prefix}${UNPREPARED_IN_JOB}` });
+    expect(f.gh.merged).toEqual([]);
+    expect(f.store.getTask(identity).status).toBe('in review');
+  });
+}
+
+it('words the guarded merge\'s refusal at the authorization check as what merging does when preparation no longer applies', async () => {
+  // Inspections: 1 the job's wait, 2 and 3 the guarded merge's validation passes, 4 the check after authorization.
+  const calls: string[] = [];
+  const f = setup({ change: () => ({ head: oid(2) }) });
+  f.merges.setAuthorization(async () => ({
+    // The observation lands while the issue's trust is read again from GitHub.
+    refresh: async () => { calls.push(`refresh after ${f.gh.inspections()}`); observeLocalHead(f.store); },
+    validate: () => { calls.push('validate'); } }));
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  // The interleaving happened: both validation passes were ready, and the inspection after the refresh refused.
+  expect(calls).toEqual(['refresh after 3']);
+  expect(f.gh.inspections()).toBe(4);
+  expect(f.store.getMergeAttempt(identity)).toBeNull();
+  expect(done).toMatchObject({ state: 'failed', reason: `Merge requirements changed during authorization validation. ${UNPREPARED_IN_JOB}` });
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
 it('keeps the unsettled push in the job\'s wording of the preparation blocker', async () => {
   const store = publishedTask(), gh = github(store);
   const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
