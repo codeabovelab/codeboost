@@ -729,6 +729,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // refusal saved. A failed read decides nothing: it saves nothing, and the same click may be sent again.
             let untrusted: string|null=null;
             if(config.github&&!mergeJobs.saved(input.actionId)) {
+              // Defensive: unreachable today. The merge check after the body is parsed already answers 503 once `stopping`
+              // is set, and nothing awaits between it and here; `runner.closing` is set only by shutdown, in the same turn
+              // as `stopping`. It keeps a later await added above from sending a trust read to GitHub during shutdown.
               if(stopping||runner?.closing)throw new ShuttingDownError();
               let access: IssueAccess|null=null;
               try { access=await readIssueAccess(requestAbort.signal); }
