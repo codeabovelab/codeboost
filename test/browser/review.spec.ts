@@ -1174,12 +1174,15 @@ test('follows the running merge job when a click from an older review is refused
  expect(mergeClicks).toBe(1);
 });
 // A refused click's job is followed only when it is running and later than the job this page shows (web/public/app.js):
-// the server attaches the task's latest job to every merge-job refusal (web/server.ts), so an ended or older one comes too.
+// the server attaches the task's latest job to every merge-job refusal (web/server.ts), so an ended one comes too, even
+// one later than the job this page shows (another tab's job that has ended since this page read its review).
 const shownJob=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c2',state:'blocked',step:null,reason:CHECK_FAILED_BLOCK,sequence:2,revision:4,updatedAt:'2026-10-11T00:00:05Z'});
 for(const refusal of [
  {name:'an ended job',shown:null,button:'Merge PR',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'failed',step:null,reason:'The server restarted before the merge finished.'})},
- {name:'an older running job',shown:shownJob,button:'Retry merge',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c1',state:'running',step:'checks',checks:[{context:'ci',state:'pending'}],updatedAt:'2026-10-11T00:00:09Z'})},
- {name:'a running record no later than the job shown',shown:shownJob,button:'Retry merge',job:mergeJobRecord({...shownJob,state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}],revision:3})},
+ {name:'an ended job later than the job shown',shown:shownJob,button:'Retry merge',job:mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000c3',state:'failed',step:null,reason:'The server restarted before the merge finished.',sequence:3,updatedAt:'2026-10-11T00:00:09Z'})},
+ // Defensive: the server's latest job only moves forward, so it cannot send a running record no later than the job this
+ // page shows. Kept to pin the "later than" half of the follow condition, which the reachable cases above do not reach.
+ {name:'a running record no later than the job shown (defensive)',shown:shownJob,button:'Retry merge',job:mergeJobRecord({...shownJob,state:'running',step:'checks',reason:null,checks:[{context:'ci',state:'pending'}],revision:3})},
 ]){
  test(`asks for a refresh, not following it, when a refused merge click carries ${refusal.name} (F6b)`,async({page})=>{
   const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
