@@ -122,7 +122,9 @@ describe('runner startup', () => {
     expect(await assembly.sources.vendor(service.config.identity)).toBe('claude');
     expect(() => assembly.sources.planContext({ ...service.config.identity, planId: 'other' })).toThrow(/only its configured plan/);
   });
-  it('fails a merge job an earlier process left running before it assembles anything (F6b)', async () => {
+  // Where in startup this runs does not matter: the server builds its merge job coordinator, and listens, only after
+  // setUpRunner resolves (web/server.ts), so no new job can start or be shown before the leftover one has ended.
+  it('fails a merge job an earlier process left running, during runner startup (F6b)', async () => {
     const { root, service } = fixture(), calls: string[] = [];
     const actionId = randomUUID();
     service.store.beginMergeJob(service.config.identity, { actionId, token: 'review-token' });

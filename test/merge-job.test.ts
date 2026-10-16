@@ -95,11 +95,11 @@ function github(store: Store, options: { checks?: (n: number) => RequiredCheck[]
   };
   return { client, merged, inspections: () => inspections };
 }
-function setup(options: Parameters<typeof github>[1] & { prepare?: Parameters<typeof preparation>[1] } = {}) {
+function setup(options: Parameters<typeof github>[1] & { prepare?: Parameters<typeof preparation>[1]; timing?: typeof TIMING } = {}) {
   const store = publishedTask(), review = service(store), gh = github(store, options);
   const merges = new MergeCoordinator(review, gh.client, undefined, undefined, PUBLISHED);
   const prep = preparation(store, options.prepare);
-  const coordinator = new MergeJobCoordinator(review, prep.fake, merges, undefined, TIMING); jobs.push(coordinator);
+  const coordinator = new MergeJobCoordinator(review, prep.fake, merges, undefined, options.timing ?? TIMING); jobs.push(coordinator);
   return { store, review, gh, merges, prep, coordinator };
 }
 const settled = async (coordinator: MergeJobCoordinator) => { await coordinator.current; return coordinator.latest()!; };
@@ -250,24 +250,30 @@ it('ends submitted when GitHub\'s merge outcome is unknown; the attempt stays in
 });
 
 it('stops waiting at once when the task is cancelled', async () => {
-  const f = setup({ checks: () => [pending()] });
+  // The first wait between inspections is far longer than this test may wait: only the job being told can end it.
+  const f = setup({ checks: () => [pending()], timing: { checkWaitMs: 600_000, firstDelayMs: 300_000, maxDelayMs: 300_000 } });
   await f.coordinator.start('review-token', randomUUID());
-  await vi.waitFor(() => expect(f.coordinator.latest()?.step).toBe('checks'));
+  await vi.waitFor(() => expect(f.coordinator.latest()?.checks).toEqual([{ context: 'ci', state: 'pending' }]));
+  const inspected = f.gh.inspections();
   // As the cancel route does: the task's cancel commits first, then the job is told.
   expect(f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID())).toBe('closed');
   f.coordinator.cancel();
-  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
+  const late = new Promise<'still waiting'>(resolve => setTimeout(() => resolve('still waiting'), 500).unref());
+  expect(await Promise.race([settled(f.coordinator), late])).toMatchObject({ state: 'cancelled' });
+  expect(f.gh.inspections()).toBe(inspected);
   expect(f.gh.merged).toEqual([]);
 });
 
 it('keeps the readiness preparation recorded valid while the job records its progress', async () => {
-  let readyAt: number | null = null;
-  const f = setup({ checks: n => { if (n === 1) readyAt = f.store.getTask(identity).stateVersion; return n <= 3 ? [pending()] : [passing()]; } });
+  const versions: number[] = [];
+  const f = setup({ checks: n => { versions.push(f.store.getTask(identity).stateVersion); return n <= 3 ? [pending()] : [passing()]; } });
   await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
-  // The guarded merge admitted the readiness bound at preparation: the job's own writes never advanced the task.
+  // Every inspection, from the one after preparation through the guarded merge's own, read the same task version:
+  // the job's three progress writes between them never advanced the task, so the guarded merge admitted that readiness.
+  expect(versions.length).toBeGreaterThanOrEqual(4);
+  expect(new Set(versions).size).toBe(1);
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'merged' });
-  expect(readyAt).not.toBeNull();
 });
 
 it('replays a resent click, refuses a second click while a job runs, and replays a refusal for a stale token', async () => {
