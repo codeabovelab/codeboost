@@ -1372,7 +1372,7 @@ async function endedJobQueueServer(page:import('@playwright/test').Page,answer:(
  await page.route('**/api/merge',async route=>{const next=answer(race.answered.length,{job:jobRecord,queue:queueRecord});
   race.answered.push(`${next.job.state}/${next.queue?.state??'none'}`);await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(next)});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
-  body.merge={...body.merge,ready:false,action:null,queue:null,job:jobRecord('running',2),blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};
+  body.merge={...body.merge,ready:false,action:null,queue:null,job:jobRecord('running',4),blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};
   if(race.hold){race.hold=false;holding();await released;}
   await route.fulfill({response,json:body});});
  await page.goto(app.url);
