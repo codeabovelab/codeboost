@@ -663,6 +663,18 @@ it('returns a saved refusal to a resend of the same click and refuses its ID for
   expect(() => store.recordMergeJobRefusal(identity, { actionId: id, token: 'other-token', reason: 'The runner is busy.' })).toThrow(ActionIdReused);
 });
 
+it('refuses a click ID saved under another plan as a reused ID, even with the same token', () => {
+  const store = publishedTask(), id = randomUUID();
+  const other = { ...identity, taskId: 'Task_43', planId: 'other' };
+  store.createPlan(JSON.stringify(plan), 'json', { ...context, identity: other }, oid(1), oid(2));
+  store.beginMergeJob(identity, { actionId: id, token: 'review-token' });
+  expect(() => store.beginMergeJob(other, { actionId: id, token: 'review-token' })).toThrow(ActionIdReused);
+  expect(() => store.recordMergeJobRefusal(other, { actionId: id, token: 'review-token', reason: 'The runner is busy.' })).toThrow(ActionIdReused);
+  expect(store.getMergeJob(other, id)).toBeNull();
+  expect(store.latestMergeJob(other)).toBeNull();
+  expect(store.getMergeJob(identity, id)).toMatchObject({ state: 'running' });
+});
+
 it('leaves a job that is no longer running unchanged when asked to update it', () => {
   const store = publishedTask(), id = randomUUID();
   store.beginMergeJob(identity, { actionId: id, token: 'review-token' });
