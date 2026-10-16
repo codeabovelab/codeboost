@@ -760,7 +760,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             }
             const running=mergeJobs.current;
             // The job's run never rejects, but this callback's own promise would: it must not throw (an unhandled rejection
-            // exits the server), so a failed read or close start is logged instead.
+            // exits the server), so a failed read or close start is logged instead. The `stopping` term is defensive:
+            // shutdown sets it in the same synchronous turn as it closes publishing, and a closing publisher starts no close
+            // (its `owed` reads the shutdown refusal as nothing owed) and has already aborted any publish in progress. The
+            // cancelled task's pull requests are closed by the next startup, whose publish of owed work finds the close owed.
             if(running)void running.finally(()=>{
               try { if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); }
               catch (error) { console.error(`Could not close the cancelled task's pull requests after its merge job: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
