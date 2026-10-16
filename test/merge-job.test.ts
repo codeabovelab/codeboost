@@ -352,7 +352,7 @@ it.each([false, true])('ends submitted, not merged or queued, when GitHub accept
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
-it.each(['finish', 'block'] as const)('reports a job it could not end (%s), which stays running and refuses a new click until startup settles it', async kind => {
+it.each(['finish', 'block'] as const)('reports a job it could not end (%s), which stays running and refuses a new click (saved, so a resend replays it) until startup settles it', async kind => {
   const f = setup(kind === 'block' ? { checks: () => [{ context: 'build', appId: null, state: 'failure' }] } : {});
   const fail = vi.fn(() => { throw new Error('disk full'); });
   const { blockMergeJob, finishMergeJob } = f.store;
@@ -367,11 +367,20 @@ it.each(['finish', 'block'] as const)('reports a job it could not end (%s), whic
     expect(fail).toHaveBeenCalledTimes(1);
     expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "disk full"`);
     expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
-    await expect(f.coordinator.start('review-token', randomUUID())).rejects.toThrow(/already running/);
+    // The coordinator has no job in memory; the store's running record refuses the click, and that refusal is saved.
+    const refused = randomUUID();
+    expect(f.coordinator.active).toBe(false);
+    await expect(f.coordinator.start('review-token', refused)).rejects.toThrow('A merge is already running for this task.');
+    expect(f.store.getMergeJob(identity, refused)).toMatchObject({ state: 'failed', refused: true, reason: 'A merge is already running for this task.' });
     // The next start settles it (runner/production.ts), once the store writes again.
     Object.assign(f.store, { blockMergeJob, finishMergeJob });
     f.store.settleInterruptedMergeJobs(identity);
     expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: kind === 'block' ? 'failed' : 'submitted' });
+    // A resend of the refused click replays its saved refusal (stale now, for that click only) and starts nothing.
+    const loads = (f.review.load as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    await expect(f.coordinator.start('review-token', refused)).rejects.toThrow('A merge is already running for this task.');
+    expect((f.review.load as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(loads);
+    expect(f.coordinator.active).toBe(false);
   } finally { logged.mockRestore(); }
 });
 
@@ -523,7 +532,7 @@ it('asks GitHub to merge nothing when shutdown stopped the job before the guarde
   // reaches the guarded merge with a signal that is already aborted.
   let release!: () => void, loaded!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; }), loading = new Promise<void>(resolve => { loaded = resolve; });
-  const load = f.review.load as unknown as ReturnType<typeof vi.fn>, view = load.getMockImplementation()!;
+  const load = f.review.load as unknown as ReturnType<typeof vi.fn>, view = load.getMockImplementation() as (...args: unknown[]) => unknown;
   load.mockImplementation(async (...args: unknown[]) => {
     if (f.coordinator.latest()?.step === 'merging') { loaded(); await gate; }
     return view(...args);

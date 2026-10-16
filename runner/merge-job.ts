@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MergeBlocked, MergeOutcomeUnknown, PUSH_UNSETTLED, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
@@ -92,7 +92,15 @@ export class MergeJobCoordinator {
       if (typeof token === 'string' && token) store.recordMergeJobRefusal(identity, { actionId, token, reason: refusal });
       throw new GuardRefusal(refusal);
     }
-    const { job } = store.beginMergeJob(identity, { actionId, token: token as string });
+    let job: MergeJob;
+    try { ({ job } = store.beginMergeJob(identity, { actionId, token: token as string })); }
+    catch (error) {
+      // The store's own refusal (a job still running on disk after its ending write failed, or a closed task) is
+      // definite too: saved and replayed like the refusals above.
+      if (error instanceof GuardRefusal && !(error instanceof ActionIdReused))
+        store.recordMergeJobRefusal(identity, { actionId, token: token as string, reason: error.message });
+      throw error;
+    }
     const abort = new AbortController(); this.#abort = abort;
     const run = Promise.resolve().then(() => this.#run(job, abort.signal)).catch(error => {
       // Anything unexpected ends the job, unless shutdown stopped it (startup then settles it) or the task was cancelled
