@@ -202,8 +202,9 @@ export class MergeJobCoordinator {
       // is applied; after, the outcome is unknown.
       const merged = await this.merges.merge(view.token, mergeId, signal);
       // A fulfilled merge does not prove its outcome: when saving it fails, the attempt stays submitting and reconciles
-      // from GitHub; a queue poll may also have ended the attempt (removed, failed or merged) after it was saved queued
-      // and before this job resumed. This job's own attempt decides, as when the merge rejects.
+      // from GitHub. This job's own attempt decides, as when the merge rejects. A queue poll that ended the attempt
+      // (removed or failed) while GitHub was asked makes the guarded merge reject instead; one ending it after the save is
+      // defensive here: the save and this read run in one turn, and a poll's result needs I/O.
       const attempt = store.getMergeAttempt(identity);
       if (attempt?.actionId !== mergeId || attempt.state === 'submitting')
         return this.#finish(job.id, 'submitted', 'GitHub accepted the merge, but its outcome was not saved; it reconciles from GitHub.');
@@ -228,6 +229,9 @@ export class MergeJobCoordinator {
    */
   #endAsAttempt(job: MergeJob, attempt: MergeAttempt, reason: string, url: string | null): void {
     if (attempt.state === 'merged' || attempt.state === 'queued') return this.#finish(job.id, attempt.state, null, url);
+    // Reached through the merge's rejection. After a fulfilled merge this is defensive (see #run): a removal or failure
+    // recorded while GitHub was asked makes the guarded merge reject, and nothing can end the attempt after its save
+    // before the job reads it.
     if (attempt.state === 'failed' || attempt.state === 'removed') {
       // A refusal because the head changed needs a fresh review, not a retry: the task is not "approved" any more.
       if (attempt.requiresFreshReview)

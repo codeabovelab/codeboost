@@ -2220,7 +2220,7 @@ export class Store {
       // GitHub refused the job's own merge attempt: the block applies only to the review that attempt was admitted for.
       // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is. A review edit
       // or the review screen's HEAD observation (a new snapshot) may land while the attempt is in flight; a plan revision
-      // only once the attempt ended (#savePlan waits for an in-flight merge), such as a queue poll ending it before the job read it.
+      // only once the attempt ended (#savePlan refuses while a merge is in flight), such as a queue poll ending it while GitHub was asked.
       const attempt = job.mergeActionId ? this.getMergeAttempt(identity) : null;
       if (attempt && attempt.actionId === job.mergeActionId) {
         const plan = this.#current(key);

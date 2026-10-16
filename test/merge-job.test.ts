@@ -103,6 +103,24 @@ function setup(options: Parameters<typeof github>[1] & { prepare?: Parameters<ty
   return { store, review, gh, merges, prep, coordinator };
 }
 const settled = async (coordinator: MergeJobCoordinator) => { await coordinator.current; return coordinator.latest()!; };
+/** GitHub's merge command, held once asked until released; `started` resolves when the guarded merge asks. */
+function holdGatewayMerge() {
+  let release!: () => void, started!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const asked = new Promise<void>(resolve => { started = resolve; });
+  const merge = async () => { calls++; started(); await gate; return { url: 'https://github.com/owner/repo/pull/7' }; };
+  return { merge, release, started: asked, calls: () => calls };
+}
+/** Records how the guarded merge the job calls settled: fulfilled, or the error it rejected with. */
+function guardedMergeOutcome(merges: MergeCoordinator) {
+  const merge = merges.merge.bind(merges);
+  let settledAs: { fulfilled: true } | { rejected: unknown } | null = null;
+  merges.merge = (async (...args: Parameters<typeof merge>) => {
+    try { const result = await merge(...args); settledAs = { fulfilled: true }; return result; }
+    catch (error) { settledAs = { rejected: error }; throw error; }
+  }) as typeof merge;
+  return () => settledAs;
+}
 /** Holds the next review load until released or failed; a load whose signal aborts rejects with the abort's reason. */
 function holdNextLoad(review: ReviewService & { view: () => unknown }) {
   let release!: () => void, fail!: (error: Error) => void, started!: (signal?: AbortSignal) => void;
@@ -226,37 +244,50 @@ it('ends failed, leaving the task in review, when a new snapshot was observed wh
   const f = setup({ merge: async () => {
     // The review screen's HEAD observation (no ledger entries) may run during a merge; it saves a new snapshot.
     const store = storeRef!, snapshot = store.getSnapshot(identity);
-    store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, oid(1), oid(2), []);
+    // As production's load does, only for a HEAD that moved from the snapshot's (the user's checkout moved on).
+    store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, oid(1), oid(3), []);
     throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
   } });
   storeRef = f.store; before = f.store.getSnapshot(identity).id;
+  expect(f.store.getSnapshot(identity).head).toBe(oid(2));
   const reviewVersion = f.store.reviewVersion(identity);
   await f.coordinator.start('review-token', randomUUID());
   expect(await settled(f.coordinator)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/review changed while GitHub was asked to merge; review it first\.$/) });
   // Only the snapshot changed: the plan revision and review version are those the attempt was admitted for.
+  expect(f.store.getSnapshot(identity)).toMatchObject({ head: oid(3) });
   expect(f.store.getSnapshot(identity).id).not.toBe(before);
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'failed', revision: 1, reviewVersion, snapshotId: before });
   expect(f.store.reviewVersion(identity)).toBe(reviewVersion);
   expect(f.store.getTask(identity).status).toBe('in review');
 });
 
-it('ends failed, leaving the task in review, when a plan revision lands after a queue poll removed the attempt and before the job resumed', async () => {
-  const f = setup({ queue: true });
+it('ends failed, leaving the task in review, when a queue poll removes the attempt and a plan revision lands while GitHub is asked to merge', async () => {
+  // GitHub's merge command is held, so the queue poll and the plan import run while it is on its way: in one process this
+  // is the only order (the guarded merge saves its outcome, then the job reads it, with no I/O in between).
+  const asked = holdGatewayMerge();
+  const f = setup({ queue: true, merge: asked.merge });
   const inspectQueue = f.gh.client as unknown as { inspectQueue: ReturnType<typeof vi.fn> };
   inspectQueue.inspectQueue.mockImplementationOnce(async (head: string) =>
     ({ state: 'removed', reviewedHead: head, removedAt: '2026-10-11T00:01:00Z', reason: 'The merge queue removed it: checks failed.' }));
-  const merge = f.merges.merge.bind(f.merges);
+  const outcome = guardedMergeOutcome(f.merges);
   const reviewVersion = f.store.reviewVersion(identity), snapshotId = f.store.getSnapshot(identity).id;
-  f.merges.merge = (async (...args: Parameters<typeof merge>) => {
-    const result = await merge(...args);
-    await f.merges.pollQueue();
-    // The removed attempt no longer holds plan writes back, so a plan import lands before the job reads the attempt.
-    f.store.importRevision(JSON.stringify({ ...plan, revision: 2 }), 'json', context, 1);
-    return result;
-  }) as typeof merge;
   await f.coordinator.start('review-token', randomUUID());
-  const done = await settled(f.coordinator);
+  await asked.started;
+  // While the attempt is in flight, plan writes are refused.
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'submitting' });
+  expect(() => f.store.importRevision(JSON.stringify({ ...plan, revision: 2 }), 'json', context, 1)).toThrow(/A merge is in progress/);
+  await f.merges.pollQueue();
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'removed' });
+  // The removed attempt no longer holds plan writes back, so a plan import lands before GitHub answers.
+  f.store.importRevision(JSON.stringify({ ...plan, revision: 2 }), 'json', context, 1);
   expect(f.store.getPlan(identity).revision).toBe(2);
+  expect(f.coordinator.latest()).toMatchObject({ state: 'running', step: 'merging' });
+  asked.release();
+  const done = await settled(f.coordinator);
+  // The interleaving happened: GitHub accepted the command, but the guarded merge could not save it queued and rejected
+  // with the removal, so the job ended through its error path.
+  expect(asked.calls()).toBe(1);
+  expect(outcome()).toMatchObject({ rejected: expect.objectContaining({ message: 'The merge queue removed it: checks failed.' }) });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ actionId: done.mergeActionId, state: 'removed', revision: 1, snapshotId });
   expect(f.store.reviewVersion(identity)).toBe(reviewVersion);
   expect(f.store.getSnapshot(identity).id).toBe(snapshotId);
@@ -1129,25 +1160,26 @@ it('ends the job cancelled when its own review load rejects only after the task 
   expect(f.gh.merged).toEqual([]);
 });
 
-it.each(['removed', 'failed'] as const)('ends the job from its attempt when a queue poll records %s after the merge queued and before the job resumed', async state => {
-  const f = setup({ queue: true });
+it.each(['removed', 'failed'] as const)('ends the job from its attempt when a queue poll records %s while GitHub is asked to merge', async state => {
+  // GitHub's merge command is held, so the queue poll runs while it is on its way: in one process this is the only order
+  // (the guarded merge saves its outcome, then the job reads it, with no I/O in between).
+  const asked = holdGatewayMerge();
+  const f = setup({ queue: true, merge: asked.merge });
   const inspectQueue = f.gh.client as unknown as { inspectQueue: ReturnType<typeof vi.fn> };
   inspectQueue.inspectQueue.mockImplementationOnce(async (head: string) => state === 'removed'
     ? { state: 'removed', reviewedHead: head, removedAt: '2026-10-11T00:01:00Z', reason: 'The merge queue removed it: checks failed.' }
     : { state: 'failed', reviewedHead: head, entryId: 'E', reason: 'The merge queue failed it: checks failed.' });
-  // The guarded merge settles (attempt saved queued); a queue poll then ends the attempt before the job resumes.
-  const merge = f.merges.merge.bind(f.merges);
-  let queuedBeforePoll: string | undefined;
-  f.merges.merge = (async (...args: Parameters<typeof merge>) => {
-    const result = await merge(...args);
-    queuedBeforePoll = f.store.getMergeAttempt(identity)?.state;
-    await f.merges.pollQueue();
-    return result;
-  }) as typeof merge;
+  const outcome = guardedMergeOutcome(f.merges);
   await f.coordinator.start('review-token', randomUUID());
+  await asked.started;
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state: 'submitting' });
+  await f.merges.pollQueue();
+  expect(f.store.getMergeAttempt(identity)).toMatchObject({ state });
+  asked.release();
   const done = await settled(f.coordinator);
-  // The interleaving happened: the merge saved queued, and the poll ended this job's attempt before the job read it.
-  expect(queuedBeforePoll).toBe('queued');
+  // The interleaving happened: GitHub accepted the command, but the guarded merge could not save it queued and rejected
+  // with the poll's reason, so the job ended through its error path.
+  expect(outcome()).toMatchObject({ rejected: expect.objectContaining({ message: expect.stringMatching(/^The merge queue .* it: checks failed\.$/) }) });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ actionId: done.mergeActionId, state, requiresFreshReview: false });
   expect(done).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge: The merge queue .* it: checks failed\. Fix it, then Retry merge\.$/) });
   expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
