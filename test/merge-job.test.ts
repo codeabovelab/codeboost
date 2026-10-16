@@ -143,6 +143,23 @@ it('waits while a required check is pending, then merges once it passes', async 
   expect(f.gh.merged).toEqual([oid(2)]);
 });
 
+it('clears the pending checks it listed when it moves to merging', async () => {
+  let passes = false, release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const f = setup({ checks: () => [passes ? passing() : pending()],
+    merge: async () => { await held; return { url: 'https://github.com/owner/repo/pull/7' }; } });
+  const job = await f.coordinator.start('review-token', randomUUID());
+  try {
+    // The saved record lists the pending check while the job waits on it.
+    await vi.waitFor(() => expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }));
+    // The check passes; the guarded merge is held, so the saved record is read at the merging step.
+    passes = true;
+    await vi.waitFor(() => expect(f.gh.merged).toEqual([oid(2)]));
+    expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'running', step: 'merging', checks: [] });
+  } finally { release(); }
+  expect(await settled(f.coordinator)).toMatchObject({ id: job.id, state: 'merged', checks: [] });
+});
+
 it('ends approved, merge blocked when required checks do not pass in time', async () => {
   const f = setup({ checks: () => [pending('build'), { context: 'deploy', appId: null, state: 'missing' }] });
   await f.coordinator.start('review-token', randomUUID());

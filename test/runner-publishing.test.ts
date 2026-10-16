@@ -1847,7 +1847,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is already running for this task.', job: { id: started.body.job.id, state: 'running', step: 'checks' } } });
     expect(await merge(served.app, before.token, secondTab)).toMatchObject({ status: 409, body: { error: refused.body.error, job: { id: started.body.job.id } } });
     expect((await mergeState(served.app)).job).toMatchObject({ id: started.body.job.id });
-    expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/merge is running/) } });
+    expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; it prepares the merge itself.' } });
     // A publish cannot begin a refresh of the PR the job waits on: publishing refuses a task in review.
     expect(await act(served.app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
     expect(served.store.taskPullRequests(served.identity).every(pr => pr.refresh === null)).toBe(true);
