@@ -642,6 +642,16 @@ it('settles a job a crash left in its merge step from its merge attempt at start
   }
 });
 
+it('leaves a job that is no longer running unchanged when asked to update it', () => {
+  const store = publishedTask(), id = randomUUID();
+  store.beginMergeJob(identity, { actionId: id, token: 'review-token' });
+  expect(store.finishMergeJob(identity, id, { state: 'failed', reason: 'The pull request moved.' })).toBe(true);
+  const ended = store.getMergeJob(identity, id)!;
+  expect(store.updateMergeJob(identity, id, { step: 'merging', checks: [{ context: 'ci', state: 'pending' }] })).toBeNull();
+  // Neither the step, the checks nor the revision moved: a late update cannot revive or rewrite an ended job.
+  expect(store.getMergeJob(identity, id)).toEqual(ended);
+});
+
 it('blocks the job and the task in one write, leaving a task that moved meanwhile as it is', () => {
   const store = publishedTask(), first = randomUUID(), second = randomUUID();
   store.beginMergeJob(identity, { actionId: first, token: 'review-token' });
