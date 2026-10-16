@@ -270,6 +270,12 @@ async function pollMergeQueue(generation) {
       const ended = `${job ? mergeJobText(job) : "The merge job ended."} Refresh to see the result.`;
       data = withEndedMergeJob(data, job, ended);
       $("banner").textContent = ended;
+      // A job that ended `queued` left its attempt in GitHub's queue: follow it, as after a click answered with it.
+      const followed = withEndedJobQueue(data, job, update.queue);
+      if (followed !== data) {
+        data = followed;
+        showMergeQueueStatus(update.queue);
+      }
       renderMerge();
       return;
     }
@@ -334,6 +340,16 @@ function withMergeQueue(view, queue) {
   else
     blockers.unshift(...view.merge.blockers.filter(blocker => blocker.code === "queue-active"));
   return { ...view, merge: { ...view.merge, ready: false, action: null, queue, blockers } };
+}
+/**
+ * The view once a job is seen ended `queued`, with the merge attempt `queue` the same poll answered. The job's attempt
+ * (its action ID is the job's `mergeActionId`) is followed as the queue poll follows one: while GitHub's queue holds it,
+ * the control keeps the job's outcome and the queue poll continues; once it is merged, removed or failed, the control and
+ * banner read that, as they do for a queue merge. Any other job or attempt leaves the view unchanged.
+ */
+function withEndedJobQueue(view, job, queue) {
+  if (job?.state !== "queued" || !queue?.actionId || queue.actionId !== job.mergeActionId) return view;
+  return ["submitting", "queued"].includes(queue.state) ? { ...view, merge: { ...view.merge, queue } } : withMergeQueue(view, queue);
 }
 function showMergeQueueStatus(queue) {
   if (queue?.state === "merged") {
@@ -686,21 +702,24 @@ $("merge").onclick = async () => {
     mergeAction = null;
     if (updated.job) {
       // A merge job runs in the background (F6b); the page follows it. When the server could not reload the review after
-      // starting the job, it answers only the job: keep the page's review and follow the job on it.
+      // starting the job, it answers only the job: keep the page's review and follow the job on it. A resend can replay
+      // this click's ended job while a later one (another tab's retry) runs: the reloaded review then carries that later
+      // job, and the page follows the later record (by sequence, or revision within one job).
+      const job = !updated.mergeRefreshRequired && updated.merge?.job && laterMergeJob(updated.merge.job, updated.job) ? updated.merge.job : updated.job;
       data = updated.mergeRefreshRequired
-        ? { ...data, merge: { ...data.merge, ready: false, action: null, job: updated.job } }
-        : { ...updated, merge: { ...updated.merge, job: updated.job } };
-      if (updated.job.state !== "running") {
+        ? { ...data, merge: { ...data.merge, ready: false, action: null, job } }
+        : { ...updated, merge: { ...updated.merge, job } };
+      if (job.state !== "running") {
         // The job had already ended when the click was answered: nothing to follow, so say how to see its result, as the
         // job poll does when a job ends.
-        const ended = `${mergeJobText(updated.job)} Refresh to see the result.`;
-        data = withEndedMergeJob(data, updated.job, ended);
+        const ended = `${mergeJobText(job)} Refresh to see the result.`;
+        data = withEndedMergeJob(data, job, ended);
         render();
         $("banner").textContent = ended;
         return;
       }
       render();
-      $("banner").textContent = mergeJobText(updated.job);
+      $("banner").textContent = mergeJobText(job);
       return;
     }
     const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";

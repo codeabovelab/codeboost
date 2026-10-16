@@ -1263,3 +1263,80 @@ test('follows a one-click merge job from preparation through the required-check 
  await page.locator('#review-link').click();await reloaded;
  expect(reviews).toBeGreaterThan(reloadsBeforeEnd);
 });
+test('follows the merge queue a polled job ended in, from a review with no queue, to merged without Refresh (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const head=view.snapshot.head,mergeActionId='0f6b0000-0000-4000-8000-0000000000e9';
+ // Shapes as runner/merge-job.ts (mergeJobView) and runner/merge.ts (#queueStatus) answer them: the job's attempt carries
+ // the job's merge action ID.
+ const job=(state:string,step:string|null,revision:number)=>({id:'0f6b0000-0000-4000-8000-0000000000e1',mergeActionId:step==='preparing'?null:mergeActionId,state,step,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ const queue=(state:string)=>({kind:'queue',state,reviewedHead:head,url:'https://github.com/example/repo/pull/7',reason:null,phase:state==='queued'?'AWAITING_CHECKS':null,position:state==='queued'?1:null,occurredAt:state==='merged'?'2026-10-11T00:10:00Z':null,actionId:mergeActionId,retryable:false});
+ // The job ends queued; GitHub's queue merges two polls later.
+ const steps=[{queue:null,job:job('running','merging',2)},{queue:queue('queued'),job:job('queued',null,3)},{queue:queue('queued'),job:job('queued',null,3)},{queue:queue('merged'),job:job('queued',null,3)}];
+ const answered:Array<{queue:unknown;job:{state:string}}>=[];let reviews=0;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json(),running=job('running','preparing',1);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,queue:null,job:running,blockers:[...review.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE},job:running})});});
+ await page.route('**/api/merge',async route=>{const next=steps[Math.min(answered.length,steps.length-1)]!;answered.push(next);await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(next)});});
+ await page.route('**/api/review',async route=>{reviews++;const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:true,action:'merge',queue:null,job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ const clicked=page.waitForResponse(response=>response.url().endsWith('/api/action'));
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ // The page started from a review with no queue, and the click's answer has none either.
+ expect((await (await clicked).json()).merge.queue).toBeNull();
+ const reviewsAfterClick=reviews;
+ await expect(page.locator('#merge')).toHaveText('Merged',{timeout:20_000});
+ // The interleaving: a poll answered the ended `queued` job with its queue still active, and only a later poll saw the merge.
+ expect(answered.map(answer=>`${answer.job.state}/${(answer.queue as {state:string}|null)?.state??'none'}`).slice(0,4)).toEqual(['running/none','queued/queued','queued/queued','queued/merged']);
+ await expect(page.locator('#banner')).toHaveText('GitHub confirmed the reviewed head was merged.');
+ await expect(page.locator('#merge')).toHaveAttribute('aria-disabled','true');
+ // As after a queue merge: the merge status names the confirmed merge, and the blockers the job settled are gone.
+ await page.locator('#merge-details').click();
+ await expect(page.locator('dialog h2')).toHaveText('Merge status');
+ await expect(page.locator('dialog li')).toHaveText(['GitHub confirmed that the reviewed head was merged.']);
+ await page.keyboard.press('Escape');
+ expect(reviews).toBe(reviewsAfterClick); // No Refresh, and no background reload.
+});
+test('follows a later running merge job when a resent click replays its own ended job (F6b)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const record=(id:string,sequence:number,state:string,step:string|null,reason:string|null=null)=>({id,mergeActionId:null,state,step,reason,checks:step==='checks'?[{context:'ci',state:'pending'}]:[],url:null,sequence,revision:2,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z'});
+ // The review shows an earlier job that ended blocked, so it offers Retry merge.
+ const shown=record('0f6b0000-0000-4000-8000-0000000000d0',1,'blocked',null,'Required check failed: ci.');
+ const clicks:string[]=[];let jobB:ReturnType<typeof record>|null=null,polls=0;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}clicks.push(body.actionId);
+  // The first answer is lost before the server admitted the click; the server then saves its job A, which ends blocked,
+  // and another tab's retry starts job B.
+  if(clicks.length===1){await route.abort('failed');return;}
+  const jobA=record(body.actionId,2,'blocked',null,'Required check failed: ci.');jobB=record('0f6b0000-0000-4000-8000-0000000000d3',3,'running','checks');
+  // As web/server.ts answers a resend: the replayed job A, with the review reloaded meanwhile, whose job is the latest (B).
+  const response=await route.fetch({url:route.request().url().replace('/api/action','/api/review'),method:'GET'}),review=await response.json();
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:jobB},job:jobA})});});
+ await page.route('**/api/merge',async route=>{polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:jobB})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,job:shown,ready:true,action:'retry'};await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>void dialog.accept());
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();
+ await expect(page.locator('#banner')).toContainText('Merge blocked.');
+ const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await reloaded;
+ const resent=page.waitForResponse(response=>response.url().endsWith('/api/action'));
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();
+ const answer=await (await resent).json();
+ // The interleaving: the resend carried the first click's key, and its answer replayed that click's ended job A beside
+ // the later running job B.
+ expect(clicks).toHaveLength(2);expect(clicks[1]).toBe(clicks[0]);
+ expect(answer.job).toMatchObject({id:clicks[0],state:'blocked',sequence:2});
+ expect(answer.merge.job).toMatchObject({state:'running',sequence:3});
+ // The page follows B, not A's outcome.
+ await expect(page.getByRole('button',{name:'Waiting for checks…',exact:true})).toHaveAttribute('aria-disabled','true');
+ await expect(page.locator('#banner')).toHaveText('Waiting for required checks: ci is pending.');
+ await expect.poll(()=>polls,{timeout:10_000}).toBeGreaterThan(0);
+ await expect(page.locator('#merge')).toHaveText('Waiting for checks…');
+ await expect(page.locator('#banner')).not.toContainText('Merge blocked');
+});
