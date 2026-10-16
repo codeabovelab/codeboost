@@ -1413,3 +1413,34 @@ test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, whi
  await expect(page.locator('#merge')).toHaveText(variant.label);
  await expect(page.locator('#banner')).toHaveText(variant.banner);
 });
+
+test('does not follow another attempt the poll answers beside a job that ended queued (F6b)',async({page})=>{
+ // The job ended queued, but the poll's attempt is another one (its action ID is not the job's merge action ID).
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',2)}:{queue:queue('queued','0f6b0000-0000-4000-8000-0000000000ee'),job:job('queued',3)});
+ await expect(page.locator('#merge')).toHaveText('Merge queued',{timeout:15_000});
+ const ended='Merge queued. Waiting for GitHub to confirm the outcome. Refresh to see the result.';
+ await expect(page.locator('#banner')).toHaveText(ended);
+ expect(race.answered).toEqual(['running/none','queued/queued']);
+ // The view is the job's outcome alone: the other attempt's queue is not shown or polled.
+ await page.waitForTimeout(3_000);
+ expect(race.answered).toHaveLength(2);
+ await expect(page.locator('#banner')).toHaveText(ended);
+ await expectEndedMergeJob(page,'Merge queued',ended);
+});
+
+for(const variant of [{state:'merged',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.',status:'GitHub confirmed that the reviewed head was merged.'},
+ {state:'removed',label:'1 blocker',banner:'Removed from merge queue. Required check failed. Refresh to verify retry readiness.',status:'Required check failed. Refresh to verify retry readiness.'}])
+test(`shows at once a job's attempt already ${variant.state} when the poll sees the job end queued (F6b)`,async({page})=>{
+ // One poll answers the job ended queued and its attempt already ended.
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>polls===0?{queue:null,job:job('running',2)}:{queue:queue(variant.state),job:job('queued',3)});
+ await expect(page.locator('#merge')).toHaveText(variant.label,{timeout:15_000});
+ expect(race.answered).toEqual(['running/none',`queued/${variant.state}`]);
+ await expect(page.locator('#banner')).toHaveText(variant.banner);
+ await page.locator('#merge-details').click();
+ await expect(page.locator('dialog h2')).toHaveText('Merge status');
+ await expect(page.locator('dialog li')).toHaveText([variant.status]);
+ await page.keyboard.press('Escape');
+ // Polling stops (the poll interval is 2 s).
+ await page.waitForTimeout(3_000);
+ expect(race.answered).toHaveLength(2);
+});
