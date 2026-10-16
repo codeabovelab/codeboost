@@ -984,6 +984,22 @@ it.each([
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
   ], 'failure'],
+  ['a newer started failure over a completed skip with the zero start time', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SKIPPED', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a newer started failure over a completed neutral run with no start time', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'NEUTRAL' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a completed run with no start time placed by its completion, after an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['a queued run with no start time over a completed pass', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
   ['a newer commit status over an older failed one', [
     { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
     { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },

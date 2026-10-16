@@ -164,14 +164,26 @@ function observedCheckState(check: Record<string, unknown>): 'success' | 'pendin
   const status = String(check.state ?? '').toUpperCase();
   return status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
 }
+/** A real time gh reports, or NaN for none or the zero time (year 1) it gives a run that has not started or finished. */
+function observedTime(value: unknown): number {
+  const at = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : NaN;
+}
 /**
- * When an observed check run or status started, to pick the latest of several with one name. gh reports a run that has
- * not started yet with no time or the zero time (year 1); such a run was queued after every started one, so it counts
- * as the latest.
+ * When an observed check run or status started, to pick the latest of several with one name. A run not yet completed
+ * (queued, in progress, pending) with no start time was queued after every started one, so it counts as the latest. A
+ * completed run with no start time is placed at its completion time, or else counts as the oldest, so it never outranks
+ * a run that started (fail closed).
  */
 function observedCheckStart(check: Record<string, unknown>): number {
-  const at = typeof check.startedAt === 'string' ? Date.parse(check.startedAt) : NaN;
-  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : Number.POSITIVE_INFINITY;
+  const started = observedTime(check.startedAt);
+  if (Number.isFinite(started)) return started;
+  const completed = typeof check.name === 'string'
+    ? String(check.status ?? '').toUpperCase() === 'COMPLETED'
+    : ['SUCCESS','FAILURE','ERROR'].includes(String(check.state ?? '').toUpperCase());
+  if (!completed) return Number.POSITIVE_INFINITY;
+  const finished = observedTime(check.completedAt);
+  return Number.isFinite(finished) ? finished : Number.NEGATIVE_INFINITY;
 }
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
