@@ -953,6 +953,40 @@ it('doubles the wait between required-check inspections from the first delay up 
   expect(waits).toEqual([3, 6, 12, 20, 20, 20]);
 });
 
+it('waits for required checks with the production timing when constructed without one, as the server does', async () => {
+  // Required checks never pass. The clock and timers are fake, so the 30-minute wait runs at once.
+  const f = setup({ checks: () => [pending()] });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+  const waits: number[] = [];
+  try {
+    const coordinator = new MergeJobCoordinator(f.review, f.prep.fake, f.merges); jobs.push(coordinator);
+    const timer = setTimeout, spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number, ...args: unknown[]) => {
+      if (coordinator.latest()?.step === 'checks') waits.push(ms ?? 0);
+      return timer(handler, ms, ...args);
+    }) as typeof setTimeout);
+    try {
+      await coordinator.start('review-token', randomUUID());
+      for (let turn = 0; coordinator.active && turn < 1_000; turn++) {
+        await new Promise(resolve => setImmediate(resolve));
+        vi.advanceTimersToNextTimer();
+      }
+      expect(await settled(coordinator)).toMatchObject({ state: 'blocked',
+        reason: 'Required checks did not pass within 30 minutes: ci is pending. Wait for the checks to pass, then Retry merge.' });
+    } finally { spy.mockRestore(); }
+  } finally { vi.useRealTimers(); }
+  // 10 s first, doubling to the 60 s maximum, and the last wait cut to what is left of the 30 minutes.
+  expect(waits.slice(0, 5)).toEqual([10_000, 20_000, 40_000, 60_000, 60_000]);
+  expect(waits.reduce((sum, ms) => sum + ms, 0)).toBe(30 * 60_000);
+  expect(waits).toEqual([10_000, 20_000, 40_000, ...Array<number>(28).fill(60_000), 50_000]);
+});
+
+it('refuses a merge job timing that is not a whole, non-negative number of milliseconds', () => {
+  const f = setup();
+  for (const timing of [{ checkWaitMs: -1 }, { firstDelayMs: 1.5 }, { maxDelayMs: Number.NaN }, { checkWaitMs: Number.POSITIVE_INFINITY }])
+    expect(() => new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, timing)).toThrow('Invalid merge job timing.');
+  expect(() => new MergeJobCoordinator(f.review, f.prep.fake, f.merges, undefined, { checkWaitMs: 0, firstDelayMs: 0, maxDelayMs: 0 })).not.toThrow();
+});
+
 it('words the guarded merge\'s refusal as what merging does when the base moves after the job\'s last ready inspection', async () => {
   // Inspection 1 is the job's wait (ready); a push to the base lands before inspection 2, the guarded merge's first.
   const f = setup({ change: n => (n >= 2 ? { base: oid(5) } : {}) });
