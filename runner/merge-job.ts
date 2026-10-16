@@ -61,7 +61,7 @@ export class MergeJobCoordinator {
    * Admit the click and start its job after the caller's transaction commits. A resend of the same click returns its
    * job without starting another. A definite refusal is saved under the click's action ID and replayed on resend. A
    * refusal during shutdown saves nothing, so that click may be sent again, and neither does one for a click without a
-   * usable review token (nothing to save it under; it is refused as stale every time).
+   * usable review token (it is refused, as stale or because a job runs, and nothing is saved).
    */
   async start(token: unknown, actionId: string, busy: () => string | null = () => null, signal?: AbortSignal): Promise<MergeJobView> {
     const { store, config } = this.service, identity = config.identity;

@@ -1227,6 +1227,18 @@ it.each([['an empty', ''], ['a non-string', 42]] as const)('refuses a click with
   expect(f.prep.calls).toEqual([]);
 });
 
+it('refuses a click without a usable token while a job runs as already running, saving nothing', async () => {
+  const f = setup({ checks: () => [pending()] }), id = randomUUID();
+  await f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.coordinator.latest()).toMatchObject({ state: 'running', step: 'checks' }));
+  const refused = await f.coordinator.start('', id).then(() => null, (error: unknown) => error);
+  expect(refused).toBeInstanceOf(GuardRefusal);
+  expect((refused as Error).message).toBe('A merge is already running for this task.');
+  expect(f.store.getMergeJob(identity, id)).toBeNull();
+  f.coordinator.cancel();
+  await f.coordinator.current;
+});
+
 it('saves no prepare-merge action when preparation can no longer start once the job\'s first review load resolves', async () => {
   // Defensive at the coordinator's boundary (see #run): the server refuses a standalone preparation while a job runs and
   // stops the job before preparation at shutdown, so the fake's startability changes directly.

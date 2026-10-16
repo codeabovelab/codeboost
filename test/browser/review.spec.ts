@@ -843,7 +843,7 @@ test('keeps a draft typed while a merge-job click is in flight (F6b)',async({pag
  await expect(page.getByLabel('Question about this item')).toHaveValue('Typed while the merge request was in flight.');
 });
 
-for(const refusal of [{name:'refused',status:409,error:'Issue #1 is not trusted for its current author.'},{name:'not applied',status:503,error:'The server is shutting down.'}])
+for(const refusal of [{name:'refused',status:409,error:'Issue #1 is not trusted for its current author.'},{name:'not applied',status:503,error:'The review server is shutting down.'}])
 test(`keeps a draft typed while a merge-job click is in flight and then ${refusal.name} (F6b)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -851,7 +851,8 @@ test(`keeps a draft typed while a merge-job click is in flight and then ${refusa
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
-  await held;await route.fulfill({status:refusal.status,contentType:'application/json',body:JSON.stringify({error:refusal.error})});});
+  // A merge-job refusal (409) carries the task's latest job, none here; a shutdown (503) carries only its error.
+  await held;await route.fulfill({status:refusal.status,contentType:'application/json',body:JSON.stringify(refusal.status===409?{error:refusal.error,job:null}:{error:refusal.error})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
@@ -1203,7 +1204,7 @@ test('keeps focus on the Merge button when a merge-job click is refused (F6b)',a
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  let mergeClicks=0;
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}mergeClicks++;
-  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Issue #1 is not trusted for its current author.'})});});
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Issue #1 is not trusted for its current author.',job:null})});});
  // A runner server reports merging as a job (its merge status carries `job`).
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
