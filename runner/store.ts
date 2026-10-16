@@ -2222,6 +2222,12 @@ export class Store {
           return this.finishMergeJob(identity, id, { state: 'failed',
             reason: `${reason} The review changed while GitHub was asked to merge; review it first.` });
       }
+      // The attempt and merge terms are defensive. A job blocks after its preparation settled (every check attempt it
+      // admitted ended), and while it runs nothing else admits an attempt or a merge: the server refuses start, resume,
+      // a standalone preparation and a second merge click; admission refuses item work in review; and a merge attempt is
+      // begun only by the job's own guarded merge. With `readyFor`, any later admission moved the state version, so the
+      // job ended `failed` above. Otherwise the job's own merge attempt ended (failed or removed) before the block, and
+      // startup recovery blocks only for such an attempt.
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);

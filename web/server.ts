@@ -744,6 +744,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
               if(access) try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
             }
             let job: Awaited<ReturnType<MergeJobCoordinator['start']>>;
+            // The executor term is defensive. Admission needs a task in review (or approved, merge blocked), and an executor
+            // run holds its task out of those statuses: an item run is queued or running (admission refuses item work in
+            // review), only a publish moves a task to in review, and it does so only after the run has returned (a publish
+            // refuses while the executor is busy). A run started from review that only settles owed work ends synchronously,
+            // so it is busy only for the microtasks before its promise settles.
             try {
               job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
                 ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
