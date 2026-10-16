@@ -590,18 +590,23 @@ it.each(['submitted', 'blocked'] as const)('reports a job it could not end durin
 });
 
 it('settles a job a crash left in its merge step from its merge attempt at startup', async () => {
-  for (const [settle, expected, status] of [
-    [() => undefined, 'submitted', 'in review'],
-    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged'],
-    [(store: Store, id: string) => store.queueMergeAttempt(identity, id, 'https://github.com/owner/repo/pull/7'), 'queued', 'in review'],
-    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Head branch was modified.', requiresFreshReview: true }), 'failed', 'in review'],
+  for (const [settle, expected, status, outcome] of [
+    [() => undefined, 'submitted', 'in review', { reason: 'The server restarted while GitHub\'s merge outcome was unknown; it reconciles from GitHub.', url: null }],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'merged', url: 'https://github.com/owner/repo/pull/7' }), 'merged', 'merged',
+      { reason: null, url: 'https://github.com/owner/repo/pull/7' }],
+    [(store: Store, id: string) => store.queueMergeAttempt(identity, id, 'https://github.com/owner/repo/pull/7'), 'queued', 'in review',
+      { reason: null, url: 'https://github.com/owner/repo/pull/7' }],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Head branch was modified.', requiresFreshReview: true }), 'failed', 'in review',
+      { reason: 'GitHub refused the merge: Head branch was modified. Review the new head first.', url: null }],
     // GitHub refused while a person changed the review: the refusal says nothing about the changed review.
     [(store: Store, id: string) => {
       const snapshot = store.getSnapshot(identity);
       store.addReviewNote(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, 'P1', 'change', 'Changed during the merge.');
       store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' });
-    }, 'failed', 'in review'],
-    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked'],
+    }, 'failed', 'in review',
+      { reason: 'GitHub refused the merge: Base branch was modified. The review changed while GitHub was asked to merge; review it first.', url: null }],
+    [(store: Store, id: string) => store.finishMergeAttempt(identity, id, { state: 'failed', reason: 'Base branch was modified.' }), 'blocked', 'approved but merge blocked',
+      { reason: 'GitHub refused the merge: Base branch was modified. Fix it, then Retry merge.', url: null }],
   ] as const) {
     // GitHub never answers: the job is in its merge step when the process "crashes".
     const f = setup({ merge: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
@@ -611,7 +616,7 @@ it('settles a job a crash left in its merge step from its merge attempt at start
     expect(job).toMatchObject({ step: 'merging', mergeActionId: attempt.actionId });
     settle(f.store, attempt.id);
     f.store.settleInterruptedMergeJobs(identity);
-    expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: expected });
+    expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: expected, ...outcome });
     expect(f.store.getTask(identity).status).toBe(status);
     // A blocked job's reason ends with its next step; a failed one's never says "merge again": the page adds that once.
     const reason = f.store.getMergeJob(identity, job.id)!.reason ?? '';
@@ -668,7 +673,7 @@ it('decides a retried job only from its own merge attempt, never from an earlier
   f.store.beginMergeJob(identity, { actionId: crashed, token: 'review-token' });
   f.store.updateMergeJob(identity, crashed, { step: 'merging', mergeActionId: randomUUID() });
   f.store.settleInterruptedMergeJobs(identity);
-  expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: expect.stringMatching(/server restarted/) });
+  expect(f.store.getMergeJob(identity, crashed)).toMatchObject({ state: 'failed', reason: 'The server restarted before the merge finished.' });
 });
 
 it('refuses, saves and replays a click on a task that is not mergeable or is being cancelled', async () => {
