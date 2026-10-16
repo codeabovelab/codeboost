@@ -1161,9 +1161,10 @@ test('states the next step a blocked merge job names, once (F6b)',async({page})=
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  // The reason runner/merge-job.ts saves when the 30-minute wait ends: nothing failed, so the step is to wait.
  const reason='Required checks did not pass within 30 minutes: ci is pending. Wait for the checks to pass, then Retry merge.';
- // Every inspection that finds checks waiting saves the job again; 30 minutes of waits (10 s doubling to 60 s) is about 33
- // inspections after preparing (1) and the checks step (2), so the ended record is about revision 36.
- const blocked=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,revision:36});
+ // The highest revision such a record can reach: preparing saves 1 and the checks step 2. Each inspection that finds checks
+ // waiting saves once; with the 30-minute limit and waits of 10 s doubling to 60 s, inspections start at most at 0, 10, 30
+ // and 70 s, then every 60 s from 130 to 1750 s: 32 inspections, revisions 3 to 34. The timeout's block saves 35.
+ const blocked=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,revision:35});
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:blocked,mergeRefreshRequired:true})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
