@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -13,7 +13,7 @@ import type { PreparedAttempt, RunnerCoordinator, RunnerDeps } from '../runner/c
 import { SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace } from '../runner/execution.ts';
 import { GitBranchPusher } from '../runner/branch-push.ts';
 import { PullRequestPublisher } from '../runner/publish.ts';
-import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
+import { ensureCommit, openRunnerRepository, retainSnapshotCommit } from '../runner/runner-repository.ts';
 import { baseBranch } from '../runner/production.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
@@ -240,7 +240,12 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   /** The runner also admits command-check attempts, as pre-merge preparation starts them (held by `hold` too). */
   checks?: boolean;
   /** A runner block and no github.pullRequest: merging targets the PR the runner published, after preparation. */
-  runnerPublished?: boolean } = {}) {
+  runnerPublished?: boolean;
+  /**
+   * As a production runner server (`setUpRunner`): before any review load, the runner-owned repository holds the
+   * snapshot's commits and is set as `runnerRepository`, so reviews read `snapshot.head` there, never the user's HEAD.
+   */
+  runnerReview?: boolean } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -248,6 +253,12 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3,
     ...(options.runnerPublished ? {} : { pullRequest: 1 }), baseBranch: 'main' } } : {}), ...(options.runnerPublished ? { runner: {} } : {}) };
   app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, options.issueGateway, undefined, undefined, async service => {
+    if (options.runnerReview) {
+      const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
+      const snapshot = service.store.getSnapshot(service.config.identity);
+      for (const commit of new Set([snapshot.base, snapshot.head])) await retainSnapshotCommit(repository, commit);
+      service.config.runnerRepository = repository.path;
+    }
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
       const review = await service.load();
@@ -1800,9 +1811,12 @@ describe('the one-click merge job (F6b of #22)', () => {
       merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/100' }; } };
   };
   let createIdentity: () => PlanIdentity = () => { throw new Error('not set'); };
-  /** A review a person could merge: the demo's out-of-scope mode change undone, its unplanned changes accepted, all approved. */
-  const mergeable = (w: World) => {
-    chmodSync(join(w.demo.repository, 'run.sh'), 0o644); git(w.demo.repository, 'commit', '-qam', 'Restore declared scope');
+  /**
+   * The user's repository moves on after the task's snapshot: a runner server never reads it, so a review that observed
+   * the user's HEAD would record this commit as a new snapshot (`mergeableReview` asserts that it does not).
+   */
+  const moveUserHead = (w: World) => {
+    git(w.demo.repository, 'commit', '-q', '--allow-empty', '-m', 'A local commit the runner never reads');
   };
   const acceptAndApprove = async (service: ReviewService) => {
     let view = await service.load();
@@ -1810,6 +1824,29 @@ describe('the one-click merge job (F6b of #22)', () => {
       view = await service.act({ action: 'accept', key: segment.key, token: view.token });
     for (const item of view.items) if (item.state !== 'approved')
       view = await service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  };
+  /**
+   * A review a person could merge, reached as on a runner server (`runnerReview`): the person amends the plan so P2
+   * declares the demo's run.sh mode change (plan import, as /api/plan/import does) and approves it, the runner completes
+   * every item, and the person accepts the unplanned change and approves every item. Every load reads `snapshot.head`
+   * in the runner-owned repository, so the snapshot never moves to the user's HEAD.
+   */
+  const mergeableReview = async (service: ReviewService) => {
+    const s = service.store, id = service.config.identity, initial = s.getSnapshot(id);
+    expect(service.config.runnerRepository).toBeDefined();
+    expect(service.reviewRepository()).toEqual({ path: service.config.runnerRepository, runnerOwned: true });
+    expect(git(service.config.repository, 'rev-parse', 'HEAD')).not.toBe(initial.head);
+    const plan = s.getPlan(id);
+    plan.items.find(item => item.id === 'P2')!.files.push({ path: 'run.sh', kind: 'edit', renamed_from: null, change: 'Make the script executable.' });
+    s.importRevision(JSON.stringify(plan), 'json', service.planContext(), plan.revision);
+    const amended = await service.load();
+    s.saveReview(id, amended.expected, amended.items.map(item => approveItem(amended.plan, amended.segments, item.id, id, item.count === 0)), []);
+    completeAll(service);
+    await acceptAndApprove(service);
+    const view = await service.load();
+    expect(view.items.every(item => item.state === 'approved')).toBe(true);
+    expect(view.segments.filter(segment => segment.scope === 'out-of-scope')).toEqual([]);
+    expect(s.getSnapshot(id)).toEqual(initial);
   };
   const review = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/review`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
   const merge = async (app: App, token: string, actionId = randomUUID()) => {
@@ -1820,10 +1857,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   const mergeState = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/merge`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
 
   it('offers Merge PR while only blockers the job resolves remain, then waits for checks and merges, refusing prepare-merge and publish meanwhile', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let checks: RequiredCheck[] = [{ context: 'ci', appId: null, state: 'pending' }], storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => checks);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
       mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -1858,7 +1895,7 @@ describe('the one-click merge job (F6b of #22)', () => {
    }, 60_000);
 
   it('refuses start and resume while a merge job waits, even after a new plan revision is imported and approved; the import only ends the job failed', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     const base = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
     // The job's fresh inspections after its first are held until the test releases them (or the job's signal stops them),
@@ -1872,7 +1909,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       });
       return base.inspect(request);
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
       mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -1916,11 +1953,11 @@ describe('the one-click merge job (F6b of #22)', () => {
    }, 60_000);
 
   it('refuses start while a merge job prepares, even after a new plan revision is imported and approved', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;
     const held = new Promise<void>(resolve => { release = resolve; });
     const gh = gateway(() => storeRef!, () => []);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh, runnerPublished: true,
       // A preparation held until the test releases it; it then fails, as a real one does once the review changed under it.
       preMerge: service => ({
         get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
@@ -1955,7 +1992,7 @@ describe('the one-click merge job (F6b of #22)', () => {
    }, 60_000);
 
   it('admits issue trust before a merge job starts: an untrusted click is refused and replayed, a failed read saves nothing', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, access: 'untrusted' | 'unreadable' | 'trusted' = 'trusted', reads = 0, prepared = 0;
     const gh = gateway(() => storeRef!, () => []);
     const gate: IssueTrustGateway = { ...issueGateway, async issueAccess(number) {
@@ -1963,7 +2000,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       if (access === 'unreadable') throw new Error('GitHub returned HTTP 502');
       return access === 'trusted' ? { number, authorLogin: 'member', collaborator: true } : { number, authorLogin: 'outside', collaborator: false };
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, mergeGateway: gh, runnerPublished: true,
       preMerge: service => { const real = preparation(service); return { ...real, get active() { return false; }, get last() { return null; },
         start: (expected: { actionId: string }) => { prepared++; return (real.start as (value: unknown) => unknown)(expected); } } as unknown as PreMergeCoordinator; } });
     storeRef = served.store; createIdentity = () => served.identity;
@@ -1989,11 +2026,11 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('refuses a merge click while a preparation\'s command check holds the runner, and the resend replays the refusal', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, preparing = false;
     const hold = Promise.withResolvers<void>();
     const gh = gateway(() => storeRef!, () => []);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh,
       runnerPublished: true, checks: true, hold: hold.promise,
       // A preparation started by prepare-merge while the task is in review: it runs a command-check attempt through the
       // real runner (held until the test releases it) and waits for it to settle, as production's does.
@@ -2033,7 +2070,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers 503 and saves nothing when shutdown stops a merge click\'s trust read', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hang = false, reading = false;
     const gh = gateway(() => storeRef!, () => []);
     const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number, options = {}) {
@@ -2042,7 +2079,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       // GitHub does not answer; only the request's own abort (at the end of shutdown's drain) ends the read.
       return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true }));
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
@@ -2057,7 +2094,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers a merge click whose trust read fails with the job a resend of the same click saved meanwhile', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hold = false, fail!: (error: Error) => void, reading!: () => void;
     const held = new Promise<void>(resolve => { reading = resolve; });
     const gh = gateway(() => storeRef!, () => []);
@@ -2066,7 +2103,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       if (hold) { hold = false; reading(); return new Promise((_resolve, reject) => { fail = reject; }); }
       return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     const { token } = await review(served.app), id = randomUUID();
@@ -2085,7 +2122,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), 503, 'Issue trust could not be verified: Issue retrieval timed out.'],
     ['gh answered', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', '', ''), 502, 'Issue trust could not be verified: gh failed (exit 1): HTTP 404: Not Found'],
   ] as const)('keeps a merge click\'s trust read failure (%s) when shutdown starts while gh stops, saving nothing', async (_name, failure, status, error) => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hang = false, fail!: (error: Error) => void, reading!: () => void;
     const held = new Promise<void>(resolve => { reading = resolve; });
     const gh = gateway(() => storeRef!, () => []);
@@ -2094,7 +2131,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       reading();
       return new Promise((_resolve, reject) => { fail = reject; });
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
@@ -2111,11 +2148,11 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers 503 when shutdown stops the reload after a merge job was saved, keeping the saved job for a resend', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hanging = false;
     // From the click on, GitHub does not answer; only the caller's abort ends each read.
     const gh = gateway(() => storeRef!, () => [], () => hanging);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
     const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
@@ -2132,10 +2169,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers the started job when its click cannot reload the review, and the resent click returns the job', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => []);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2162,11 +2199,11 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('replays a click\'s own job on resend after that job ended and another click started a later job', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     // A failing required check ends each job blocked, which leaves the task mergeable again (Retry merge).
     const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2194,7 +2231,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers a merge click with the job\'s latest record when it ended during the click\'s reload', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, slow = false;
     const base = gateway(() => storeRef!, () => []);
     // The click's reload reads GitHub's display status (not fresh), and that read is held until the job has merged; the
@@ -2203,7 +2240,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       if (slow && !request?.fresh) await vi.waitFor(() => expect(storeRef!.latestMergeJob(createIdentity())?.state).toBe('merged'), { timeout: 40_000, interval: 50 });
       return base.inspect(request);
     } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2216,10 +2253,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('answers a merge click whose reload fails with the job\'s latest record, once the job ended during that reload', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => []);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2245,10 +2282,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('offers Merge PR to a task in review and Retry merge once a job ended blocked, from the task\'s current status', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2266,7 +2303,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, release!: () => void, preparing = false;
     const held = new Promise<void>(resolve => { release = resolve; });
     // The stub records a rebase to commits that do not exist, so it starts only once the click has been answered: the
@@ -2274,7 +2311,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     let answered!: () => void;
     const clickAnswered = new Promise<void>(resolve => { answered = resolve; });
     const gh = gateway(() => storeRef!, () => []);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh, runnerPublished: true,
       // A preparation caught in its push: it holds a real push marker, so a cancel waits ("stopping") until the push
       // settles, and clearing the marker closes the task, as production does.
       preMerge: service => {
@@ -2315,10 +2352,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('stops a waiting merge job promptly on shutdown and leaves it running on disk for the next startup', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hanging = false;
     const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }], () => hanging);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 30, maxDelayMs: 30 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2338,7 +2375,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('closes the merge job before the store, so a job settling after the shutdown abort records its outcome', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, merging: AbortSignal | null = null;
     const base = gateway(() => storeRef!, () => []);
     // GitHub was asked to merge; after the abort it answers, a little later, with a refusal.
@@ -2346,7 +2383,7 @@ describe('the one-click merge job (F6b of #22)', () => {
       merging = options!.signal!;
       merging.addEventListener('abort', () => setTimeout(() => reject(new MergeSubmissionError('Base branch was modified.', 'refused')), 300), { once: true });
     }) };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
@@ -2371,10 +2408,10 @@ describe('the one-click merge job (F6b of #22)', () => {
   }, 60_000);
 
   it('stops a waiting merge job when the task is cancelled, and closes the task\'s pull requests', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null;
     const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
       // Waits far longer than this test: only the cancel route's own stop can end the job in time.
       mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 60_000, maxDelayMs: 60_000 } });
     storeRef = served.store; createIdentity = () => served.identity;
@@ -2388,13 +2425,13 @@ describe('the one-click merge job (F6b of #22)', () => {
    }, 60_000);
 
   it('logs, and does not reject, when reading the task fails as the server follows a settled merge job', async () => {
-    const w = world(); mergeable(w);
+    const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, release!: () => void;
     const answered = new Promise<void>(resolve => { release = resolve; });
     const base = gateway(() => storeRef!, () => []);
     // GitHub answers the merge only once the click was answered, so the job settles after the click's own review reload.
     const gh: MergeGateway = { inspect: base.inspect, merge: async () => { await answered; return { url: 'https://github.com/acme/app/pull/100' }; } };
-    const served = await serve(w, { before: async service => { completeAll(service); await acceptAndApprove(service); }, issueGateway, preMerge: preparation, mergeGateway: gh,
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
       runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
     storeRef = served.store; createIdentity = () => served.identity;
     await publishSettled(served.app, served.identity);
