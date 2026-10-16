@@ -149,13 +149,11 @@ async function refresh() {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
-    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
-    if (newerJob) data = withMergeJobObservation(data, newerJob);
+    const newer = newerMergeObservations(updated, mergeObservationOwner);
+    data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
     snippetSelection = null;
     render();
-    if (newerQueue) showMergeQueueStatus(newerQueue);
-    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
+    showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -385,12 +383,10 @@ async function act(command) {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
-    data = newerQueue ? withMergeQueue(updated, newerQueue) : updated;
-    if (newerJob) data = withMergeJobObservation(data, newerJob);
+    const newer = newerMergeObservations(updated, mergeObservationOwner);
+    data = withNewerMergeObservations(updated, newer);
     render();
-    if (newerQueue) showMergeQueueStatus(newerQueue);
-    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
+    showNewerMergeObservations(newer);
     return true;
   } catch (error) {
     if (generation !== reviewGeneration) return false;
@@ -1045,6 +1041,29 @@ function withMergeJobObservation(view, job) {
     blockers: view.merge.blockers.filter(blocker => blocker.code !== "job-refresh") } };
   return withEndedMergeJob(view, job, mergeJobBanner(job));
 }
+/**
+ * The poll's observations that a full response read before them must keep: the merge attempt (`queue`), the task's latest
+ * job (`job`), and, for a kept job that ended `queued`, the attempt the poll followed for it (`jobQueue`, whose action ID
+ * is the job's `mergeActionId`). The full response's own queue may be none or another attempt's, so `queue` alone would
+ * drop the attempt the poll saw merged, removed or failed, or still queued and polled.
+ */
+function newerMergeObservations(updated, observationOwner) {
+  const queue = newerMergeQueue(updated, observationOwner), job = newerMergeJob(updated, observationOwner), followed = data?.merge?.queue;
+  const jobQueue = job?.state === "queued" && followed?.actionId && followed.actionId === job.mergeActionId ? followed : null;
+  return { queue, job, jobQueue };
+}
+/** The full response `view` with the newer observations kept, as the poll presented them. */
+function withNewerMergeObservations(view, { queue, job, jobQueue }) {
+  let kept = queue ? withMergeQueue(view, queue) : view;
+  if (job) kept = withMergeJobObservation(kept, job);
+  return jobQueue ? withEndedJobQueue(kept, job, jobQueue) : kept;
+}
+/** The banner for the newer observations kept, as the poll showed them; call after render. */
+function showNewerMergeObservations({ queue, job, jobQueue }) {
+  if (queue) showMergeQueueStatus(queue);
+  if (job) $("banner").textContent = mergeJobBanner(job);
+  if (jobQueue) showMergeQueueStatus(jobQueue);
+}
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
   const fullResponseIsTerminal = ["merged", "removed", "failed"].includes(older?.state);
@@ -1467,12 +1486,10 @@ async function importPlan(event) {
       mergePollState = null;
       mergePollDelay = 2000;
       rememberDraft();
-      const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
-      data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
-      if (newerJob) data = withMergeJobObservation(data, newerJob);
+      const newer = newerMergeObservations(updated, mergeObservationOwner);
+      data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
       render();
-      if (newerQueue) showMergeQueueStatus(newerQueue);
-      if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
+      showNewerMergeObservations(newer);
       if ($("plan-file").files[0] === file) $("plan-file").value = "";
       renderPlanFile();
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
@@ -1655,12 +1672,10 @@ async function applyPlanAuthor(index) {
       mergePollTimer = null;
       mergePollState = null;
       mergePollDelay = 2000;
-      const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
-      data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
-      if (newerJob) data = withMergeJobObservation(data, newerJob);
+      const newer = newerMergeObservations(updated, mergeObservationOwner);
+      data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
       render();
-      if (newerQueue) showMergeQueueStatus(newerQueue);
-      if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
+      showNewerMergeObservations(newer);
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     } catch (error) {
       request.observationError = `Revision r${revision} was applied, but the current plan could not reload. ${error.message}`;
@@ -1919,12 +1934,10 @@ $("plans-refresh").onclick = async () => {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated, mergeObservationOwner), newerJob = newerMergeJob(updated, mergeObservationOwner);
-    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
-    if (newerJob) data = withMergeJobObservation(data, newerJob);
+    const newer = newerMergeObservations(updated, mergeObservationOwner);
+    data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
     render();
-    if (newerQueue) showMergeQueueStatus(newerQueue);
-    if (newerJob) $("banner").textContent = mergeJobBanner(newerJob);
+    showNewerMergeObservations(newer);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;

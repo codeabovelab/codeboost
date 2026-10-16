@@ -1349,3 +1349,67 @@ test('follows a later running merge job when a resent click replays its own ende
  await expect(page.locator('#banner')).not.toContainText('Merge blocked');
 });
 
+/** A runner server whose every full review shows its merge job running in the guarded merge (`merging`), with no merge
+ * attempt (each was read before the job asked GitHub). The job poll answers `answer(polls)`, in the shapes
+ * runner/merge-job.ts (mergeJobView) and runner/merge.ts (#queueStatus) send: the job's attempt carries its merge action ID.
+ * A full review marked `race.hold` waits until `race.release()`. */
+async function endedJobQueueServer(page:import('@playwright/test').Page,answer:(polls:number,parts:{job:(state:MergeJobView['state'],revision:number)=>MergeJobView;queue:(state:string,actionId?:string)=>{state:string}})=>{queue:{state:string}|null;job:MergeJobView}){
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const head=view.snapshot.head,mergeActionId='0f6b0000-0000-4000-8000-0000000000e9';
+ const jobRecord=(state:MergeJobView['state'],revision:number)=>mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e1',mergeActionId,state,step:state==='running'?'merging':null,revision});
+ const queueRecord=(state:string,actionId=mergeActionId)=>({kind:'queue',state,reviewedHead:head,url:'https://github.com/example/repo/pull/7',reason:state==='removed'?'Required check failed.':null,phase:state==='queued'?'AWAITING_CHECKS':null,position:state==='queued'?1:null,occurredAt:state==='merged'||state==='removed'?'2026-10-11T00:10:00Z':null,actionId,retryable:state==='removed'});
+ const race={answered:[] as string[],hold:false,release:()=>{},held:Promise.resolve()};
+ let holding!:()=>void;race.held=new Promise<void>(resolve=>{holding=resolve;});
+ const released=new Promise<void>(resolve=>{race.release=resolve;});
+ await page.route('**/api/merge',async route=>{const next=answer(race.answered.length,{job:jobRecord,queue:queueRecord});
+  race.answered.push(`${next.job.state}/${next.queue?.state??'none'}`);await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(next)});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge={...body.merge,ready:false,action:null,queue:null,job:jobRecord('running',2),blockers:[...body.merge.blockers,...jobResolvedBlockers],settledBeforeJobMerge:SETTLED_BEFORE_JOB_MERGE};
+  if(race.hold){race.hold=false;holding();await released;}
+  await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ await expect(page.getByRole('button',{name:'Merging…',exact:true})).toBeVisible();
+ return race;
+}
+
+for(const variant of [{name:'merged',label:'Merged',banner:'GitHub confirmed the reviewed head was merged.'},{name:'still queued',label:'Merge queued',banner:'Merge queued at position 1. Waiting for GitHub.'}])
+test(`keeps the merge attempt a polled job ended queued in, ${variant.name}, while an older Refresh response was held (F6b)`,async({page})=>{
+ let ended=false;
+ // Before the job ends the poll sees it merging; then it ends `queued` with its attempt queued, and GitHub's queue
+ // merges it on the next poll (or still holds it).
+ const race=await endedJobQueueServer(page,(polls,{job,queue})=>!ended?{queue:null,job:job('running',2)}
+  :{queue:queue(variant.name==='merged'&&race.answered.filter(answer=>answer.startsWith('queued')).length>0?'merged':'queued'),job:job('queued',3)});
+ race.hold=true;
+ const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').click();await race.held;
+ // Selecting an item while Refresh waits renders the merge control, which schedules a poll; it sees the job end.
+ ended=true;
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await expect(page.locator('#merge')).toHaveText(variant.label,{timeout:15_000});
+ await expect(page.locator('#banner')).toHaveText(variant.banner);
+ // The interleaving: before the held Refresh response was released, the poll saw the job end queued and followed its attempt.
+ const afterEnd=race.answered.filter(answer=>answer!=='running/none');
+ if(variant.name==='merged')expect(afterEnd).toEqual(['queued/queued','queued/merged']);
+ else{expect(afterEnd.length).toBeGreaterThan(0);expect([...new Set(afterEnd)]).toEqual(['queued/queued']);}
+ const seen=race.answered.length;
+ race.release();
+ const answer=await (await refreshed).json();
+ // The held response was read while the job was merging, before it had an attempt.
+ expect(answer.merge).toMatchObject({queue:null,job:{state:'running',step:'merging'}});
+ await page.waitForTimeout(3_000);
+ if(variant.name==='merged'){
+  // Merged survives, and no poll restarts (the poll interval is 2 s).
+  expect(race.answered.length).toBe(seen);
+  await page.locator('#merge-details').click();
+  await expect(page.locator('dialog li')).toHaveText(['GitHub confirmed that the reviewed head was merged.']);
+  await page.keyboard.press('Escape');
+ }else{
+  // The attempt is still followed: the queue poll continues.
+  expect(race.answered.length).toBeGreaterThan(seen);
+ }
+ await expect(page.locator('#merge')).toHaveText(variant.label);
+ await expect(page.locator('#banner')).toHaveText(variant.banner);
+});
