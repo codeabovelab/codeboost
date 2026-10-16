@@ -1197,6 +1197,26 @@ test('keeps the Merge button pending while its click is in flight, across a rend
  await expect(page.getByRole('button',{name:'Preparing…',exact:true})).toHaveAttribute('aria-disabled','true');
 });
 
+test('keeps the direct Merge button disabled while its click is in flight, across a render',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let release!:()=>void,arrived!:()=>void;
+ const released=new Promise<void>(resolve=>{release=resolve;}),held=new Promise<void>(resolve=>{arrived=resolve;});
+ // No runner: the click merges directly, and the server answers once GitHub has.
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},
+  merge:async()=>{arrived();await released;return {url:'https://github.com/example/repo/pull/21'};}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await openReview(page,app.url);page.on('dialog',dialog=>dialog.accept());
+ const button=page.locator('#merge');
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await held;
+ await expect(button).toBeDisabled();await expect(button).toHaveText('Requesting merge…');
+ // Selecting an item renders the page, merge control included, while the click's request is still in flight.
+ await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+ await expect(page.getByRole('button',{name:/P2 Document retry behavior/})).toHaveAttribute('aria-current','true');
+ await expect(button).toBeDisabled();await expect(button).toHaveText('Requesting merge…');
+ release();
+ await expect(page.locator('#banner')).toContainText('Merge submitted.');await expect(button).toBeDisabled();
+});
+
 test('keeps focus on the Merge button when a merge-job click is refused (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -1289,9 +1309,12 @@ test('states the next step a blocked merge job names, once (F6b)',async({page})=
  // The highest revision such a record can reach: preparing saves 1 and the checks step 2. Each inspection that finds checks
  // waiting saves once; with the 30-minute limit and waits of 10 s doubling to 60 s, inspections start at most at 0, 10, 30
  // and 70 s, then every 60 s from 130 to 1750 s: 32 inspections, revisions 3 to 34. The timeout's block saves 35.
- const blocked=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000b2',state:'blocked',step:null,reason,revision:35});
+ const id='0f6b0000-0000-4000-8000-0000000000b2',blocked=mergeJobRecord({id,state:'blocked',step:null,reason,revision:35});
+ // The click is answered while the job prepares; the 30-minute wait ends long after, so the poll delivers the block.
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
-  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:blocked,mergeRefreshRequired:true})});});
+  const review=await clickReview(route),running=mergeJobRecord({id,state:'running',step:'preparing'});
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:{...review.merge,ready:false,action:null,job:running},job:running})});});
+ await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:blocked})}));
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge={...body.merge,job:null};await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
