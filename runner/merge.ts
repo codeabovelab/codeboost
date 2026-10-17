@@ -1,5 +1,5 @@
 import type { ReviewService, ReviewView } from './review.ts';
-import { mergeActionResponse, type MergeAttempt } from './store.ts';
+import { mergeActionResponse, type MergeAttempt, type TaskPullRequest } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type MergeTarget, type RemoteMergeState } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
@@ -20,6 +20,20 @@ export class MergeNotApplied extends Error {}
 class CommittedFailure extends Error {}
 /** The click was admitted but GitHub's outcome is unknown; its attempt stays in flight, so the key must be kept. */
 export class MergeOutcomeUnknown extends Error {}
+/**
+ * Validation refused because a blocker remains. Its message is the guarded merge's own wording; the blocker rides along
+ * so a merge job can word its reason as what merging does (runner/merge-job.ts `inJobTerms`).
+ */
+export class MergeBlocked extends Error {
+  readonly prefix: string;
+  readonly blocker: MergeBlocker | undefined;
+  constructor(prefix: string, blocker: MergeBlocker | undefined) {
+    super(`${prefix}${blocker?.message ?? 'Merge is blocked.'}`);
+    this.prefix = prefix; this.blocker = blocker;
+  }
+}
+/** The preparation blocker's message while a push of the rewritten head has not settled. */
+export const PUSH_UNSETTLED = 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.';
 export interface MergeQueueStatus {
   kind: MergeAttempt['kind']; state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
   phase: MergeAttempt['phase']; position: number | null; occurredAt: string | null; retryable: boolean;
@@ -119,8 +133,32 @@ export class MergeCoordinator {
     if (!latest || latest.number === null) throw new MergeTargetUnavailable(`The task has no published pull request into ${published.baseBranch}.`);
     if (published.configured !== undefined && published.configured !== latest.number)
       throw new MergeTargetUnavailable(`github.pullRequest is #${published.configured}, but the task's pull request is #${latest.number}. Remove github.pullRequest from the review configuration.`);
-    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch }, openingId: latest.openingId,
-      marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
+    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch, ...this.#alreadyFixedRange(here, published.baseBranch) },
+      openingId: latest.openingId, marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
+  }
+
+  /**
+   * The already-fixed scan of a runner-published PR (F6b of #22). It must cover every base commit after the task's
+   * original base (its first snapshot's), since a rebase can bring any of them under the PR. The pre-PR check of the
+   * task's first opening into the current base branch scanned that branch from its snapshot's base to its tip and found
+   * nothing; when that base is the task's original base, the scan starts at that tip: commits a later rebase onto the
+   * branch brings in up to that tip were scanned by that check, and later ones are in this scan, whichever of the
+   * task's openings the merge follows. An opening into another base branch says nothing about this one. A first
+   * opening recorded before schema v19 has no check, and no record shows which base branch an older check scanned (a
+   * publish may record a check and stop before opening), so no other check stands in. Then, and when the check scanned
+   * from a rebased base, the scan starts at the task's original base. The task's own commits are excluded.
+   */
+  #alreadyFixedRange(here: TaskPullRequest[], base: string): { alreadyFixedSince: string; ownCommits: string[] } {
+    const { store, config } = this.service, identity = config.identity;
+    const original = store.firstSnapshot(identity).base;
+    const first = here.find(pr => pr.base === base);
+    const check = first?.checkId ? store.getAlreadyFixed(identity, first.checkId) : null;
+    const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
+    // The outcome term is defensive: beginPullRequest saves a check ID only for a clear check (#assertCheckedHead).
+    if (check?.result.outcome !== 'clear') return { alreadyFixedSince: original, ownCommits };
+    let scannedFrom: string | null = null;
+    try { scannedFrom = store.getSnapshot(identity, check.snapshotId).base; } catch { /* unknown: scan from the original base */ }
+    return { alreadyFixedSince: scannedFrom === original ? check.result.baseHead : original, ownCommits };
   }
 
   /** Whether GitHub shows the task's published PR where it was opened, as the only open PR from its branch. */
@@ -209,7 +247,7 @@ export class MergeCoordinator {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
       if (task.pushInProgress) blockers.push({ code: 'preparation',
-        message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' });
+        message: PUSH_UNSETTLED });
       else if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
         && !this.service.store.preMergeReady(this.service.config.identity, {
           stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
@@ -283,7 +321,18 @@ export class MergeCoordinator {
       ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
       : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' };
     if (attempt?.state === 'merged') return { code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' };
-    if (attempt && !this.#freshReviewComplete(attempt)) return { code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+    if (attempt && !this.#freshReviewComplete(attempt)) {
+      // A new snapshot or plan revision after an attempt (a rebase, for example) needs every item approved again for it;
+      // the attempt's own reason (often GitHub's refusal) would not say so.
+      const { store, config } = this.service;
+      const after = attempt.reason ? ` (${attempt.reason})` : '';
+      const message = store.getSnapshot(config.identity).id !== attempt.snapshotId
+        ? `The pull request changed after the last merge attempt${after}. Approve every item again for the replacement snapshot, then merge.`
+        : store.getPlan(config.identity).revision !== attempt.revision
+          ? `The plan changed after the last merge attempt${after}. Approve every item again for the new plan revision, then merge.`
+          : attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.';
+      return { code: 'queue-head', message };
+    }
     return null;
   }
 
@@ -306,7 +355,7 @@ export class MergeCoordinator {
    * `actionId` is the click's idempotency key. A resend with the same key (after a lost response) returns the saved
    * attempt's current outcome and never submits again.
    */
-  async merge(token: unknown, actionId?: unknown): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
+  async merge(token: unknown, actionId?: unknown, caller?: AbortSignal): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
     // A resend of the click still in progress joins it, so it gets the final result rather than a saved interim state.
     if (this.#active && typeof actionId === 'string' && this.#activeClick?.actionId === actionId) {
@@ -326,9 +375,13 @@ export class MergeCoordinator {
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(new Error('Merge request deadline exceeded.')), this.operationTimeoutMs);
+    // A caller that owns the merge (the one-click merge job) stops it as shutdown or a deadline would.
+    const stop = () => abort.abort(caller!.reason);
+    if (caller?.aborted) stop(); else caller?.addEventListener('abort', stop, { once: true });
     this.#abort = abort;
     const attempt = this.#merge(token, abort.signal, actionId as string | undefined).finally(() => {
       clearTimeout(timer);
+      caller?.removeEventListener('abort', stop);
       if (this.#active === attempt) { this.#active = null; this.#activeClick = null; }
       if (this.#abort === abort) this.#abort = null;
     });
@@ -428,7 +481,7 @@ export class MergeCoordinator {
       // final PR inspection; a synchronous local trust check then closes the admission window without another await.
       const authorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
-      if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
+      if (!status.ready) throw new MergeBlocked('', status.blockers[0]);
       view = await this.service.load({ signal });
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       const { status: finalStatus, resolved: finalTarget } = await this.#statusForMerge(view, signal);
@@ -438,7 +491,10 @@ export class MergeCoordinator {
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head || !samePullRequest({ status: finalStatus, resolved: finalTarget }))
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
-      if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
+      // From here on, a MergeBlocked's job wording (runner/merge-job.ts inJobTerms) is defensive in job mode: nothing changes
+      // the state version during a job, the reloads catch a changed token first, and a moved base trips the PR identity
+      // check first. Defensive tests in test/merge-job.test.ts pin it.
+      if (!finalStatus.ready) throw new MergeBlocked('Merge requirements changed during validation. ', finalStatus.blockers[0]);
       let commandStatus = finalStatus;
       let queueWatermark: string | null = null;
       if (status.remote.mergeQueue) {
@@ -449,7 +505,7 @@ export class MergeCoordinator {
         commandStatus = command.status;
         if (commandStatus.remote.base !== finalStatus.remote.base || commandStatus.remote.head !== finalStatus.remote.head || commandStatus.remote.mergeQueue !== finalStatus.remote.mergeQueue || !samePullRequest(command))
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
-        if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
+        if (!commandStatus.ready) throw new MergeBlocked('Merge requirements changed after queue correlation. ', commandStatus.blockers[0]);
       }
       if (authorization) {
         await authorization.refresh();
@@ -458,7 +514,7 @@ export class MergeCoordinator {
           || authorized.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(authorized))
           throw new Error('The pull request changed during merge validation. Refresh before merging.');
         if (!authorized.status.ready)
-          throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
+          throw new MergeBlocked('Merge requirements changed during authorization validation. ', authorized.status.blockers[0]);
         commandStatus = authorized.status;
       }
       if (commandStatus.remote.mergeQueue) {
@@ -472,7 +528,7 @@ export class MergeCoordinator {
           || boundary.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(boundary))
           throw new Error('The pull request changed after queue correlation. Refresh before merging.');
         if (!boundary.status.ready)
-          throw new Error(`Merge requirements changed after queue correlation. ${boundary.status.blockers[0]!.message}`);
+          throw new MergeBlocked('Merge requirements changed after queue correlation. ', boundary.status.blockers[0]);
         commandStatus = boundary.status;
       }
       // The final review load awaits its history worker, so the pull request is inspected once more after it: the last
@@ -484,7 +540,7 @@ export class MergeCoordinator {
       if (last.status.remote.base !== commandStatus.remote.base || last.status.remote.head !== commandStatus.remote.head
         || last.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(last))
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
-      if (!last.status.ready) throw new Error(`Merge requirements changed during validation. ${last.status.blockers[0]!.message}`);
+      if (!last.status.ready) throw new MergeBlocked('Merge requirements changed during validation. ', last.status.blockers[0]);
       commandStatus = last.status;
       authorization?.validate();
       if (this.service.store && this.service.config) {

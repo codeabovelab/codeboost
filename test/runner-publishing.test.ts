@@ -9,14 +9,14 @@ import { startServer } from '../web/server.ts';
 import { Store, type PublishRecord } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
-import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
+import type { PreparedAttempt, RunnerCoordinator, RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace } from '../runner/execution.ts';
 import { GitBranchPusher } from '../runner/branch-push.ts';
 import { PullRequestPublisher } from '../runner/publish.ts';
-import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
+import { ensureCommit, openRunnerRepository, retainSnapshotCommit } from '../runner/runner-repository.ts';
 import { baseBranch } from '../runner/production.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
-import type { MergeGateway } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
 import { OWED_REFUSAL } from '../runner/publishing.ts';
 import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
@@ -24,6 +24,8 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
+import { MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, type MergeJobTiming } from '../runner/merge-job.ts';
+import type { RemoteMergeState, RequiredCheck } from '../github/merge.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
 import { CommandFailed } from '../github/run-with-input.ts';
 
@@ -233,21 +235,37 @@ function world(): World {
  * of the three coordinator paths that can raise a finding. `before` shapes the Store before the runner exists, as an
  * earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource;
-  issueGateway?: IssueTrustGateway; preMerge?: (service: ReviewService) => PreMergeCoordinator } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void | Promise<void>; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource;
+  issueGateway?: IssueTrustGateway; preMerge?: (service: ReviewService, runner: RunnerCoordinator) => PreMergeCoordinator; mergeGateway?: MergeGateway; mergeJobTiming?: MergeJobTiming;
+  /** The runner also admits command-check attempts, as pre-merge preparation starts them (held by `hold` too). */
+  checks?: boolean;
+  /** A runner block and no github.pullRequest: merging targets the PR the runner published, after preparation. */
+  runnerPublished?: boolean;
+  /**
+   * As a production runner server (`setUpRunner`): before any review load, the runner-owned repository holds the
+   * snapshot's commits and is set as `runnerRepository`, so reviews read `snapshot.head` there, never the user's HEAD.
+   */
+  runnerReview?: boolean } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
   let findings: SafetyFindings | undefined;
-  const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1, baseBranch: 'main' } } : {}) };
-  app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
+  const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3,
+    ...(options.runnerPublished ? {} : { pullRequest: 1 }), baseBranch: 'main' } } : {}), ...(options.runnerPublished ? { runner: {} } : {}) };
+  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, options.issueGateway, undefined, undefined, async service => {
+    if (options.runnerReview) {
+      const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
+      const snapshot = service.store.getSnapshot(service.config.identity);
+      for (const commit of new Set([snapshot.base, snapshot.head])) await retainSnapshotCommit(repository, commit);
+      service.config.runnerRepository = repository.path;
+    }
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
       const review = await service.load();
       service.store.saveReview(identity, review.expected,
         review.items.map(item => approveItem(review.plan, review.segments, item.id, identity, item.count === 0)), []);
     }
-    options.before?.(service);
+    await options.before?.(service);
     const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
     await ensureCommit(repository, service.store.getSnapshot(service.config.identity).head);
     const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
@@ -278,15 +296,15 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     };
     const deps: RunnerDeps = source
       ? executionDeps(service.store, workspace, launch, sources, OWNER, findings)
-      : { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
+      : { runnerOwner: OWNER, kinds: options.checks ? ['execute', 'check'] : ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
         start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
           // `hold`: the attempt keeps running until the test releases it.
           settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
         validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
-    return { deps, sources, findings, publisher, ...(options.preMerge ? { preMerge: () => options.preMerge!(service) } : {}),
+    return { deps, sources, findings, publisher, ...(options.preMerge ? { preMerge: (runner: RunnerCoordinator) => options.preMerge!(service, runner) } : {}),
       ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
-  });
+  }, options.mergeJobTiming ? { mergeJobTiming: options.mergeJobTiming } : {});
   cleanups.push(close);
   // As the CLI does once it has verified the lock.
   if (options.startup !== false) app.publishOwed(() => undefined);
@@ -1749,4 +1767,697 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(await act(app, 'close-pull-requests')).toMatchObject({ status: 409, body: { error: 'The task has no pull request to close.' } });
     expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: 'The task is cancelled; its pull requests are closed, not published.' } });
   });
+});
+
+describe('the one-click merge job (F6b of #22)', () => {
+  const issueGateway: IssueTrustGateway = {
+    repository: REPO,
+    async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+    async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
+    async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+  };
+  /** Preparation as F5/F6a end it: readiness recorded exactly on its own action. */
+  const preparation = (service: ReviewService) => ({
+    get active() { return false; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
+    cancelTask: () => 'closed' as const, close: async () => undefined,
+    start: async (expected: { actionId: string }) => {
+      const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
+      const readiness = { stateVersion: service.store.getTask(identity).stateVersion, reviewVersion: service.store.reviewVersion(identity),
+        snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: service.commandPolicyDigest() };
+      return service.store.settlePreMergeAction(identity, expected.actionId,
+        { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
+    },
+  } as unknown as PreMergeCoordinator);
+  /** GitHub showing the task's published PR at the reviewed pair; `checks()` gives its required checks now. */
+  const gateway = (store: () => Store, checks: () => RequiredCheck[], hang: () => boolean = () => false):
+    MergeGateway & { merged: string[]; inspections: () => number; hung: AbortSignal[] } => {
+    const merged: string[] = [], hung: AbortSignal[] = [];
+    let inspections = 0;
+    return { merged, hung, inspections: () => inspections,
+      inspect: async request => {
+        inspections++;
+        // From this inspection on, GitHub does not answer; only the caller's abort ends the read.
+        if (hang() && request?.signal) {
+          hung.push(request.signal);
+          await new Promise((_resolve, reject) => request.signal!.addEventListener('abort', () => reject(request.signal!.reason), { once: true }));
+        }
+        const identity = createIdentity(), pr = store().taskPullRequests(identity).find(row => row.number === request?.target?.pullRequest);
+        const snapshot = store().getSnapshot(identity);
+        return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true,
+          mergeQueue: false, requiredChecks: checks(), alreadyFixed: 'clear', pullRequest: request!.target!.pullRequest, draft: false,
+          published: { headBranch: request!.target!.headBranch!, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr!.openingId),
+            branchOpen: [{ number: request!.target!.pullRequest, base: 'main' }] } } as RemoteMergeState;
+      },
+      merge: async head => { merged.push(head); return { url: 'https://github.com/acme/app/pull/100' }; } };
+  };
+  let createIdentity: () => PlanIdentity = () => { throw new Error('not set'); };
+  /**
+   * The user's repository moves on after the task's snapshot: a runner server never reads it, so a review that observed
+   * the user's HEAD would record this commit as a new snapshot (`mergeableReview` asserts that it does not).
+   */
+  const moveUserHead = (w: World) => {
+    git(w.demo.repository, 'commit', '-q', '--allow-empty', '-m', 'A local commit the runner never reads');
+  };
+  const acceptAndApprove = async (service: ReviewService) => {
+    let view = await service.load();
+    for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+      view = await service.act({ action: 'accept', key: segment.key, token: view.token });
+    for (const item of view.items) if (item.state !== 'approved')
+      view = await service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  };
+  /**
+   * A review a person could merge, reached as on a runner server (`runnerReview`): the person amends the plan so P2
+   * declares the demo's run.sh mode change (plan import, as /api/plan/import does) and approves it, the runner completes
+   * every item, and the person accepts the unplanned change and approves every item. Every load reads `snapshot.head`
+   * in the runner-owned repository, so the snapshot never moves to the user's HEAD.
+   */
+  const mergeableReview = async (service: ReviewService) => {
+    const s = service.store, id = service.config.identity, initial = s.getSnapshot(id);
+    expect(service.config.runnerRepository).toBeDefined();
+    expect(service.reviewRepository()).toEqual({ path: service.config.runnerRepository, runnerOwned: true });
+    expect(git(service.config.repository, 'rev-parse', 'HEAD')).not.toBe(initial.head);
+    const plan = s.getPlan(id);
+    plan.items.find(item => item.id === 'P2')!.files.push({ path: 'run.sh', kind: 'edit', renamed_from: null, change: 'Make the script executable.' });
+    s.importRevision(JSON.stringify(plan), 'json', service.planContext(), plan.revision);
+    const amended = await service.load();
+    s.saveReview(id, amended.expected, amended.items.map(item => approveItem(amended.plan, amended.segments, item.id, id, item.count === 0)), []);
+    completeAll(service);
+    await acceptAndApprove(service);
+    const view = await service.load();
+    expect(view.items.every(item => item.state === 'approved')).toBe(true);
+    expect(view.segments.filter(segment => segment.scope === 'out-of-scope')).toEqual([]);
+    expect(s.getSnapshot(id)).toEqual(initial);
+  };
+  const review = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/review`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
+  const merge = async (app: App, token: string, actionId = randomUUID()) => {
+    const response = await fetch(`${new URL(app.url).origin}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'merge', token, actionId }) });
+    return { status: response.status, body: await response.json() as Record<string, any> };
+  };
+  const mergeState = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/merge`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
+
+  it('offers Merge PR while only blockers the job resolves remain, then waits for checks and merges, refusing prepare-merge and publish meanwhile', async () => {
+    const w = world(); moveUserHead(w);
+    let checks: RequiredCheck[] = [{ context: 'ci', appId: null, state: 'pending' }], storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => checks);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const before = await review(served.app);
+    // Not prepared yet, and a required check pends: both are the job's to resolve.
+    expect(before.merge.blockers.map((blocker: { code: string }) => blocker.code)).toEqual(expect.arrayContaining(['preparation', 'check']));
+    // Worded as what Merge PR does: the screen has no Prepare control.
+    expect(before.merge.blockers.find((blocker: { code: string }) => blocker.code === 'preparation').message)
+      .toBe('The merge has not been prepared for the current review; merging prepares it.');
+    // A runner server sends the codes a job settles before it merges, which the page drops once a job reached the merge.
+    expect(before.merge.settledBeforeJobMerge).toEqual([...SETTLED_BEFORE_JOB_MERGE]);
+    expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
+    const started = await merge(served.app, before.token);
+    expect(started.status).toBe(200);
+    expect(started.body.job).toMatchObject({ state: 'running' });
+    expect(started.body.merge).toMatchObject({ ready: false, job: { state: 'running' } });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }), { timeout: 10_000 });
+    // A second tab still holds the review read before the click: its click is refused, and the refusal carries the
+    // running job so that page follows it. A resend replays the refusal with the task's latest job, still never as a job.
+    const secondTab = randomUUID(), refused = await merge(served.app, before.token, secondTab);
+    expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is already running for this task.', job: { id: started.body.job.id, state: 'running', step: 'checks' } } });
+    expect(await merge(served.app, before.token, secondTab)).toMatchObject({ status: 409, body: { error: refused.body.error, job: { id: started.body.job.id } } });
+    expect((await mergeState(served.app)).job).toMatchObject({ id: started.body.job.id });
+    expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; it prepares the merge itself.' } });
+    // A publish cannot begin a refresh of the PR the job waits on: publishing refuses a task in review.
+    expect(await act(served.app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
+    expect(served.store.taskPullRequests(served.identity).every(pr => pr.refresh === null)).toBe(true);
+    checks = [{ context: 'ci', appId: null, state: 'success' }];
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+    expect(gh.merged).toEqual([served.store.getSnapshot(served.identity).head]);
+    expect(served.store.getTask(served.identity).status).toBe('merged');
+   }, 60_000);
+
+  it('refuses start and resume while a merge job waits, even after a new plan revision is imported and approved; the import only ends the job failed', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const base = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
+    // The job's fresh inspections after its first are held until the test releases them (or the job's signal stops them),
+    // so the job is still waiting for checks at every step below, whatever the machine's speed.
+    let fresh = 0, release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const gh: MergeGateway = { merge: base.merge, inspect: async request => {
+      if (request?.fresh && ++fresh > 1) await new Promise<void>((resolve, reject) => {
+        void released.then(resolve);
+        request.signal?.addEventListener('abort', () => reject(request.signal!.reason), { once: true });
+      });
+      return base.inspect(request);
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    // The first inspection has answered (its pending check is recorded) and the second is held.
+    await vi.waitFor(async () => {
+      expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'checks', checks: [{ context: 'ci', state: 'pending' }] });
+      expect(fresh).toBe(2);
+    }, { timeout: 10_000 });
+    // As a person would: import a new revision of the plan (plan import has no task-status guard), then approve it all.
+    const plan = served.store.getPlan(served.identity);
+    const imported = await fetch(`${new URL(served.app.url).origin}/api/plan/import`, { method: 'POST', headers: { 'x-codeboost-token': served.app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ source: JSON.stringify(plan), format: 'json', expectedRevision: plan.revision, actionId: randomUUID() }) });
+    expect(imported.status).toBe(200);
+    expect(served.store.getPlan(served.identity).revision).toBe(plan.revision + 1);
+    await acceptAndApprove(served.app.service);
+    expect(served.store.unapprovedExecutionItems(served.identity, plan.revision + 1)).toEqual([]);
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    const calls = [...w.github.calls], branchHead = w.github.head(served.branch), attempts = served.store.recentAttempts(served.identity, 50).length;
+    // Neither is offered, and both are refused, while the job runs.
+    expect(await view(served.app)).toMatchObject({ startable: false, resumable: false });
+    for (const action of ['start', 'resume']) {
+      const id = randomUUID(), refused = await act(served.app, action, id);
+      expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+      // Saved like other refusals: the same action ID replays it.
+      expect(await act(served.app, action, id)).toMatchObject({ status: 409, body: { error: refused.body.error } });
+    }
+    expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'checks' });
+    expect(fresh).toBe(2);
+    // What the import itself does to the job: the readiness it prepared is for the old review, so its next inspection
+    // ends it failed, and nothing is merged, run, pushed or published.
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'failed',
+      reason: 'The merge has not been prepared for the current review; merging prepares it.' }), { timeout: 10_000 });
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
+    expect(served.app.publishing!.busy(served.identity)).toBe(false);
+    expect(w.github.calls).toEqual(calls);
+    expect(w.github.head(served.branch)).toBe(branchHead);
+    expect(base.merged).toEqual([]);
+   }, 60_000);
+
+  it('refuses start while a merge job prepares, even after a new plan revision is imported and approved', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, release!: () => void, preparing = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh, runnerPublished: true,
+      // A preparation held until the test releases it; it then fails, as a real one does once the review changed under it.
+      preMerge: service => ({
+        get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
+        cancelTask: () => 'closed' as const, close: async () => undefined,
+        start: async (expected: { actionId: string }) => {
+          preparing = true;
+          await held;
+          preparing = false;
+          const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
+          return service.store.settlePreMergeAction(identity, expected.actionId,
+            { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'The review changed during preparation.' }, null);
+        },
+      } as unknown as PreMergeCoordinator) });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => { expect(preparing).toBe(true); expect((await mergeState(served.app)).job).toMatchObject({ state: 'running', step: 'preparing' }); }, { timeout: 10_000 });
+    const plan = served.store.getPlan(served.identity);
+    const imported = await fetch(`${new URL(served.app.url).origin}/api/plan/import`, { method: 'POST', headers: { 'x-codeboost-token': served.app.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ source: JSON.stringify(plan), format: 'json', expectedRevision: plan.revision, actionId: randomUUID() }) });
+    expect(imported.status).toBe(200);
+    await acceptAndApprove(served.app.service);
+    const calls = [...w.github.calls], attempts = served.store.recentAttempts(served.identity, 50).length;
+    expect(await view(served.app)).toMatchObject({ startable: false });
+    expect(await act(served.app, 'start')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'failed' }), { timeout: 10_000 });
+    expect(w.github.calls).toEqual(calls);
+    expect(gh.merged).toEqual([]);
+   }, 60_000);
+
+  it('admits issue trust before a merge job starts: an untrusted click is refused and replayed, a failed read saves nothing', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, access: 'untrusted' | 'unreadable' | 'trusted' = 'trusted', reads = 0, prepared = 0;
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, async issueAccess(number) {
+      reads++;
+      if (access === 'unreadable') throw new Error('GitHub returned HTTP 502');
+      return access === 'trusted' ? { number, authorLogin: 'member', collaborator: true } : { number, authorLogin: 'outside', collaborator: false };
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, mergeGateway: gh, runnerPublished: true,
+      preMerge: service => { const real = preparation(service); return { ...real, get active() { return false; }, get last() { return null; },
+        start: (expected: { actionId: string }) => { prepared++; return (real.start as (value: unknown) => unknown)(expected); } } as unknown as PreMergeCoordinator; } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // A failed read decides nothing: nothing is saved, so the same click may be sent again.
+    access = 'unreadable';
+    expect((await merge(served.app, token, id)).status).toBe(502);
+    expect(served.store.getMergeJob(served.identity, id)).toBeNull();
+    access = 'untrusted';
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: expect.stringMatching(/not trusted/) } });
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ refused: true });
+    // The resend replays the refusal without another read, even once the issue is trusted.
+    access = 'trusted'; const before = reads;
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: expect.stringMatching(/not trusted/) } });
+    expect(reads).toBe(before);
+    expect(prepared).toBe(0);
+    expect((await mergeState(served.app)).job).toBeNull();
+    // A new click on a trusted issue starts the job.
+    expect((await merge(served.app, token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+    expect(prepared).toBe(1);
+  }, 60_000);
+
+  it('refuses a merge click while a preparation\'s command check holds the runner, and the resend replays the refusal', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, preparing = false;
+    const hold = Promise.withResolvers<void>();
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh,
+      runnerPublished: true, checks: true, hold: hold.promise,
+      // A preparation started by prepare-merge while the task is in review: it runs a command-check attempt through the
+      // real runner (held until the test releases it) and waits for it to settle, as production's does.
+      preMerge: (service, runner) => ({
+        get active() { return preparing; }, get last() { return null; }, settlePendingPush: async () => null,
+        cancelTask: () => 'closed' as const, close: async () => undefined,
+        assertStartable() { if (preparing) throw new GuardRefusal('Pre-merge preparation is already running.'); },
+        start: async (expected: { actionId: string }) => {
+          preparing = true;
+          try {
+            const identity = service.config.identity;
+            runner.start(identity, { expectedStateVersion: service.store.getTask(identity).stateVersion, kind: 'check',
+              item: service.store.getPlan(identity).items[0]!.id, deadline: Date.now() + 60_000, expectedContext: service.store.currentContext(identity) });
+            await runner.settled(identity);
+            const snapshot = service.store.getSnapshot(identity);
+            return service.store.settlePreMergeAction(identity, expected.actionId,
+              { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'The task or review changed during preparation. Reload first.' }, null);
+          } finally { preparing = false; }
+        },
+      } as unknown as PreMergeCoordinator) });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(await act(served.app, 'prepare-merge')).toMatchObject({ status: 200 });
+    await vi.waitFor(() => expect(served.app.runner!.isActive(served.identity)).toBe(true), { timeout: 10_000 });
+    const { token } = await review(served.app), id = randomUUID(), busy = 'The runner or publisher is busy; the merge cannot start yet.';
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: busy, job: null } });
+    // No job started: the click's refusal is saved instead.
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ refused: true, reason: busy });
+    expect((await mergeState(served.app)).job).toBeNull();
+    hold.resolve();
+    await vi.waitFor(() => { expect(preparing).toBe(false); expect(served.app.runner!.isActive(served.identity)).toBe(false); }, { timeout: 10_000 });
+    // The resend replays the saved refusal, though the runner is idle now.
+    expect(await merge(served.app, token, id)).toMatchObject({ status: 409, body: { error: busy, job: null } });
+    expect((await mergeState(served.app)).job).toBeNull();
+    expect(gh.merged).toEqual([]);
+  }, 60_000);
+
+  it('answers 503 and saves nothing when shutdown stops a merge click\'s trust read', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, hang = false, reading = false;
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number, options = {}) {
+      if (!hang) return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+      reading = true;
+      // GitHub does not answer; only the request's own abort (at the end of shutdown's drain) ends the read.
+      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true }));
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hang = true;
+    const clicked = merge(served.app, token, id);
+    await vi.waitFor(() => expect(reading).toBe(true), { timeout: 10_000 });
+    const closed = served.close();
+    expect(await clicked).toMatchObject({ status: 503 });
+    await closed;
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('answers a merge click whose trust read fails with the job a resend of the same click saved meanwhile', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, hold = false, fail!: (error: Error) => void, reading!: () => void;
+    const held = new Promise<void>(resolve => { reading = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number) {
+      // The first click's read is held until it fails; the resend's read (and the publish's before) answers at once.
+      if (hold) { hold = false; reading(); return new Promise((_resolve, reject) => { fail = reject; }); }
+      return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    hold = true;
+    const first = merge(served.app, token, id);
+    await held;
+    const second = await merge(served.app, token, id);
+    expect(second).toMatchObject({ status: 200, body: { job: { id } } });
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ id });
+    fail(new Error('GitHub returned HTTP 502'));
+    expect(await first).toMatchObject({ status: 200, body: { job: { id } } });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+  }, 60_000);
+
+  it.each([
+    ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), 503, 'Issue trust could not be verified: Issue retrieval timed out.'],
+    ['gh answered', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', '', ''), 502, 'Issue trust could not be verified: gh failed (exit 1): HTTP 404: Not Found'],
+  ] as const)('keeps a merge click\'s trust read failure (%s) when shutdown starts while gh stops, saving nothing', async (_name, failure, status, error) => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, hang = false, fail!: (error: Error) => void, reading!: () => void;
+    const held = new Promise<void>(resolve => { reading = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const gate: IssueTrustGateway = { ...issueGateway, issueAccess(number) {
+      if (!hang) return Promise.resolve({ number, authorLogin: 'member', collaborator: true });
+      reading();
+      return new Promise((_resolve, reject) => { fail = reject; });
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway: gate, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hang = true;
+    const clicked = merge(served.app, token, id);
+    await held;
+    // Shutdown's first step runs at once; the read then ends with its own failure, which happened first.
+    const closed = served.close();
+    fail(failure());
+    expect(await clicked).toMatchObject({ status, body: { error } });
+    await closed;
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toBeNull(); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('answers 503 when shutdown stops the reload after a merge job was saved, keeping the saved job for a resend', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, hanging = false;
+    // From the click on, GitHub does not answer; only the caller's abort ends each read.
+    const gh = gateway(() => storeRef!, () => [], () => hanging);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID(), database = served.app.service.config.database;
+    hanging = true;
+    const clicked = merge(served.app, token, id);
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, id)).not.toBeNull(), { timeout: 10_000 });
+    await vi.waitFor(() => expect(gh.hung.length).toBeGreaterThan(0), { timeout: 10_000 });
+    const closed = served.close();
+    expect(await clicked).toMatchObject({ status: 503 });
+    await closed;
+    // The job was saved under the click's action ID, which a resend replays (merge-job.test.ts covers the replay).
+    const reopened = new Store(database);
+    try { expect(reopened.getMergeJob(served.identity, id)).toMatchObject({ id }); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('answers the started job when its click cannot reload the review, and the resent click returns the job', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // The click's own reload after its job was saved fails once (as a history worker timing out would). The admission load
+    // and the reload share the request's signal; the job's loads carry the job's own signal.
+    const service = served.app.service, realLoad = service.load.bind(service), requestSignals = new Set<AbortSignal>();
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      const signal = options?.signal;
+      if (signal && !failed && requestSignals.has(signal)) { failed = true; throw new Error('History work exceeded its overall deadline.'); }
+      if (signal) requestSignals.add(signal);
+      return realLoad(options);
+    };
+    const clicked = await merge(served.app, token, id);
+    expect(failed).toBe(true);
+    const saved = served.store.getMergeJob(served.identity, id);
+    expect(saved).not.toBeNull(); // The click's job was saved and started.
+    // The job itself, so the page follows it, and a request to refresh the review.
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id: saved!.id }, mergeRefreshRequired: true } });
+    // The same click, sent again, replays its job.
+    const resent = await merge(served.app, token, id);
+    expect(resent).toMatchObject({ status: 200, body: { job: { id: served.store.getMergeJob(served.identity, id)!.id } } });
+  }, 60_000);
+
+  it('replays a click\'s own job on resend after that job ended and another click started a later job', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    // A failing required check ends each job blocked, which leaves the task mergeable again (Retry merge).
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const first = await review(served.app), clickA = randomUUID();
+    expect((await merge(served.app, first.token, clickA)).body.job).toMatchObject({ id: clickA });
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, clickA)).toMatchObject({ state: 'blocked' }), { timeout: 10_000 });
+    // Another tab reads the review again and clicks Retry merge: job B is now the task's latest job.
+    const clickB = randomUUID();
+    expect((await merge(served.app, (await review(served.app)).token, clickB)).body.job).toMatchObject({ id: clickB });
+    await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, clickB)).toMatchObject({ state: 'blocked' }), { timeout: 10_000 });
+    expect(served.store.latestMergeJob(served.identity)).toMatchObject({ id: clickB });
+    // Click A, resent (its answer was lost): the answer is job A, not the task's latest job.
+    expect(await merge(served.app, first.token, clickA)).toMatchObject({ status: 200, body: { job: { id: clickA, state: 'blocked' } } });
+    // The same when the resend's reload fails: both jobs have ended, so the only review load now is that reload.
+    const service = served.app.service, realLoad = service.load.bind(service);
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      if (!failed) { failed = true; throw new Error('History work exceeded its overall deadline.'); }
+      return realLoad(options);
+    };
+    try {
+      expect(await merge(served.app, first.token, clickA)).toMatchObject({ status: 200, body: { job: { id: clickA, state: 'blocked' }, mergeRefreshRequired: true } });
+      expect(failed).toBe(true);
+    } finally { service.load = realLoad; }
+  }, 60_000);
+
+  it('answers a merge click with the job\'s latest record when it ended during the click\'s reload', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, slow = false;
+    const base = gateway(() => storeRef!, () => []);
+    // The click's reload reads GitHub's display status (not fresh), and that read is held until the job has merged; the
+    // job's own fresh inspections answer at once. So the job ends during the click's reload, whatever the machine's speed.
+    const gh: MergeGateway = { merge: base.merge, inspect: async request => {
+      if (slow && !request?.fresh) await vi.waitFor(() => expect(storeRef!.latestMergeJob(createIdentity())?.state).toBe('merged'), { timeout: 40_000, interval: 50 });
+      return base.inspect(request);
+    } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    slow = true;
+    const clicked = await merge(served.app, token, id);
+    // The job merged while the click's response was being prepared: the response says so, not "preparing".
+    expect(served.store.getMergeJob(served.identity, id)).toMatchObject({ state: 'merged' });
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id, state: 'merged' } } });
+  }, 60_000);
+
+  it('answers a merge click whose reload fails with the job\'s latest record, once the job ended during that reload', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const { token } = await review(served.app), id = randomUUID();
+    // The admission load and the click's reload share the request's signal; the job's loads carry its own. The reload
+    // waits until the job has merged, then fails (as a history worker timing out would).
+    const service = served.app.service, realLoad = service.load.bind(service), requestSignals = new Set<AbortSignal>();
+    let failed = false;
+    service.load = async (options?: Parameters<typeof realLoad>[0]) => {
+      const signal = options?.signal;
+      if (signal && !failed && requestSignals.has(signal)) {
+        failed = true;
+        await vi.waitFor(() => expect(served.store.getMergeJob(served.identity, id)?.state).toBe('merged'), { timeout: 40_000, interval: 50 });
+        throw new Error('History work exceeded its overall deadline.');
+      }
+      if (signal) requestSignals.add(signal);
+      return realLoad(options);
+    };
+    const clicked = await merge(served.app, token, id);
+    expect(failed).toBe(true);
+    // The admission's record said "running, preparing"; the answer is the job as it is now.
+    expect(clicked).toMatchObject({ status: 200, body: { job: { id, state: 'merged' }, mergeRefreshRequired: true } });
+  }, 60_000);
+
+  it('offers Merge PR to a task in review and Retry merge once a job ended blocked, from the task\'s current status', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'failure' }]);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const before = await review(served.app);
+    expect(served.store.getTask(served.identity).status).toBe('in review');
+    expect(before.merge).toMatchObject({ ready: true, action: 'merge', job: null });
+    const started = await merge(served.app, before.token);
+    expect(started.status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ id: started.body.job.id, state: 'blocked' }), { timeout: 10_000 });
+    expect(served.store.getTask(served.identity).status).toBe('approved but merge blocked');
+    const after = await review(served.app);
+    // The guarded merge has no attempt to retry, so only the task's status makes this a retry.
+    expect(after.merge.queue).toBeNull();
+    expect(after.merge).toMatchObject({ ready: true, action: 'retry', job: { id: started.body.job.id, state: 'blocked' } });
+  }, 60_000);
+
+  it('closes the pull requests of a task whose cancel waited for the merge job\'s preparation to settle', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, release!: () => void, preparing = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    // The stub records a rebase to commits that do not exist, so it starts only once the click has been answered: the
+    // click's own review reload (which awaits a history worker, #170) must not read them.
+    let answered!: () => void;
+    const clickAnswered = new Promise<void>(resolve => { answered = resolve; });
+    const gh = gateway(() => storeRef!, () => []);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, mergeGateway: gh, runnerPublished: true,
+      // A preparation caught in its push: it holds a real push marker, so a cancel waits ("stopping") until the push
+      // settles, and clearing the marker closes the task, as production does.
+      preMerge: service => {
+        const identity = service.config.identity;
+        let marker: { attemptId: string } | null = null;
+        return {
+          get active() { return preparing; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null, close: async () => undefined,
+          cancelTask: (stateVersion: number, actionId: string) => service.store.cancelTask(identity, stateVersion, actionId),
+          start: async (expected: { actionId: string }) => {
+            preparing = true;
+            await clickAnswered;
+            const reviewed = () => ({ revision: service.store.getPlan(identity).revision, snapshotId: service.store.getSnapshot(identity).id, reviewVersion: service.store.reviewVersion(identity) });
+            const head = service.store.getSnapshot(identity).head, rewritten = 'e'.repeat(40);
+            service.store.recordRebase(identity, reviewed(), 'f'.repeat(40), rewritten, [{ oldSha: head, newSha: rewritten }]);
+            marker = service.store.beginPrePush(identity, reviewed(), service.store.getTask(identity).stateVersion,
+              { branch: service.store.taskPullRequests(identity)[0]!.headBranch, from: head, to: rewritten });
+            await held;
+            service.store.finishPrePush(service.store.getTask(identity).planKey, marker.attemptId);
+            preparing = false;
+            const snapshot = service.store.getSnapshot(identity);
+            return service.store.settlePreMergeAction(identity, expected.actionId,
+              { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [], reason: 'Task cancelled.' }, null);
+          },
+        } as unknown as PreMergeCoordinator;
+      } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    answered();
+    await vi.waitFor(() => expect(served.store.getTask(served.identity).pushInProgress).not.toBeNull(), { timeout: 10_000 });
+    expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    expect(served.store.getTask(served.identity)).toMatchObject({ status: 'in review', cancelRequested: expect.any(String) });
+    expect(w.github.prs[0]!.open).toBe(true);
+    release();
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 10_000 });
+    await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
+    expect(served.store.getTask(served.identity).status).toBe('cancelled');
+  }, 60_000);
+
+  it('stops a waiting merge job promptly on shutdown and leaves it running on disk for the next startup', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, hanging = false;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }], () => hanging);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 30, maxDelayMs: 30 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks' }), { timeout: 10_000 });
+    // GitHub stops answering the job's next inspection; only the job's own abort can end that read.
+    hanging = true;
+    await vi.waitFor(() => expect(gh.hung).toHaveLength(1), { timeout: 10_000 });
+    const database = served.app.service.config.database, closing = Date.now();
+    const closed = served.close();
+    // Shutdown's first synchronous turn stops the job, before any drain, so it cannot ask GitHub to merge meanwhile.
+    expect(gh.hung[0]!.aborted).toBe(true);
+    await closed;
+    expect(Date.now() - closing).toBeLessThan(10_000);
+    const reopened = new Store(database);
+    try { expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'running', step: 'checks' }); } finally { reopened.close(); }
+  }, 60_000);
+
+  it('closes the merge job before the store, so a job settling after the shutdown abort records its outcome', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, merging: AbortSignal | null = null;
+    const base = gateway(() => storeRef!, () => []);
+    // GitHub was asked to merge; after the abort it answers, a little later, with a refusal.
+    const gh: MergeGateway = { inspect: base.inspect, merge: (_head, options) => new Promise((_resolve, reject) => {
+      merging = options!.signal!;
+      merging.addEventListener('abort', () => setTimeout(() => reject(new MergeSubmissionError('Base branch was modified.', 'refused')), 300), { once: true });
+    }) };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(() => expect(merging).not.toBeNull(), { timeout: 10_000 });
+    const database = served.app.service.config.database, order: string[] = [];
+    const jobClose = MergeJobCoordinator.prototype.close, storeClose = Store.prototype.close;
+    const jobs = vi.spyOn(MergeJobCoordinator.prototype, 'close').mockImplementation(async function (this: MergeJobCoordinator) {
+      await jobClose.call(this); order.push('job settled');
+    });
+    const stores = vi.spyOn(Store.prototype, 'close').mockImplementation(function (this: Store) { order.push('store closed'); return storeClose.call(this); });
+    try { await served.close(); } finally { jobs.mockRestore(); stores.mockRestore(); }
+    // Shutdown closed the job before the store (close awaiting the job is shown in merge-job.test.ts), and the job's last
+    // write landed: it ended as its merge attempt records it.
+    expect(order[0]).toBe('job settled');
+    expect(order).toContain('store closed');
+    const reopened = new Store(database);
+    try {
+      expect(reopened.latestMergeJob(served.identity)).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+      expect(reopened.getTask(served.identity).status).toBe('approved but merge blocked');
+    } finally { reopened.close(); }
+  }, 60_000);
+
+  it('stops a waiting merge job when the task is cancelled, and closes the task\'s pull requests', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      // Waits far longer than this test: only the cancel route's own stop can end the job in time.
+      mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 60_000, maxDelayMs: 60_000 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks' }), { timeout: 10_000 });
+    expect((await act(served.app, 'cancel-task')).body.result).toEqual({ outcome: 'closed' });
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'cancelled' }), { timeout: 5_000 });
+    await vi.waitFor(() => expect(w.github.prs[0]!.open).toBe(false), { timeout: 20_000 });
+    expect(gh.merged).toEqual([]);
+   }, 60_000);
+
+  it('logs, and does not reject, when reading the task fails as the server follows a settled merge job', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null, release!: () => void;
+    const answered = new Promise<void>(resolve => { release = resolve; });
+    const base = gateway(() => storeRef!, () => []);
+    // GitHub answers the merge only once the click was answered, so the job settles after the click's own review reload.
+    const gh: MergeGateway = { inspect: base.inspect, merge: async () => { await answered; return { url: 'https://github.com/acme/app/pull/100' }; } };
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh,
+      runnerPublished: true, mergeJobTiming: { checkWaitMs: 20_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const unhandled: unknown[] = [], onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    const logged = vi.spyOn(console, 'error');
+    // The first task read after the job's ending write fails: that is the server's `.finally` following the job.
+    let failNext = false;
+    const getTask = served.store.getTask.bind(served.store), finishMergeJob = served.store.finishMergeJob.bind(served.store);
+    served.store.finishMergeJob = ((...args: Parameters<Store['finishMergeJob']>) => { const ended = finishMergeJob(...args); failNext = true; return ended; }) as Store['finishMergeJob'];
+    served.store.getTask = ((identity: PlanIdentity) => {
+      if (failNext) { failNext = false; throw new Error('database is locked'); }
+      return getTask(identity);
+    }) as Store['getTask'];
+    try {
+      expect((await merge(served.app, (await review(served.app)).token)).status).toBe(200);
+      release();
+      await vi.waitFor(() => expect(served.store.latestMergeJob(served.identity)).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
+      // The server's callback runs a few microtasks after the ending write; an unhandled rejection is reported after them.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(failNext).toBe(false);
+      expect(unhandled).toEqual([]);
+      expect(logged).toHaveBeenCalledWith('Could not close the cancelled task\'s pull requests after its merge job: "database is locked"');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      served.store.getTask = getTask; served.store.finishMergeJob = finishMergeJob; logged.mockRestore();
+    }
+  }, 60_000);
 });

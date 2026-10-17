@@ -733,6 +733,8 @@ it('requires current-snapshot approvals after an ordinary queue removal and forc
     await h.coordinator.pollQueue();
     h.replaceHead(sha('c'));
     expect((await h.coordinator.status(h.view())).action).toBeNull();
+    expect((await h.coordinator.status(h.view())).blockers).toEqual(expect.arrayContaining([{ code: 'queue-head',
+      message: 'The pull request changed after the last merge attempt (Checks failed.). Approve every item again for the replacement snapshot, then merge.' }]));
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'replacement-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
@@ -745,6 +747,9 @@ it('requires current-revision approvals after a same-snapshot plan amendment', a
     await h.coordinator.pollQueue();
     h.amendPlan();
     expect((await h.coordinator.status(h.view())).action).toBeNull();
+    // The snapshot is unchanged: the message names the plan, not a replacement snapshot.
+    expect((await h.coordinator.status(h.view())).blockers).toEqual(expect.arrayContaining([{ code: 'queue-head',
+      message: 'The plan changed after the last merge attempt (Checks failed.). Approve every item again for the new plan revision, then merge.' }]));
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'amended-plan-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
@@ -933,6 +938,168 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(calls.at(-1)).toEqual(['pr','merge','7','--repo','owner/repo','--merge','--match-head-commit',sha('b')]);
   await client.inspect();
   expect(pullReads).toBe(2);
+});
+
+/** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
+async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: appId }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(true);
+  return state.requiredChecks.map(check => check.state);
+}
+
+it.each([
+  ['SUCCESS', 'success'], ['NEUTRAL', 'success'], ['SKIPPED', 'success'],
+  ['FAILURE', 'failure'], ['CANCELLED', 'failure'], ['TIMED_OUT', 'failure'], ['ACTION_REQUIRED', 'failure'], ['STARTUP_FAILURE', 'failure'], ['STALE', 'failure'],
+] as const)('reads a required check run that completed %s as %s, as GitHub does for required checks', async (conclusion, expected) => {
+  expect(await requiredTestState([{ name: 'test', status: 'COMPLETED', conclusion, startedAt: '2026-10-11T00:00:00Z' }])).toEqual([expected]);
+});
+
+it.each([
+  ['a newer pending re-run over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z', completedAt: '2026-10-11T00:01:00Z' },
+    { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:05:00Z', completedAt: '0001-01-01T00:00:00Z' },
+  ], 'pending'],
+  ['a newer passing re-run over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['a newer failure over an older pass, listed first', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+  ], 'failure'],
+  ['a queued re-run that has not started (zero time) over an older failure', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' },
+  ], 'pending'],
+  ['the run that passes least when two started at once', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+  ], 'failure'],
+  ['a started failure beside a completed skip with only zero times (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SKIPPED', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a started failure beside a completed neutral run with no time (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'NEUTRAL' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed after a failure started before its completion (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed after a failure started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed before a failure started (the later failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed in the second a pass started (order unknown: a tie, the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a pass started (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'success'],
+  ['a failed run with no start time, completed after a pass started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a queued run with no start (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
+  ['a queued run with no start time over a completed pass', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
+  ['a newer commit status over an older failed one', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['a pending commit status with no start time over a started passing one', [
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+    { context: 'test', state: 'PENDING' },
+  ], 'pending'],
+  ['a failed commit status with no time beside a started passing one (a tie: the failure counts)', [
+    { context: 'test', state: 'FAILURE' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['an errored commit status with no time beside a started passing one (a tie: the error counts)', [
+    { context: 'test', state: 'ERROR' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing commit status with no time beside a started failed one (a tie: the failure counts)', [
+    { context: 'test', state: 'SUCCESS' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no time beside a started failed one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failed run with no time beside a started passing one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a started failed commit status beside a passing one with no time (a tie: the failure counts)', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS' },
+  ], 'failure'],
+] as const)('counts the latest observation of a required check: %s', async (_case, rollup, expected) => {
+  expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+// GitHub: "If a check and a commit status have the same name, both must pass when that name is required." The latest
+// of each kind counts, and the one that passes least decides; a newer observation of one kind never replaces the other.
+it.each([
+  ['a newer passing status does not hide a failed check run', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a newer passing status does not hide a pending check run', [
+    { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'pending'],
+  ['a newer passing check run does not hide a failed status', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failure outranks a pending of the other kind', [
+    { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' },
+    { context: 'test', state: 'ERROR', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['both kinds passing', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['each kind re-run: the latest of each passes', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:01:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:02:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'success'],
+  ['only a check run', [{ name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' }], 'pending'],
+  ['only a commit status', [{ context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' }], 'failure'],
+] as const)('requires both a check run and a commit status with the required name: %s', async (_case, rollup, expected) => {
+  expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
+  expect(await requiredTestState([
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z', app: { databaseId: 10 } },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 10)).toEqual(['success']);
 });
 
 it('rejects an unsupported runtime merge method', () => {
@@ -1317,6 +1484,17 @@ it('gives an injected check the merge inputs and fails closed on an unknown outc
   expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('unknown');
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, { ...checks, repository: 'other/repo' })).toThrow(/merge repository/);
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, { check: checks.check })).toThrow(/merge repository/);
+});
+
+it('scans for an earlier fix from the target\'s scan start and skips the task\'s own commits (F6b)', async () => {
+  const inputs: AlreadyFixedInput[] = [];
+  const checks: AlreadyFixedGateway = { repository: 'Owner/Repo', check: async input => { inputs.push(input); return { outcome: 'clear', baseHead: sha('9') }; } };
+  const run = async (args: readonly string[]) => mergeReads(args, { baseRefName: 'release/1', baseRefOid: sha('c') });
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks);
+  await client.inspect({ fresh: true, target: { pullRequest: 7, alreadyFixedSince: sha('a'), ownCommits: [sha('e'), sha('d'), sha('e')] } });
+  expect(inputs[0]).toEqual({ issue: 21, taskBase: sha('a'), baseBranch: 'release/1', ownPullRequests: [7], ownCommits: new Set([sha('d'), sha('e')]) });
+  await expect(client.inspect({ fresh: true, target: { pullRequest: 7, alreadyFixedSince: 'main' } })).rejects.toThrow(/scan start/);
+  await expect(client.inspect({ fresh: true, target: { pullRequest: 7, ownCommits: ['x'] } })).rejects.toThrow(/own commit/);
 });
 
 it('keeps the caller cancellation when the merge check is aborted', async () => {

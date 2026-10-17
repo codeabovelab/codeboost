@@ -64,6 +64,13 @@ export interface MergeTarget {
   ownPullRequests?: readonly number[];
   /** The task branch of a published target (#121). The inspection then also reads `RemoteMergeState.published`. */
   headBranch?: string;
+  /**
+   * Where the already-fixed commit scan starts, so it covers every base commit after the task's original base, which a
+   * rebase can bring under the PR (F6b of #22; the runner picks it, `merge-handoff.md`). Default: the PR's base commit.
+   */
+  alreadyFixedSince?: string;
+  /** Commits the task made; the already-fixed scan does not count them. Default: none. */
+  ownCommits?: readonly string[];
 }
 
 export interface MergeResult { url: string; }
@@ -104,7 +111,7 @@ export interface GhMergeConfig {
   baseBranch?: string;
 }
 
-type ResolvedTarget = { pullRequest: number; ownPullRequests: readonly number[]; headBranch?: string };
+type ResolvedTarget = { pullRequest: number; ownPullRequests: readonly number[]; headBranch?: string; alreadyFixedSince?: string; ownCommits?: readonly string[] };
 type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;
 export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
@@ -142,6 +149,48 @@ function timestamp(value: unknown, label: string): string {
   return value;
 }
 
+/**
+ * The state GitHub gives one observed required check. A check run that completed SUCCESS, NEUTRAL or SKIPPED passes, as
+ * GitHub treats those conclusions for required checks; a commit status passes only with SUCCESS.
+ */
+function observedCheckState(check: Record<string, unknown>): 'success' | 'pending' | 'failure' {
+  if (typeof check.name === 'string') {
+    const status = String(check.status ?? '').toUpperCase();
+    const conclusion = String(check.conclusion ?? '').toUpperCase();
+    if (['QUEUED','IN_PROGRESS','WAITING','PENDING','REQUESTED'].includes(status)) return 'pending';
+    if (status === 'COMPLETED') return ['SUCCESS','NEUTRAL','SKIPPED'].includes(conclusion) ? 'success' : 'failure';
+    return 'failure';
+  }
+  const status = String(check.state ?? '').toUpperCase();
+  return status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
+}
+/** A real time gh reports, or NaN for none or the zero time (year 1) it gives a run that has not started or finished. */
+function observedTime(value: unknown): number {
+  const at = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : NaN;
+}
+/**
+ * When an observed check run or status started, to pick the latest of several with one name, or NaN when that is not
+ * known. A run or commit status not yet completed (queued, in progress, pending) with no start time was queued after
+ * every started one, so it counts as the latest (+Infinity). A completed one with no start time gets NaN: its order
+ * relative to the latest is unknown (see `observedCheckOlderThan`).
+ */
+function observedCheckStart(check: Record<string, unknown>): number {
+  const started = observedTime(check.startedAt);
+  if (Number.isFinite(started)) return started;
+  return observedCheckState(check) === 'pending' ? Number.POSITIVE_INFINITY : NaN;
+}
+/**
+ * For a completed run or commit status with no start time: its completion time, before which it started, so it is
+ * known to be older than any observation of its kind that started after that time. NaN when it has a start time, is not
+ * completed, or has no completion time.
+ */
+function observedCheckOlderThan(check: Record<string, unknown>): number {
+  return Number.isNaN(observedCheckStart(check)) ? observedTime(check.completedAt) : NaN;
+}
+/** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
+const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
+
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
@@ -176,7 +225,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const own = target?.ownPullRequests ?? [];
     if (own.some(number => !validNumber(number))) throw new Error('Invalid pull request number.');
     if (target?.headBranch !== undefined && (typeof target.headBranch !== 'string' || !BRANCH.test(target.headBranch))) throw new Error('Invalid pull request branch.');
-    return { pullRequest, ownPullRequests: [...new Set([pullRequest, ...own])], ...(target?.headBranch !== undefined ? { headBranch: target.headBranch } : {}) };
+    if (target?.alreadyFixedSince !== undefined && (typeof target.alreadyFixedSince !== 'string' || !SHA.test(target.alreadyFixedSince))) throw new Error('Invalid already-fixed scan start.');
+    if (target?.ownCommits !== undefined && (!Array.isArray(target.ownCommits) || target.ownCommits.some(sha => typeof sha !== 'string' || !SHA.test(sha)))) throw new Error('Invalid own commit.');
+    return { pullRequest, ownPullRequests: [...new Set([pullRequest, ...own])], ...(target?.headBranch !== undefined ? { headBranch: target.headBranch } : {}),
+      ...(target?.alreadyFixedSince !== undefined ? { alreadyFixedSince: target.alreadyFixedSince } : {}),
+      ...(target?.ownCommits !== undefined ? { ownCommits: [...new Set(target.ownCommits)].sort() } : {}) };
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -195,20 +248,21 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
 
   /**
    * The pre-merge "already fixed" check runs the pre-PR check (`github/already-fixed.ts`) with the same rules. This PR and
-   * the task's other recorded PRs are its own: excluded while open, a match once merged. The base-branch scan starts at the
-   * PR's base commit, the base the merge is validated against; the task has no own commits on the base branch before its
-   * merge.
+   * the task's other recorded PRs are its own: excluded while open, a match once merged. The base-branch scan starts at
+   * `target.alreadyFixedSince` when given (a runner-published PR), else at the PR's base commit; `target.ownCommits`, the
+   * task's own commits a rebase may have rewritten, are not counted.
    * The check stops early enough that its `gh` processes, which may need both grace periods after an abort, settle before
    * the inspection's deadline; stopped that way it is `unknown`.
    */
-  async #alreadyFixed(ownPullRequests: readonly number[], baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
+  async #alreadyFixed(target: ResolvedTarget, baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
     // A check started with no settle time left could leave processes running past the inspection's deadline.
     const runFor = deadlineAt - MERGE_CHECK_SETTLE_MS - Date.now();
     if (runFor <= 0) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' };
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), runFor);
     try {
-      const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [...ownPullRequests], ownCommits: new Set() },
+      const result = await this.checks.check({ issue: this.config.issue, taskBase: target.alreadyFixedSince ?? base, baseBranch,
+        ownPullRequests: [...target.ownPullRequests], ownCommits: new Set(target.ownCommits ?? []) },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
       // An answer that arrives after the check was stopped is not used. (One after a caller's abort is refused by the
       // inspection itself, once the rule reads have ended.)
@@ -244,7 +298,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const stopOthers = (error: unknown) => { failed.abort(error); throw error; };
     // Handled from the start: a stopped check can settle before the other stages, and an unhandled rejection meanwhile
     // would reach Node's process-wide handler (#48).
-    const alreadyFixed = this.#alreadyFixed(target.ownPullRequests, pr.baseRefName, base, deadlineAt, reads)
+    const alreadyFixed = this.#alreadyFixed(target, pr.baseRefName, base, deadlineAt, reads)
       .catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
     const [ruleRead, listRead] = await Promise.allSettled([
       this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
@@ -354,24 +408,30 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
     }
     const requiredChecks = [...requirements.values()].map(required => {
-      const match = observed.find(check => {
+      const matches = observed.filter(check => {
         const context = typeof check.name === 'string' ? check.name : check.context;
         const app = check.app && typeof check.app === 'object' ? (check.app as { databaseId?: unknown }).databaseId : null;
         return context === required.context && (required.appId === null || app === required.appId);
       });
-      if (!match) return { ...required, state: 'missing' as const };
-      let state: RequiredCheck['state'];
-      if (typeof match.name === 'string') {
-        const status = String(match.status ?? '').toUpperCase();
-        const conclusion = String(match.conclusion ?? '').toUpperCase();
-        if (['QUEUED','IN_PROGRESS','WAITING','PENDING','REQUESTED'].includes(status)) state = 'pending';
-        else if (status === 'COMPLETED') state = conclusion === 'SUCCESS' ? 'success' : 'failure';
-        else state = 'failure';
-      } else {
-        const status = String(match.state ?? '').toUpperCase();
-        state = status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
-      }
-      return { ...required, state };
+      if (!matches.length) return { ...required, state: 'missing' as const };
+      // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
+      // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not
+      // re-runs of each other: GitHub requires both to pass. So the latest of each kind counts, and the one that passes
+      // least decides.
+      // The latest is the observation with the greatest known start (a not-completed one with no start counts as
+      // +Infinity). A completed observation with no start time is dropped when another of its kind started (or is
+      // not-completed with no start) strictly after its completion: it is known to be older. Otherwise its order is
+      // unknown, so it ties with the latest, and it can only make the result pass less.
+      const latestOfKind = (kind: Record<string, unknown>[]) => {
+        if (kind.length === 0) return null;
+        const seen = kind.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check), olderThan: observedCheckOlderThan(check) }));
+        const latest = Math.max(...seen.map(check => Number.isNaN(check.at) ? Number.NEGATIVE_INFINITY : check.at));
+        return seen.filter(check => Number.isNaN(check.at) ? !(latest > check.olderThan) : check.at === latest)
+          .reduce((worst, next) => checkStateRank[next.state] < checkStateRank[worst.state] ? next : worst).state;
+      };
+      const states = [latestOfKind(matches.filter(check => typeof check.name === 'string')), latestOfKind(matches.filter(check => typeof check.name !== 'string'))]
+        .filter(state => state !== null);
+      return { ...required, state: states.reduce((worst, next) => checkStateRank[next] < checkStateRank[worst] ? next : worst) };
     });
     return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }

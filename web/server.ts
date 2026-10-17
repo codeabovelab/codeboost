@@ -24,6 +24,7 @@ import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { MAX_SOURCE_BYTES } from '../core/parse-v1.ts';
 import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
+import { MergeJobCoordinator, withMergeJob, type MergeJobTiming } from '../runner/merge-job.ts';
 export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & {
   repo: { name: string; baseRef: string };
   /** Revalidates any mutable authority carried by this description at the synchronous prompt-construction boundary. */
@@ -70,12 +71,16 @@ export const RUNNER_NOT_IN_DEMO = 'Demos do not run the runner. Use a review con
 export interface ServerTestHooks {
   /** Test-only gate for forcing a response lifecycle transition before the Issues wait is armed. */
   beforeIssueRefreshWait?(): Promise<void> | void;
+  /** Shorter required-check waits for tests of the one-click merge (F6b). */
+  mergeJobTiming?: MergeJobTiming;
 }
 export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planningInput?: PlanningDeps | PlanningSetup, runnerSetup?: RunnerSetup, testHooks: ServerTestHooks = {}) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
   let preMerge: PreMergeCoordinator | null = null;
+  /** The one-click merge (F6b of #22); only with a runner-published PR, which requires preparation. */
+  let mergeJobs: MergeJobCoordinator | null = null;
   let planning: PlanningDeps | undefined, issueSource: IssueGateway | null;
   /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
   let executor: ItemExecutor | null = null;
@@ -129,6 +134,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           validate: () => requireTrustedIssue(access),
         };
       });
+      if (preMerge && merges && merges.published?.requiresPreparation)
+        mergeJobs = new MergeJobCoordinator(service, preMerge, merges, capability, testHooks.mergeJobTiming);
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
       if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, {
@@ -142,7 +149,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   }
   // History reading and linking run in a worker (runner/history-job.ts); `signal` ends with the request at shutdown.
   const loadReview=async(signal?:AbortSignal)=>{const view=await service.load({signal});return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
-  const load=async(signal?:AbortSignal)=>{const view=await loadReview(signal);return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
+  const mergeView=async(view:Awaited<ReturnType<typeof loadReview>>,signal?:AbortSignal)=>{
+    if(!merges)return {available:false};
+    const status=await merges.displayStatus(view,signal);
+    // With a runner, Merge PR starts a merge job, which itself prepares and waits for required checks (F6b of #22).
+    return mergeJobs?withMergeJob(status,mergeJobs.latest(),service.store.getTask(identity).status):status;
+  };
+  const load=async(signal?:AbortSignal)=>{const view=await loadReview(signal);return {...view,merge:await mergeView(view,signal)};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
@@ -207,6 +220,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     // A publish reads the task head and pushes it; a new item must not move it meanwhile.
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
+    // A merge job prepares, waits for checks and merges the PR's head. A run would move that head, and its end publishes
+    // (pushes the head, refreshes the PR) under the job. Before owed work too: settling it ends in the same publish.
+    if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; wait for it to end or cancel the task.');
     // Recovery owns this claim for Resume even when owed work will settle instead of admitting an item. Start must not
     // consume it and strand the task behind the resulting human gate.
     if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
@@ -420,6 +436,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           service.store.afterCommit(() => afterPreMerge(preMerge!.settlePendingPush()));
           return { outcome: 'stopping' as const };
         }
+        // A merge job stops its wait at once; its preparation and guarded merge stop through their own routes.
+        if (mergeJobs?.active) service.store.afterCommit(() => mergeJobs!.cancel());
         const outcome = preMerge?.active
           ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
           : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
@@ -434,6 +452,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (action === 'prepare-merge') {
         if (access) requireTrustedIssue(access);
         if (!preMerge) throw new GuardRefusal('Pre-merge preparation is not configured.');
+        if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; it prepares the merge itself.');
         if (runner.isActive(identity) || executor?.busy(identity) || publishing?.busy(identity))
           throw new GuardRefusal('The runner or publisher is busy; pre-merge preparation cannot start yet.');
         preMerge.assertStartable();
@@ -623,7 +642,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (stopping) { json(503, { error: 'The review server is shutting down.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
-        if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
+        if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue(),job:mergeJobs?.latest()??null});return; }
         if (req.method === 'GET' && path === '/api/issues') { json(200, issues.view()); return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method === 'GET' && path === '/api/runner') { json(200, runnerView()); return; }
@@ -703,6 +722,70 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           // Every merge click carries its idempotency key; a request without one would bypass replay.
           if(!isUuidV4(input.actionId)) { json(400,{error:'A merge request needs a UUID v4 actionId.'}); return; }
           if(!merges)throw new Error('Merging is not configured for this review.');
+          // With a runner, one click starts the whole merge job (F6b of #22) and returns at once; the browser follows it
+          // through GET /api/merge.
+          if(mergeJobs) {
+            // Trust is admitted before the job starts, as for prepare-merge: an untrusted issue's click is refused, and the
+            // refusal saved. A failed read decides nothing: it saves nothing, and the same click may be sent again.
+            let untrusted: string|null=null;
+            if(config.github&&!mergeJobs.saved(input.actionId)) {
+              // Defensive: unreachable today. The merge check after the body is parsed already answers 503 once `stopping`
+              // is set, and nothing awaits between it and here; `runner.closing` is set only by shutdown, in the same turn
+              // as `stopping`. It keeps a later await added above from sending a trust read to GitHub during shutdown.
+              if(stopping||runner?.closing)throw new ShuttingDownError();
+              let access: IssueAccess|null=null;
+              try { access=await readIssueAccess(requestAbort.signal); }
+              catch (error) {
+                // A resend of this click may have saved its job while this read ran: that job is the answer (start replays it).
+                if(!mergeJobs.saved(input.actionId)) {
+                  // The read's own timeout, or gh's answer, came first: a shutdown that started while gh stopped does not
+                  // replace it. Otherwise a read stopped by shutdown decides nothing: 503, and the browser resends the click.
+                  if(!timedOut(error)&&!ghAnswered(error)&&(stopping||runner?.closing||requestAbort.signal.aborted))throw new ShuttingDownError();
+                  throw error;
+                }
+              }
+              if(access) try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
+            }
+            let job: Awaited<ReturnType<MergeJobCoordinator['start']>>;
+            // The executor term is defensive. Admission needs a task in review (or approved, merge blocked), and an executor
+            // run holds its task out of those statuses: an item run is queued or running (admission refuses item work in
+            // review), only a publish moves a task to in review, and it does so only after the run has returned (a publish
+            // refuses while the executor is busy). A run started from review that only settles owed work ends synchronously,
+            // so it is busy only for the microtasks before its promise settles.
+            try {
+              job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
+                ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
+            } catch (error) {
+              // A refusal (new or replayed) carries the task's latest job, so a page holding an older review, such as a
+              // second tab, follows the job another click started. A saved refusal is still never shown as a job.
+              if(error instanceof GuardRefusal) { json(409,{error:error.message,job:mergeJobs.latest()}); return; }
+              throw error;
+            }
+            const running=mergeJobs.current;
+            // The job's run never rejects, but this callback's own promise would: it must not throw (an unhandled rejection
+            // exits the server), so a failed read or close start is logged instead. The `stopping` term is defensive:
+            // shutdown sets it in the same synchronous turn as it closes publishing, and a closing publisher starts no close
+            // (its `owed` reads the shutdown refusal as nothing owed) and has already aborted any publish in progress. The
+            // cancelled task's pull requests are closed by the next startup, whose publish of owed work finds the close owed.
+            if(running)void running.finally(()=>{
+              try { if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); }
+              catch (error) { console.error(`Could not close the cancelled task's pull requests after its merge job: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
+            });
+            // The job is saved, so its click is settled. The reload awaits a history worker (#170) while the job's preparation
+            // writes, so it can fail without anything being wrong with the job: answer the job, and the page follows it and
+            // asks for a refresh (as after a direct merge whose reload fails). A reload stopped by shutdown answers 503, and
+            // the resent click replays the job.
+            let loaded: Awaited<ReturnType<typeof load>>;
+            try { loaded=await load(requestAbort.signal); }
+            catch (error) {
+              if(stopping||runner?.closing||requestAbort.signal.aborted)throw new ShuttingDownError();
+              const latest=mergeJobs.latest();
+              json(200,{job:latest?.id===job.id?latest:job,mergeRefreshRequired:true});return;
+            }
+            // The job may have moved on (or ended) while the review reloaded: answer its latest record, not the admission's.
+            const latest=mergeJobs.latest();
+            json(200,{...loaded,job:latest?.id===job.id?latest:job});return;
+          }
           let merged: Awaited<ReturnType<MergeCoordinator['merge']>>;
           // A merge stopped for a passing reason applied nothing, so answer 503 and the browser resends the same key.
           try { merged=await merges.merge(input.token,input.actionId); }
@@ -807,6 +890,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
+    // Same turn: a merge job (F6b) stops before it can ask GitHub to merge; its settlement is awaited below.
+    mergeJobs?.stop();
     // Same turn as the admission flag: a request already reading its body must not start a new Ask worker.
     questions.stopAdmission();
     runner?.rejectAdmission();
@@ -828,7 +913,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // whole pre-merge lifecycle before the write gate closes, so those settlement writes cannot be refused.
     const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
     const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
-    await step(() => preMerge?.close());
+    // A merge job awaits its preparation, so both stop together: the job is aborted while preparation is.
+    await step(() => Promise.all([mergeJobs?.close(), preMerge?.close()]));
     // Step 3: after the drain, close the Store write gate. A request-path write still pending after the abort
     // (for example merge reconciliation after a GitHub await) now fails with 503; settling coordinators keep the capability.
     service.store.closeWrites();

@@ -4,7 +4,11 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS, PreMergeCoordinator,
-  type PreMergeAuthorization } from '../runner/pre-merge.ts';
+  type PreMergeAuthorization, type PreMergeResult } from '../runner/pre-merge.ts';
+import { MergeCoordinator } from '../runner/merge.ts';
+import { MergeJobCoordinator } from '../runner/merge-job.ts';
+import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
+import { openingMarker } from '../github/pull-requests.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -40,7 +44,17 @@ const unusedPush = { push: async () => { throw new Error('No push expected.'); }
 vi.setConfig({ testTimeout: 15_000 });
 afterEach(() => { vi.restoreAllMocks(); for (const service of services.splice(0)) service.close(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-const markRunnerOwned = (service: ReviewService) => {
+/** The task's PR as the runner publishes it (F6b tests): a clear pre-PR check, then PR 7 from BRANCH into main. */
+const publishPullRequest = (service: ReviewService) => {
+  const identity = service.config.identity, store = service.store, snapshot = store.getSnapshot(identity);
+  const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: snapshot.id,
+    reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: snapshot.base } });
+  const opening = store.beginPullRequest(identity, { checkId: check.id, repository: 'acme/app', base: 'main', headBranch: BRANCH,
+    headSha: snapshot.head, draft: false });
+  expect(store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/acme/app/pull/7',
+    headSha: snapshot.head, draft: false }, true)).toBe('in review');
+};
+const markRunnerOwned = (service: ReviewService, published = false) => {
   const identity = service.config.identity;
   service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'queued');
   const attempt = service.store.admitAttempt(identity, { expectedStateVersion: service.store.getTask(identity).stateVersion,
@@ -48,7 +62,8 @@ const markRunnerOwned = (service: ReviewService) => {
   service.store.markRunning(identity, attempt.id);
   service.store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
     result: { unchanged: false, head: service.store.getSnapshot(identity).head } });
-  service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
+  if (published) publishPullRequest(service);
+  else service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
   service.config.runnerRepository = service.config.repository;
 };
 const markRunnerUnchanged = (service: ReviewService) => {
@@ -95,6 +110,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   rebaseResult?: (service: ReviewService, input: { oldHead: string; onto: string }, run: number) => string | undefined;
   /** Branch reads never answer; only their abort signal ends them. */
   branchReadHangs?: boolean;
+  /** The runner published the task's PR 7 (merging then requires preparation, as in production). */
+  published?: boolean;
+  /** Set up everything but start no preparation; `result` is then null. */
+  deferStart?: boolean;
   /** Remote fetches fail once codeboost has pushed. */
   fetchFailsAfterPush?: boolean;
   /** A collaborator pushes this commit to the branch just before codeboost's push, which is then refused. */
@@ -141,7 +160,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
   let view = await service.load();
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
-  if (options.runnerCommitted !== false) markRunnerOwned(service); else markRunnerUnchanged(service);
+  if (options.runnerCommitted !== false) markRunnerOwned(service, options.published === true); else markRunnerUnchanged(service);
   view = await service.load(); view = await service.act({ action: 'approve', item: 'P1', token: view.token });
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
   let rebaseAborts = 0;
@@ -294,7 +313,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const task = service.store.getTask(identity);
   const actionRequest = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
   if (options.actionId) service.store.userAction(identity, { actionId: options.actionId, kind: 'prepare-merge', request: actionRequest }, () => ({ outcome: 'preparing' }));
-  const result = await coordinator.start({ stateVersion: task.stateVersion,
+  const result = options.deferStart ? null as unknown as PreMergeResult : await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
     ...(options.actionId ? { actionId: options.actionId } : {}) });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, actionRequest, pushes, remote: () => remotePair,
@@ -1788,4 +1807,111 @@ it('starts no settlement read when less than the process-settlement reserve is l
   expect(fixture.branchReads()).toBe(0);
   expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
   await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+// F6b of #22: the acceptance cases, run through the one-click merge job with real preparation.
+async function mergeJob(rebasedText: string, commandExit?: number, options: Parameters<typeof rebaseFixture>[2] = {}, refuse: () => boolean = () => false) {
+  const fixture = await rebaseFixture(rebasedText, commandExit, { ...options, deferStart: true, published: true });
+  const merged: string[] = [];
+  // As production builds it with a runner: the task's published PR, which requires durable preparation readiness.
+  const gateway: MergeGateway = {
+    inspect: async request => {
+      const pr = fixture.service.store.taskPullRequests(fixture.service.config.identity).find(row => row.number === request?.target?.pullRequest)!;
+      return { base: fixture.remote().base, head: fixture.remote().head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
+        rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false,
+        published: { headBranch: request!.target!.headBranch!, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr.openingId),
+          branchOpen: [{ number: 7, base: 'main' }] } };
+    },
+    merge: async head => {
+      merged.push(head);
+      if (refuse()) throw new MergeSubmissionError('Required status check "ci" is expected.', 'refused');
+      return { url: 'https://github.com/acme/app/pull/7' };
+    },
+  };
+  const merges = new MergeCoordinator(fixture.service, gateway, undefined, undefined,
+    { repository: 'acme/app', baseBranch: 'main', requiresPreparation: true });
+  const jobs = new MergeJobCoordinator(fixture.service, fixture.coordinator, merges, undefined, { checkWaitMs: 2_000, firstDelayMs: 5, maxDelayMs: 20 });
+  const start = async () => jobs.start((await fixture.service.load()).token, randomUUID());
+  const settled = async () => { await jobs.current; return jobs.latest()!; };
+  const close = async () => { await jobs.close(); await fixture.coordinator.close(); await fixture.runner.close(); };
+  return { ...fixture, merged, merges, jobs, start, settled, close };
+}
+
+it('merges through the job when a moved base leaves approvals valid, pushing and checking the rewritten head', async () => {
+  const f = await mergeJob('feature\n', 0);
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'merged' });
+  expect(f.pushes).toHaveLength(1);
+  expect(f.checkedHeads).toEqual([f.rebased]);
+  expect(f.merged).toEqual([f.rebased]);
+  await f.close();
+});
+
+it('stops the job for review when the rebase makes an approval stale, and merges nothing', async () => {
+  const f = await mergeJob('changed by rebase\n');
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('fails the job when a command check breaks on the rewritten head', async () => {
+  const f = await mergeJob('feature\n', 1);
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('stops the job for review when a collaborator pushed to the pull request', async () => {
+  const f = await mergeJob('feature\n');
+  const repository = f.service.config.repository;
+  writeFileSync(join(repository, 'late.txt'), 'collaborator\n'); fixtureGit(repository, 'add', 'late.txt'); fixtureGit(repository, 'commit', '-qm', 'collaborator');
+  f.moveRemote({ base: f.remote().base, head: fixtureGit(repository, 'rev-parse', 'HEAD') });
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/head moved/) });
+  expect(f.pushes).toEqual([]);
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('stops a retry for review when its preparation rebases after GitHub refused the merge', async () => {
+  let refuse = true;
+  const f = await mergeJob('feature\n', 0, {
+    // The retry's rebase replays the already-rebased head onto the moved base, keeping its content.
+    rebaseResult: (service, input, run) => run < 2 ? undefined : fixtureGit(service.config.repository, 'commit-tree',
+      fixtureGit(service.config.repository, 'rev-parse', `${input.oldHead}^{tree}`), '-p', input.onto, '-m', 'feature, rebased again'),
+  }, () => refuse);
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+  expect(f.service.store.getTask(f.service.config.identity).status).toBe('approved but merge blocked');
+  // The base moves again before the person retries: the retry's preparation rebases, making a new snapshot.
+  refuse = false;
+  const repository = f.service.config.repository, base = f.remote().base;
+  const moved = fixtureGit(repository, 'commit-tree', fixtureGit(repository, 'rev-parse', `${base}^{tree}`), '-p', base, '-m', 'base moved after the refusal');
+  f.moveRemote({ base: moved, head: f.remote().head });
+  await f.start();
+  // After a merge attempt, a replacement snapshot needs every item approved again (#24): the retry stops for review.
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/requires refreshed attribution or approval/) });
+  expect((await f.service.load()).items.every(item => item.state === 'stale')).toBe(true);
+  expect((await f.merges.status()).blockers).toEqual(expect.arrayContaining([
+    expect.objectContaining({ code: 'queue-head', message: expect.stringMatching(/Approve every item again for the replacement snapshot/) })]));
+  expect(f.merged).toHaveLength(1);
+  await f.close();
+}, 60_000);
+
+it('ends the job cancelled when the task is cancelled while a command check runs', async () => {
+  const f = await mergeJob('feature\n', 0, { commandWaitsForCancellation: true });
+  await f.start();
+  // The preparation's review loads each await a history worker (#170) before the check starts.
+  await vi.waitFor(() => expect(f.runner.isActive(f.service.config.identity)).toBe(true), { timeout: 20_000 });
+  const identity = f.service.config.identity;
+  // As the cancel route does: the task's cancel commits (it waits on the running check), then the job is told.
+  expect(f.coordinator.cancelTask(f.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  f.jobs.cancel();
+  expect(await f.settled()).toMatchObject({ state: 'cancelled' });
+  expect(new Set(f.cancelReasons)).toEqual(new Set(['cancelled']));
+  expect(f.merged).toEqual([]);
+  await vi.waitFor(() => expect(f.service.store.getTask(identity).status).toBe('cancelled'));
+  await f.close();
 });

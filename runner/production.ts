@@ -264,6 +264,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image,
       { abort: async (attemptId, resultHead, state) => (await getRebaser()).abort(attemptId, resultHead, state) }, rebasePlanKey) });
   service.store.settleInterruptedPreMergeActions(identity);
+  service.store.settleInterruptedMergeJobs(identity);
   const repository = await getRepository();
   const imageId = image();
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
