@@ -992,10 +992,30 @@ it.each([
     { name: 'test', status: 'COMPLETED', conclusion: 'NEUTRAL' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
   ], 'failure'],
-  ['a completed run with no start time placed by its completion, after an older failure', [
+  ['a passing run with no start time, completed after a failure started before its completion (a tie: the failure counts)', [
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed after a failure started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed before a failure started (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a pass started (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:06:00Z' },
   ], 'success'],
+  ['a failed run with no start time, completed after a pass started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a queued run with no start (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
   ['a queued run with no start time over a completed pass', [
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
     { name: 'test', status: 'QUEUED', conclusion: '' },

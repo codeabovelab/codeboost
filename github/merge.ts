@@ -172,15 +172,21 @@ function observedTime(value: unknown): number {
 /**
  * When an observed check run or status started, to pick the latest of several with one name, or NaN when that is not
  * known. A run or commit status not yet completed (queued, in progress, pending) with no start time was queued after
- * every started one, so it counts as the latest. A completed run or commit status with no start time is placed at its
- * completion time. One with neither time could be the newest, so it is never ordered below another: it ties with the
- * latest, and the tie rule (the one that passes least counts) decides, so an unknown time never reads as passing.
+ * every started one, so it counts as the latest (+Infinity). A completed one with no start time gets NaN: its order
+ * relative to the latest is unknown (see `observedCheckOlderThan`).
  */
 function observedCheckStart(check: Record<string, unknown>): number {
   const started = observedTime(check.startedAt);
   if (Number.isFinite(started)) return started;
-  if (observedCheckState(check) === 'pending') return Number.POSITIVE_INFINITY;
-  return observedTime(check.completedAt);
+  return observedCheckState(check) === 'pending' ? Number.POSITIVE_INFINITY : NaN;
+}
+/**
+ * For a completed run or commit status with no start time: its completion time, before which it started, so it is
+ * known to be older than any observation of its kind that started after that time. NaN when it has a start time, is not
+ * completed, or has no completion time.
+ */
+function observedCheckOlderThan(check: Record<string, unknown>): number {
+  return Number.isNaN(observedCheckStart(check)) ? observedTime(check.completedAt) : NaN;
 }
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
@@ -412,12 +418,15 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not
       // re-runs of each other: GitHub requires both to pass. So the latest of each kind counts, and the one that passes
       // least decides.
-      // A completed observation with no time (NaN) ties with the latest, so it can only make the result pass less.
+      // The latest is the observation with the greatest known start (a not-completed one with no start counts as
+      // +Infinity). A completed observation with no start time is dropped when another of its kind started (or is
+      // not-completed with no start) strictly after its completion: it is known to be older. Otherwise its order is
+      // unknown, so it ties with the latest, and it can only make the result pass less.
       const latestOfKind = (kind: Record<string, unknown>[]) => {
         if (kind.length === 0) return null;
-        const seen = kind.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check) }));
+        const seen = kind.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check), olderThan: observedCheckOlderThan(check) }));
         const latest = Math.max(...seen.map(check => Number.isNaN(check.at) ? Number.NEGATIVE_INFINITY : check.at));
-        return seen.filter(check => Number.isNaN(check.at) || check.at === latest)
+        return seen.filter(check => Number.isNaN(check.at) ? !(latest > check.olderThan) : check.at === latest)
           .reduce((worst, next) => checkStateRank[next.state] < checkStateRank[worst.state] ? next : worst).state;
       };
       const states = [latestOfKind(matches.filter(check => typeof check.name === 'string')), latestOfKind(matches.filter(check => typeof check.name !== 'string'))]
