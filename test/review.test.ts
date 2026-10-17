@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { execFileSync } from 'node:child_process';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
@@ -10,6 +11,7 @@ import { approveItem, reviewedSegment } from '../core/approvals.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { identityKey } from '../core/identity.ts';
 import { fixtureGit } from './fixtures/git.ts';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import { gatedGit } from './fixtures/gated-git.ts';
 // A passthrough, so the stale-key test can count how often load() serializes a segment.
 vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
@@ -239,4 +241,42 @@ it('reads a base commit\'s tree once and hands each caller its own copy (#91)',(
  const second=service.planContext();
  expect(second.baseEntries[0]!.path).not.toBe('changed by a caller');
  expect(second.baseEntries.slice(1)).toEqual(first.baseEntries.slice(1));
+});
+it('refuses to start without a known checkout path identity', () => {
+ const {service,config}=fixture();service.close();services.splice(services.indexOf(service),1);
+ for(const pathIdentity of [undefined,{caseSensitive:'yes',unicodeNormalization:'none'},{caseSensitive:true},{caseSensitive:false,unicodeNormalization:'NFD'}])
+  expect(()=>new ReviewService({...config,pathIdentity} as unknown as typeof config)).toThrow('Known checkout path identity is required.');
+});
+it('keys paths by the configured case and Unicode identity, refusing what it cannot key safely', () => {
+ const {service,config}=fixture();service.close();services.splice(services.indexOf(service),1);
+ const key=(caseSensitive:boolean,unicodeNormalization:'none'|'NFC')=>{
+  const opened=new ReviewService({...config,pathIdentity:{caseSensitive,unicodeNormalization}});services.push(opened);return opened.planContext().pathKey;
+ };
+ const decomposed='docs/cafe\u0301.md',composed='docs/caf\u00e9.md';
+ expect(decomposed).not.toBe(composed);
+ expect(key(true,'none')('Src/A.ts')).toBe('Src/A.ts');
+ expect(key(true,'none')(decomposed)).toBe(decomposed);
+ expect(key(true,'NFC')(decomposed)).toBe(composed);
+ expect(key(false,'none')('Src/A.ts')).toBe('src/a.ts');
+ // Case folding beyond ASCII depends on the filesystem, so a case-insensitive checkout refuses rather than guesses.
+ expect(()=>key(false,'NFC')(composed)).toThrow('filesystem-specific identity adapter');
+});
+it('lists base entries by Git mode: links with their stored target, gitlinks, and regular or executable blobs as files', () => {
+ const {service,config}=fixture();const repository=config.repository;
+ const blob=(text:string)=>execFileSync('git',[...HARDENED_GIT_OPTIONS,'hash-object','-w','--stdin'],{cwd:repository,input:text,encoding:'utf8',env:hardenedGitEnvironment()}).trim();
+ const head=fixtureGit(repository,'rev-parse','HEAD');
+ // Index entries written directly, so the tree holds exactly these modes whatever the checkout filesystem supports.
+ for(const [mode,oid,path] of [['120000',blob('../outside\n'),'links/up'],['120000',blob('target dir/file'),'links/spaced'],
+  ['160000',head,'vendor/sub'],['100755',blob('#!/bin/sh\n'),'bin/run'],['100644',blob('tab'),'odd\tname\n.txt']] as const)
+  fixtureGit(repository,'update-index','--add','--cacheinfo',`${mode},${oid},${path}`);
+ fixtureGit(repository,'commit','-q','-m','modes');
+ const entries=service.planContextAt(fixtureGit(repository,'rev-parse','HEAD')).baseEntries;
+ const at=(path:string)=>entries.find(entry=>entry.path===path);
+ expect(at('links/up')).toEqual({path:'links/up',kind:'symlink',target:'../outside\n'});
+ expect(at('links/spaced')).toEqual({path:'links/spaced',kind:'symlink',target:'target dir/file'});
+ expect(at('vendor/sub')).toEqual({path:'vendor/sub',kind:'gitlink'});
+ expect(at('bin/run')).toEqual({path:'bin/run',kind:'file'});
+ expect(at('odd\tname\n.txt')).toEqual({path:'odd\tname\n.txt',kind:'file'});
+ expect(entries.filter(entry=>entry.kind!=='file').map(entry=>entry.path).sort()).toEqual(['links/spaced','links/up','vendor/sub']);
+ expect(()=>service.planContextAt('HEAD')).toThrow('Expected a full checkpoint head.');
 });

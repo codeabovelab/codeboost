@@ -7,7 +7,7 @@ Owner and subsequent assignments: issue #29. This is evidence for E1, not comple
 
 | Requirement | Existing implementation and runnable evidence | Disposition |
 | --- | --- | --- |
-| Immutable v1 schema and registry-keyed semantic dispatch; identical CLI copies | `core/plan.ts` statically imports v1 and guards the registry paths/key; `test/registry.test.ts` checks snapshots and CLI copies | Reuse for the sole released v1. Generalized schema loading for another retained version is not implemented; track under #6 before a new version is introduced |
+| Immutable v1 schema and registry-keyed semantic dispatch; identical CLI copies | At E1, `core/plan.ts` statically imported v1 and guarded the registry paths/key; `test/registry.test.ts` checks snapshots and CLI copies | Reuse for the sole released v1. Generalized schema loading for another retained version is not implemented; track under #6 before a new version is introduced. *Later:* implemented when #6 closed; see [plan-library-alignment.md](plan-library-alignment.md) |
 | Deterministic bounded JSON/YAML, decoded duplicate keys, prohibited YAML features, safe integers, UTF-8 and depth limits | `core/parse-v1.ts`; `test/plan-v1.test.ts` frozen fixtures | Reuse |
 | Selected issue, canonical leaf paths, checkout case/Unicode identity, projected dependencies, base entry types and retained link lineage | `validatePlan`; `test/plan.test.ts`, `test/plan-v1.test.ts` | Reuse; runtime link-write auditing still belongs to D/F |
 | Exact complete command argv; appended flags cannot inherit approval | `commandArgv`/`commandAllowed`; frozen v1 tests | Reuse; execution enforcement belongs to D/F |

@@ -89,6 +89,14 @@ it.each([
   expect(fake.events.slice(-2)).toEqual(['settled', 'remove']);
 });
 
+it('quotes at most 300 code units of a failed run\'s output, with whitespace collapsed', async () => {
+  const quote = (stdout: string) => provider(fakeDeps({ exitCode: 1, stdout }).deps).invoke(draftRequest(), new AbortController().signal)
+    .then(() => '', (error: Error) => error.message.split('Claude said: ')[1]);
+  expect(await quote('a'.repeat(299) + 'b')).toBe('a'.repeat(299) + 'b');
+  expect(await quote('a'.repeat(300) + 'TAIL')).toBe('a'.repeat(300));
+  expect(await quote(' x \n\t y ')).toBe('x y');
+});
+
 it.each([
   ['another attempt', (input: InvocationInput) => ({ attemptId: 'someone-else', context: input.context })],
   ['another plan revision', (input: InvocationInput) => ({ context: { ...input.context, planRevision: 2 } })],

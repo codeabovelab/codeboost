@@ -9,6 +9,8 @@ import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { capAdapterInvocationBudget, createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
+import { MAX_SOURCE_BYTES } from '../core/parse-v1.ts';
+import { prepareDraft } from '../core/planning-author.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 describe('production agent adapters', () => {
@@ -122,6 +124,44 @@ describe('production agent adapters', () => {
         .toThrow(`Codex cannot run the ${phase} phase`);
       expect(isInvocationActive(invocation.attemptId)).toBe(false);
     });
+
+  // Fixtures at the two bounds a planning answer meets: the raw stdout ceiling and the 1 MiB plan parser limit.
+  const structuredEnvelope = (answer: string, bytes: number) => {
+    const head = '{"type":"result","subtype":"success","is_error":false,"result":"done","structured_output":', tail = '}';
+    const padding = bytes - Buffer.byteLength(head + answer + tail);
+    if (padding < 0) throw new Error('Fixture answer exceeds the envelope size.');
+    // Insignificant whitespace pads the envelope without changing the decoded answer.
+    return Buffer.from(head + ' '.repeat(padding) + answer + tail);
+  };
+  it('decodes a Claude envelope as large as the stdout ceiling into the same structured answer', () => {
+    const answer = JSON.stringify({ summary: 'x'.repeat(4 * 1024 * 1024) });
+    const raw = structuredEnvelope(answer, OUTPUT_LIMITS.stdoutBytes);
+    expect(raw.length).toBe(OUTPUT_LIMITS.stdoutBytes);
+    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
+  });
+
+  it('re-serializes a structured answer, so decoded text can exceed its raw bytes (#166 may change this)', () => {
+    // Describes today's decoder, which re-serializes the answer (#166 may change that): JSON.parse then JSON.stringify
+    // writes 1e20 in full, so 4 raw bytes become 21. The supervisor bounds the decoded text itself; see the
+    // decoded-output limit cases in agent-supervisor.test.ts.
+    const raw = structuredEnvelope(JSON.stringify({ n: [] }).replace('[]', '[' + Array(1000).fill('1e20').join(',') + ']'), 8 * 1024);
+    const { text } = parseClaudeOutput(raw, true);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(raw.length);
+  });
+
+  it('applies the 1 MiB plan parser limit to the decoded answer at the exact byte in draft validation', () => {
+    const draft = prepareDraft({ context: { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, issue: 1,
+      baseEntries: [{ path: 'a', kind: 'file' }], pathKey: path => path, allowedCommands: [] }, requestId: 'request', revision: 1,
+      repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['a'] },
+      issue: { number: 1, title: 'Fix', body: '', comments: [] }, approvedLessons: [], feedback: '' });
+    const answerOf = (bytes: number) => JSON.stringify({ summary: 'x'.repeat(bytes - '{"summary":""}'.length) });
+    for (const [bytes, accepted] of [[MAX_SOURCE_BYTES, true], [MAX_SOURCE_BYTES + 1, false]] as const) {
+      const { text } = parseClaudeOutput(structuredEnvelope(answerOf(bytes), bytes + 1024), true);
+      expect(Buffer.byteLength(text)).toBe(bytes);
+      // At the limit the answer parses and fails only later, on its missing revision; one byte more fails in the parser.
+      expect(() => draft.validate(text)).toThrow(accepted ? 'Response revision mismatch.' : 'Input size exceeds 1 MiB.');
+    }
+  });
 
   it('publishes immutable production output ceilings', () => {
     expect(OUTPUT_LIMITS).toEqual({ stdoutBytes: 16 * 1024 * 1024, stderrBytes: 4 * 1024 * 1024,
