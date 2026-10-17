@@ -117,6 +117,8 @@ test('an older generation poll returning late neither applies nor lets a re-rend
   await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();
   await expect(page.locator('#banner')).not.toContainText('confirmed the reviewed head was merged');
   releases[1]!();
+  // The current generation's poll applies its answer and continues the one chain: a third poll follows.
+  await expect.poll(()=>polls,{timeout:15_000}).toBe(3);
   await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();
  }finally{releases.forEach(release=>release());}
 });
