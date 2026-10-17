@@ -149,7 +149,6 @@ function timestamp(value: unknown, label: string): string {
   return value;
 }
 
-/** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 /**
  * The state GitHub gives one observed required check. A check run that completed SUCCESS, NEUTRAL or SKIPPED passes, as
  * GitHub treats those conclusions for required checks; a commit status passes only with SUCCESS.
@@ -165,18 +164,34 @@ function observedCheckState(check: Record<string, unknown>): 'success' | 'pendin
   const status = String(check.state ?? '').toUpperCase();
   return status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
 }
+/** A real time gh reports, or NaN for none or the zero time (year 1) it gives a run that has not started or finished. */
+function observedTime(value: unknown): number {
+  const at = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : NaN;
+}
 /**
- * When an observed check run or status started, to pick the latest of several with one name. gh reports a run that has
- * not started yet with no time or the zero time (year 1); such a run was queued after every started one, so it counts
- * as the latest.
+ * When an observed check run or status started, to pick the latest of several with one name, or NaN when that is not
+ * known. A run or commit status not yet completed (queued, in progress, pending) with no start time was queued after
+ * every started one, so it counts as the latest (+Infinity). A completed one with no start time gets NaN: its order
+ * relative to the latest is unknown (see `observedCheckOlderThan`).
  */
 function observedCheckStart(check: Record<string, unknown>): number {
-  const at = typeof check.startedAt === 'string' ? Date.parse(check.startedAt) : NaN;
-  return Number.isFinite(at) && new Date(at).getUTCFullYear() > 1 ? at : Number.POSITIVE_INFINITY;
+  const started = observedTime(check.startedAt);
+  if (Number.isFinite(started)) return started;
+  return observedCheckState(check) === 'pending' ? Number.POSITIVE_INFINITY : NaN;
+}
+/**
+ * For a completed run or commit status with no start time: its completion time, before which it started, so it is
+ * known to be older than any observation of its kind that started after that time. NaN when it has a start time, is not
+ * completed, or has no completion time.
+ */
+function observedCheckOlderThan(check: Record<string, unknown>): number {
+  return Number.isNaN(observedCheckStart(check)) ? observedTime(check.completedAt) : NaN;
 }
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
 
+/** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
@@ -400,10 +415,23 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       });
       if (!matches.length) return { ...required, state: 'missing' as const };
       // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
-      // does not outrank a newer pending or passing run.
-      const latest = matches.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check) }))
-        .reduce((best, next) => next.at > best.at || (next.at === best.at && checkStateRank[next.state] < checkStateRank[best.state]) ? next : best);
-      return { ...required, state: latest.state };
+      // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not
+      // re-runs of each other: GitHub requires both to pass. So the latest of each kind counts, and the one that passes
+      // least decides.
+      // The latest is the observation with the greatest known start (a not-completed one with no start counts as
+      // +Infinity). A completed observation with no start time is dropped when another of its kind started (or is
+      // not-completed with no start) strictly after its completion: it is known to be older. Otherwise its order is
+      // unknown, so it ties with the latest, and it can only make the result pass less.
+      const latestOfKind = (kind: Record<string, unknown>[]) => {
+        if (kind.length === 0) return null;
+        const seen = kind.map(check => ({ state: observedCheckState(check), at: observedCheckStart(check), olderThan: observedCheckOlderThan(check) }));
+        const latest = Math.max(...seen.map(check => Number.isNaN(check.at) ? Number.NEGATIVE_INFINITY : check.at));
+        return seen.filter(check => Number.isNaN(check.at) ? !(latest > check.olderThan) : check.at === latest)
+          .reduce((worst, next) => checkStateRank[next.state] < checkStateRank[worst.state] ? next : worst).state;
+      };
+      const states = [latestOfKind(matches.filter(check => typeof check.name === 'string')), latestOfKind(matches.filter(check => typeof check.name !== 'string'))]
+        .filter(state => state !== null);
+      return { ...required, state: states.reduce((worst, next) => checkStateRank[next] < checkStateRank[worst] ? next : worst) };
     });
     return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }

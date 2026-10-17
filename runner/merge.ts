@@ -20,6 +20,20 @@ export class MergeNotApplied extends Error {}
 class CommittedFailure extends Error {}
 /** The click was admitted but GitHub's outcome is unknown; its attempt stays in flight, so the key must be kept. */
 export class MergeOutcomeUnknown extends Error {}
+/**
+ * Validation refused because a blocker remains. Its message is the guarded merge's own wording; the blocker rides along
+ * so a merge job can word its reason as what merging does (runner/merge-job.ts `inJobTerms`).
+ */
+export class MergeBlocked extends Error {
+  readonly prefix: string;
+  readonly blocker: MergeBlocker | undefined;
+  constructor(prefix: string, blocker: MergeBlocker | undefined) {
+    super(`${prefix}${blocker?.message ?? 'Merge is blocked.'}`);
+    this.prefix = prefix; this.blocker = blocker;
+  }
+}
+/** The preparation blocker's message while a push of the rewritten head has not settled. */
+export const PUSH_UNSETTLED = 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.';
 export interface MergeQueueStatus {
   kind: MergeAttempt['kind']; state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
   phase: MergeAttempt['phase']; position: number | null; occurredAt: string | null; retryable: boolean;
@@ -140,6 +154,7 @@ export class MergeCoordinator {
     const first = here.find(pr => pr.base === base);
     const check = first?.checkId ? store.getAlreadyFixed(identity, first.checkId) : null;
     const ownCommits = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
+    // The outcome term is defensive: beginPullRequest saves a check ID only for a clear check (#assertCheckedHead).
     if (check?.result.outcome !== 'clear') return { alreadyFixedSince: original, ownCommits };
     let scannedFrom: string | null = null;
     try { scannedFrom = store.getSnapshot(identity, check.snapshotId).base; } catch { /* unknown: scan from the original base */ }
@@ -232,7 +247,7 @@ export class MergeCoordinator {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
       if (task.pushInProgress) blockers.push({ code: 'preparation',
-        message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' });
+        message: PUSH_UNSETTLED });
       else if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
         && !this.service.store.preMergeReady(this.service.config.identity, {
           stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
@@ -466,7 +481,7 @@ export class MergeCoordinator {
       // final PR inspection; a synchronous local trust check then closes the admission window without another await.
       const authorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
-      if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
+      if (!status.ready) throw new MergeBlocked('', status.blockers[0]);
       view = await this.service.load({ signal });
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       const { status: finalStatus, resolved: finalTarget } = await this.#statusForMerge(view, signal);
@@ -476,7 +491,10 @@ export class MergeCoordinator {
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head || !samePullRequest({ status: finalStatus, resolved: finalTarget }))
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
-      if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
+      // From here on, a MergeBlocked's job wording (runner/merge-job.ts inJobTerms) is defensive in job mode: nothing changes
+      // the state version during a job, the reloads catch a changed token first, and a moved base trips the PR identity
+      // check first. Defensive tests in test/merge-job.test.ts pin it.
+      if (!finalStatus.ready) throw new MergeBlocked('Merge requirements changed during validation. ', finalStatus.blockers[0]);
       let commandStatus = finalStatus;
       let queueWatermark: string | null = null;
       if (status.remote.mergeQueue) {
@@ -487,7 +505,7 @@ export class MergeCoordinator {
         commandStatus = command.status;
         if (commandStatus.remote.base !== finalStatus.remote.base || commandStatus.remote.head !== finalStatus.remote.head || commandStatus.remote.mergeQueue !== finalStatus.remote.mergeQueue || !samePullRequest(command))
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
-        if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
+        if (!commandStatus.ready) throw new MergeBlocked('Merge requirements changed after queue correlation. ', commandStatus.blockers[0]);
       }
       if (authorization) {
         await authorization.refresh();
@@ -496,7 +514,7 @@ export class MergeCoordinator {
           || authorized.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(authorized))
           throw new Error('The pull request changed during merge validation. Refresh before merging.');
         if (!authorized.status.ready)
-          throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
+          throw new MergeBlocked('Merge requirements changed during authorization validation. ', authorized.status.blockers[0]);
         commandStatus = authorized.status;
       }
       if (commandStatus.remote.mergeQueue) {
@@ -510,7 +528,7 @@ export class MergeCoordinator {
           || boundary.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(boundary))
           throw new Error('The pull request changed after queue correlation. Refresh before merging.');
         if (!boundary.status.ready)
-          throw new Error(`Merge requirements changed after queue correlation. ${boundary.status.blockers[0]!.message}`);
+          throw new MergeBlocked('Merge requirements changed after queue correlation. ', boundary.status.blockers[0]);
         commandStatus = boundary.status;
       }
       // The final review load awaits its history worker, so the pull request is inspected once more after it: the last
@@ -522,7 +540,7 @@ export class MergeCoordinator {
       if (last.status.remote.base !== commandStatus.remote.base || last.status.remote.head !== commandStatus.remote.head
         || last.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(last))
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
-      if (!last.status.ready) throw new Error(`Merge requirements changed during validation. ${last.status.blockers[0]!.message}`);
+      if (!last.status.ready) throw new MergeBlocked('Merge requirements changed during validation. ', last.status.blockers[0]);
       commandStatus = last.status;
       authorization?.validate();
       if (this.service.store && this.service.config) {

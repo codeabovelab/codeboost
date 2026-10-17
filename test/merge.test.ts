@@ -941,11 +941,11 @@ it('parses required checks from both rule sources and pins the gh merge head', a
 });
 
 /** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
-async function requiredTestState(statusCheckRollup: unknown[]) {
+async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup });
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: null }] } }]]);
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: appId }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
@@ -984,12 +984,122 @@ it.each([
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
   ], 'failure'],
+  ['a started failure beside a completed skip with only zero times (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SKIPPED', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a started failure beside a completed neutral run with no time (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'NEUTRAL' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed after a failure started before its completion (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed after a failure started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a passing run with no start time, completed before a failure started (the later failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed in the second a pass started (order unknown: a tie, the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a pass started (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'success'],
+  ['a failed run with no start time, completed after a pass started (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed before a queued run with no start (older: dropped)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
+  ['a queued run with no start time over a completed pass', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'QUEUED', conclusion: '' },
+  ], 'pending'],
   ['a newer commit status over an older failed one', [
     { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
     { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
   ], 'success'],
+  ['a pending commit status with no start time over a started passing one', [
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+    { context: 'test', state: 'PENDING' },
+  ], 'pending'],
+  ['a failed commit status with no time beside a started passing one (a tie: the failure counts)', [
+    { context: 'test', state: 'FAILURE' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['an errored commit status with no time beside a started passing one (a tie: the error counts)', [
+    { context: 'test', state: 'ERROR' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing commit status with no time beside a started failed one (a tie: the failure counts)', [
+    { context: 'test', state: 'SUCCESS' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a passing run with no time beside a started failed one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failed run with no time beside a started passing one (a tie: the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a started failed commit status beside a passing one with no time (a tie: the failure counts)', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS' },
+  ], 'failure'],
 ] as const)('counts the latest observation of a required check: %s', async (_case, rollup, expected) => {
   expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+// GitHub: "If a check and a commit status have the same name, both must pass when that name is required." The latest
+// of each kind counts, and the one that passes least decides; a newer observation of one kind never replaces the other.
+it.each([
+  ['a newer passing status does not hide a failed check run', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a newer passing status does not hide a pending check run', [
+    { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'pending'],
+  ['a newer passing check run does not hide a failed status', [
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['a failure outranks a pending of the other kind', [
+    { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' },
+    { context: 'test', state: 'ERROR', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'failure'],
+  ['both kinds passing', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
+  ], 'success'],
+  ['each kind re-run: the latest of each passes', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:01:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:02:00Z' },
+    { context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:03:00Z' },
+  ], 'success'],
+  ['only a check run', [{ name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-11T00:00:00Z' }], 'pending'],
+  ['only a commit status', [{ context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' }], 'failure'],
+] as const)('requires both a check run and a commit status with the required name: %s', async (_case, rollup, expected) => {
+  expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
+  expect(await requiredTestState([
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z', app: { databaseId: 10 } },
+    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
+  ], 10)).toEqual(['success']);
 });
 
 it('rejects an unsupported runtime merge method', () => {

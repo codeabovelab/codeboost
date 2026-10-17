@@ -384,7 +384,7 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.merged).toEqual([]);
   });
 
-  it('scans for an earlier fix from the pre-PR check\'s base after a rebase, skipping the task\'s own commits', async () => {
+  it('scans for an earlier fix from the tip the first opening\'s pre-PR check scanned through after a rebase, skipping the task\'s own commits', async () => {
     const { store } = published(), gh = github(store);
     const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
     // A pre-merge rebase moved the reviewed base from oid(1) to oid(10) and rewrote the owned head oid(2) as oid(12).
@@ -393,6 +393,17 @@ describe('the merge gate with a runner block (#121)', () => {
     await merges.status(undefined, true);
     expect(gh.targets.at(-1)).toMatchObject({ pullRequest: 7, alreadyFixedSince: oid(9) });
     expect([...gh.targets.at(-1)!.ownCommits!].sort()).toEqual([oid(12), oid(2)].sort());
+  });
+
+  it('does not skip a foreign commit in the task\'s ledger when scanning for an earlier fix', async () => {
+    const { store } = published(), gh = github(store);
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    // A base commit the task's history shows (for example one mentioning the issue) is foreign, not the task's own.
+    store.recordHistory(identity, reviewed(), oid(1), oid(2), [{ sha: oid(5), owner: null, origin: 'foreign', sourceSha: null }]);
+    expect(store.getLedger(identity).map(entry => [entry.sha, entry.origin])).toEqual([[oid(2), 'owned'], [oid(5), 'foreign']]);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await merges.status(undefined, true);
+    expect(gh.targets.at(-1)!.ownCommits).toEqual([oid(2)]);
   });
 
   it('keeps scanning from the PR\'s own pre-PR check after a re-publish records a newer check from a rebased base', async () => {

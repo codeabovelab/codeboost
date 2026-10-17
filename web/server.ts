@@ -729,6 +729,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // refusal saved. A failed read decides nothing: it saves nothing, and the same click may be sent again.
             let untrusted: string|null=null;
             if(config.github&&!mergeJobs.saved(input.actionId)) {
+              // Defensive: unreachable today. The merge check after the body is parsed already answers 503 once `stopping`
+              // is set, and nothing awaits between it and here; `runner.closing` is set only by shutdown, in the same turn
+              // as `stopping`. It keeps a later await added above from sending a trust read to GitHub during shutdown.
               if(stopping||runner?.closing)throw new ShuttingDownError();
               let access: IssueAccess|null=null;
               try { access=await readIssueAccess(requestAbort.signal); }
@@ -743,11 +746,27 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
               }
               if(access) try { requireTrustedIssue(access); } catch (error) { if(!(error instanceof GuardRefusal))throw error; untrusted=error.message; }
             }
-            const job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
-              ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
+            let job: Awaited<ReturnType<MergeJobCoordinator['start']>>;
+            // The executor term is defensive. Admission needs a task in review (or approved, merge blocked), and an executor
+            // run holds its task out of those statuses: an item run is queued or running (admission refuses item work in
+            // review), only a publish moves a task to in review, and it does so only after the run has returned (a publish
+            // refuses while the executor is busy). A run started from review that only settles owed work ends synchronously,
+            // so it is busy only for the microtasks before its promise settles.
+            try {
+              job=await mergeJobs.start(input.token,input.actionId,()=>untrusted??(runner?.isActive(identity)||executor?.busy(identity)||publishing?.busy(identity)
+                ?'The runner or publisher is busy; the merge cannot start yet.':null),requestAbort.signal);
+            } catch (error) {
+              // A refusal (new or replayed) carries the task's latest job, so a page holding an older review, such as a
+              // second tab, follows the job another click started. A saved refusal is still never shown as a job.
+              if(error instanceof GuardRefusal) { json(409,{error:error.message,job:mergeJobs.latest()}); return; }
+              throw error;
+            }
             const running=mergeJobs.current;
             // The job's run never rejects, but this callback's own promise would: it must not throw (an unhandled rejection
-            // exits the server), so a failed read or close start is logged instead.
+            // exits the server), so a failed read or close start is logged instead. The `stopping` term is defensive:
+            // shutdown sets it in the same synchronous turn as it closes publishing, and a closing publisher starts no close
+            // (its `owed` reads the shutdown refusal as nothing owed) and has already aborted any publish in progress. The
+            // cancelled task's pull requests are closed by the next startup, whose publish of owed work finds the close owed.
             if(running)void running.finally(()=>{
               try { if(publishing&&!stopping&&service.store.getTask(identity).status==='cancelled')publishing.taskCancelled(identity); }
               catch (error) { console.error(`Could not close the cancelled task's pull requests after its merge job: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }

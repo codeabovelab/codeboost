@@ -88,6 +88,10 @@ export interface PreMergeReadiness {
   stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; commandPolicyDigest: string;
 }
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
+/** The next step after a failing required check or GitHub's refusal blocks a merge job (docs/implementation/merge-handoff.md). */
+export const FIX_THEN_RETRY = 'Fix it, then Retry merge.';
+/** The longest review token a merge job or its saved refusal is saved under. */
+export const MAX_MERGE_JOB_TOKEN_LENGTH = 512;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
@@ -154,6 +158,11 @@ export interface MergeJob {
    * browser orders records of different jobs by it, since wall-clock times can step back.
    */
   sequence: number;
+  /**
+   * The record's version, from 1: every saved change to the job adds one. The browser orders records of the same job by
+   * it, since two saves can share an update time or the clock can step back between them.
+   */
+  revision: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -362,7 +371,8 @@ export class Store {
           this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (
             id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS merge_jobs_plan ON merge_jobs(plan_key);`);
-          // The pre-PR already-fixed check each opening followed: the merge's scan starts at that check's base.
+          // The pre-PR already-fixed check each opening followed: the merge's scan may start at the tip that check scanned
+          // through (docs/implementation/merge-handoff.md).
           if (!this.#db.prepare('PRAGMA table_info(task_pull_requests)').all().some(column => column.name === 'check_id'))
             this.#db.exec('ALTER TABLE task_pull_requests ADD COLUMN check_id TEXT');
           this.#db.exec('PRAGMA user_version=19');
@@ -2130,10 +2140,11 @@ export class Store {
    */
   beginMergeJob(identity: PlanIdentity, input: { actionId: string; token: string; now?: string }): { job: MergeJob; resent: boolean } {
     assertUuidV4(input.actionId, 'Action ID');
-    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       const task = this.#task(key);
+      // A saved click is looked up first, so a resend under its ID with any other token (unusable ones too) is refused
+      // as a reused ID, as a different usable one is.
       const existing = this.#get('SELECT data FROM merge_jobs WHERE id=?', input.actionId);
       if (existing) {
         const job = decode<MergeJob>(existing.data);
@@ -2141,11 +2152,12 @@ export class Store {
           throw new ActionIdReused('Action ID already used for a different request.');
         return { job, resent: true };
       }
+      if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
-        url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now };
+        url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return { job, resent: false };
     });
@@ -2156,7 +2168,7 @@ export class Store {
    */
   recordMergeJobRefusal(identity: PlanIdentity, input: { actionId: string; token: string; reason: string }): MergeJob {
     assertUuidV4(input.actionId, 'Action ID');
-    if (typeof input.token !== 'string' || !input.token || input.token.length > 512) throw new Error('A review token is required.');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#task(key);
@@ -2168,7 +2180,7 @@ export class Store {
       }
       const now = new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'failed', step: null,
-        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), startedAt: now, updatedAt: now, refused: true };
+        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now, refused: true };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return job;
     });
@@ -2188,9 +2200,10 @@ export class Store {
    * so the job and the task cannot disagree after a crash. A task that moved meanwhile keeps its status.
    * With `readyFor`, the block applies only while the preparation's readiness still holds (checked in the same
    * transaction): a check result that arrived after a review edit or another task change says nothing about the
-   * changed review, so the job then ends `failed` and the task keeps its status.
+   * changed review, so the job then ends `failed` and the task keeps its status. `next`, the person's next step, follows
+   * the reason only when the job ends `blocked`: a `failed` end says why, and the page adds "Merge again when ready."
    */
-  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }): boolean {
+  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }, next?: string): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
       const job = this.getMergeJob(identity, id);
@@ -2203,23 +2216,33 @@ export class Store {
         if (!this.preMergeReady(identity, { stateVersion: task.state_version as number, reviewVersion: this.#current(key).review_version as number,
           snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: readyFor.commandPolicyDigest }))
           return this.finishMergeJob(identity, id, { state: 'failed',
-            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies. Merge again.' });
+            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies.' });
       }
       // GitHub refused the job's own merge attempt: the block applies only to the review that attempt was admitted for.
-      // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is.
+      // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is. A review edit
+      // (a review note, review_version only) may land while the attempt is in flight. The snapshot term is defensive: a
+      // merge job needs a runner, whose review load reads the recorded head, so no HEAD observation records a snapshot. A
+      // plan revision lands only once the attempt ended (#savePlan refuses while a merge is in flight), such as a queue
+      // poll ending it while GitHub was asked.
       const attempt = job.mergeActionId ? this.getMergeAttempt(identity) : null;
       if (attempt && attempt.actionId === job.mergeActionId) {
         const plan = this.#current(key);
         if (plan.revision !== attempt.revision || plan.snapshot_id !== attempt.snapshotId || plan.review_version !== attempt.reviewVersion)
           return this.finishMergeJob(identity, id, { state: 'failed',
-            reason: `${reason} The review changed while GitHub was asked to merge; review it, then merge again.` });
+            reason: `${reason} The review changed while GitHub was asked to merge; review it first.` });
       }
+      // The attempt and merge terms are defensive. A job blocks after its preparation settled (every check attempt it
+      // admitted ended), and while it runs nothing else admits an attempt or a merge: the server refuses start, resume,
+      // a standalone preparation and a second merge click; admission refuses item work in review; and a merge attempt is
+      // begun only by the job's own guarded merge. With `readyFor`, any later admission moved the state version, so the
+      // job ended `failed` above. Otherwise the job's own merge attempt ended (failed or removed) before the block, and
+      // startup recovery blocks only for such an attempt.
       if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
         && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);
         this.#touch(key);
       }
-      return this.finishMergeJob(identity, id, { state: 'blocked', reason });
+      return this.finishMergeJob(identity, id, { state: 'blocked', reason: next ? `${reason} ${next}` : reason });
     });
   }
   /** End a running job. Returns false when it had already ended. */
@@ -2234,7 +2257,8 @@ export class Store {
       if (!row) throw new Error('Unknown merge job.');
       const next = change(decode<MergeJob>(row.data));
       if (!next) return null;
-      const job = { ...next, updatedAt: new Date().toISOString() };
+      // Each saved change is strictly later than the one before, whatever the clock says.
+      const job = { ...next, revision: (Number.isSafeInteger(next.revision) ? next.revision : 1) + 1, updatedAt: new Date().toISOString() };
       this.#run('UPDATE merge_jobs SET data=? WHERE id=?', encode(job), id);
       return job;
     });
@@ -2264,7 +2288,7 @@ export class Store {
     if (!running) return;
     const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
     if (!attempt || attempt.actionId !== running.mergeActionId) {
-      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished. Merge again.' });
+      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
       return;
     }
     if (attempt.state === 'merged' || attempt.state === 'queued') {
@@ -2279,10 +2303,10 @@ export class Store {
     if (attempt.requiresFreshReview) {
       // The head changed: the task needs a fresh review, so it is not moved to approved, merge blocked.
       this.finishMergeJob(identity, running.id, { state: 'failed',
-        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head, then merge again.` });
+        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head first.` });
       return;
     }
-    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`);
+    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`, undefined, FIX_THEN_RETRY);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {
