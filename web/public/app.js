@@ -717,6 +717,8 @@ $("merge").onclick = async () => {
   const busyOwner = beginBusy("write");
   reviewGeneration++;
   mergeGeneration++;
+  // Defensive, like every generation change: a click needs `ready`, which excludes a running job or an active attempt,
+  // so no poll timer is pending here today (traced, not tested).
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
   mergePollState = null;
