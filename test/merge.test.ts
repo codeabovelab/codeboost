@@ -1000,9 +1000,13 @@ it.each([
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:03:00Z' },
   ], 'failure'],
-  ['a passing run with no start time, completed before a failure started (older: dropped)', [
+  ['a passing run with no start time, completed before a failure started (the later failure counts)', [
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T00:05:00Z' },
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-11T00:06:00Z' },
+  ], 'failure'],
+  ['a failed run with no start time, completed in the second a pass started (order unknown: a tie, the failure counts)', [
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
+    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' },
   ], 'failure'],
   ['a failed run with no start time, completed before a pass started (older: dropped)', [
     { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T00:05:00Z' },
