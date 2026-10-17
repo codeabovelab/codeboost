@@ -384,7 +384,7 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.merged).toEqual([]);
   });
 
-  it('scans for an earlier fix from the pre-PR check\'s base after a rebase, skipping the task\'s own commits', async () => {
+  it('scans for an earlier fix from the tip the first opening\'s pre-PR check scanned through after a rebase, skipping the task\'s own commits', async () => {
     const { store } = published(), gh = github(store);
     const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
     // A pre-merge rebase moved the reviewed base from oid(1) to oid(10) and rewrote the owned head oid(2) as oid(12).

@@ -371,7 +371,8 @@ export class Store {
           this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (
             id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS merge_jobs_plan ON merge_jobs(plan_key);`);
-          // The pre-PR already-fixed check each opening followed: the merge's scan starts at that check's base.
+          // The pre-PR already-fixed check each opening followed: the merge's scan may start at the tip that check scanned
+          // through (docs/implementation/merge-handoff.md).
           if (!this.#db.prepare('PRAGMA table_info(task_pull_requests)').all().some(column => column.name === 'check_id'))
             this.#db.exec('ALTER TABLE task_pull_requests ADD COLUMN check_id TEXT');
           this.#db.exec('PRAGMA user_version=19');
