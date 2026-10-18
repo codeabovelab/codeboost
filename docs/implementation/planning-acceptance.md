@@ -86,5 +86,11 @@ The Store guarantees revision/snapshot binding and pending-only settlement acros
 processes, and E3 requires the caller's snapshot identity before admission. G4 now
 composes the browser with production planning setup, lane D's provider boundary,
 F's HTTP lifecycle and Store persistence in `plans-production.spec.ts`. The exact-head
-real-Docker planning gate also passes, completing T18. T9 remains incomplete until
-its remaining F6 common-CI and all-suite gate passes.
+real-Docker planning gate also passes, completing T18.
+
+T9 is still incomplete. F6 runs the recordings in both required jobs, `test` and
+`real-docker`, and the live Claude probes in the nightly `Live probes` workflow
+([CI](ci.md)). No workflow records fixtures: when a recording goes stale, run
+`scripts/record-planning.ts` again as above. T9 can be ticked when a repository
+administrator requires `test` and `real-docker` on `main`, both pass on the same head,
+and a `Live probes` run passes with the `CLAUDE_CODE_OAUTH_TOKEN` secret.

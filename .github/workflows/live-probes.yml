@@ -1,0 +1,48 @@
+name: Live probes
+# Runs the live Claude startup probes against the real Claude service. It is not a pull request check: it runs
+# nightly on the default branch and when started by hand. See docs/implementation/ci.md.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: live-probes
+  cancel-in-progress: false
+jobs:
+  live-probes:
+    runs-on: ubuntu-latest
+    # The probes' own time limits total 33 min (6, 8, 8 and 11). agent-container and agent-supervisor may each spend
+    # up to 10 min building the image before their probes; agent-question builds inside its probe's own 11 min. The
+    # teardown hooks have Vitest limits that total 9 min: agent-container 2 after each test and 2 at the end,
+    # agent-supervisor 3 and agent-question 2. That is 62 min, plus setup. These are only Vitest's limits: the afterAll
+    # hooks in agent-container and agent-question call docker through spawnSync with no timeout of their own, and
+    # Vitest's hook timer cannot fire while such a call blocks. The 75 min job limit caps the run.
+    timeout-minutes: 75
+    steps:
+      # Fail at once when the secret is missing, so a missing secret never looks like a passing run.
+      - name: Require the Claude token
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::The repository secret CLAUDE_CODE_OAUTH_TOKEN is not set. Add it to run the live probes."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.7.0'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # The docker project runs these files one at a time, as in the Agent isolation workflow. The filter keeps only
+      # the tests whose titles end in "(live Claude)".
+      - name: Run the live Claude probes
+        env:
+          CODEBOOST_RUN_AUTH_PROBES: '1'
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: npx vitest run --project docker -t '\(live Claude\)$' --reporter=default --reporter=json --outputFile=live-probes.json test/agent-container.test.ts test/agent-question.test.ts test/agent-supervisor.test.ts
+      # Vitest exits 0 when it skips every probe, so check that each probe passed and nothing else ran.
+      - name: Check that every probe passed
+        run: node scripts/live-probes.ts check live-probes.json
