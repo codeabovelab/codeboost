@@ -71,9 +71,13 @@ The job:
    exits with success when it skips every test, so this step fails unless each
    probe listed in `scripts/live-probes.ts` passed and no other test ran.
 
-If you add, rename or remove a probe, update `LIVE_PROBES` in
-`scripts/live-probes.ts`. `test/vitest-config.test.ts` fails if the list and the
-test titles differ.
+If you add, rename or remove a probe, or rename a `describe` block around one,
+update `LIVE_PROBES` in `scripts/live-probes.ts`. `test/vitest-config.test.ts`
+parses each probe file. It fails unless the tests that
+`CODEBOOST_RUN_AUTH_PROBES` enables have exactly the full names in the list: the
+`describe` titles and the test title, joined with spaces, as Vitest names them.
+The switch may only be the condition of an `if` block that holds only tests and
+declarations, or of `it.runIf`. Any other use fails the test.
 
 Codex has no probe, because Codex is refused in every phase (#93).
 
