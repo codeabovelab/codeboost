@@ -22,19 +22,15 @@ const DOCKER_TESTS = [
 
 describe('Vitest scheduling', () => {
   it('finishes ordinary tests before running Docker-backed files one at a time', () => {
-    const projects = (config as { test?: { projects?: Array<{ test?: Record<string, unknown> }> } }).test?.projects;
-    expect(projects).toHaveLength(2);
-    expect(projects?.[0]?.test).toMatchObject({
-      name: 'parallel',
-      include: ['test/*.test.ts'],
-      exclude: DOCKER_TESTS,
-      sequence: { groupOrder: 0 },
-    });
-    expect(projects?.[1]?.test).toMatchObject({
-      name: 'docker',
-      include: DOCKER_TESTS,
-      fileParallelism: false,
-      sequence: { groupOrder: 1 },
+    // The whole config, exactly: any other key, such as an `exclude`, `testNamePattern` or `passWithNoTests` in a
+    // project, could drop files or tests from both CI jobs while every job still passes.
+    expect(config).toEqual({
+      test: {
+        projects: [
+          { test: { name: 'parallel', include: ['test/*.test.ts'], exclude: DOCKER_TESTS, sequence: { groupOrder: 0 } } },
+          { test: { name: 'docker', include: DOCKER_TESTS, fileParallelism: false, sequence: { groupOrder: 1 } } },
+        ],
+      },
     });
   });
 });
@@ -54,7 +50,7 @@ const SETUP = [{ uses: 'actions/checkout@v4' },
 const runs = (steps: Array<{ run?: string }>) => steps.flatMap(step => step.run === undefined ? [] : [step.run]);
 
 type Node = { type: string; [key: string]: unknown };
-type ProbeFileTest = { name: string | undefined; gated: boolean };
+type ProbeFileTest = { name: string; gated: boolean };
 // An enclosing `describe`: its literal title, or why its title is not known.
 type Suite = { title: string } | { problem: string };
 const PROBE_SWITCH = 'CODEBOOST_RUN_AUTH_PROBES';
@@ -101,6 +97,13 @@ const isConstant = (node: Node): boolean => (node.type === 'Literal' && ['string
   || (node.type === 'TemplateLiteral' && (node.expressions as Node[]).every(isConstant))
   || (node.type === 'BinaryExpression' && isConstant(node.left as Node) && isConstant(node.right as Node));
 const isPlainValue = (node: Node) => ['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) || isConstant(node);
+// A timeout: a number literal, or a binary operation on numbers, such as `22 * 60_000`.
+const isNumber = (node: Node): boolean => (node.type === 'Literal' && typeof node.value === 'number')
+  || (node.type === 'BinaryExpression' && isNumber(node.left as Node) && isNumber(node.right as Node));
+// Exactly (literal title, function expression[, timeout]). An options object, such as `{ skip: true }`, could skip or
+// change the test, so it is refused.
+const isPlainSuiteArgs = (args: Node[]) => (args.length === 2 || (args.length === 3 && isNumber(args[2]!)))
+  && literalText(args[0]) !== undefined && ['ArrowFunctionExpression', 'FunctionExpression'].includes(args[1]!.type);
 // Throws unless the statement is a `const` or `let` declaration of plain names, each with a plain value. A `var` is
 // refused because it is visible outside the block.
 function assertPlainDeclaration(statement: Node, file: string) {
@@ -111,15 +114,19 @@ function assertPlainDeclaration(statement: Node, file: string) {
 }
 
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
-// whether CODEBOOST_RUN_AUTH_PROBES enables it. Every `describe` around a gated test must be a plain `describe(...)`
-// with a literal title, or this throws: a title with expressions, or `describe.each`, `.for`, `.skip` or any other
-// modifier, would make the full name differ from the one this computes. A gate counts only where Vitest always
+// whether CODEBOOST_RUN_AUTH_PROBES enables it. Every `it`, `test` or `describe` call in the file, with or without a
+// modifier, must have a string literal or a template literal without expressions as its title, or this throws, so
+// that the caller can check every title for the marker. Every `describe` around a gated test must be a plain
+// `describe(...)` with exactly a literal title, a function expression and optionally a numeric timeout, or this
+// throws: a modifier such as `describe.each`, `.for` or `.skip`, or an options object such as `{ skip: true }`, could
+// skip the test or make its full name differ from the one this computes. A gated test call must have the same
+// arguments. A gate counts only where Vitest always
 // registers its tests while it loads the file: as a statement directly in the module body or directly in the body of a
 // plain `describe` callback that is itself such a statement. A gate inside any other block or expression, such as
 // another `if`, a loop or a helper that is never called, throws. The switch may appear only as the exact condition of an
-// `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
+// `if (...) { ... }` block without `else`, whose statements are each a plain `it`/`test` call or a
 // `const` or `let` declaration of plain names with plain values (see `isPlainValue`), or of
-// `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the switch's name in the source text,
+// `it.runIf(...)`/`test.runIf(...)`. Every occurrence of the switch's name in the source text,
 // comments and strings included, must be one of these gates, or this throws. A variable name built at runtime from
 // pieces, such as `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`, is not caught.
 function probeFileTests(file: string, source: string): ProbeFileTest[] {
@@ -127,13 +134,15 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
   if (errors.length) throw new Error(`${file} does not parse: ${errors[0]!.message}`);
   const tests: ProbeFileTest[] = [];
   let gates = 0;
-  const record = (describes: Suite[], titleNode: unknown, gated: boolean) => {
-    const title = literalText(titleNode);
-    if (gated && title === undefined) throw new Error(`Gated test without a literal title in ${file}.`);
+  const record = (describes: Suite[], args: Node[], gated: boolean, offset: unknown) => {
+    const title = literalText(args[0]);
+    if (title === undefined) throw new Error(`A test without a literal title at offset ${String(offset)} in ${file}.`);
+    if (gated && !isPlainSuiteArgs(args))
+      throw new Error(`A gated test whose arguments are not a literal title, a function and a timeout at offset ${String(offset)} in ${file}.`);
     const unknown = describes.find(suite => 'problem' in suite);
     if (gated && unknown) throw new Error(`Gated test in ${file} inside a describe ${unknown.problem}.`);
     const titles = describes.map(suite => 'title' in suite ? suite.title : '?');
-    tests.push({ name: title === undefined ? undefined : [...titles, title].join(' '), gated });
+    tests.push({ name: [...titles, title].join(' '), gated });
   };
   // `loading` is true only for a statement that always runs as Vitest loads the file, and for its expression: a statement
   // directly in the module body or directly in the body of a `describe` callback that is itself such a statement.
@@ -149,7 +158,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       for (const statement of block.body as Node[]) {
         const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node) : undefined;
         if (call && call.kind !== 'describe' && call.methods.length === 0) {
-          record(describes, call.args[0], true);
+          record(describes, call.args, true, statement.start);
           call.args.slice(1).forEach(arg => visit(arg, describes, false));
         } else if (statement.type === 'VariableDeclaration') {
           assertPlainDeclaration(statement, file);
@@ -168,9 +177,12 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       else call.innerArgs.flat().forEach(arg => visit(arg, describes, false));
       if (call.kind === 'describe') {
         const title = literalText(call.args[0]);
+        if (title === undefined) throw new Error(`A describe without a literal title at offset ${String(node.start)} in ${file}.`);
         const suite: Suite = call.methods.length > 0
           ? { problem: `with the modifier .${call.methods.join('.')} at offset ${String(node.start)}` }
-          : title === undefined ? { problem: `without a literal title at offset ${String(node.start)}` } : { title };
+          : !isPlainSuiteArgs(call.args)
+            ? { problem: `whose arguments are not a literal title, a function and a timeout at offset ${String(node.start)}` }
+            : { title };
         const inner = [...describes, suite];
         // Vitest calls a describe callback while it loads the file, so the statements directly in the callback's body keep
         // `loading`. Everything else in the arguments does not.
@@ -182,7 +194,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
         }
         return;
       }
-      record(describes, call.args[0], gate);
+      record(describes, call.args, gate, node.start);
       call.args.forEach(arg => visit(arg, describes, false));
       return;
     }
@@ -321,16 +333,17 @@ describe('CI workflows', () => {
 
   it('names every live probe exactly as its test file titles it', () => {
     // The tests that the probe switch enables are exactly the listed probes, by Vitest full name, and every one ends in
-    // the suffix the workflow's -t filter selects. No other test in the file carries the suffix.
+    // the suffix the workflow's -t filter selects. No other test in the file carries the suffix: every title in the file
+    // is a literal, or probeFileTests throws, so this sees each one.
     for (const file of LIVE_PROBE_FILES) {
       const tests = probeFileTests(file, readFileSync(join(ROOT, file), 'utf8'));
-      const gated = tests.filter(test => test.gated).map(test => test.name!);
+      const gated = tests.filter(test => test.gated).map(test => test.name);
       expect(gated.toSorted(), file).toEqual(LIVE_PROBES.filter(probe => probe.file === file).map(probe => probe.name).toSorted());
       for (const name of gated) {
         expect(name.endsWith(` ${LIVE_PROBE_MARKER}`), name).toBe(true);
         expect(name, file).toMatch(new RegExp(MARKER_FILTER));
       }
-      expect(tests.filter(test => !test.gated && test.name !== undefined && new RegExp(MARKER_FILTER).test(test.name)), file)
+      expect(tests.filter(test => !test.gated && new RegExp(MARKER_FILTER).test(test.name)), file)
         .toEqual([]);
     }
     // Every JavaScript or TypeScript source file under test/ except this one, helpers and fixtures included, since a

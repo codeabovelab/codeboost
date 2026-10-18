@@ -60,7 +60,10 @@ anything is allocated. It passes with no Docker binary on `PATH`.
 
 `real-docker` runs `npm test` with no excludes. `vitest.config.ts` runs the
 ordinary files first. Then it runs the Docker-backed files one at a time,
-because they share one image tag and one Docker daemon. This job is the T9
+because they share one image tag and one Docker daemon. `test/vitest-config.test.ts`
+pins the whole of `vitest.config.ts`, so it fails if either project gets any
+other key, such as an `exclude`, `testNamePattern` or `passWithNoTests` that
+could drop files or tests from both jobs. This job is the T9
 Docker gate. [Agent isolation](agent-isolation.md#what-the-gate-proves) lists
 what it proves.
 
@@ -108,12 +111,17 @@ update `LIVE_PROBES` in `scripts/live-probes.ts`. `test/vitest-config.test.ts`
 parses each probe file. It fails unless the tests that
 `CODEBOOST_RUN_AUTH_PROBES` enables have exactly the full names in the list: the
 `describe` titles and the test title, joined with spaces, as Vitest names them.
-Each `describe` around a gated test must be a plain `describe(...)` with a
-literal title. A title with expressions, or `describe.each`, `describe.for`,
-`describe.skip` or any other modifier, makes the test fail.
+Every `it`, `test` and `describe` call in a probe file must have a string
+literal or a template literal without expressions as its title, or the test
+fails. So the test sees every title, and fails if a test that the switch does
+not enable has a title that ends with the marker. Each `describe` around a
+gated test, and each gated `it` or `test` call, must have exactly a literal
+title, a function expression and optionally a numeric timeout.
+`describe.each`, `describe.for`, `describe.skip` or any other modifier, or an
+options object such as `{ skip: true }`, makes the test fail.
 The switch may only be the condition of an `if` block without `else`, or of
-`it.runIf`. Each statement in such an `if` block must be an `it` or `test` call
-with a literal title, or a `const` or `let` declaration of plain names. Each
+`it.runIf`. Each statement in such an `if` block must be a plain `it` or `test`
+call, or a `const` or `let` declaration of plain names. Each
 name must have a plain value: a function expression, or a constant. A constant
 is a string, number or boolean literal, a template literal whose expressions are
 constants, or a binary operation on constants. Any other value, such as a call
