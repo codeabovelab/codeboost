@@ -93,13 +93,21 @@ function suiteCall(node: Node) {
   if (callee.type !== 'Identifier' || !['it', 'test', 'describe'].includes(callee.name as string)) return undefined;
   return { kind: callee.name as string, methods, innerArgs, args: node.arguments as Node[] };
 }
-// Throws unless the node has no call outside a function body: a gated block may declare helpers for its tests, but
-// any call at block level could register a test that this check does not see.
-function assertNoCall(node: Node) {
-  if (FUNCTIONS.includes(node.type)) return;
-  if (['CallExpression', 'NewExpression', 'TaggedTemplateExpression', 'AwaitExpression'].includes(node.type))
-    throw new Error(`A gated block runs a ${node.type} outside a test at offset ${String(node.start)}.`);
-  children(node).forEach(assertNoCall);
+// A value that a gated block may give a variable: a function expression, which runs only when called, or a constant: a
+// string, number or boolean literal, a template literal whose expressions are constants, or a binary operation on
+// constants. Nothing else is allowed: a call could register a test this check does not see, and an assignment or
+// update, such as `(on = true)`, could turn on a test outside the gate.
+const isConstant = (node: Node): boolean => (node.type === 'Literal' && ['string', 'number', 'boolean'].includes(typeof node.value))
+  || (node.type === 'TemplateLiteral' && (node.expressions as Node[]).every(isConstant))
+  || (node.type === 'BinaryExpression' && isConstant(node.left as Node) && isConstant(node.right as Node));
+const isPlainValue = (node: Node) => ['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) || isConstant(node);
+// Throws unless the statement is a `const` or `let` declaration of plain names, each with a plain value. A `var` is
+// refused because it is visible outside the block.
+function assertPlainDeclaration(statement: Node, file: string) {
+  const declarations = statement.declarations as Array<{ id: Node; init: Node | null }>;
+  if (!['const', 'let'].includes(statement.kind as string) || !declarations.every(declaration =>
+    declaration.id.type === 'Identifier' && declaration.init !== null && isPlainValue(declaration.init)))
+    throw new Error(`A gated block declares a variable that is not a const or let with a plain value at offset ${String(statement.start)} in ${file}.`);
 }
 
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
@@ -110,9 +118,10 @@ function assertNoCall(node: Node) {
 // plain `describe` callback that is itself such a statement. A gate inside any other block or expression, such as
 // another `if`, a loop or a helper that is never called, throws. The switch may appear only as the exact condition of an
 // `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
-// variable declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the
-// switch's name in the source text, comments and strings included, must be one of these gates, or this throws. A
-// variable name built at runtime from pieces, such as `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`, is not caught.
+// `const` or `let` declaration of plain names with plain values (see `isPlainValue`), or of
+// `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the switch's name in the source text,
+// comments and strings included, must be one of these gates, or this throws. A variable name built at runtime from
+// pieces, such as `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`, is not caught.
 function probeFileTests(file: string, source: string): ProbeFileTest[] {
   const { program, errors } = parseSync(file, source);
   if (errors.length) throw new Error(`${file} does not parse: ${errors[0]!.message}`);
@@ -143,7 +152,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
           record(describes, call.args[0], true);
           call.args.slice(1).forEach(arg => visit(arg, describes, false));
         } else if (statement.type === 'VariableDeclaration') {
-          assertNoCall(statement);
+          assertPlainDeclaration(statement, file);
           visit(statement, describes, false);
         } else throw new Error(`A gated block holds a statement that is not a test at offset ${String(statement.start)} in ${file}.`);
       }
@@ -265,7 +274,10 @@ describe('CI workflows', () => {
     expect(job.steps.map(step => Object.keys(step).toSorted())).toEqual([['env', 'name', 'run'], ['uses'], ['uses', 'with'],
       ['run'], ['env', 'name', 'run'], ['name', 'run']]);
     expect(job.steps.slice(1, 4)).toEqual([...SETUP, { run: 'npm ci --ignore-scripts' }]);
-    expect(job.steps[0]).toMatchObject({ name: 'Require the Claude token', env: token });
+    expect(job.steps[0]).toEqual({ name: 'Require the Claude token', env: token,
+      run: 'if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then\n'
+        + '  echo "::error::The repository secret CLAUDE_CODE_OAUTH_TOKEN is not set. Add it to run the live probes."\n'
+        + '  exit 1\nfi\n' });
     expect(job.steps[4]).toEqual({ name: 'Run the live Claude probes', env: { CODEBOOST_RUN_AUTH_PROBES: '1', ...token },
       run: `npx vitest run --project docker -t '${MARKER_FILTER}' --reporter=default --reporter=json `
         + `--outputFile=live-probes.json ${LIVE_PROBE_FILES.join(' ')}` });

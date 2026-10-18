@@ -26,7 +26,9 @@ job. It also fails if a workflow has a top-level key other than the ones it has
 now (`name`, `on`, `permissions`, and `concurrency` in `live-probes.yml`
 only), so no workflow can add `defaults` or `env` for every job.
 
-The test pins each job's steps exactly, in this order:
+The test pins each job's steps exactly, in this order, including each step's
+`run` text. It also runs the `live-probes` token check with an empty, a missing
+and a set token.
 
 | Job | Steps |
 | --- | --- |
@@ -109,8 +111,14 @@ parses each probe file. It fails unless the tests that
 Each `describe` around a gated test must be a plain `describe(...)` with a
 literal title. A title with expressions, or `describe.each`, `describe.for`,
 `describe.skip` or any other modifier, makes the test fail.
-The switch may only be the condition of an `if` block that holds only tests and
-variable declarations, or of `it.runIf`. Such a gate must be where Vitest always
+The switch may only be the condition of an `if` block without `else`, or of
+`it.runIf`. Each statement in such an `if` block must be an `it` or `test` call
+with a literal title, or a `const` or `let` declaration of plain names. Each
+name must have a plain value: a function expression, or a constant. A constant
+is a string, number or boolean literal, a template literal whose expressions are
+constants, or a binary operation on constants. Any other value, such as a call
+or an assignment like `(on = true)`, makes the test fail, and so does a `var`,
+because it is visible outside the block. Such a gate must be where Vitest always
 registers tests as it loads the file: a statement directly in the body of the
 file, or directly in the body of a `describe` callback that is itself such a
 statement. A gate inside any other block or expression, such as another `if`, a
