@@ -283,6 +283,13 @@ describe('CI workflows', () => {
       expect(workflow(name).permissions, name).toEqual({ contents: 'read' });
   });
 
+  it('runs the package scripts the gating jobs call exactly as written here', () => {
+    // Both required jobs call these scripts; a filter, -t, --project or --passWithNoTests here would narrow them silently.
+    const scripts = (JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> }).scripts;
+    expect({ test: scripts.test, typecheck: scripts.typecheck, 'test:browser': scripts['test:browser'] })
+      .toEqual({ test: 'vitest run', typecheck: 'tsc --noEmit', 'test:browser': 'playwright test' });
+  });
+
   it('uses the same Node version in every workflow', () => {
     const versions = ['ci.yml', 'agent-isolation.yml', 'live-probes.yml'].flatMap(name => Object.values(workflow(name).jobs)
       .flatMap(job => job.steps.filter(step => String(step.uses).startsWith('actions/setup-node@'))

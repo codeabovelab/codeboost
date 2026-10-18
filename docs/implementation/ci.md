@@ -63,7 +63,9 @@ ordinary files first. Then it runs the Docker-backed files one at a time,
 because they share one image tag and one Docker daemon. `test/vitest-config.test.ts`
 pins the whole of `vitest.config.ts`, so it fails if either project gets any
 other key, such as an `exclude`, `testNamePattern` or `passWithNoTests` that
-could drop files or tests from both jobs. This job is the T9
+could drop files or tests from both jobs. It also pins the `test`, `typecheck`
+and `test:browser` scripts in `package.json` that the jobs call, so a filter
+added there fails it too. This job is the T9
 Docker gate. [Agent isolation](agent-isolation.md#what-the-gate-proves) lists
 what it proves.
 
