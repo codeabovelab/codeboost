@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parseSync } from 'vite';
@@ -52,8 +52,6 @@ const PROBE_SWITCH = 'CODEBOOST_RUN_AUTH_PROBES';
 const isNode = (value: unknown): value is Node =>
   typeof value === 'object' && value !== null && typeof (value as { type?: unknown }).type === 'string';
 const children = (node: Node) => Object.values(node).flatMap(value => Array.isArray(value) ? value : [value]).filter(isNode);
-const mentionsSwitch = (node: Node): boolean => (node.type === 'Identifier' && node.name === PROBE_SWITCH)
-  || (node.type === 'Literal' && node.value === PROBE_SWITCH) || children(node).some(mentionsSwitch);
 const isIdentifier = (node: unknown, name: string) => isNode(node) && node.type === 'Identifier' && node.name === name;
 const isMember = (node: unknown, object: (node: unknown) => boolean, property: string): boolean =>
   isNode(node) && node.type === 'MemberExpression' && node.computed === false && object(node.object)
@@ -66,6 +64,9 @@ const literalText = (node: unknown) => !isNode(node) ? undefined
   : node.type === 'Literal' && typeof node.value === 'string' ? node.value
   : node.type === 'TemplateLiteral' && (node.expressions as unknown[]).length === 0
     ? (node.quasis as Array<{ value: { cooked: string } }>)[0]!.value.cooked : undefined;
+// The switch as an identifier, a string literal or a template literal without expressions.
+const isSwitchName = (node: Node) => (node.type === 'Identifier' && node.name === PROBE_SWITCH) || literalText(node) === PROBE_SWITCH;
+const mentionsSwitch = (node: Node): boolean => isSwitchName(node) || children(node).some(mentionsSwitch);
 // A call whose callee chain starts at `it`, `test` or `describe`, such as `it.runIf(...)('title', ...)`: the kind, the
 // methods and arguments of the inner calls, and the outer call's arguments.
 function suiteCall(node: Node) {
@@ -93,12 +94,14 @@ function assertNoCall(node: Node) {
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
 // whether CODEBOOST_RUN_AUTH_PROBES enables it. The switch may appear only as the exact condition of an
 // `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
-// declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Any other use throws, so
-// no gate can hide a test from this check.
+// declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the
+// switch's name in the source text, comments and strings included, must be one of these gates, or this throws. A
+// variable name built at runtime from pieces, such as `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`, is not caught.
 function probeFileTests(file: string, source: string): ProbeFileTest[] {
   const { program, errors } = parseSync(file, source);
   if (errors.length) throw new Error(`${file} does not parse: ${errors[0]!.message}`);
   const tests: ProbeFileTest[] = [];
+  let gates = 0;
   const record = (describes: string[], titleNode: unknown, gated: boolean) => {
     const title = literalText(titleNode);
     if (gated && title === undefined) throw new Error(`Gated test without a literal title in ${file}.`);
@@ -109,6 +112,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       const block = node.consequent as Node;
       if (!isSwitchOn(node.test) || block.type !== 'BlockStatement' || node.alternate !== null)
         throw new Error(`Unrecognized ${PROBE_SWITCH} condition at offset ${String(node.start)} in ${file}.`);
+      gates += 1;
       for (const statement of block.body as Node[]) {
         const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node) : undefined;
         if (call && call.kind !== 'describe' && call.methods.length === 0) {
@@ -125,7 +129,8 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
     if (call) {
       const gate = call.kind !== 'describe' && call.methods.length === 1 && call.methods[0] === 'runIf'
         && call.innerArgs.length === 1 && call.innerArgs[0]!.length === 1 && isSwitchOn(call.innerArgs[0]![0]);
-      if (!gate) call.innerArgs.flat().forEach(arg => visit(arg, describes));
+      if (gate) gates += 1;
+      else call.innerArgs.flat().forEach(arg => visit(arg, describes));
       if (call.kind === 'describe') {
         const title = literalText(call.args[0]);
         call.args.forEach(arg => visit(arg, title === undefined ? describes : [...describes, title]));
@@ -135,11 +140,14 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       call.args.forEach(arg => visit(arg, describes));
       return;
     }
-    if ((node.type === 'Identifier' && node.name === PROBE_SWITCH) || (node.type === 'Literal' && node.value === PROBE_SWITCH))
+    if (isSwitchName(node))
       throw new Error(`Unrecognized use of ${PROBE_SWITCH} at offset ${String(node.start)} in ${file}.`);
     children(node).forEach(child => visit(child, describes));
   };
   visit(program as unknown as Node, []);
+  const occurrences = source.split(PROBE_SWITCH).length - 1;
+  if (occurrences !== gates)
+    throw new Error(`${file} names ${PROBE_SWITCH} ${String(occurrences)} time(s) but has ${String(gates)} recognized gate(s).`);
   return tests;
 }
 
@@ -208,10 +216,12 @@ describe('CI workflows', () => {
       for (const name of gated) expect(name, file).toMatch(/ \(live Claude\)$/);
       expect(tests.filter(test => !test.gated && test.name?.endsWith('(live Claude)')), file).toEqual([]);
     }
-    const gated = readdirSync(join(ROOT, 'test')).filter(name => name.endsWith('.test.ts') && name !== 'vitest-config.test.ts')
-      .filter(name => readFileSync(join(ROOT, 'test', name), 'utf8').includes('CODEBOOST_RUN_AUTH_PROBES'))
-      .map(name => `test/${name}`);
-    expect(gated).toEqual(LIVE_PROBE_FILES);
+    // Every TypeScript file under test/, helpers and fixtures included, since a probe file could import a gate.
+    const named = readdirSync(join(ROOT, 'test'), { recursive: true, encoding: 'utf8' })
+      .map(name => `test/${name.split(sep).join('/')}`)
+      .filter(file => file.endsWith('.ts') && file !== 'test/vitest-config.test.ts')
+      .filter(file => readFileSync(join(ROOT, file), 'utf8').includes(PROBE_SWITCH));
+    expect(named.toSorted()).toEqual(LIVE_PROBE_FILES.toSorted());
   });
 });
 

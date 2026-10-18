@@ -77,7 +77,12 @@ parses each probe file. It fails unless the tests that
 `CODEBOOST_RUN_AUTH_PROBES` enables have exactly the full names in the list: the
 `describe` titles and the test title, joined with spaces, as Vitest names them.
 The switch may only be the condition of an `if` block that holds only tests and
-declarations, or of `it.runIf`. Any other use fails the test.
+declarations, or of `it.runIf`. The test counts every occurrence of the name
+`CODEBOOST_RUN_AUTH_PROBES` in each probe file's text, comments and strings
+included, and fails unless each one is such a gate. It also fails if any other
+`.ts` file under `test/`, helpers and fixtures included, names the switch. It
+cannot catch a variable name built at runtime from pieces, such as
+`process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`.
 
 Codex has no probe, because Codex is refused in every phase (#93).
 
