@@ -45,6 +45,38 @@ const workflow = (name: string) =>
   };
 const runs = (steps: Array<{ run?: string }>) => steps.flatMap(step => step.run === undefined ? [] : [step.run]);
 
+// The titles of every test that runs only when CODEBOOST_RUN_AUTH_PROBES is set. Each use of the switch must be an
+// `if (...) { ... }` block or an `it.runIf(...)('title', ...)` call; any other form fails, so a new gate cannot hide
+// a test from this check.
+function gatedTestTitles(source: string): string[] {
+  const titles: string[] = [];
+  const gate = "process.env.CODEBOOST_RUN_AUTH_PROBES === '1'";
+  for (const match of source.matchAll(/CODEBOOST_RUN_AUTH_PROBES/g)) {
+    const start = match.index - 'process.env.'.length;
+    const runIf = /\b(?:it|test)\.runIf\($/.exec(source.slice(0, start));
+    if (runIf && source.startsWith(`${gate})(`, start)) {
+      const title = /^\(\s*'([^']*)'/.exec(source.slice(start + gate.length + 1));
+      if (!title) throw new Error(`Gated test without a single-quoted title at offset ${start}.`);
+      titles.push(title[1]!);
+      continue;
+    }
+    if (!source.slice(0, start).endsWith('if (') || !source.startsWith(`${gate}) {`, start))
+      throw new Error(`Unrecognized use of CODEBOOST_RUN_AUTH_PROBES at offset ${start}.`);
+    const open = start + gate.length + 2;
+    let depth = 0, end = open;
+    for (; end < source.length; end += 1) {
+      if (source[end] === '{') depth += 1;
+      else if (source[end] === '}' && --depth === 0) break;
+    }
+    const body = source.slice(open, end);
+    const calls = [...body.matchAll(/\b(?:it|test)(?:\.\w+)*\(/g)].length;
+    const named = [...body.matchAll(/\b(?:it|test)(?:\.\w+)*\(\s*'([^']*)'/g)].map(call => call[1]!);
+    if (calls !== named.length) throw new Error(`Gated block has a test without a single-quoted title at offset ${start}.`);
+    titles.push(...named);
+  }
+  return titles;
+}
+
 describe('CI workflows', () => {
   it('excludes exactly the Docker-backed files from the CI test job', () => {
     const ci = workflow('ci.yml');
@@ -105,6 +137,14 @@ describe('CI workflows', () => {
       expect(titles.length).toBe(LIVE_PROBES.filter(probe => probe.file === file).length);
       for (const title of titles)
         expect(LIVE_PROBES.some(probe => probe.file === file && probe.name.endsWith(` ${title}`))).toBe(true);
+      // Every test the probe switch enables must carry the suffix, or the workflow's -t filter never runs it.
+      const gatedTitles = gatedTestTitles(source);
+      expect(gatedTitles.length, file).toBeGreaterThan(0);
+      for (const title of gatedTitles) {
+        expect(title, file).toMatch(/ \(live Claude\)$/);
+        expect(titles, file).toContain(title);
+      }
+      expect(gatedTitles.length, file).toBe(titles.length);
     }
     const gated = readdirSync(join(ROOT, 'test')).filter(name => name.endsWith('.test.ts') && name !== 'vitest-config.test.ts')
       .filter(name => readFileSync(join(ROOT, 'test', name), 'utf8').includes('CODEBOOST_RUN_AUTH_PROBES'))

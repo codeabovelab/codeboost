@@ -13,8 +13,9 @@ concurrency:
 jobs:
   live-probes:
     runs-on: ubuntu-latest
-    # The probes' own time limits total 33 min (6, 8, 8 and 11), and each of the three files may spend up to 10 min
-    # building the image.
+    # The probes' own time limits total 33 min (6, 8, 8 and 11). agent-container and agent-supervisor may each spend
+    # up to 10 min building the image before their probes; agent-question builds inside its probe's own 11 min. That
+    # is 53 min, plus setup.
     timeout-minutes: 75
     steps:
       # Fail at once when the secret is missing, so a missing secret never looks like a passing run.
