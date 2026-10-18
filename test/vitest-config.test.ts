@@ -42,6 +42,7 @@ describe('Vitest scheduling', () => {
 const workflow = (name: string) =>
   parse(readFileSync(join(ROOT, '.github/workflows', name), 'utf8')) as {
     on: Record<string, unknown>;
+    permissions: unknown;
     jobs: Record<string, Record<string, unknown> & { env?: unknown;
     steps: Array<Record<string, unknown> & { name?: string; run?: string; env?: Record<string, string> }> }>;
   };
@@ -104,11 +105,12 @@ function assertNoCall(node: Node) {
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
 // whether CODEBOOST_RUN_AUTH_PROBES enables it. Every `describe` around a gated test must be a plain `describe(...)`
 // with a literal title, or this throws: a title with expressions, or `describe.each`, `.for`, `.skip` or any other
-// modifier, would make the full name differ from the one this computes. A gate counts only where Vitest registers tests while it loads the
-// file: at the module's top level or in a `describe` callback, never in any other function body, so a gate in a
-// helper that is never called throws. The switch may appear only as the exact condition of an
+// modifier, would make the full name differ from the one this computes. A gate counts only where Vitest always
+// registers its tests while it loads the file: as a statement directly in the module body or directly in the body of a
+// plain `describe` callback that is itself such a statement. A gate inside any other block or expression, such as
+// another `if`, a loop or a helper that is never called, throws. The switch may appear only as the exact condition of an
 // `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
-// declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the
+// variable declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the
 // switch's name in the source text, comments and strings included, must be one of these gates, or this throws. A
 // variable name built at runtime from pieces, such as `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`, is not caught.
 function probeFileTests(file: string, source: string): ProbeFileTest[] {
@@ -124,13 +126,14 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
     const titles = describes.map(suite => 'title' in suite ? suite.title : '?');
     tests.push({ name: title === undefined ? undefined : [...titles, title].join(' '), gated });
   };
-  // `loading` is true where code runs as Vitest loads the file: outside every function body except `describe` callbacks.
+  // `loading` is true only for a statement that always runs as Vitest loads the file, and for its expression: a statement
+  // directly in the module body or directly in the body of a `describe` callback that is itself such a statement.
   const visit = (node: Node, describes: Suite[], loading: boolean): void => {
     if (FUNCTIONS.includes(node.type)) { children(node).forEach(child => visit(child, describes, false)); return; }
     if (node.type === 'IfStatement' && mentionsSwitch(node.test as Node)) {
       const block = node.consequent as Node;
       if (!loading)
-        throw new Error(`A ${PROBE_SWITCH} gate outside module load or a describe callback at offset ${String(node.start)} in ${file}.`);
+        throw new Error(`A ${PROBE_SWITCH} gate that does not always run as Vitest loads the file at offset ${String(node.start)} in ${file}.`);
       if (!isSwitchOn(node.test) || block.type !== 'BlockStatement' || node.alternate !== null)
         throw new Error(`Unrecognized ${PROBE_SWITCH} condition at offset ${String(node.start)} in ${file}.`);
       gates += 1;
@@ -138,10 +141,10 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
         const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node) : undefined;
         if (call && call.kind !== 'describe' && call.methods.length === 0) {
           record(describes, call.args[0], true);
-          call.args.slice(1).forEach(arg => visit(arg, describes, loading));
+          call.args.slice(1).forEach(arg => visit(arg, describes, false));
         } else if (statement.type === 'VariableDeclaration') {
           assertNoCall(statement);
-          visit(statement, describes, loading);
+          visit(statement, describes, false);
         } else throw new Error(`A gated block holds a statement that is not a test at offset ${String(statement.start)} in ${file}.`);
       }
       return;
@@ -151,29 +154,34 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       const gate = call.kind !== 'describe' && call.methods.length === 1 && call.methods[0] === 'runIf'
         && call.innerArgs.length === 1 && call.innerArgs[0]!.length === 1 && isSwitchOn(call.innerArgs[0]![0]);
       if (gate && !loading)
-        throw new Error(`A ${PROBE_SWITCH} gate outside module load or a describe callback at offset ${String(node.start)} in ${file}.`);
+        throw new Error(`A ${PROBE_SWITCH} gate that does not always run as Vitest loads the file at offset ${String(node.start)} in ${file}.`);
       if (gate) gates += 1;
-      else call.innerArgs.flat().forEach(arg => visit(arg, describes, loading));
+      else call.innerArgs.flat().forEach(arg => visit(arg, describes, false));
       if (call.kind === 'describe') {
         const title = literalText(call.args[0]);
         const suite: Suite = call.methods.length > 0
           ? { problem: `with the modifier .${call.methods.join('.')} at offset ${String(node.start)}` }
           : title === undefined ? { problem: `without a literal title at offset ${String(node.start)}` } : { title };
         const inner = [...describes, suite];
-        // Vitest calls a describe callback while it loads the file, so the callback's body keeps `loading`.
+        // Vitest calls a describe callback while it loads the file, so the statements directly in the callback's body keep
+        // `loading`. Everything else in the arguments does not.
         for (const arg of call.args) {
-          if (FUNCTIONS.includes(arg.type)) children(arg).forEach(child => visit(child, inner, loading));
-          else visit(arg, inner, loading);
+          const body = arg.body as Node | undefined;
+          if (!FUNCTIONS.includes(arg.type) || body?.type !== 'BlockStatement') { visit(arg, inner, false); continue; }
+          (arg.params as Node[]).forEach(param => visit(param, inner, false));
+          (body.body as Node[]).forEach(statement => visit(statement, inner, loading));
         }
         return;
       }
       record(describes, call.args[0], gate);
-      call.args.forEach(arg => visit(arg, describes, loading));
+      call.args.forEach(arg => visit(arg, describes, false));
       return;
     }
     if (isSwitchName(node))
       throw new Error(`Unrecognized use of ${PROBE_SWITCH} at offset ${String(node.start)} in ${file}.`);
-    children(node).forEach(child => visit(child, describes, loading));
+    // Only the module body and an expression statement pass `loading` on to their direct children.
+    const keep = loading && (node.type === 'Program' || node.type === 'ExpressionStatement');
+    children(node).forEach(child => visit(child, describes, keep));
   };
   visit(program as unknown as Node, [], true);
   const occurrences = source.split(PROBE_SWITCH).length - 1;
@@ -227,6 +235,17 @@ describe('CI workflows', () => {
       expect(Object.keys(job).toSorted()).toEqual(['runs-on', 'steps', 'timeout-minutes']);
   });
 
+  it('has no workflow keys other than the ones it uses now', () => {
+    // A workflow-level `defaults` or `env`, such as `defaults: { run: { shell: 'true {0}' } }`, would change every
+    // `run:` step of every job, for example into a no-op that passes.
+    const top = (name: string) => Object.keys(parse(readFileSync(join(ROOT, '.github/workflows', name), 'utf8')) as object);
+    expect(top('ci.yml')).toEqual(['name', 'on', 'permissions', 'jobs']);
+    expect(top('agent-isolation.yml')).toEqual(['name', 'on', 'permissions', 'jobs']);
+    expect(top('live-probes.yml')).toEqual(['name', 'on', 'permissions', 'concurrency', 'jobs']);
+    for (const name of ['ci.yml', 'agent-isolation.yml', 'live-probes.yml'])
+      expect(workflow(name).permissions, name).toEqual({ contents: 'read' });
+  });
+
   it('uses the same Node version in every workflow', () => {
     const versions = ['ci.yml', 'agent-isolation.yml', 'live-probes.yml'].flatMap(name => Object.values(workflow(name).jobs)
       .flatMap(job => job.steps.filter(step => String(step.uses).startsWith('actions/setup-node@'))
@@ -237,8 +256,20 @@ describe('CI workflows', () => {
   it('runs only the live Claude probes, by hand or nightly, never on a pull request or push', () => {
     const live = workflow('live-probes.yml');
     expect(Object.keys(live.on).toSorted()).toEqual(['schedule', 'workflow_dispatch']);
+    expect(Object.keys(live.jobs)).toEqual(['live-probes']);
     const job = live.jobs['live-probes']!;
-    expect(job.env).toBeUndefined();
+    // No `defaults`, `env`, `strategy` or `container`: any of them could change what the steps run.
+    expect(Object.keys(job).toSorted()).toEqual(['runs-on', 'steps', 'timeout-minutes']);
+    expect(job).toMatchObject({ 'runs-on': 'ubuntu-latest', 'timeout-minutes': 75 });
+    const token = { CLAUDE_CODE_OAUTH_TOKEN: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}' };
+    expect(job.steps.map(step => Object.keys(step).toSorted())).toEqual([['env', 'name', 'run'], ['uses'], ['uses', 'with'],
+      ['run'], ['env', 'name', 'run'], ['name', 'run']]);
+    expect(job.steps.slice(1, 4)).toEqual([...SETUP, { run: 'npm ci --ignore-scripts' }]);
+    expect(job.steps[0]).toMatchObject({ name: 'Require the Claude token', env: token });
+    expect(job.steps[4]).toEqual({ name: 'Run the live Claude probes', env: { CODEBOOST_RUN_AUTH_PROBES: '1', ...token },
+      run: `npx vitest run --project docker -t '${MARKER_FILTER}' --reporter=default --reporter=json `
+        + `--outputFile=live-probes.json ${LIVE_PROBE_FILES.join(' ')}` });
+    expect(job.steps[5]).toEqual({ name: 'Check that every probe passed', run: 'node scripts/live-probes.ts check live-probes.json' });
     const vitest = job.steps.filter(step => step.run?.startsWith('npx vitest'));
     expect(vitest).toHaveLength(1);
     const words = vitest[0]!.run!.split(/\s+/);

@@ -21,8 +21,21 @@ one, and a matrix adds its values to the name. So do not rename the `test` or
 `real-docker` job, and do not give either one a `name` or a `strategy` (matrix):
 the required check would then never report, and no pull request could merge.
 `test/vitest-config.test.ts` fails if either job has any key other than
-`runs-on`, `timeout-minutes` and `steps`, if its steps differ from the ones
-this page lists, or if either workflow has another job.
+`runs-on`, `timeout-minutes` and `steps`, or if either workflow has another
+job. It also fails if a workflow has a top-level key other than the ones it has
+now (`name`, `on`, `permissions`, and `concurrency` in `live-probes.yml`
+only), so no workflow can add `defaults` or `env` for every job.
+
+The test pins each job's steps exactly, in this order:
+
+| Job | Steps |
+| --- | --- |
+| `test` | `actions/checkout@v4`; `actions/setup-node@v4` with Node 26.7.0 and the npm cache; `npm ci --ignore-scripts`; `npm run typecheck`; `npm test` with one `--exclude` for each Docker-backed file; `npx playwright install --with-deps chromium`; `npm run test:browser` |
+| `real-docker` | `actions/checkout@v4`; `actions/setup-node@v4` with Node 26.7.0 and the npm cache; `npm ci --ignore-scripts`; `npm run typecheck`; `npm test` |
+| `live-probes` | the token check; `actions/checkout@v4`; `actions/setup-node@v4` with Node 26.7.0 and the npm cache; `npm ci --ignore-scripts`; the live probe Vitest run; `node scripts/live-probes.ts check live-probes.json` |
+
+The `live-probes` job also may have only the keys `runs-on`,
+`timeout-minutes` and `steps`, so it has no `defaults`, `env` or `strategy`.
 
 ### `test`
 
@@ -97,10 +110,11 @@ Each `describe` around a gated test must be a plain `describe(...)` with a
 literal title. A title with expressions, or `describe.each`, `describe.for`,
 `describe.skip` or any other modifier, makes the test fail.
 The switch may only be the condition of an `if` block that holds only tests and
-declarations, or of `it.runIf`. Such a gate must be where Vitest registers tests
-as it loads the file: at the top level of the file or in a `describe` callback.
-A gate in any other function, such as a helper that is never called, makes the
-test fail. The test counts every occurrence of the name
+variable declarations, or of `it.runIf`. Such a gate must be where Vitest always
+registers tests as it loads the file: a statement directly in the body of the
+file, or directly in the body of a `describe` callback that is itself such a
+statement. A gate inside any other block or expression, such as another `if`, a
+loop or a helper that is never called, makes the test fail. The test counts every occurrence of the name
 `CODEBOOST_RUN_AUTH_PROBES` in each probe file's text, comments and strings
 included, and fails unless each one is such a gate. It also fails if any other
 source file under `test/` names the switch: any `.ts`, `.tsx`, `.mts`, `.cts`,
