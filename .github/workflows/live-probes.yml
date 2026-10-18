@@ -13,8 +13,9 @@ concurrency:
 jobs:
   live-probes:
     runs-on: ubuntu-latest
-    # Covers the 10 min image build, up to 11 min per probe and teardown.
-    timeout-minutes: 60
+    # The probes' own time limits total 33 min (6, 8, 8 and 11), and each of the three files may spend up to 10 min
+    # building the image.
+    timeout-minutes: 75
     steps:
       # Fail at once when the secret is missing, so a missing secret never looks like a passing run.
       - name: Require the Claude token
