@@ -1,5 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 import config from '../vitest.config.ts';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const DOCKER_TESTS = [
   'test/agent-container.test.ts',
@@ -27,5 +33,35 @@ describe('Vitest scheduling', () => {
       fileParallelism: false,
       sequence: { groupOrder: 1 },
     });
+  });
+});
+
+const workflow = (name: string) =>
+  parse(readFileSync(join(ROOT, '.github/workflows', name), 'utf8')) as {
+    on: Record<string, unknown>;
+    jobs: Record<string, { env?: unknown; steps: Array<{ name?: string; run?: string; env?: Record<string, string> }> }>;
+  };
+const runs = (steps: Array<{ run?: string }>) => steps.flatMap(step => step.run === undefined ? [] : [step.run]);
+
+describe('CI workflows', () => {
+  it('excludes exactly the Docker-backed files from the CI test job', () => {
+    const ci = workflow('ci.yml');
+    const commands = runs(ci.jobs.test!.steps).filter(run => run.startsWith('npm test'));
+    expect(commands).toHaveLength(1);
+    const words = commands[0]!.split(/\s+/);
+    const excluded = words.flatMap((word, index) => word === '--exclude' ? [words[index + 1]] : []);
+    expect(excluded.toSorted()).toEqual(DOCKER_TESTS);
+    expect(words.filter(word => word.startsWith('-')).every(word => word === '--' || word === '--exclude')).toBe(true);
+  });
+
+  it('runs the complete Vitest suite in real-docker on every pull request and on the CI push branches', () => {
+    const ci = workflow('ci.yml'), isolation = workflow('agent-isolation.yml');
+    expect(Object.keys(isolation.on).toSorted()).toEqual(['pull_request', 'push']);
+    // No path filter: a required check that a filter skips never reports, and the pull request cannot merge.
+    expect(isolation.on.pull_request).toBeNull();
+    expect(ci.on.pull_request).toBeNull();
+    expect(isolation.on.push).toEqual(ci.on.push);
+    expect(isolation.on.push).toEqual({ branches: ['main', 'codex/**'] });
+    expect(runs(isolation.jobs['real-docker']!.steps)).toEqual(['npm ci --ignore-scripts', 'npm run typecheck', 'npm test']);
   });
 });
