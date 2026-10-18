@@ -42,15 +42,18 @@ describe('Vitest scheduling', () => {
 const workflow = (name: string) =>
   parse(readFileSync(join(ROOT, '.github/workflows', name), 'utf8')) as {
     on: Record<string, unknown>;
-    jobs: Record<string, { env?: unknown; steps: Array<{ name?: string; run?: string; env?: Record<string, string> }> }>;
+    jobs: Record<string, Record<string, unknown> & { env?: unknown;
+    steps: Array<Record<string, unknown> & { name?: string; run?: string; env?: Record<string, string> }> }>;
   };
 const runs = (steps: Array<{ run?: string }>) => steps.flatMap(step => step.run === undefined ? [] : [step.run]);
 
 type Node = { type: string; [key: string]: unknown };
 type ProbeFileTest = { name: string | undefined; gated: boolean };
 const PROBE_SWITCH = 'CODEBOOST_RUN_AUTH_PROBES';
+const SOURCE = /\.(?:ts|tsx|mts|cts|js|mjs|cjs)$/;
 const isNode = (value: unknown): value is Node =>
   typeof value === 'object' && value !== null && typeof (value as { type?: unknown }).type === 'string';
+const FUNCTIONS = ['ArrowFunctionExpression', 'FunctionExpression', 'FunctionDeclaration'];
 const children = (node: Node) => Object.values(node).flatMap(value => Array.isArray(value) ? value : [value]).filter(isNode);
 const isIdentifier = (node: unknown, name: string) => isNode(node) && node.type === 'Identifier' && node.name === name;
 const isMember = (node: unknown, object: (node: unknown) => boolean, property: string): boolean =>
@@ -85,14 +88,16 @@ function suiteCall(node: Node) {
 // Throws unless the node has no call outside a function body: a gated block may declare helpers for its tests, but
 // any call at block level could register a test that this check does not see.
 function assertNoCall(node: Node) {
-  if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type)) return;
+  if (FUNCTIONS.includes(node.type)) return;
   if (['CallExpression', 'NewExpression', 'TaggedTemplateExpression', 'AwaitExpression'].includes(node.type))
     throw new Error(`A gated block runs a ${node.type} outside a test at offset ${String(node.start)}.`);
   children(node).forEach(assertNoCall);
 }
 
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
-// whether CODEBOOST_RUN_AUTH_PROBES enables it. The switch may appear only as the exact condition of an
+// whether CODEBOOST_RUN_AUTH_PROBES enables it. A gate counts only where Vitest registers tests while it loads the
+// file: at the module's top level or in a `describe` callback, never in any other function body, so a gate in a
+// helper that is never called throws. The switch may appear only as the exact condition of an
 // `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
 // declaration without a call, or of `it.runIf(...)`/`test.runIf(...)` with a literal title. Every occurrence of the
 // switch's name in the source text, comments and strings included, must be one of these gates, or this throws. A
@@ -107,9 +112,13 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
     if (gated && title === undefined) throw new Error(`Gated test without a literal title in ${file}.`);
     tests.push({ name: title === undefined ? undefined : [...describes, title].join(' '), gated });
   };
-  const visit = (node: Node, describes: string[]): void => {
+  // `loading` is true where code runs as Vitest loads the file: outside every function body except `describe` callbacks.
+  const visit = (node: Node, describes: string[], loading: boolean): void => {
+    if (FUNCTIONS.includes(node.type)) { children(node).forEach(child => visit(child, describes, false)); return; }
     if (node.type === 'IfStatement' && mentionsSwitch(node.test as Node)) {
       const block = node.consequent as Node;
+      if (!loading)
+        throw new Error(`A ${PROBE_SWITCH} gate outside module load or a describe callback at offset ${String(node.start)} in ${file}.`);
       if (!isSwitchOn(node.test) || block.type !== 'BlockStatement' || node.alternate !== null)
         throw new Error(`Unrecognized ${PROBE_SWITCH} condition at offset ${String(node.start)} in ${file}.`);
       gates += 1;
@@ -117,10 +126,10 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
         const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node) : undefined;
         if (call && call.kind !== 'describe' && call.methods.length === 0) {
           record(describes, call.args[0], true);
-          call.args.slice(1).forEach(arg => visit(arg, describes));
+          call.args.slice(1).forEach(arg => visit(arg, describes, loading));
         } else if (statement.type === 'VariableDeclaration') {
           assertNoCall(statement);
-          visit(statement, describes);
+          visit(statement, describes, loading);
         } else throw new Error(`A gated block holds a statement that is not a test at offset ${String(statement.start)} in ${file}.`);
       }
       return;
@@ -129,22 +138,29 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
     if (call) {
       const gate = call.kind !== 'describe' && call.methods.length === 1 && call.methods[0] === 'runIf'
         && call.innerArgs.length === 1 && call.innerArgs[0]!.length === 1 && isSwitchOn(call.innerArgs[0]![0]);
+      if (gate && !loading)
+        throw new Error(`A ${PROBE_SWITCH} gate outside module load or a describe callback at offset ${String(node.start)} in ${file}.`);
       if (gate) gates += 1;
-      else call.innerArgs.flat().forEach(arg => visit(arg, describes));
+      else call.innerArgs.flat().forEach(arg => visit(arg, describes, loading));
       if (call.kind === 'describe') {
         const title = literalText(call.args[0]);
-        call.args.forEach(arg => visit(arg, title === undefined ? describes : [...describes, title]));
+        const inner = title === undefined ? describes : [...describes, title];
+        // Vitest calls a describe callback while it loads the file, so the callback's body keeps `loading`.
+        for (const arg of call.args) {
+          if (FUNCTIONS.includes(arg.type)) children(arg).forEach(child => visit(child, inner, loading));
+          else visit(arg, inner, loading);
+        }
         return;
       }
       record(describes, call.args[0], gate);
-      call.args.forEach(arg => visit(arg, describes));
+      call.args.forEach(arg => visit(arg, describes, loading));
       return;
     }
     if (isSwitchName(node))
       throw new Error(`Unrecognized use of ${PROBE_SWITCH} at offset ${String(node.start)} in ${file}.`);
-    children(node).forEach(child => visit(child, describes));
+    children(node).forEach(child => visit(child, describes, loading));
   };
-  visit(program as unknown as Node, []);
+  visit(program as unknown as Node, [], true);
   const occurrences = source.split(PROBE_SWITCH).length - 1;
   if (occurrences !== gates)
     throw new Error(`${file} names ${PROBE_SWITCH} ${String(occurrences)} time(s) but has ${String(gates)} recognized gate(s).`);
@@ -193,6 +209,18 @@ describe('CI workflows', () => {
     for (const file of LIVE_PROBE_FILES) expect(DOCKER_TESTS).toContain(file);
   });
 
+  it('never skips or soft-fails a gating job or any of its steps', () => {
+    // A condition or continue-on-error on the required checks or on the live probe job could skip a step or let it
+    // fail while the job still passes.
+    for (const [name, job] of [['ci.yml', 'test'], ['agent-isolation.yml', 'real-docker'], ['live-probes.yml', 'live-probes']] as const) {
+      const jobConfig = workflow(name).jobs[job]!;
+      for (const part of [jobConfig, ...jobConfig.steps]) {
+        expect(Object.keys(part), `${name} ${job}`).not.toContain('if');
+        expect(Object.keys(part), `${name} ${job}`).not.toContain('continue-on-error');
+      }
+    }
+  });
+
   it('fails the live probe job at once when the token secret is empty', () => {
     const guard = workflow('live-probes.yml').jobs['live-probes']!.steps[0]!;
     expect(guard.env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}' });
@@ -216,10 +244,11 @@ describe('CI workflows', () => {
       for (const name of gated) expect(name, file).toMatch(/ \(live Claude\)$/);
       expect(tests.filter(test => !test.gated && test.name?.endsWith('(live Claude)')), file).toEqual([]);
     }
-    // Every TypeScript file under test/, helpers and fixtures included, since a probe file could import a gate.
+    // Every JavaScript or TypeScript source file under test/ except this one, helpers and fixtures included, since a
+    // probe file could import a gate.
     const named = readdirSync(join(ROOT, 'test'), { recursive: true, encoding: 'utf8' })
       .map(name => `test/${name.split(sep).join('/')}`)
-      .filter(file => file.endsWith('.ts') && file !== 'test/vitest-config.test.ts')
+      .filter(file => SOURCE.test(file) && file !== 'test/vitest-config.test.ts')
       .filter(file => readFileSync(join(ROOT, file), 'utf8').includes(PROBE_SWITCH));
     expect(named.toSorted()).toEqual(LIVE_PROBE_FILES.toSorted());
   });

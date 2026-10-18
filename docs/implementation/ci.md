@@ -57,7 +57,10 @@ them. They do not call a vendor or GitHub.
 The live probes call the real Claude service. They are not a pull request
 check, and they do not run on a pull request or a push. GitHub runs scheduled
 workflows only from the default branch, so the nightly run starts after this
-workflow is on `main`.
+workflow is on `main`. The repository is public, so GitHub disables this
+scheduled workflow after 60 days without repository activity. To turn it on
+again, open the Actions tab, select the `Live probes` workflow and select
+**Enable workflow**.
 
 The job:
 
@@ -71,16 +74,26 @@ The job:
    exits with success when it skips every test, so this step fails unless each
    probe listed in `scripts/live-probes.ts` passed and no other test ran.
 
+`test/vitest-config.test.ts` fails if the `live-probes` job, or the `test` job
+in `ci.yml` or the `real-docker` job in `agent-isolation.yml`, or any step of
+these jobs, has an `if` condition or `continue-on-error`. Either one could skip
+a step or let it fail while the job passes.
+
 If you add, rename or remove a probe, or rename a `describe` block around one,
 update `LIVE_PROBES` in `scripts/live-probes.ts`. `test/vitest-config.test.ts`
 parses each probe file. It fails unless the tests that
 `CODEBOOST_RUN_AUTH_PROBES` enables have exactly the full names in the list: the
 `describe` titles and the test title, joined with spaces, as Vitest names them.
 The switch may only be the condition of an `if` block that holds only tests and
-declarations, or of `it.runIf`. The test counts every occurrence of the name
+declarations, or of `it.runIf`. Such a gate must be where Vitest registers tests
+as it loads the file: at the top level of the file or in a `describe` callback.
+A gate in any other function, such as a helper that is never called, makes the
+test fail. The test counts every occurrence of the name
 `CODEBOOST_RUN_AUTH_PROBES` in each probe file's text, comments and strings
 included, and fails unless each one is such a gate. It also fails if any other
-`.ts` file under `test/`, helpers and fixtures included, names the switch. It
+source file under `test/` names the switch: any `.ts`, `.tsx`, `.mts`, `.cts`,
+`.js`, `.mjs` or `.cjs` file, helpers and fixtures included, except
+`test/vitest-config.test.ts` itself. It
 cannot catch a variable name built at runtime from pieces, such as
 `process.env['CODEBOOST_' + 'RUN_AUTH_PROBES']`.
 
