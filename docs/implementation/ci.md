@@ -113,8 +113,13 @@ parses each probe file. It fails unless the tests that
 `describe` titles and the test title, joined with spaces, as Vitest names them.
 Every `it`, `test` and `describe` call in a probe file must have a string
 literal or a template literal without expressions as its title, or the test
-fails. So the test sees every title, and fails if a test that the switch does
-not enable has a title that ends with the marker. Each `describe` around a
+fails. The call must reach `it`, `test` or `describe` through plain calls and
+plain property names only, such as `it.skip(...)` or `it.each([...])(...)`.
+Any other form, such as ``it.each`table`(...)``, `it['skip'](...)` or
+`(it as T)(...)`, makes the test fail. A call through another name, such as
+`const t = it; t(...)`, is not checked. So the test sees the title of every
+such call, and fails if a test that the switch does not enable has a title that
+ends with the marker. Each `describe` around a
 gated test, and each gated `it` or `test` call, must have exactly a literal
 title, a function expression and optionally a numeric timeout.
 `describe.each`, `describe.for`, `describe.skip` or any other modifier, or an

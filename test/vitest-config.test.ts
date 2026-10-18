@@ -74,9 +74,17 @@ const literalText = (node: unknown) => !isNode(node) ? undefined
 // The switch as an identifier, a string literal or a template literal without expressions.
 const isSwitchName = (node: Node) => (node.type === 'Identifier' && node.name === PROBE_SWITCH) || literalText(node) === PROBE_SWITCH;
 const mentionsSwitch = (node: Node): boolean => isSwitchName(node) || children(node).some(mentionsSwitch);
-// A call whose callee chain starts at `it`, `test` or `describe`, such as `it.runIf(...)('title', ...)`: the kind, the
-// methods and arguments of the inner calls, and the outer call's arguments.
-function suiteCall(node: Node) {
+// Links that can lead from a callee to `it`, `test` or `describe` but that `suiteCall` does not model, such as the tag
+// in ``it.each`table`(...)``, a computed member such as `it['skip']`, a non-null assertion or parentheses.
+const UNMODELED_LINKS: Record<string, string> = { TaggedTemplateExpression: 'tag', MemberExpression: 'object',
+  CallExpression: 'callee', ChainExpression: 'expression', ParenthesizedExpression: 'expression',
+  TSNonNullExpression: 'expression', TSAsExpression: 'expression', TSSatisfiesExpression: 'expression',
+  TSTypeAssertion: 'expression', TSInstantiationExpression: 'expression' };
+// A call whose callee chain starts at `it`, `test` or `describe` through plain calls and non-computed members only, such
+// as `it.runIf(...)('title', ...)` or `it.each([...])('title', ...)`: the kind, the methods and arguments of the inner
+// calls, and the outer call's arguments. Throws if the chain reaches `it`, `test` or `describe` through any other link
+// (see `UNMODELED_LINKS`), because the caller could not check that call's title.
+function suiteCall(node: Node, file: string) {
   if (node.type !== 'CallExpression') return undefined;
   const methods: string[] = [], innerArgs: Node[][] = [];
   let callee = node.callee as Node;
@@ -86,7 +94,13 @@ function suiteCall(node: Node) {
       && callee.property.type === 'Identifier') { methods.unshift(callee.property.name as string); callee = callee.object as Node; }
     else break;
   }
-  if (callee.type !== 'Identifier' || !['it', 'test', 'describe'].includes(callee.name as string)) return undefined;
+  if (callee.type !== 'Identifier' || !['it', 'test', 'describe'].includes(callee.name as string)) {
+    for (let link: unknown = callee; isNode(link); link = link[UNMODELED_LINKS[link.type] ?? '']) {
+      if (link.type === 'Identifier' && ['it', 'test', 'describe'].includes(link.name as string))
+        throw new Error(`A call that reaches ${String(link.name)} through ${callee.type} at offset ${String(node.start)} in ${file}.`);
+    }
+    return undefined;
+  }
   return { kind: callee.name as string, methods, innerArgs, args: node.arguments as Node[] };
 }
 // A value that a gated block may give a variable: a function expression, which runs only when called, or a constant: a
@@ -114,9 +128,11 @@ function assertPlainDeclaration(statement: Node, file: string) {
 }
 
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
-// whether CODEBOOST_RUN_AUTH_PROBES enables it. Every `it`, `test` or `describe` call in the file, with or without a
-// modifier, must have a string literal or a template literal without expressions as its title, or this throws, so
-// that the caller can check every title for the marker. Every `describe` around a gated test must be a plain
+// whether CODEBOOST_RUN_AUTH_PROBES enables it. Every call whose callee chain reaches `it`, `test` or `describe` must
+// reach it through plain calls and non-computed members only, such as `it.skip(...)` or `it.each([...])(...)`, or this
+// throws: ``it.each`table`(...)``, `it['skip'](...)` and `(it as T)(...)` throw. Each such call must have a string
+// literal or a template literal without expressions as its title, or this throws, so that the caller can check every
+// title for the marker. A call through an alias, such as `const t = it; t(...)`, is not seen. Every `describe` around a gated test must be a plain
 // `describe(...)` with exactly a literal title, a function expression and optionally a numeric timeout, or this
 // throws: a modifier such as `describe.each`, `.for` or `.skip`, or an options object such as `{ skip: true }`, could
 // skip the test or make its full name differ from the one this computes. A gated test call must have the same
@@ -156,7 +172,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
         throw new Error(`Unrecognized ${PROBE_SWITCH} condition at offset ${String(node.start)} in ${file}.`);
       gates += 1;
       for (const statement of block.body as Node[]) {
-        const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node) : undefined;
+        const call = statement.type === 'ExpressionStatement' ? suiteCall(statement.expression as Node, file) : undefined;
         if (call && call.kind !== 'describe' && call.methods.length === 0) {
           record(describes, call.args, true, statement.start);
           call.args.slice(1).forEach(arg => visit(arg, describes, false));
@@ -167,7 +183,7 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       }
       return;
     }
-    const call = suiteCall(node);
+    const call = suiteCall(node, file);
     if (call) {
       const gate = call.kind !== 'describe' && call.methods.length === 1 && call.methods[0] === 'runIf'
         && call.innerArgs.length === 1 && call.innerArgs[0]!.length === 1 && isSwitchOn(call.innerArgs[0]![0]);
