@@ -8,6 +8,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The longest recent run took 20 min, about half of this limit. A hung browser suite would otherwise hold the
+    # runner for GitHub's default of 360 min.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

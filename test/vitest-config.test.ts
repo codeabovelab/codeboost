@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parseSync } from 'vite';
 import { parse } from 'yaml';
-import { checkLiveProbeReport, LIVE_PROBE_FILES, LIVE_PROBES } from '../scripts/live-probes.ts';
+import { checkLiveProbeReport, LIVE_PROBE_FILES, LIVE_PROBE_MARKER, LIVE_PROBES } from '../scripts/live-probes.ts';
 import config from '../vitest.config.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -45,10 +45,17 @@ const workflow = (name: string) =>
     jobs: Record<string, Record<string, unknown> & { env?: unknown;
     steps: Array<Record<string, unknown> & { name?: string; run?: string; env?: Record<string, string> }> }>;
   };
+// The `-t` pattern that selects the titles ending in the marker.
+const MARKER_FILTER = `${LIVE_PROBE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+const NODE_VERSION = '26.7.0';
+const SETUP = [{ uses: 'actions/checkout@v4' },
+  { uses: 'actions/setup-node@v4', with: { 'node-version': NODE_VERSION, cache: 'npm' } }];
 const runs = (steps: Array<{ run?: string }>) => steps.flatMap(step => step.run === undefined ? [] : [step.run]);
 
 type Node = { type: string; [key: string]: unknown };
 type ProbeFileTest = { name: string | undefined; gated: boolean };
+// An enclosing `describe`: its literal title, or why its title is not known.
+type Suite = { title: string } | { problem: string };
 const PROBE_SWITCH = 'CODEBOOST_RUN_AUTH_PROBES';
 const SOURCE = /\.(?:ts|tsx|mts|cts|js|mjs|cjs)$/;
 const isNode = (value: unknown): value is Node =>
@@ -95,7 +102,9 @@ function assertNoCall(node: Node) {
 }
 
 // Every test in a probe file with its Vitest full name (describe titles and the test title, joined with spaces), and
-// whether CODEBOOST_RUN_AUTH_PROBES enables it. A gate counts only where Vitest registers tests while it loads the
+// whether CODEBOOST_RUN_AUTH_PROBES enables it. Every `describe` around a gated test must be a plain `describe(...)`
+// with a literal title, or this throws: a title with expressions, or `describe.each`, `.for`, `.skip` or any other
+// modifier, would make the full name differ from the one this computes. A gate counts only where Vitest registers tests while it loads the
 // file: at the module's top level or in a `describe` callback, never in any other function body, so a gate in a
 // helper that is never called throws. The switch may appear only as the exact condition of an
 // `if (...) { ... }` block without `else`, whose statements are each an `it`/`test` call with a literal title or a
@@ -107,13 +116,16 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
   if (errors.length) throw new Error(`${file} does not parse: ${errors[0]!.message}`);
   const tests: ProbeFileTest[] = [];
   let gates = 0;
-  const record = (describes: string[], titleNode: unknown, gated: boolean) => {
+  const record = (describes: Suite[], titleNode: unknown, gated: boolean) => {
     const title = literalText(titleNode);
     if (gated && title === undefined) throw new Error(`Gated test without a literal title in ${file}.`);
-    tests.push({ name: title === undefined ? undefined : [...describes, title].join(' '), gated });
+    const unknown = describes.find(suite => 'problem' in suite);
+    if (gated && unknown) throw new Error(`Gated test in ${file} inside a describe ${unknown.problem}.`);
+    const titles = describes.map(suite => 'title' in suite ? suite.title : '?');
+    tests.push({ name: title === undefined ? undefined : [...titles, title].join(' '), gated });
   };
   // `loading` is true where code runs as Vitest loads the file: outside every function body except `describe` callbacks.
-  const visit = (node: Node, describes: string[], loading: boolean): void => {
+  const visit = (node: Node, describes: Suite[], loading: boolean): void => {
     if (FUNCTIONS.includes(node.type)) { children(node).forEach(child => visit(child, describes, false)); return; }
     if (node.type === 'IfStatement' && mentionsSwitch(node.test as Node)) {
       const block = node.consequent as Node;
@@ -144,7 +156,10 @@ function probeFileTests(file: string, source: string): ProbeFileTest[] {
       else call.innerArgs.flat().forEach(arg => visit(arg, describes, loading));
       if (call.kind === 'describe') {
         const title = literalText(call.args[0]);
-        const inner = title === undefined ? describes : [...describes, title];
+        const suite: Suite = call.methods.length > 0
+          ? { problem: `with the modifier .${call.methods.join('.')} at offset ${String(node.start)}` }
+          : title === undefined ? { problem: `without a literal title at offset ${String(node.start)}` } : { title };
+        const inner = [...describes, suite];
         // Vitest calls a describe callback while it loads the file, so the callback's body keeps `loading`.
         for (const arg of call.args) {
           if (FUNCTIONS.includes(arg.type)) children(arg).forEach(child => visit(child, inner, loading));
@@ -189,7 +204,34 @@ describe('CI workflows', () => {
     expect(ci.on.pull_request).toBeNull();
     expect(isolation.on.push).toEqual(ci.on.push);
     expect(isolation.on.push).toEqual({ branches: ['main', 'codex/**'] });
-    expect(runs(isolation.jobs['real-docker']!.steps)).toEqual(['npm ci --ignore-scripts', 'npm run typecheck', 'npm test']);
+    expect(isolation.jobs['real-docker']!.steps).toEqual(
+      [...SETUP, { run: 'npm ci --ignore-scripts' }, { run: 'npm run typecheck' }, { run: 'npm test' }]);
+  });
+
+  it('runs exactly the type check, the non-Docker Vitest files and the browser suite in the CI test job', () => {
+    expect(workflow('ci.yml').jobs.test!.steps).toEqual([...SETUP, { run: 'npm ci --ignore-scripts' }, { run: 'npm run typecheck' },
+      { run: `npm test -- ${DOCKER_TESTS.map(file => `--exclude ${file}`).join(' ')}` },
+      { run: 'npx playwright install --with-deps chromium' }, { run: 'npm run test:browser' }]);
+  });
+
+  it('keeps the required check names: one job per workflow, with no name and no matrix', () => {
+    // A check is named after its job id, or after its `name` when it has one; a matrix adds the matrix values to the
+    // name. Either change would leave the required check `test` or `real-docker` never reporting. The test job's
+    // timeout is about twice its longest recent run (20 min).
+    const ci = workflow('ci.yml').jobs, isolation = workflow('agent-isolation.yml').jobs;
+    expect(Object.keys(ci)).toEqual(['test']);
+    expect(Object.keys(isolation)).toEqual(['real-docker']);
+    expect(ci.test).toMatchObject({ 'runs-on': 'ubuntu-latest', 'timeout-minutes': 45 });
+    expect(isolation['real-docker']).toMatchObject({ 'runs-on': 'ubuntu-latest', 'timeout-minutes': 45 });
+    for (const job of [ci.test!, isolation['real-docker']!])
+      expect(Object.keys(job).toSorted()).toEqual(['runs-on', 'steps', 'timeout-minutes']);
+  });
+
+  it('uses the same Node version in every workflow', () => {
+    const versions = ['ci.yml', 'agent-isolation.yml', 'live-probes.yml'].flatMap(name => Object.values(workflow(name).jobs)
+      .flatMap(job => job.steps.filter(step => String(step.uses).startsWith('actions/setup-node@'))
+        .map(step => (step.with as Record<string, unknown> | undefined)?.['node-version'])));
+    expect(versions).toEqual([NODE_VERSION, NODE_VERSION, NODE_VERSION]);
   });
 
   it('runs only the live Claude probes, by hand or nightly, never on a pull request or push', () => {
@@ -200,8 +242,8 @@ describe('CI workflows', () => {
     const vitest = job.steps.filter(step => step.run?.startsWith('npx vitest'));
     expect(vitest).toHaveLength(1);
     const words = vitest[0]!.run!.split(/\s+/);
-    // The docker project runs the files one at a time; the filter keeps only titles that end in "(live Claude)".
-    expect(vitest[0]!.run!.startsWith("npx vitest run --project docker -t '\\(live Claude\\)$' ")).toBe(true);
+    // The docker project runs the files one at a time; the filter keeps only titles that end in the marker.
+    expect(vitest[0]!.run!.startsWith(`npx vitest run --project docker -t '${MARKER_FILTER}' `)).toBe(true);
     expect(words.filter(word => word.startsWith('test/'))).toEqual(LIVE_PROBE_FILES);
     expect(vitest[0]!.env).toEqual({ CODEBOOST_RUN_AUTH_PROBES: '1',
       CLAUDE_CODE_OAUTH_TOKEN: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}' });
@@ -241,8 +283,12 @@ describe('CI workflows', () => {
       const tests = probeFileTests(file, readFileSync(join(ROOT, file), 'utf8'));
       const gated = tests.filter(test => test.gated).map(test => test.name!);
       expect(gated.toSorted(), file).toEqual(LIVE_PROBES.filter(probe => probe.file === file).map(probe => probe.name).toSorted());
-      for (const name of gated) expect(name, file).toMatch(/ \(live Claude\)$/);
-      expect(tests.filter(test => !test.gated && test.name?.endsWith('(live Claude)')), file).toEqual([]);
+      for (const name of gated) {
+        expect(name.endsWith(` ${LIVE_PROBE_MARKER}`), name).toBe(true);
+        expect(name, file).toMatch(new RegExp(MARKER_FILTER));
+      }
+      expect(tests.filter(test => !test.gated && test.name !== undefined && new RegExp(MARKER_FILTER).test(test.name)), file)
+        .toEqual([]);
     }
     // Every JavaScript or TypeScript source file under test/ except this one, helpers and fixtures included, since a
     // probe file could import a gate.

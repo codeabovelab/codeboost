@@ -16,10 +16,19 @@ settings are not stored in the repository.
 so both can be required checks. A required check that a path filter skips
 never reports, and GitHub then blocks the merge.
 
+A check takes its name from the job id, or from the job's `name` when it has
+one, and a matrix adds its values to the name. So do not rename the `test` or
+`real-docker` job, and do not give either one a `name` or a `strategy` (matrix):
+the required check would then never report, and no pull request could merge.
+`test/vitest-config.test.ts` fails if either job has any key other than
+`runs-on`, `timeout-minutes` and `steps`, if its steps differ from the ones
+this page lists, or if either workflow has another job.
+
 ### `test`
 
 `test` runs the Vitest files that do not need Docker, and then the browser
-suite (`npm run test:browser`). It excludes the Docker-backed files with
+suite (`npm run test:browser`). Its time limit is 45 minutes; its longest
+recent run took 20 minutes. It excludes the Docker-backed files with
 `--exclude`. The Docker-backed files are the `dockerTests` list in
 `vitest.config.ts`. The excludes must equal that list:
 `test/vitest-config.test.ts` fails if they differ.
@@ -84,6 +93,9 @@ update `LIVE_PROBES` in `scripts/live-probes.ts`. `test/vitest-config.test.ts`
 parses each probe file. It fails unless the tests that
 `CODEBOOST_RUN_AUTH_PROBES` enables have exactly the full names in the list: the
 `describe` titles and the test title, joined with spaces, as Vitest names them.
+Each `describe` around a gated test must be a plain `describe(...)` with a
+literal title. A title with expressions, or `describe.each`, `describe.for`,
+`describe.skip` or any other modifier, makes the test fail.
 The switch may only be the condition of an `if` block that holds only tests and
 declarations, or of `it.runIf`. Such a gate must be where Vitest registers tests
 as it loads the file: at the top level of the file or in a `describe` callback.

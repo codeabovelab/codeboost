@@ -10,7 +10,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-// Every probe title ends with this suffix. The workflow selects the probes with `-t` and this text.
+// Every probe title ends with a space and this suffix. The workflow's `-t` filter is this text escaped as a regular
+// expression and anchored at the end; test/vitest-config.test.ts fails if the two differ.
 export const LIVE_PROBE_MARKER = '(live Claude)';
 
 export const LIVE_PROBES = [
