@@ -8,7 +8,7 @@ settings are not stored in the repository.
 
 | Workflow file | Job (check name) | Runs on | What it runs |
 | --- | --- | --- | --- |
-| `.github/workflows/ci.yml` | `test` | every pull request; pushes to `main` and `codex/**` | Type check; every Vitest file except the Docker-backed files; the Playwright browser suite |
+| `.github/workflows/ci.yml` | `test` | every pull request; pushes to `main` and `codex/**` | Type check; every top-level `test/*.test.ts` file except the Docker-backed files; the Playwright browser suite |
 | `.github/workflows/agent-isolation.yml` | `real-docker` | every pull request; pushes to `main` and `codex/**` | Type check; the complete Vitest suite against real Docker |
 | `.github/workflows/live-probes.yml` | `live-probes` | started by hand (`workflow_dispatch`); every night at 06:23 UTC | The four live Claude startup probes only |
 
@@ -47,6 +47,19 @@ recent run took 20 minutes. It excludes the Docker-backed files with
 `--exclude`. The Docker-backed files are the `dockerTests` list in
 `vitest.config.ts`. The excludes must equal that list:
 `test/vitest-config.test.ts` fails if they differ.
+
+Vitest runs only the top-level `test/*.test.ts` files: the `include` of both
+projects in `vitest.config.ts` is `test/*.test.ts` or the Docker-backed list, so
+a test file in a subfolder of `test/` does not run in any job.
+`test/vitest-config.test.ts` pins the whole Vitest config, so a change to the
+`include` makes it fail.
+
+The browser suite runs every spec in `test/browser/`. `playwright.config.ts`
+sets `forbidOnly: true`, so Playwright refuses to run when a spec has a
+`test.only` or `describe.only`, locally as well as in CI. Without it, a committed
+`.only` would make the job run only that test and pass. `test/vitest-config.test.ts`
+pins the whole Playwright config, so it fails if `forbidOnly` is removed or a
+`grep`, `testMatch`, `testIgnore` or narrower `testDir` is added.
 
 When a test file starts to use Docker, add it to `dockerTests` in
 `vitest.config.ts`, to `DOCKER_TESTS` in `test/vitest-config.test.ts` and to the
@@ -120,8 +133,12 @@ plain property names only, such as `it.skip(...)` or `it.each([...])(...)`.
 Any other form, such as ``it.each`table`(...)``, `it['skip'](...)` or
 `(it as T)(...)`, makes the test fail. A call through another name, such as
 `const t = it; t(...)`, is not checked. So the test sees the title of every
-such call, and fails if a test that the switch does not enable has a title that
-ends with the marker. Each `describe` around a
+such call, and fails if a test that the switch does not enable has a literal
+title that ends with the marker. The test reads a `.each` or `.for` title before
+Vitest fills its placeholders, so it does not see a marker that a placeholder
+adds, as in `it.each(['(live Claude)'])('sneaky %s', ...)`. The `-t` filter of
+the `live-probes` job selects such a test, and the report check then fails the
+job, because a test that is not a probe ran. Each `describe` around a
 gated test, and each gated `it` or `test` call, must have exactly a literal
 title, a function expression and optionally a numeric timeout.
 `describe.each`, `describe.for`, `describe.skip` or any other modifier, or an

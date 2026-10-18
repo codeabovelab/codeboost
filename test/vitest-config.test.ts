@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { parseSync } from 'vite';
 import { parse } from 'yaml';
 import { checkLiveProbeReport, LIVE_PROBE_FILES, LIVE_PROBE_MARKER, LIVE_PROBES } from '../scripts/live-probes.ts';
+import playwrightConfig from '../playwright.config.ts';
 import config from '../vitest.config.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -32,6 +33,18 @@ describe('Vitest scheduling', () => {
         ],
       },
     });
+  });
+});
+
+describe('Playwright config', () => {
+  it('runs every browser spec and refuses a committed test.only', () => {
+    // The whole config, exactly: a `grep`, `testMatch`, `testIgnore` or narrower `testDir` could drop specs from the
+    // CI test job while it still passes, and without `forbidOnly` a committed `test.only` would run only that test.
+    // defineConfig adds one symbol-keyed marker; Playwright reads only string keys.
+    expect(Object.getOwnPropertySymbols(playwrightConfig).map(String)).toEqual(['Symbol(defineConfigWasUsed)']);
+    expect(Object.fromEntries(Object.entries(playwrightConfig))).toEqual({ testDir: './test/browser', forbidOnly: true, fullyParallel: false, workers: 1,
+      timeout: 60_000, expect: { timeout: 15_000 },
+      use: { browserName: 'chromium', viewport: { width: 1512, height: 982 }, trace: 'retain-on-failure' } });
   });
 });
 
@@ -356,8 +369,10 @@ describe('CI workflows', () => {
 
   it('names every live probe exactly as its test file titles it', () => {
     // The tests that the probe switch enables are exactly the listed probes, by Vitest full name, and every one ends in
-    // the suffix the workflow's -t filter selects. No other test in the file carries the suffix: every title in the file
-    // is a literal, or probeFileTests throws, so this sees each one.
+    // the suffix the workflow's -t filter selects. No other test in the file carries the suffix in its literal title:
+    // every title in the file is a literal, or probeFileTests throws, so this sees each one. A `.each` or `.for` title is
+    // read before Vitest fills its placeholders, so `it.each(['(live Claude)'])('sneaky %s', ...)` passes here; the
+    // live-probes job's report check (`checkLiveProbeReport`) then refuses that test, because it ran and is not a probe.
     for (const file of LIVE_PROBE_FILES) {
       const tests = probeFileTests(file, readFileSync(join(ROOT, file), 'utf8'));
       const gated = tests.filter(test => test.gated).map(test => test.name);
