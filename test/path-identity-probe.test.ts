@@ -29,7 +29,7 @@ if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) echo 'codeboost-path-identity true none';;
-    refused) echo 'docker: Error response from daemon: unknown or invalid runtime name: x.' >&2; exit 125;;
+    refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
     late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
     hang) exec sleep 30;;
@@ -83,7 +83,8 @@ describe('task storage probe against Docker answers', () => {
   });
   it('removes its container and volume by name when the daemon refuses the run, and confirms it is gone', async () => {
     writeFileSync(mode, 'refused');
-    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): docker: Error response from daemon: unknown or invalid runtime name: x.');
+    await expect(probeTaskStoragePathIdentity(imageId)).rejects
+      .toThrow(/^docker run failed \(exit 125\): docker: Error response from daemon: unknown or invalid runtime name: x\.\nSee 'docker run --help'\.$/);
     expect(removals()).toEqual([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]);
   });
   it('removes a container a killed client left created but never started', async () => {
