@@ -23,8 +23,8 @@ beforeAll(() => {
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
   // that stopped); each such call is logged in the hung file. Of rm and inspect, the code reads only the exit status
   // and, for a missing name, the "No such container" text; for an existing container this fake prints less stdout
-  // than Docker (the name; the full inspect array), which nothing reads. `lost` is the client's own exit 125 when the
-  // connection drops after the create was sent (wording as Docker 27's CLI, not reproduced here). Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
+  // than Docker (the name; the full inspect array), which nothing reads. `unreachable` is the client's own exit 125
+  // with no daemon answer, as Docker 27.4.0 prints it with DOCKER_HOST=tcp://127.0.0.1:1. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
   // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
   // CLIs before 20.10 did by the docker/cli changelog (not run here).
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
@@ -34,7 +34,7 @@ if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) echo 'codeboost-path-identity true none';;
-    lost) echo 'error during connect: Post "http://docker.example/v1.47/containers/create": EOF' >&2; exit 125;;
+    unreachable) printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
     late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
@@ -129,8 +129,10 @@ describe('task storage probe against Docker answers', () => {
       + ` The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`);
     const cause = (failure as Error).cause as AggregateError;
     expect(cause.errors.map((error: Error) => error.message)).toEqual([expect.stringMatching(/^docker run failed/), `Docker did not confirm that ${name} is gone.`]);
-    // The last thing Docker said: the inspect still found the container.
-    expect((cause.errors[1].cause as { status: number | null }).status).toBe(0);
+    // The last thing Docker said: the inspect still found the container, or (when giving up fell due during the rm)
+    // the rm's refusal while its removal was in progress.
+    const said = cause.errors[1].cause as { status: number | null; stderr: string };
+    expect(said.status === 0 || (said.status === 1 && /is already in progress/.test(said.stderr))).toBe(true);
   }, 60_000);
   it('removes nothing when the client was refused before it started', async () => {
     writeFileSync(mode, 'answer');
@@ -177,10 +179,10 @@ describe('task storage probe against Docker answers', () => {
     expect(cleanup.cause).toMatchObject({ status: null, error: { code: 'ETIMEDOUT' } });
   }, 60_000);
   it('waits out the settle window when docker run exits without a daemon answer', async () => {
-    // Exit 125 from the client itself (a connection lost after the create was sent): the create may still land.
-    writeFileSync(mode, 'lost');
+    // Exit 125 from the client itself: with no daemon answer, a create may have been sent and may still land.
+    writeFileSync(mode, 'unreachable');
     const started = performance.now();
-    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): error during connect');
+    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): docker: Cannot connect to the Docker daemon');
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
   }, 60_000);
 });

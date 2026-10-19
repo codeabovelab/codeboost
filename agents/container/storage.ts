@@ -461,9 +461,9 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
 async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
   let last: DockerOutcome | undefined;
-  // Each call gets the time left before giving up (at least 1 s, so the last ask can still be answered), and after the
-  // first call none starts once that time has passed: a daemon that stops answering stretches the bound by at most one
-  // call's floor and its stop grace.
+  // Each call gets the time left before giving up, capped at 10 s and at least 1 s (so the last ask can still be
+  // answered), and after the first call none starts once that time has passed: a daemon that stops answering
+  // stretches the bound by at most one call's floor and its stop grace.
   const ask = async (args: readonly string[]) => {
     if (last && performance.now() >= giveUpAt)
       throw new Error(`Docker did not confirm that ${name} is gone.`, { cause: last });
