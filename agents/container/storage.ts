@@ -7,7 +7,7 @@ import type { PathIdentity } from '../../core/path-identity.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
-import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
+import { DockerError, NOT_STARTED, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
 import { MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, TREE_SCRIPT } from './tree-script.ts';
@@ -432,6 +432,9 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
   const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
   if (outcome.status !== 0) {
     const failure = new DockerError(args, outcome);
+    // A client that never started sent nothing to the daemon, so there is nothing to remove.
+    const error = outcome.error as NodeJS.ErrnoException | undefined;
+    if (outcome.status === null && (error?.code === NOT_STARTED || error?.syscall?.startsWith('spawn'))) throw failure;
     // A client that did not finish leaves the daemon's outcome unknown: a killed create may still land, so only absence
     // after the settle window counts. A daemon answer settles at once.
     try { await removeProbeContainer(name, outcome.status === null ? CREATE_SETTLE_MS : 0); }
@@ -446,16 +449,22 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
   return { caseSensitive: answer[1] === 'true', unicodeNormalization: answer[2] as PathIdentity['unicodeNormalization'] };
 }
 
-/** Remove a failed probe's container and its anonymous volume by name, until Docker reports it absent. */
+/**
+ * Remove a failed probe's container and its anonymous volume by name. `rm --force` exits 0 for a name that does not
+ * exist, so only an inspect that reports the name absent, after the settle window, proves the probe is gone.
+ */
 async function removeProbeContainer(name: string, settleMs: number): Promise<void> {
-  const settleBy = performance.now() + settleMs, giveUpAt = performance.now() + settleMs + 30_000;
+  const settleBy = performance.now() + settleMs, giveUpAt = settleBy + 30_000;
+  const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
   for (;;) {
-    const args = ['rm', '--force', '--volumes', name];
-    const result = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
-    // Removed: nothing else can create this name, so the probe is gone.
-    if (result.status === 0) return;
-    if (absent(result) && performance.now() >= settleBy) return;
-    // Absent within the settle window, or a removal Docker refused for now (one already in progress): ask again.
+    let args: readonly string[] = ['rm', '--force', '--volumes', name];
+    let result = await docker(args);
+    if (result.status === 0) {
+      args = ['container', 'inspect', name];
+      result = await docker(args);
+      if (absent(result) && performance.now() >= settleBy) return;
+    }
+    // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
     if (performance.now() >= giveUpAt) throw new DockerError(args, result);
     await pause(250);
   }

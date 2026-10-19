@@ -8,28 +8,36 @@ import { probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 // The probe's own handling of Docker's answers (#162), against a `docker` on PATH that answers as the daemon would. The
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
-const calls = join(root, 'calls'), mode = join(root, 'mode'), removals = join(root, 'removals');
+const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
   mkdirSync(bin, { mode: 0o700 });
   const image = JSON.stringify([{ Id: `sha256:${'b'.repeat(64)}`, Config: { User: '10001:10001', Labels: { 'org.opencontainers.image.base.name': BASE_IMAGE,
     'io.codeboost.codex.version': CODEX_VERSION, 'io.codeboost.claude.version': CLAUDE_VERSION, 'io.codeboost.profile.version': '1' } } }]);
-  // `run`: per the mode file, answer, refuse as the daemon does, or hang until the client is killed (a create that may have
-  // landed). `rm`: per the removals file, report the container removed or absent.
+  // `run`: per the mode file, answer, refuse as the daemon does, or hang until the client is killed. In `late` mode the
+  // create lands two seconds later, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
+  // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
+exists() { [ ! -e '${removed}' ] && [ -e '${landAt}' ] && [ "$(date +%s)" -ge "$(cat '${landAt}')" ]; }
 if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) echo 'codeboost-path-identity true none';;
     refused) echo 'docker: Error response from daemon: no such runtime' >&2; exit 125;;
+    created) echo 0 > '${landAt}'; exec sleep 30;;
+    late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
     hang) exec sleep 30;;
   esac
 fi
 if [ "$1" = rm ]; then
-  if [ "$(cat '${removals}')" = removed ]; then exit 0; fi
-  echo "Error response from daemon: No such container: $4" >&2; exit 1
+  if exists; then : > '${removed}'; else echo "Error response from daemon: No such container: $4" >&2; fi
+  exit 0
+fi
+if [ "$1 $2" = "container inspect" ]; then
+  if exists; then echo '[{}]'; exit 0; fi
+  echo "Error response from daemon: No such container: $3" >&2; exit 1
 fi
 exit 0
 `);
@@ -38,33 +46,47 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { if (existsSync(calls)) rmSync(calls); writeFileSync(removals, 'absent'); });
-const logged = () => readFileSync(calls, 'utf8').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
+beforeEach(() => { for (const file of [calls, landAt, removed]) if (existsSync(file)) rmSync(file); });
+const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
+
+const removals = () => logged().slice(1);
+const left = () => existsSync(landAt) && !existsSync(removed);
 
 describe('task storage probe against Docker answers', () => {
   it('reads the identity from a probe that ran, and removes nothing by hand (--rm did)', async () => {
     writeFileSync(mode, 'answer');
     expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
-    expect(logged()).toHaveLength(1);
+    expect(removals()).toEqual([]);
   });
-  it('removes its container and volume by name when the daemon refuses the run', async () => {
+  it('removes its container and volume by name when the daemon refuses the run, and confirms it is gone', async () => {
     writeFileSync(mode, 'refused');
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): docker: Error response from daemon: no such runtime');
-    expect(logged().slice(1)).toEqual([`rm --force --volumes ${probeName()}`]);
+    expect(removals()).toEqual([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]);
   });
-  it('removes a container a killed client may have created but never started', async () => {
-    writeFileSync(mode, 'hang'); writeFileSync(removals, 'removed');
+  it('removes a container a killed client left created but never started', async () => {
+    writeFileSync(mode, 'created');
     await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('docker run failed (client killed or not started)');
-    expect(logged().slice(1)).toEqual([`rm --force --volumes ${probeName()}`]);
-  }, 30_000);
-  it('keeps asking through the settle window while a killed create may still land', async () => {
-    writeFileSync(mode, 'hang');
+    expect(removals()).toContain(`rm --force --volumes ${probeName()}`);
+    expect(left()).toBe(false);
+  }, 60_000);
+  it('removes a create that lands after the killed client, within the settle window', async () => {
+    // The first removals find nothing (rm still exits 0); only asking until the window closes catches the late create.
+    writeFileSync(mode, 'late');
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('client killed or not started');
-    // Absent at every ask, so it asked until the window closed rather than trusting the first answer.
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
-    expect(logged().slice(1).length).toBeGreaterThan(1);
-    expect(new Set(logged().slice(1))).toEqual(new Set([`rm --force --volumes ${probeName()}`]));
+    expect(existsSync(removed)).toBe(true);
+    expect(new Set(removals())).toEqual(new Set([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]));
   }, 60_000);
+  it('removes nothing, and does not wait, when docker never started', async () => {
+    writeFileSync(mode, 'answer');
+    const empty = join(root, 'empty'); mkdirSync(empty, { recursive: true });
+    process.env.PATH = empty;
+    const started = performance.now();
+    try { await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (client killed or not started)'); }
+    finally { process.env.PATH = `${bin}:${savedPath}`; }
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(existsSync(calls)).toBe(false);
+  });
 });
