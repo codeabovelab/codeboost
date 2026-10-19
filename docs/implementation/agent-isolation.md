@@ -417,7 +417,8 @@ against real Docker, including two reviews with different Ask owners on one daem
   that changes the image, the adapters or the prompts. Codex has no live probe while it
   is refused in every phase (#93).
 - T9 as a whole is complete as of 2026-10-19. `test` and `real-docker` are required on
-  `main` and passed on the same head, and a `Live probes` run passed. [CI](ci.md#t9-status)
+  `main`, both passed on the same head (before the ruleset existed), and a `Live probes`
+  run passed. [CI](ci.md#t9-status)
   gives the evidence and says how to keep it green.
 - Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
   is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
