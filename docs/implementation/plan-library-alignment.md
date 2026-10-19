@@ -1,6 +1,6 @@
 # Plan library alignment: closing #6
 
-Baseline: `22e76a8bc90b59c8407bb78bee1c229b249b4936` (main, 2026-10-11).
+Original audit baseline: `22e76a8bc90b59c8407bb78bee1c229b249b4936` (main, 2026-10-11). The change was last brought up to date with `main` at `7fd4dfe52d02de62a516e4d880b4564e83c78513` (2026-10-19).
 
 Issue #6 tracked the v1 plan library contract and the runner obligations that came out of the PR #1 and PR #4 reviews. PR #4 delivered the library part. Later lanes delivered most of the runner part. This change closes the remaining library and test gaps and moves the remaining runtime gaps to their own issues.
 
