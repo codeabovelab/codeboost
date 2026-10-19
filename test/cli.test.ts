@@ -32,7 +32,9 @@ function review(github: Record<string, unknown> | null = { baseBranch: 'main' },
    * a slow daemon, for as long as the test keeps the file. It models only the calls a successful startup makes, checked
    * against Docker 27.4.0: recovery's label listings (`ps --all --quiet --no-trunc`, `volume ls --quiet`,
    * `network ls --quiet --no-trunc`) with nothing to list answer as here, exit 0 and no output; of `build` only the exit
-   * status is read; and the probe on real task storage prints the line given here (runner-workspace.test.ts). The probe's failure cleanup, whose rm and inspect answers matter, is tested against its
+   * status is read; `image inspect` answers a one-element array, of which the image builder reads only `Id`,
+   * `Config.User` and `Config.Labels`, given here in Docker's shape; and the probe on real task storage prints the line
+   * given here (runner-workspace.test.ts). The probe's failure cleanup, whose rm and inspect answers matter, is tested against its
    * own fake in path-identity-probe.test.ts.
    */
   const fakeDocker = () => {

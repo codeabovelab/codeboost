@@ -20,7 +20,8 @@ beforeAll(() => {
   // create lands two seconds later, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm refuses as Docker does during an auto-remove; with the stuck file, a removed
-  // container is still reported. Checked against Docker 27.4.0. With the old-cli file, rm of a missing name exits 1, as
+  // container is still reported. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
+  // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
   // CLIs before 20.10 did by the docker/cli changelog (not run here).
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
