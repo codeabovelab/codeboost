@@ -220,11 +220,13 @@ T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
 2. Both required jobs passed on the same head, `ba8294d` on `main` (the F6c
    merge, PR #177): [`test`](https://github.com/codeabovelab/codeboost/actions/runs/39115311602)
    and [`real-docker`](https://github.com/codeabovelab/codeboost/actions/runs/39115311588).
+   These runs came before the ruleset existed. From the pull request that
+   records this status on, every merge into `main` must pass both under it.
 3. The `CLAUDE_CODE_OAUTH_TOKEN` secret exists. A `live-probes` run started by
    hand on 2026-10-19 on `main` at `ba8294d`
    [passed](https://github.com/codeabovelab/codeboost/actions/runs/39206371497),
    and its report check printed "All 4 live Claude probes passed." The nightly
-   scheduled runs now run too.
+   runs are now scheduled.
 
 The probes are Claude-only, because Codex is refused in every phase (#93).
 
@@ -232,8 +234,9 @@ To keep T9 green:
 
 - Keep `test` and `real-docker` required on `main`, and do not rename either
   job (see [Workflows](#workflows)).
-- Keep the `CLAUDE_CODE_OAUTH_TOKEN` secret valid. When it expires, every
-  `live-probes` run fails at its first step.
+- Keep the `CLAUDE_CODE_OAUTH_TOKEN` secret valid. If it is removed, every
+  `live-probes` run fails at its first step. If it expires, the runs fail
+  later, at the step that runs the probes.
 - If GitHub disables the scheduled `Live probes` workflow after 60 days without
   repository activity, turn it on again (see [`live-probes`](#live-probes)).
 - When `test/planning-recorded.test.ts` fails because a recording is stale,
