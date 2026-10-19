@@ -137,29 +137,86 @@ describe('production agent adapters', () => {
     const answer = JSON.stringify({ summary: 'x'.repeat(4 * 1024 * 1024) });
     const raw = structuredEnvelope(answer, OUTPUT_LIMITS.stdoutBytes);
     expect(raw.length).toBe(OUTPUT_LIMITS.stdoutBytes);
-    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
+    // Compared without a diff: on a mismatch, vitest would spend minutes diffing megabyte strings instead of failing.
+    const decoded = parseClaudeOutput(raw, true);
+    expect(decoded.providerFailed).toBe(false);
+    expect(decoded.text.length).toBe(answer.length);
+    expect(decoded.text === answer).toBe(true);
   });
 
-  it('re-serializes a structured answer, so decoded text can exceed its raw bytes (#166 may change this)', () => {
-    // Describes today's decoder, which re-serializes the answer (#166 may change that): JSON.parse then JSON.stringify
-    // writes 1e20 in full, so 4 raw bytes become 21. The supervisor bounds the decoded text itself; see the
-    // decoded-output limit cases in agent-supervisor.test.ts.
-    const raw = structuredEnvelope(JSON.stringify({ n: [] }).replace('[]', '[' + Array(1000).fill('1e20').join(',') + ']'), 8 * 1024);
-    const { text } = parseClaudeOutput(raw, true);
-    expect(Buffer.byteLength(text)).toBeGreaterThan(raw.length);
+  it('returns a structured answer as the exact text of structured_output in the envelope, whatever surrounds it', () => {
+    // Spacing, escapes, number spellings and brackets inside strings all survive, and so do members on either side.
+    const answer = '{ "summary" : "caf\\u00e9 } ] \\" \\\\", "n": [1e20, 1.0, -0E+0],\n "nested": {"a": [{}, []]} }';
+    const raw = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"text with } and \\" in it",'
+      + `"structured_output":\t${answer}\n, "usage": {"input_tokens": 1}, "end": null}`);
+    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
+    expect(parseClaudeOutput(Buffer.from(`{"subtype":"success","is_error":false,"structured_output":${answer}}`), true).text)
+      .toBe(answer);
+  });
+
+  // #166: re-encoding the answer once let a duplicate key or an inexact integer reach the plan parser already resolved.
+  const validPlan = { schema_version: 1, issue: 1, revision: 1, summary: 'Plan', questions: [],
+    items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }],
+      acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] };
+  const draft = () => prepareDraft({ context: { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, issue: 1,
+    baseEntries: [{ path: 'a', kind: 'file' }], pathKey: path => path, allowedCommands: [] }, requestId: 'request', revision: 1,
+    repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['a'] },
+    issue: { number: 1, title: 'Fix', body: '', comments: [] }, approvedLessons: [], feedback: '' });
+  it.each([
+    ['a duplicate key', JSON.stringify(validPlan).replace('"summary":"Plan"', '"summary":"Plan","summary":"Other"'), 'Duplicate key: summary'],
+    ['an inexact integer', JSON.stringify(validPlan).replace('"revision":1', '"revision":1.0000000000000001'), 'Integer is not exactly representable.'],
+  ])('lets draft validation refuse %s in a structured answer', (_case, answer, refusal) => {
+    const { text } = parseClaudeOutput(structuredEnvelope(answer, answer.length + 256), true);
+    // Compared without a diff, so a broken decoder fails at once rather than in a minutes-long diff of a large string.
+    expect(text.length).toBe(answer.length);
+    expect(text === answer).toBe(true);
+    expect(() => draft().validate(text)).toThrow(refusal);
+    // The same plan without the defect is accepted, so the refusal is the defect's.
+    const valid = JSON.stringify(validPlan);
+    expect(draft().validate(parseClaudeOutput(structuredEnvelope(valid, valid.length + 256), true).text).value).toEqual(validPlan);
+  });
+
+  it('refuses a structured envelope that repeats a top-level key, before reading what it reports', () => {
+    for (const envelope of ['{"subtype":"success","is_error":false,"structured_output":{"a":1},"structured_output":{"a":2}}',
+      '{"subtype":"success","is_error":true,"is_error":false,"structured_output":{"a":1}}',
+      // The last is_error would otherwise make this a provider failure rather than a refusal.
+      '{"subtype":"success","is_error":false,"is_error":true,"structured_output":{"a":1}}',
+      // Keys are compared decoded, so another spelling of the same key is a repeat.
+      '{"subtype":"success","is_error":false,"structured_output":{"a":1},"structured\\u005foutput":{"a":2}}'])
+      expect(() => parseClaudeOutput(Buffer.from(envelope), true)).toThrow('malformed');
+    // Without a schema the envelope is read as before.
+    expect(parseClaudeOutput(Buffer.from('{"is_error":false,"result":"a","result":"b"}'))).toEqual({ text: 'b', providerFailed: false });
+  });
+
+  // The base refused these too. They guard the scanner's precondition: it is given only an object envelope.
+  it.each(['[{"is_error":false}]', '[]', '"text"', 'true'])('refuses a structured envelope that is not an object: %s', envelope => {
+    expect(() => parseClaudeOutput(Buffer.from(envelope), true)).toThrow('malformed');
+  });
+
+  it('finds structured_output however the envelope is spaced or its key is spelled', () => {
+    for (const envelope of [' \r\n{ "subtype" : "success" , "is_error" : false , "structured_output" : {"a":1} } \n',
+      '{"subtype":"success","is_error":false,"structured\\u005foutput":{"a":1}}'])
+      expect(parseClaudeOutput(Buffer.from(envelope), true).text).toBe('{"a":1}');
+  });
+
+  it('applies the 1 MiB plan parser limit to the bytes of structured_output in the envelope, not to a re-encoding', () => {
+    // Spacing inside the answer counts: re-encoded, this answer would be far below the limit.
+    const answer = `{ "summary": "x" ${' '.repeat(MAX_SOURCE_BYTES)}}`;
+    expect(Buffer.byteLength(JSON.stringify(JSON.parse(answer)))).toBeLessThan(MAX_SOURCE_BYTES);
+    const { text } = parseClaudeOutput(structuredEnvelope(answer, answer.length + 256), true);
+    // Compared without a diff, so a broken decoder fails at once rather than in a minutes-long diff of a large string.
+    expect(text.length).toBe(answer.length);
+    expect(text === answer).toBe(true);
+    expect(() => draft().validate(text)).toThrow('Input size exceeds 1 MiB.');
   });
 
   it('applies the 1 MiB plan parser limit to the decoded answer at the exact byte in draft validation', () => {
-    const draft = prepareDraft({ context: { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, issue: 1,
-      baseEntries: [{ path: 'a', kind: 'file' }], pathKey: path => path, allowedCommands: [] }, requestId: 'request', revision: 1,
-      repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['a'] },
-      issue: { number: 1, title: 'Fix', body: '', comments: [] }, approvedLessons: [], feedback: '' });
     const answerOf = (bytes: number) => JSON.stringify({ summary: 'x'.repeat(bytes - '{"summary":""}'.length) });
     for (const [bytes, accepted] of [[MAX_SOURCE_BYTES, true], [MAX_SOURCE_BYTES + 1, false]] as const) {
       const { text } = parseClaudeOutput(structuredEnvelope(answerOf(bytes), bytes + 1024), true);
       expect(Buffer.byteLength(text)).toBe(bytes);
       // At the limit the answer parses and fails only later, on its missing revision; one byte more fails in the parser.
-      expect(() => draft.validate(text)).toThrow(accepted ? 'Response revision mismatch.' : 'Input size exceeds 1 MiB.');
+      expect(() => draft().validate(text)).toThrow(accepted ? 'Response revision mismatch.' : 'Input size exceeds 1 MiB.');
     }
   });
 

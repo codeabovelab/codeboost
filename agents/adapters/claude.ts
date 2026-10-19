@@ -8,14 +8,59 @@ import { assertAdapterRequest, capAdapterInvocationBudget, createAdapterInvocati
   type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 /**
+ * The exact source text of each member of a top-level JSON object, by key. `json` must already have passed
+ * `JSON.parse` as an object, so only string and nesting boundaries are tracked here; every loop also stops at the end
+ * of the text, so other input cannot hang it. Refuses a key that appears twice, where `JSON.parse` would silently keep
+ * the last value.
+ */
+function topLevelMembers(json: string): Map<string, string> {
+  const members = new Map<string, string>();
+  const isSpace = (char: string | undefined) => char === ' ' || char === '\t' || char === '\n' || char === '\r';
+  let at = 0;
+  const skipSpace = () => { while (isSpace(json[at])) at++; };
+  const skipString = () => { // `at` is on the opening quote; leaves `at` after the closing one.
+    for (at++; at < json.length && json[at] !== '"'; at++) if (json[at] === '\\') at++;
+    at++;
+  };
+  skipSpace(); at++; // '{'
+  for (skipSpace(); at < json.length && json[at] !== '}'; skipSpace()) {
+    const keyStart = at; skipString();
+    const key = JSON.parse(json.slice(keyStart, at)) as string;
+    skipSpace(); at++; skipSpace(); // ':'
+    const valueStart = at;
+    if (json[at] === '"') skipString();
+    else if (json[at] === '{' || json[at] === '[') {
+      let depth = 0;
+      do {
+        if (json[at] === '"') { skipString(); continue; }
+        if (json[at] === '{' || json[at] === '[') depth++;
+        else if (json[at] === '}' || json[at] === ']') depth--;
+        at++;
+      } while (depth > 0 && at < json.length);
+    } else while (at < json.length && !isSpace(json[at]) && json[at] !== ',' && json[at] !== '}') at++;
+    if (members.has(key)) throw new Error('Claude returned a malformed output envelope.');
+    members.set(key, json.slice(valueStart, at));
+    skipSpace(); if (json[at] === ',') at++;
+  }
+  return members;
+}
+
+/**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
  * true, is a provider failure; it can omit `result`. With `--json-schema` (planning), a successful answer needs
- * `subtype: "success"` and is the schema-validated `structured_output` object, returned as JSON text; `result` then
- * holds only Claude's prose. Plain-text envelopes without a `subtype` are still accepted.
+ * `subtype: "success"` and is the schema-validated `structured_output` object. It is returned as the exact JSON text
+ * of that member in the CLI's envelope, never re-encoded here, so the plan parser sees any duplicate key or inexact
+ * integer the envelope holds (#166). Whether the API or CLI resolves those before writing the envelope is not verified.
+ * With a schema, an envelope that repeats a top-level key is malformed, whatever it reports. `result` then holds only
+ * Claude's prose. Plain-text envelopes without a `subtype` are still accepted.
  */
 export function parseClaudeOutput(raw: Buffer, structured = false): { text: string; providerFailed: boolean } {
-  const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) as
+  const source = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  const envelope = JSON.parse(source) as
     { subtype?: unknown; result?: unknown; is_error?: unknown; structured_output?: unknown };
+  // Read every member before classifying: JSON.parse keeps only the last of a repeated key, such as `is_error`.
+  const members = structured && envelope !== null && typeof envelope === 'object' && !Array.isArray(envelope)
+    ? topLevelMembers(source) : null;
   if (typeof envelope.is_error !== 'boolean' || (envelope.result !== undefined && typeof envelope.result !== 'string')
     || (envelope.subtype !== undefined && typeof envelope.subtype !== 'string'))
     throw new Error('Claude returned a malformed output envelope.');
@@ -31,7 +76,7 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
   const answer = envelope.structured_output;
   if (answer === null || typeof answer !== 'object' || Array.isArray(answer))
     throw new Error('Claude returned no structured output for a schema-constrained answer.');
-  return Object.freeze({ text: JSON.stringify(answer), providerFailed: false });
+  return Object.freeze({ text: members!.get('structured_output')!, providerFailed: false });
 }
 
 /**
