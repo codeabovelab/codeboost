@@ -416,10 +416,10 @@ against real Docker, including two reviews with different Ask owners on one daem
   startup path. Start the workflow by hand, or run the probes locally, before a release
   that changes the image, the adapters or the prompts. Codex has no live probe while it
   is refused in every phase (#93).
-- T9 as a whole is not complete yet. Lane F6 has added the workflows ([CI](ci.md)). What
-  remains: a repository administrator must require `test` and `real-docker` on `main`;
-  both jobs must pass on the same head after that; and a `Live probes` run must pass
-  once the secret exists.
+- T9 as a whole is complete as of 2026-10-19. `test` and `real-docker` are
+  required on `main`, both passed on the same head (before the checks were required),
+  and a `Live probes` run passed. [CI](ci.md#t9-status) gives the evidence and says how
+  to keep it green.
 - Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
   is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
   as review. Running an item's `cmd` in a writable task filesystem is not built yet; when it is, each run must call

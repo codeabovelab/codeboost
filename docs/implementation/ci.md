@@ -167,7 +167,8 @@ Codex has no probe, because Codex is refused in every phase (#93).
 
 ## Settings for a repository administrator
 
-The repository cannot make these settings itself.
+The repository cannot make these settings itself. Both were made on
+2026-10-19 (see [T9 status](#t9-status)).
 
 1. **Required checks on `main`.** In the branch protection rule or ruleset for
    `main`, require the status checks `test` and `real-docker`. Do not require
@@ -208,11 +209,38 @@ To run the live probes locally, set `CODEBOOST_RUN_AUTH_PROBES=1` and
 `CLAUDE_CODE_OAUTH_TOKEN`, then run the `vitest` command from
 `live-probes.yml`.
 
-## What remains before T9 is complete
+## T9 status
 
-T9 in the [plan](../designs/codeboost-plan-indexed-review.md) stays open until
-all of these are true:
+T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
+2026-10-19. The evidence:
 
-1. A repository administrator requires `test` and `real-docker` on `main`.
-2. Both required jobs pass on the same head after this setup is merged.
-3. The `CLAUDE_CODE_OAUTH_TOKEN` secret exists and a `live-probes` run passes.
+1. Since 2026-10-19, the active repository ruleset "main checks" requires
+   `test` and `real-docker` on `main`. It does not require `live-probes`, by
+   design.
+2. Both required jobs passed on the same head, `ba8294d` on `main` (the F6c
+   merge, PR #177): [`test`](https://github.com/codeabovelab/codeboost/actions/runs/39115311602)
+   and [`real-docker`](https://github.com/codeabovelab/codeboost/actions/runs/39115311588).
+   These runs came before the ruleset existed. Every merge into `main` from
+   now on, starting with the pull request that records this status, must pass
+   both required checks.
+3. The `CLAUDE_CODE_OAUTH_TOKEN` secret exists. A `live-probes` run started by
+   hand on 2026-10-19 on `main` at `ba8294d`
+   [passed](https://github.com/codeabovelab/codeboost/actions/runs/39206371497),
+   and its report check printed "All 4 live Claude probes passed." Nightly
+   runs start at 06:23 UTC.
+
+The probes are Claude-only, because Codex is refused in every phase (#93).
+
+To keep T9 green:
+
+- Keep `test` and `real-docker` required on `main`, and do not rename either
+  job (see [Workflows](#workflows)).
+- Keep the `CLAUDE_CODE_OAUTH_TOKEN` secret valid. If it is removed, every
+  `live-probes` run fails at its first step. If it expires, the runs fail
+  later, at the step that runs the probes.
+- If GitHub disables the scheduled `Live probes` workflow after 60 days without
+  repository activity, turn it on again (see [`live-probes`](#live-probes)).
+- When `test/planning-recorded.test.ts` fails because a recording is stale,
+  record the fixtures again by hand (see
+  [Record the planning fixtures again](#record-the-planning-fixtures-again)).
+  No workflow records them.
