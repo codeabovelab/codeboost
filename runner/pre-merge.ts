@@ -3,17 +3,33 @@ import { readHistoryInWorker } from './history-job.ts';
 import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
-import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { GuardRefusal, MERGEABLE_STATUSES, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MAX_REBASE_TIMEOUT_MS, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS,
   RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService, ReviewView } from './review.ts';
-import type { PreMergeReadiness, RebaseMarker } from './store.ts';
+import { BranchPushRefused } from './branch-push.ts';
+import type { PreMergeReadiness, PushMarker, PushOutcome, RebaseMarker } from './store.ts';
 
-export interface RemotePair { base: string; head: string }
+/** `branch` is the task PR's head branch, present when the runner published the PR. */
+export interface RemotePair { base: string; head: string; branch?: string }
 export interface PreMergeRemote {
   inspect(signal?: AbortSignal): Promise<RemotePair>;
   fetch(pair: RemotePair, signal?: AbortSignal): Promise<void>;
+  /**
+   * Make the task branch point at `to`, leased to exactly `from`. Throws `BranchPushRefused` when nothing was pushed
+   * because the branch holds something else; any other failure leaves the outcome unknown.
+   */
+  push(input: { branch: string; from: string; to: string; beforePush: () => void }, signal?: AbortSignal): Promise<void>;
+  /** The commit the task branch points at on GitHub, or null when it does not exist. */
+  readBranch(branch: string, signal?: AbortSignal): Promise<string | null>;
 }
+/** One read of the branch, bounded as `#settlePush` says, settles a push whose outcome is unknown. */
+export const PUSH_SETTLEMENT_TIMEOUT_MS = 30_000;
+/**
+ * GitHub's pull-request API reports a pushed head asynchronously. After a push, no new inspection starts once this long
+ * has passed; the last one may still take its own timeout to answer.
+ */
+export const PUSHED_HEAD_VISIBLE_TIMEOUT_MS = 30_000;
 export interface PreMergeAuthorization {
   /** Complete the last external authorization read before a later external operation. */
   refresh(): Promise<void>;
@@ -29,12 +45,17 @@ type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 // D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
 // of that ownership settlement inside the preparation's one overall deadline.
 export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
-/** Git and GitHub subprocesses abort before the advertised operation deadline, leaving their bounded stop/drain time. */
+/**
+ * Git and GitHub subprocesses abort before the advertised operation deadline, leaving their stop/drain time. That time
+ * is bounded except in two cases, which are waited for, fail-closed: a process that stays in a subprocess's group after
+ * it exits, and, for Git calls that change something (fetch, update-ref, push), a process that left the group but holds
+ * its output (reads, ls-remote and cat-file, fail instead after the pipe drain).
+ */
 export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
 /** Keep a full process-settlement window between live rebase expiry and its separately budgeted durable cleanup. */
 const REBASE_CLEANUP_HANDOFF_RESERVE_MS = PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
 
-/** Production preparation before F6: refresh, rebase, re-review, then exact-head command checks. */
+/** Production preparation: refresh, rebase, re-review, push the rewritten head, then exact-head command checks. */
 export class PreMergeCoordinator {
   readonly service: ReviewService;
   readonly runner: RunnerCoordinator;
@@ -43,10 +64,13 @@ export class PreMergeCoordinator {
   readonly operationTimeoutMs: number;
   readonly processSettlementReserveMs: number;
   readonly commandSettlementReserveMs: number;
+  readonly pushVisibleTimeoutMs: number;
   readonly authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
   readonly settle: <T>(fn: () => T) => T;
-  #active: Promise<PreMergeResult> | null = null;
+  #active: Promise<unknown> | null = null;
   #abort: AbortController | null = null;
+  /** Aborted only by shutdown: a cancel must not stop the branch read that settles a push and closes the task. */
+  readonly #shutdown = new AbortController();
   #closing = false;
   #last: PreMergeResult | null = null;
   #lastBinding: { stateVersion: number; reviewVersion: number; snapshotId: string } | null = null;
@@ -54,15 +78,17 @@ export class PreMergeCoordinator {
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
     operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
     authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>,
-    reserves: { processMs?: number; commandMs?: number } = {}) {
+    reserves: { processMs?: number; commandMs?: number; pushVisibleMs?: number } = {}) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 60 * 60_000)
       throw new Error('Invalid pre-merge operation deadline.');
     this.service = service; this.runner = runner; this.rebaser = rebaser; this.remote = remote;
     this.operationTimeoutMs = operationTimeoutMs; this.authorize = authorize;
     this.processSettlementReserveMs = reserves.processMs ?? PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
     this.commandSettlementReserveMs = reserves.commandMs ?? COMMAND_CHECK_SETTLEMENT_RESERVE_MS;
+    this.pushVisibleTimeoutMs = reserves.pushVisibleMs ?? PUSHED_HEAD_VISIBLE_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.processSettlementReserveMs) || this.processSettlementReserveMs < 0
-      || !Number.isSafeInteger(this.commandSettlementReserveMs) || this.commandSettlementReserveMs < 0)
+      || !Number.isSafeInteger(this.commandSettlementReserveMs) || this.commandSettlementReserveMs < 0
+      || !Number.isSafeInteger(this.pushVisibleTimeoutMs) || this.pushVisibleTimeoutMs < 0)
       throw new Error('Invalid pre-merge settlement reserve.');
     this.settle = settleWith(capability);
   }
@@ -137,7 +163,8 @@ export class PreMergeCoordinator {
     return active;
   }
   async close(): Promise<void> {
-    this.#closing = true; this.#abort?.abort(new Error('Server shutdown.')); await this.#active;
+    this.#closing = true; this.#shutdown.abort(new Error('Server shutdown.')); this.#abort?.abort(new Error('Server shutdown.'));
+    await this.#active;
   }
   /** Cancel the task and promptly stop whichever rebase, remote read or command check this preparation owns. */
   cancelTask(expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
@@ -147,6 +174,47 @@ export class PreMergeCoordinator {
       : this.service.store.cancelTask(identity, expectedStateVersion, actionId);
     this.service.store.afterCommit(() => this.#abort?.abort(new Error('Task cancelled.')));
     return outcome;
+  }
+
+  /**
+   * Settle a push whose outcome is unknown (a crash, shutdown or failure during the push) by reading the branch, then
+   * clear its marker. Returns null when no push is pending; throws when the branch could not be read.
+   */
+  async settleInterruptedPush(): Promise<PushOutcome | null> {
+    const marker = this.service.store.getTask(this.service.config.identity).pushInProgress;
+    return marker ? (await this.#settlePush(marker)).outcome : null;
+  }
+  /**
+   * Settle a push left by a crash, shutdown or unreadable branch, as one tracked job that shutdown aborts and awaits:
+   * after startup recovery, and when a task is cancelled with no preparation running. While it runs, a preparation is
+   * refused as already running. Never throws: a failed read leaves the marker for the next preparation, and a server
+   * already closing or busy skips it.
+   */
+  settlePendingPush(): Promise<PushOutcome | null> {
+    if (this.#closing || this.#active) return Promise.resolve(null);
+    const active = this.settleInterruptedPush().catch(() => null)
+      .finally(() => { if (this.#active === active) this.#active = null; });
+    this.#active = active;
+    return active;
+  }
+  /** Clear the marker; returns the task state version just before and just after, read in the same turn. */
+  #finishPush(marker: PushMarker): { before: number; after: number } {
+    const identity = this.service.config.identity, before = this.service.store.getTask(identity).stateVersion;
+    this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(identity).planKey, marker.attemptId));
+    return { before, after: this.service.store.getTask(identity).stateVersion };
+  }
+  /**
+   * One branch read, all of it, Git's settlement after an abort included, within `limitMs` (at most
+   * PUSH_SETTLEMENT_TIMEOUT_MS): the read is aborted the process-settlement reserve before that, and does not start
+   * when less than the reserve is left. One case is not bounded: a process that stays in Git's group after Git exits
+   * is waited for, as for every Git call, since its group ID may be reused and it cannot be signalled safely.
+   */
+  async #settlePush(marker: PushMarker, limitMs = PUSH_SETTLEMENT_TIMEOUT_MS): Promise<{ outcome: PushOutcome; before: number; after: number }> {
+    const readMs = Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs) - this.processSettlementReserveMs;
+    if (readMs < 1) throw Object.assign(new Error('Too little time is left to read the branch and settle Git.'), { code: 'ETIMEDOUT' });
+    const read = await this.remote.readBranch(marker.branch, AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(readMs)]));
+    const outcome: PushOutcome = read === marker.to ? 'pushed' : read === marker.from ? 'not-pushed' : 'moved';
+    return { outcome, ...this.#finishPush(marker) };
   }
 
   /** `beforeRecord` rechecks the caller's task and review generations, in the turn that records the refreshed pair. */
@@ -205,6 +273,88 @@ export class PreMergeCoordinator {
     if (!this.settle(() => this.service.store.abortRebase(this.service.store.getTask(identity).planKey, marker.attemptId)))
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
+  /**
+   * Inspect the PR until GitHub reports a head other than the pre-push head, with backoff. No inspection starts after
+   * `pushVisibleTimeoutMs`, so the wait lasts at most that plus one inspection, within the preparation deadline. A PR
+   * still at the pre-push head after that fails the preparation without refreshing the review: the branch itself
+   * already holds another head.
+   */
+  async #awaitHeadChange(before: RemotePair, signal: AbortSignal, remaining: () => number): Promise<RemotePair> {
+    const until = performance.now() + this.pushVisibleTimeoutMs;
+    for (let delay = 250; ; delay = Math.min(delay * 2, 4_000)) {
+      const seen = await this.remote.inspect(signal); signal.throwIfAborted();
+      // Only the head shows whether GitHub caught up: a base that moved meanwhile says nothing about the pushed head.
+      if (seen.head !== before.head) return seen;
+      const wait = Math.min(delay, until - performance.now(), remaining() - this.processSettlementReserveMs);
+      if (wait < 1) throw new GuardRefusal(`GitHub has not reported the pull request's new head yet; it still shows ${before.head}. Prepare the merge again shortly.`);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, wait);
+        const stop = () => { clearTimeout(timer); reject(signal.reason); };
+        signal.addEventListener('abort', stop, { once: true });
+      });
+    }
+  }
+  /**
+   * Push the reviewed, rewritten head over exactly the remote head it rewrote. The durable marker is written before the
+   * first external write and cleared only after a read of the branch settles the outcome; when that read is impossible
+   * (shutdown, or GitHub unreachable) the marker stays for the next preparation or startup.
+   */
+  async #pushRewrite(remote: RemotePair, view: ReviewView, signal: AbortSignal, deadline: number,
+    authorize: () => Promise<PreMergeAuthorization | undefined>,
+    bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => void):
+    Promise<{ result: 'pushed' | 'refused' | 'moved'; stateVersion: number }> {
+    const identity = this.service.config.identity;
+    if (!remote.branch) throw new GuardRefusal('The pull request was not published by the runner, so its rewritten head cannot be pushed.');
+    const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
+      reviewVersion: view.expected.reviewVersion! };
+    // Captured before the asynchronous authorization read: any task write that lands during it (a reassignment, a
+    // referenced-code change) must refuse the claim, not be adopted by it. The caller has already checked that the
+    // review reload before this (after a rebase, it awaits a history worker) adopted nothing new.
+    const admitted = this.service.store.getTask(identity).stateVersion;
+    const authorization = await authorize();
+    signal.throwIfAborted();
+    const marker = this.service.store.beginPrePush(identity, reviewed, admitted,
+      { branch: remote.branch, from: remote.head, to: view.snapshot.head });
+    const binding = this.service.store.getTask(identity).stateVersion;
+    // The task state this push left, for binding a later failure: the version clearing the marker produced when nothing
+    // else wrote since the claim, else the claim's own. A write while the push or its read was in flight, such as a plan
+    // revision, must leave a later failure stale.
+    const owned = (cleared: { before: number; after: number }) => cleared.before === binding ? cleared.after : binding;
+    try {
+      await this.remote.push({ branch: marker.branch, from: marker.from, to: marker.to, beforePush: () => {
+        // The last local checks before the external write: shutdown, trust, and no task or review change since the
+        // claim. Shutdown sets the runner's admission flag first and closes this coordinator only after the HTTP drain,
+        // so between the two only the runner's flag shows that shutdown began.
+        if (this.runner.closing) throw new GuardRefusal('The server is shutting down.');
+        authorization?.validate();
+        const task = this.service.store.getTask(identity);
+        if (task.stateVersion !== binding || task.cancelRequested !== null
+          || this.service.store.reviewVersion(identity) !== reviewed.reviewVersion
+          || this.service.store.getSnapshot(identity).id !== reviewed.snapshotId)
+          throw new GuardRefusal('The task or review changed before the rewritten head was pushed. Reload first.');
+        signal.throwIfAborted();
+      } }, signal);
+    } catch (error) {
+      if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
+      // Shutdown (from its first step, when the runner stops admission): this failure path starts no settlement read;
+      // startup settles the marker. Otherwise one read, within what is left of the preparation's deadline with Git's settlement reserve kept inside it (except for a process that stays in
+      // Git's group after Git exits, which is waited for; see #settlePush), settles it; a cancel does not stop that
+      // read. When the preparation's own deadline ended the push, less than that reserve is left, so no read starts and
+      // the marker stays, as for an unreadable branch.
+      let settled = binding, outcome: PushOutcome | null = null;
+      const left = Math.floor(deadline - performance.now());
+      if (!this.#closing && !this.runner.closing && left >= 1) {
+        try { const read = await this.#settlePush(marker, left); settled = owned(read); outcome = read.outcome; }
+        catch { /* The marker stays; the next preparation or startup reads the branch again. */ }
+      }
+      bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head }, settled);
+      // The branch holds neither the pre-push head nor ours: someone else moved it while the push's outcome was unknown
+      // (for example, right after the push, before its read-back). That head is reviewed, as after a refusal.
+      if (outcome === 'moved') return { result: 'moved', stateVersion: settled };
+      throw error;
+    }
+    return { result: 'pushed', stateVersion: owned(this.#finishPush(marker)) };
+  }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
     deadline: number, onObserved: (value: { pair: RemotePair; binding: { stateVersion: number; reviewVersion: number;
       snapshotId: string } }) => void, onChecked: (checked: readonly string[]) => void): Promise<PreparedResult> {
@@ -253,15 +403,22 @@ export class PreMergeCoordinator {
     // Rebase lifecycle writes advance task state without changing the review that admitted them. Bind a resulting
     // failure to that original review/snapshot while adopting only the task-state transition owned by the rebase. If a
     // read fails, the older binding remains safely stale.
-    const bindRebaseFailure = (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair) => {
+    const bindRebaseFailure = (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => {
       try {
         onObserved({ pair, binding: {
-          stateVersion: this.service.store.getTask(identity).stateVersion,
+          stateVersion: stateVersion ?? this.service.store.getTask(identity).stateVersion,
           reviewVersion: reviewed.reviewVersion, snapshotId: reviewed.snapshotId,
         } });
       } catch { /* An unbound failure is conservatively historical. */ }
     };
-    const load = async () => track(await this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()), signal }));
+    const loadView = () => this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()), signal });
+    // Every review load awaits a history worker (#170). A load that must not adopt a change made while it awaited checks
+    // its guard before the view is recorded, so a refusal stays bound to the earlier state and is reported as stale.
+    const reload = async (guard: { stateVersion: number; reviewVersion: number; snapshotId: string }) => {
+      const loaded = await loadView();
+      assertCurrent(guard);
+      return track(loaded);
+    };
     signal.throwIfAborted();
     if (this.runner.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     const runnerStatus = this.runner.status(identity);
@@ -269,9 +426,22 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('Runner cleanup is unresolved; restart and recover owned resources before preparing a merge.');
     if (this.service.store.getTask(identity).rebaseInProgress !== null)
       throw new GuardRefusal('Rebase cleanup is unresolved; restart and recover the owned rebase before preparing a merge.');
-    let view = await load(), task = this.service.store.getTask(identity);
+    const pending = this.service.store.getTask(identity).pushInProgress;
+    if (pending) {
+      // Not this preparation's signal: a cancel must let the read finish, so the cleared marker can close the task.
+      try { await this.#settlePush(pending, remaining()); }
+      catch (error) {
+        signal.throwIfAborted();
+        throw new GuardRefusal(`The outcome of an earlier push of the rewritten head is unknown, and the branch could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      signal.throwIfAborted();
+      // Settling advanced task state. The caller's binding is stale now; it reloads and starts again.
+      throw new GuardRefusal('An earlier push of the rewritten head was settled. Reload, then prepare the merge again.');
+    }
+    let view = await loadView(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
+    track(view);
     if (!MERGEABLE_STATUSES.includes(task.status)) throw new GuardRefusal(`The task is ${task.status}; prepare it from review.`);
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     if (!this.service.reviewRepository().runnerOwned)
@@ -286,10 +456,11 @@ export class PreMergeCoordinator {
         || this.service.store.getSnapshot(identity).id !== guard.snapshotId)
         throw new GuardRefusal('The task or review changed during preparation. Reload first.');
     };
-    const initial = await this.remote.inspect(signal); await this.remote.fetch(initial, signal); signal.throwIfAborted();
+    let initial = await this.remote.inspect(signal); await this.remote.fetch(initial, signal); signal.throwIfAborted();
     assertCurrent(expected);
-    // F6 will push the rewritten head. Until then, a retry must recognize the durable rewrite lineage instead of
-    // mistaking codeboost's still-remote predecessor for a collaborator push.
+    // A rewrite is pushed only once its review is clear. Until then (a review stop, or a failed or refused push), a retry
+    // must recognize the durable rewrite lineage instead of mistaking codeboost's still-remote predecessor for a
+    // collaborator push.
     const retainedRemoteHead = initial.head !== view.snapshot.head
       && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
     if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
@@ -332,11 +503,52 @@ export class PreMergeCoordinator {
         bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
         throw error;
       }
-      view = await load();
+      // What the rebase left, read in the turn it committed. The reload awaits a history worker (#170): a reassignment or
+      // review edit that lands during it must refuse the push below, not become the state the push binds to.
+      const rebased = { stateVersion: this.service.store.getTask(identity).stateVersion,
+        reviewVersion: this.service.store.reviewVersion(identity), snapshotId: this.service.store.getSnapshot(identity).id };
+      // Bind a failure of the reload itself (a worker timeout) to the state the rebase left: it is current, not stale.
+      const rebasedSnapshot = this.service.store.getSnapshot(identity);
+      bindRebaseFailure(rebased, { base: rebasedSnapshot.base, head: rebasedSnapshot.head }, rebased.stateVersion);
+      view = await reload(rebased);
     }
     const blocker = this.#reviewBlocker(view);
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
       checked: [], reason: blocker };
+    if (initial.head !== view.snapshot.head) {
+      const { result: pushed, stateVersion: pushState } = await this.#pushRewrite(initial, view, signal, deadline, authorize,
+        bindRebaseFailure);
+      // Bind any later failure to the state the push (or refusal) left, so it is reported as current, not stale.
+      bindRebaseFailure({ reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id },
+        { base: view.snapshot.base, head: view.snapshot.head }, pushState);
+      // Either way the branch no longer holds the pre-push head: ours after a push, someone else's after a refusal.
+      // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
+      const seen = await this.#awaitHeadChange(initial, signal, remaining);
+      if (pushed !== 'pushed' || seen.head !== view.snapshot.head || seen.base !== initial.base) {
+        // As on the pushed path below: a plan revision or review edit that landed during the wait (or the fetch) must not
+        // have this preparation's remote observation recorded into it.
+        const binding = { stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id };
+        assertCurrent(binding);
+        const moved = seen; await this.remote.fetch(moved, signal); signal.throwIfAborted();
+        assertCurrent(binding);
+        // Traced from the reviewed head and its rewrite lineage, nearest first. That lineage holds the pushed head, every
+        // earlier rewrite codeboost may already have pushed, and the original head a collaborator may have built on.
+        view = track(await this.#refresh(moved, reviewBudget, signal, () => assertCurrent(binding), view.snapshot.head));
+        return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
+          reason: pushed === 'pushed'
+            ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
+            : pushed === 'moved'
+              ? 'The pull request branch moved while the rewritten head was being pushed; attribution and approvals were refreshed.'
+              : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
+      }
+      // Nothing but this push may have changed the task meanwhile: a plan revision or review edit applied while it was in
+      // flight would otherwise be adopted by the reload below and run checks under approvals it made stale. The reload
+      // awaits a history worker (#170), so the same guard holds after it as well: an edit during the reload is refused.
+      const pushedBinding = { stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id };
+      assertCurrent(pushedBinding);
+      initial = seen;
+      view = await reload(pushedBinding);
+    }
     const checked: string[] = [];
     for (const item of view.items.filter(candidate => candidate.acceptance.some(check => check.type === 'cmd'))) {
       signal.throwIfAborted();
@@ -362,8 +574,13 @@ export class PreMergeCoordinator {
       if (signal.aborted) stop();
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       // The check attempt itself advances task state even when it fails. Bind that owned transition without adopting a
-      // concurrent review edit; such an edit must leave the preparation historical and stale.
-      if (this.service.store.reviewVersion(identity) === view.expected.reviewVersion) {
+      // concurrent review edit, reassignment or plan change; any of them must leave the preparation historical and stale.
+      // A change while the check ran settles it as stale; one after its terminal write, while the runner released its
+      // workspace, leaves its context different from the current one.
+      const settled = this.service.store.getAttempt(identity, attempt.id);
+      const owned = this.service.store.reviewVersion(identity) === view.expected.reviewVersion && settled.state !== 'stale'
+        && sameContext(settled.context, this.service.store.currentContext(identity));
+      if (owned) {
         const snapshot = this.service.store.getSnapshot(identity);
         onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
           stateVersion: this.service.store.getTask(identity).stateVersion,
@@ -371,13 +588,17 @@ export class PreMergeCoordinator {
         } });
       }
       signal.throwIfAborted();
-      const settled = this.service.store.getAttempt(identity, attempt.id);
       const runnerStatus = this.runner.status(identity);
       if (runnerStatus.unresolved || this.runner.unreleased)
         throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
-      checked.push(item.id); onChecked(checked); view = await load();
+      if (!owned) throw new GuardRefusal('The task or review changed during preparation. Reload first.');
+      checked.push(item.id); onChecked(checked);
+      // The state the check left (its own attempt advanced the task), read in this turn: a reassignment or review edit
+      // during the reload below must refuse, not be adopted into readiness.
+      view = await reload({ stateVersion: this.service.store.getTask(identity).stateVersion,
+        reviewVersion: view.expected.reviewVersion!, snapshotId: this.service.store.getSnapshot(identity).id });
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
@@ -393,7 +614,7 @@ export class PreMergeCoordinator {
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during preparation; attribution and approvals were refreshed.' };
     }
-    view = await load();
+    view = await reload(guarded);
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during preparation; reload it.' };
@@ -404,7 +625,7 @@ export class PreMergeCoordinator {
     // Authorization is asynchronous. A review edit during that read invalidates its result just as one during the
     // final remote inspection does; nothing may persist readiness from the pre-authorization view.
     assertCurrent(guarded);
-    view = await load();
+    view = await reload(guarded);
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during final authorization; reload it.' };

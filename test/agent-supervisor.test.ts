@@ -665,7 +665,7 @@ describe('container invocation supervisor', () => {
     // formatting fails the probe.
     const schemaValue = (output: string) => output.replace(/\r?\n$/, '');
 
-    it('runs the production Claude adapter and parses its bounded envelope', async () => {
+    it('runs the production Claude adapter and parses its bounded envelope (live Claude)', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       // Questions answer in plain text; planning answers are schema-constrained (the next probe).
@@ -679,7 +679,7 @@ describe('container invocation supervisor', () => {
       expect(schemaValue(result.stdout)).toBe('codeboost-adapter-schema-marker');
     }, 8 * 60_000);
 
-    it('returns a schema-constrained Claude planning answer as bare JSON from the mounted schema', async () => {
+    it('returns a schema-constrained Claude planning answer as bare JSON from the mounted schema (live Claude)', async () => {
       // `const` makes the schema itself enforce the marker. Claude can also read the mounted file, so the marker alone
       // does not prove the flag: the strict structured_output decode does, since without --json-schema there is none.
       const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['marker'],

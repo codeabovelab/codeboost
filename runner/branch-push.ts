@@ -10,7 +10,10 @@ import type { GitCallOptions, RunnerRepository } from './runner-repository.ts';
  * user's checkout is never read or written, and neither the user's Git config nor their credential helpers are used.
  */
 
-/** The branch holds a commit codeboost did not make, or moved while the push ran. Nothing was pushed; a person decides. */
+/**
+ * Nothing was pushed: the branch holds a commit the push may not overwrite (one codeboost did not make, or, with an
+ * `expected` head, anything else), or it moved while the push ran. A person, or a fresh review, decides.
+ */
 export class BranchPushRefused extends Error {}
 
 export interface GitBranchPusherConfig extends Pick<GitCallOptions, 'onProcessGroup' | 'timeoutMs'> {
@@ -21,8 +24,8 @@ export interface GitBranchPusherConfig extends Pick<GitCallOptions, 'onProcessGr
   /** `owner/name` on GitHub. */
   readonly remote: string;
   /**
-   * The commits the task's ledger records as owned (made by codeboost). Only these may be overwritten. Read after the
-   * remote branch, so a ledger written meanwhile is seen.
+   * The commits the task's ledger records as owned (made by codeboost). Without an `expected` head, only these may be
+   * overwritten; with one, only that exact commit may be. Read after the remote branch, so a ledger written meanwhile is seen.
    */
   readonly ownedCommits: (identity: PlanIdentity) => Iterable<string>;
   /** The push URL. Default `https://<GH_HOST or github.com>/<remote>.git`. A local path is allowed, for tests. */
@@ -113,7 +116,7 @@ export class GitBranchPusher implements BranchPusher {
     const unique = [...new Set(commits)];
     await this.#git(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--', this.#url, ...unique], signal, true);
     const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false,
-      Buffer.from(`${unique.join('\n')}\n`));
+      Buffer.from(`${unique.join('\n')}\n`), true);
     const records = found.split('\n');
     if (records.length !== unique.length || records.some((record, index) => record !== `${unique[index]} commit`))
       throw new Error('The refreshed remote base or head is not a commit in the runner repository.');
@@ -123,22 +126,31 @@ export class GitBranchPusher implements BranchPusher {
       await this.#git(['update-ref', `refs/codeboost/remote-commits/${commit}`, commit], signal);
   }
 
-  async push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: MutationBoundary }, signal?: AbortSignal): Promise<void> {
+  async push(identity: PlanIdentity, input: { head: string; branch: string; expected?: string; beforePush?: MutationBoundary },
+    signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');
     if (!COMMIT_ID.test(input.head)) throw new Error('A full commit ID is required.');
-    if (!BRANCH.test(input.branch) || input.branch.length > 255) throw new Error('Only a codeboost/ task branch can be pushed.');
-    const ref = `refs/heads/${input.branch}`;
+    if (input.expected !== undefined && !COMMIT_ID.test(input.expected)) throw new Error('A full commit ID is required.');
+    const ref = this.#ref(input.branch);
     // Git answers "<id> missing" for an absent object; any other failure (no repository, permissions) keeps Git's error.
-    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`));
+    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`), true);
     if (found === `${input.head} missing`) throw new Error(`The runner repository has no commit ${input.head}.`);
     if (found !== `${input.head} commit`) throw new Error(`${input.head} is not a commit in the runner repository.`);
     const remote = await this.#read(ref, signal);
     // Already there: a push whose outcome was lost, or a retry. Nothing to do.
     if (remote === input.head) return;
-    const owned = new Set(this.#config.ownedCommits(identity));
-    if (remote !== null && !owned.has(remote))
-      throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
+    // `expected` is the exact head a pre-merge rebase rewrote (F6 of #22). Its commits, a collaborator's included, live on
+    // in the rewritten head, so it alone may be overwritten: any other value, even a commit codeboost made, refuses.
+    if (input.expected !== undefined) {
+      if (remote !== input.expected)
+        throw new BranchPushRefused(`The branch ${input.branch} holds ${remote ?? 'nothing'}, not the rebased head ${input.expected}. Nothing was pushed.`);
+    } else {
+      // Read after the remote branch, every time, so a ledger written meanwhile is seen.
+      const owned = new Set(this.#config.ownedCommits(identity));
+      if (remote !== null && !owned.has(remote))
+        throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
+    }
     signal?.throwIfAborted();
     const finalize = await input.beforePush?.();
     finalize?.();
@@ -155,21 +167,39 @@ export class GitBranchPusher implements BranchPusher {
     if (after !== input.head) throw new Error(`After the push, the branch ${input.branch} is at ${after ?? 'nothing'}, not ${input.head}.`);
   }
 
+  /** The commit the task branch points at on the remote, or null when it does not exist. */
+  async readBranch(identity: PlanIdentity, branch: string, signal?: AbortSignal): Promise<string | null> {
+    if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');
+    return this.#read(this.#ref(branch), signal);
+  }
+
+  #ref(branch: string): string {
+    if (!BRANCH.test(branch) || branch.length > 255) throw new Error('Only a codeboost/ task branch can be pushed.');
+    return `refs/heads/${branch}`;
+  }
+
   /** The commit `ref` points at on the remote, or null when it does not exist. */
   async #read(ref: string, signal?: AbortSignal): Promise<string | null> {
-    const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true);
+    // A read changes nothing, so it need not wait for a process that escaped Git's group and holds its output: it returns
+    // failed (the output may be incomplete) after the pipe drain. The caller then knows nothing: a push marker stays.
+    // Members still in Git's group are waited for, as for every Git call.
+    const out = await this.#git(['ls-remote', '--refs', '--', this.#url, ref], signal, true, undefined, true);
     // ls-remote matches patterns by their tail, so `refs/heads/x/<ref>` would match too: keep only the exact name.
     const matches = out.split('\n').filter(Boolean).map(line => line.split('\t')).filter(([, name]) => name === ref);
     if (matches.length > 1 || (matches[0] && !COMMIT_ID.test(matches[0][0]!))) throw new Error(`The remote's answer for ${ref} is malformed.`);
     return matches[0]?.[0] ?? null;
   }
 
-  async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer): Promise<string> {
+  /**
+   * `readOnly` (ls-remote, cat-file: commands that change nothing) bounds the wait for a process that left Git's group
+   * but holds its output: the call fails after the pipe drain instead. Members of Git's group are always waited for.
+   */
+  async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer, readOnly = false): Promise<string> {
     const protocol = this.#url.startsWith('/') ? 'file' : 'https';
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
       ...remote ? ['-c', `protocol.${protocol}.allow=always`, ...CREDENTIAL_HELPER] : [], ...args],
     { cwd: this.#config.repository.path, env: pushEnvironment(this.#config.env), timeoutMs: this.#config.timeoutMs ?? 120_000,
-      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input });
+      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input, boundEscapedOutput: readOnly });
     // Aborted before or while Git ran: the caller's reason (such as shutdown) is what leaves, not Git's failure.
     signal?.throwIfAborted();
     if (outcome.status !== 0) throw gitFailure(args[0]!, outcome.status, [outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join('\n'),

@@ -40,6 +40,8 @@ export interface TaskPullRequest {
   ownerReviewVersion: number;
   /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
   refresh: { head: string; draft: boolean; stateVersion: number } | null;
+  /** The clear already-fixed check this opening followed; null for an opening recorded before schema v19. */
+  checkId: string | null;
 }
 export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; reviewVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
@@ -86,13 +88,17 @@ export interface PreMergeReadiness {
   stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; commandPolicyDigest: string;
 }
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
+/** The next step after a failing required check or GitHub's refusal blocks a merge job (docs/implementation/merge-handoff.md). */
+export const FIX_THEN_RETRY = 'Fix it, then Retry merge.';
+/** The longest review token a merge job or its saved refusal is saved under. */
+export const MAX_MERGE_JOB_TOKEN_LENGTH = 512;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
 }
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
-  currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
+  currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; pushInProgress: PushMarker | null; budgetDeadline: number | null;
   createdAt: string; updatedAt: string;
 }
 export interface RebaseMarker {
@@ -110,6 +116,55 @@ export interface RebaseMarker {
   /** The one sandboxed child whose Docker/storage resources the parent rebase currently owns. */
   conflict: { attemptId: string; allocationId: string; networkAllocationId: string; source: string } | null;
   processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
+}
+/**
+ * A pre-merge push of the rewritten head (F6 of #22), recorded before the push's first external write. While it exists,
+ * GitHub may or may not hold `to`: nothing irreversible starts until a read of the branch settles the outcome.
+ */
+export interface PushMarker {
+  attemptId: string;
+  /** The task's PR branch on GitHub (`codeboost/...`). */
+  branch: string;
+  /** The exact remote head read before the push; the push is leased to it. */
+  from: string;
+  /** The reviewed, rewritten head being pushed. */
+  to: string;
+  /** The snapshot whose head is `to`. */
+  snapshotId: string;
+  startedAt: number;
+}
+/** What a read of the branch showed after a push: `to`, still `from`, or anything else. */
+export type PushOutcome = 'pushed' | 'not-pushed' | 'moved';
+/** A one-click merge job (F6b of #22; docs/implementation/merge-handoff.md). */
+export type MergeJobState = 'running' | 'merged' | 'queued' | 'submitted' | 'blocked' | 'review-required' | 'failed' | 'cancelled';
+export type MergeJobStep = 'preparing' | 'checks' | 'merging';
+export interface MergeJob {
+  /** The click's action ID. */
+  id: string;
+  /** The action ID of the guarded merge this job started, once it reaches that step: its attempt carries it. */
+  mergeActionId: string | null;
+  /** The click was refused at admission; a resend replays the refusal (`reason`). */
+  refused?: boolean;
+  /** The review token the click was made with; a resend must carry the same one. */
+  token: string;
+  state: MergeJobState;
+  step: MergeJobStep | null;
+  reason: string | null;
+  /** Required checks that have not succeeded yet, as the last inspection read them. */
+  checks: { context: string; state: string }[];
+  url: string | null;
+  /**
+   * The job's place among the task's jobs and refused clicks, starting at 1: a later click has a higher number. The
+   * browser orders records of different jobs by it, since wall-clock times can step back.
+   */
+  sequence: number;
+  /**
+   * The record's version, from 1: every saved change to the job adds one. The browser orders records of the same job by
+   * it, since two saves can share an update time or the clock can step back between them.
+   */
+  revision: number;
+  startedAt: string;
+  updatedAt: string;
 }
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
@@ -188,8 +243,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 17) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 19) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -304,6 +359,23 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN prompt_comments TEXT');
           this.#db.exec('PRAGMA user_version=17');
+        }
+        // The durable marker of a pre-merge push of the rewritten head (F6 of #22).
+        if (version < 18) {
+          if (!this.#db.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'push_in_progress'))
+            this.#db.exec('ALTER TABLE tasks ADD COLUMN push_in_progress TEXT');
+          this.#db.exec('PRAGMA user_version=18');
+        }
+        // One-click merge jobs (F6b of #22). Kept apart from tasks, so a job's progress never changes the task state version.
+        if (version < 19) {
+          this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (
+            id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS merge_jobs_plan ON merge_jobs(plan_key);`);
+          // The pre-PR already-fixed check each opening followed: the merge's scan may start at the tip that check scanned
+          // through (docs/implementation/merge-handoff.md).
+          if (!this.#db.prepare('PRAGMA table_info(task_pull_requests)').all().some(column => column.name === 'check_id'))
+            this.#db.exec('ALTER TABLE task_pull_requests ADD COLUMN check_id TEXT');
+          this.#db.exec('PRAGMA user_version=19');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -449,6 +521,12 @@ export class Store {
     this.#run("UPDATE requests SET state='invalidated',reason='Repository snapshot changed.' WHERE key=? AND state IN ('pending','ready')", key);
     return snapshot;
   }
+  /** The task's first snapshot: its base is where the task began, before any rebase. */
+  firstSnapshot(identity: PlanIdentity): Snapshot {
+    const row = this.#get('SELECT data FROM snapshots WHERE key=? ORDER BY rowid ASC LIMIT 1', identityKey(identity));
+    if (!row) throw new Error('Unknown snapshot.');
+    return decode<Snapshot>(row.data);
+  }
   getSnapshot(identity: PlanIdentity, id?: string): Snapshot {
     const key = identityKey(identity);
     const row = this.#get('SELECT data FROM snapshots WHERE key=? AND id=?', key, id ?? this.#current(key).snapshot_id!);
@@ -533,7 +611,7 @@ export class Store {
       const task = this.#task(key);
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
@@ -760,6 +838,7 @@ export class Store {
       this.#expect(key, expected);
       this.#assertContextWritable(key);
       if (this.#task(key).rebase_in_progress !== null) throw new GuardRefusal('A claimed rebase is in progress; wait for it to settle.');
+      if (this.#task(key).push_in_progress !== null) throw new GuardRefusal('A push of the rewritten head is in progress; wait for it to settle.');
       return this.#applyRebase(identity, key, base, head, mappings);
     });
   }
@@ -791,6 +870,7 @@ export class Store {
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be rebased.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
       if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is already in progress for this task.');
+      if (task.push_in_progress !== null) throw new GuardRefusal('A push of the rewritten head is in progress for this task.');
       const snapshot = this.getSnapshot(identity);
       if (snapshot.base !== input.oldBase || snapshot.head !== input.oldHead)
         throw new GuardRefusal('The reviewed base or head changed before the rebase started.');
@@ -965,6 +1045,62 @@ export class Store {
       this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=?', key);
       return snapshot;
     });
+  }
+  /**
+   * Claim the push of the reviewed, rewritten head before its first external write. `from` is the exact remote head
+   * read for the lease; it must be a durable rewrite predecessor of `to`, and `to` must be the current snapshot head.
+   */
+  beginPrePush(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,
+    input: { branch: string; from: string; to: string; attemptId?: string; startedAt?: number }): PushMarker {
+    sha(input.from); sha(input.to);
+    if (!/^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.branch) || input.branch.length > 255)
+      throw new Error('Only a codeboost/ task branch can be pushed.');
+    if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for pushing.');
+    if (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0) throw new Error('Invalid expected task state version.');
+    const attemptId = input.attemptId ?? randomUUID(), startedAt = input.startedAt ?? Date.now();
+    assertUuidV4(attemptId, 'Push attempt ID');
+    if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid push start time.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      const task = this.#task(key);
+      if (task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be pushed.`);
+      if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; push it from review.`);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be pushed.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be pushed.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      this.#assertNoRewriteInFlight(task);
+      const snapshot = this.getSnapshot(identity);
+      if (snapshot.head !== input.to) throw new GuardRefusal('The reviewed head changed before the push started.');
+      if (!this.isRewrittenHead(identity, input.from, input.to))
+        throw new GuardRefusal('The pull request head is not a rewrite predecessor of the reviewed head.');
+      const marker: PushMarker = { attemptId, branch: input.branch, from: input.from, to: input.to, snapshotId: snapshot.id, startedAt };
+      this.#run('UPDATE tasks SET push_in_progress=? WHERE plan_key=?', encode(marker), key);
+      this.#touch(key);
+      return marker;
+    });
+  }
+  /**
+   * Clear the matching push once a read of the branch settled its outcome. A cancel requested while the push ran closes
+   * the task now, as a settled rebase does.
+   */
+  finishPrePush(planKey: string, attemptId: string): boolean {
+    assertUuidV4(attemptId, 'Push attempt ID');
+    return this.#transaction(() => {
+      const task = this.#task(planKey);
+      const encoded = task.push_in_progress as string | null | undefined;
+      if (encoded === null || encoded === undefined || decode<PushMarker>(encoded).attemptId !== attemptId) return false;
+      if (this.#run('UPDATE tasks SET push_in_progress=NULL WHERE plan_key=? AND push_in_progress=?', planKey, encoded).changes !== 1) return false;
+      if (task.cancel_requested !== null && !this.#closed(task.status as TaskStatus)) this.#closeTask(planKey, 'cancelled', task.cancel_requested as string);
+      else this.#touch(planKey);
+      return true;
+    });
+  }
+  /** Pushes whose outcome no read has settled yet (a crash or shutdown during the push). */
+  pushesInProgress(): { planKey: string; marker: PushMarker }[] {
+    return this.#db.prepare('SELECT plan_key, push_in_progress FROM tasks WHERE push_in_progress IS NOT NULL').all()
+      .map(row => ({ planKey: row.plan_key as string, marker: decode<PushMarker>(row.push_in_progress) }));
   }
   /** Clear only the matching rebase, after the live operation settles or recovery removes its resources. */
   abortRebase(planKey: string, attemptId: string): boolean {
@@ -1389,7 +1525,7 @@ export class Store {
         status TEXT NOT NULL CHECK (status IN (${list(TASK_STATUSES)})),
         state_version INTEGER NOT NULL DEFAULT 0, context_generation INTEGER NOT NULL DEFAULT 0,
         assignment_id TEXT NOT NULL, referenced_code_hash TEXT NOT NULL,
-        current_attempt_id TEXT, requeue_pending INTEGER NOT NULL DEFAULT 0, cancel_requested TEXT, rebase_in_progress TEXT,
+        current_attempt_id TEXT, requeue_pending INTEGER NOT NULL DEFAULT 0, cancel_requested TEXT, rebase_in_progress TEXT, push_in_progress TEXT,
         budget_deadline INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         FOREIGN KEY (plan_key, current_attempt_id) REFERENCES attempts(plan_key, id));
       CREATE TABLE IF NOT EXISTS attempts (
@@ -1436,6 +1572,7 @@ export class Store {
       referencedCodeHash: row.referenced_code_hash as string, currentAttemptId: row.current_attempt_id as string | null,
       requeuePending: row.requeue_pending === 1, cancelRequested: row.cancel_requested as string | null,
       rebaseInProgress: row.rebase_in_progress === null ? null : decode(row.rebase_in_progress),
+      pushInProgress: row.push_in_progress === null || row.push_in_progress === undefined ? null : decode<PushMarker>(row.push_in_progress),
       budgetDeadline: row.budget_deadline as number | null, createdAt: row.created_at as string, updatedAt: row.updated_at as string,
     };
   }
@@ -1677,7 +1814,7 @@ export class Store {
       if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
       this.#bumpContext(key);
     });
@@ -1692,10 +1829,16 @@ export class Store {
       if (this.#closed(task.status)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+      this.#assertNoRewriteInFlight(task);
       this.#run('UPDATE tasks SET status=? WHERE plan_key=?', to, key);
       this.#touch(key);
     });
+  }
+  /** A rebase still owns local resources, or a push of its result may still move the PR head on GitHub. */
+  #assertNoRewriteInFlight(task: Record<string, SQLOutputValue>): void {
+    if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+    if (task.push_in_progress !== null && task.push_in_progress !== undefined)
+      throw new GuardRefusal('A push of the rewritten head is in progress for this task.');
   }
   /** GitHub may still merge the reviewed head while the latest merge attempt is submitting or queued. */
   #activeMerge(key: string): boolean {
@@ -1736,7 +1879,7 @@ export class Store {
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-        if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+        this.#assertNoRewriteInFlight(task);
         // The code-writing task budget (null until execution starts) ends execution admission. Review checks have their
         // own exact-head deadline and must remain runnable after implementation ends.
         if (!reviewCheck && task.budget_deadline !== null && (task.budget_deadline as number) <= now)
@@ -1870,7 +2013,7 @@ export class Store {
       if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
         throw new GuardRefusal('A merge is in progress. Cancel the task after it finishes or fails.');
       const active = this.#activeAttempt(key);
-      if (task.rebase_in_progress !== null) {
+      if (task.rebase_in_progress !== null || task.push_in_progress !== null) {
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
         this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
         this.#touch(key);
@@ -1991,6 +2134,180 @@ export class Store {
     const saved = decode<{ ok?: unknown; value?: { outcome?: unknown }; preMergeReadiness?: PreMergeReadiness }>(row.response);
     return saved.ok === true && saved.value?.outcome === 'ready' && stable(saved.preMergeReadiness) === stable(readiness);
   }
+  /**
+   * Admit a merge job for this click. A resend of the same click returns its job; another click while a job runs, or a
+   * reused action ID with another token, is refused. Never touches the task.
+   */
+  beginMergeJob(identity: PlanIdentity, input: { actionId: string; token: string; now?: string }): { job: MergeJob; resent: boolean } {
+    assertUuidV4(input.actionId, 'Action ID');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      // A saved click is looked up first, so a resend under its ID with any other token (unusable ones too) is refused
+      // as a reused ID, as a different usable one is.
+      const existing = this.#get('SELECT data FROM merge_jobs WHERE id=?', input.actionId);
+      if (existing) {
+        const job = decode<MergeJob>(existing.data);
+        if (job.token !== input.token || this.#get('SELECT plan_key FROM merge_jobs WHERE id=?', input.actionId)!.plan_key !== key)
+          throw new ActionIdReused('Action ID already used for a different request.');
+        return { job, resent: true };
+      }
+      if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
+      if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
+      const now = input.now ?? new Date().toISOString();
+      const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
+        url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now };
+      this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
+      return { job, resent: false };
+    });
+  }
+  /**
+   * Save a definite admission refusal under the click's action ID, so a resend replays it rather than starting a job.
+   * A resend of the same click returns the saved record; another request under that ID is refused as a reused ID.
+   */
+  recordMergeJobRefusal(identity: PlanIdentity, input: { actionId: string; token: string; reason: string }): MergeJob {
+    assertUuidV4(input.actionId, 'Action ID');
+    if (typeof input.token !== 'string' || !input.token || input.token.length > MAX_MERGE_JOB_TOKEN_LENGTH) throw new Error('A review token is required.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#task(key);
+      const existing = this.#get('SELECT plan_key, data FROM merge_jobs WHERE id=?', input.actionId);
+      if (existing) {
+        const job = decode<MergeJob>(existing.data);
+        if (job.token !== input.token || existing.plan_key !== key) throw new ActionIdReused('Action ID already used for a different request.');
+        return job;
+      }
+      const now = new Date().toISOString();
+      const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'failed', step: null,
+        reason: input.reason.slice(0, 2_000), checks: [], url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now, refused: true };
+      this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
+      return job;
+    });
+  }
+  /** One more than the task's highest job sequence; rows in `merge_jobs` are never deleted, so it only grows. */
+  #nextMergeJobSequence(key: string): number {
+    const row = this.#get(`SELECT COALESCE(MAX(json_extract(data,'$.sequence')),0) AS n FROM merge_jobs WHERE plan_key=?`, key) as { n: number };
+    return row.n + 1;
+  }
+  /** Move a running job to another step or record what it waits for. A job no longer running is left unchanged. */
+  updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[];
+    mergeActionId?: string }): MergeJob | null {
+    return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, ...patch } : null);
+  }
+  /**
+   * End a running job `blocked` and, in the same transaction, move a task still in review to approved, merge blocked,
+   * so the job and the task cannot disagree after a crash. A task that moved meanwhile keeps its status.
+   * With `readyFor`, the block applies only while the preparation's readiness still holds (checked in the same
+   * transaction): a check result that arrived after a review edit or another task change says nothing about the
+   * changed review, so the job then ends `failed` and the task keeps its status. `next`, the person's next step, follows
+   * the reason only when the job ends `blocked`: a `failed` end says why, and the page adds "Merge again when ready."
+   */
+  blockMergeJob(identity: PlanIdentity, id: string, reason: string, readyFor?: { commandPolicyDigest: string }, next?: string): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const job = this.getMergeJob(identity, id);
+      if (!job) throw new Error('Unknown merge job.');
+      // A job that already ended decides nothing about the task now.
+      if (job.state !== 'running') return false;
+      const task = this.#task(key);
+      if (readyFor) {
+        const snapshot = this.getSnapshot(identity);
+        if (!this.preMergeReady(identity, { stateVersion: task.state_version as number, reviewVersion: this.#current(key).review_version as number,
+          snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: readyFor.commandPolicyDigest }))
+          return this.finishMergeJob(identity, id, { state: 'failed',
+            reason: 'The review or task changed while waiting for required checks; the preparation no longer applies.' });
+      }
+      // GitHub refused the job's own merge attempt: the block applies only to the review that attempt was admitted for.
+      // A review edit, new snapshot or plan revision while GitHub was asked leaves the changed task as it is. A review edit
+      // (a review note, review_version only) may land while the attempt is in flight. The snapshot term is defensive: a
+      // merge job needs a runner, whose review load reads the recorded head, so no HEAD observation records a snapshot. A
+      // plan revision lands only once the attempt ended (#savePlan refuses while a merge is in flight), such as a queue
+      // poll ending it while GitHub was asked.
+      const attempt = job.mergeActionId ? this.getMergeAttempt(identity) : null;
+      if (attempt && attempt.actionId === job.mergeActionId) {
+        const plan = this.#current(key);
+        if (plan.revision !== attempt.revision || plan.snapshot_id !== attempt.snapshotId || plan.review_version !== attempt.reviewVersion)
+          return this.finishMergeJob(identity, id, { state: 'failed',
+            reason: `${reason} The review changed while GitHub was asked to merge; review it first.` });
+      }
+      // The attempt and merge terms are defensive. A job blocks after its preparation settled (every check attempt it
+      // admitted ended), and while it runs nothing else admits an attempt or a merge: the server refuses start, resume,
+      // a standalone preparation and a second merge click; admission refuses item work in review; and a merge attempt is
+      // begun only by the job's own guarded merge. With `readyFor`, any later admission moved the state version, so the
+      // job ended `failed` above. Otherwise the job's own merge attempt ended (failed or removed) before the block, and
+      // startup recovery blocks only for such an attempt.
+      if (task.status === 'in review' && !this.#activeAttempt(key) && !this.#activeMerge(key)
+        && task.rebase_in_progress === null && (task.push_in_progress === null || task.push_in_progress === undefined)) {
+        this.#run('UPDATE tasks SET status=? WHERE plan_key=?', 'approved but merge blocked', key);
+        this.#touch(key);
+      }
+      return this.finishMergeJob(identity, id, { state: 'blocked', reason: next ? `${reason} ${next}` : reason });
+    });
+  }
+  /** End a running job. Returns false when it had already ended. */
+  finishMergeJob(identity: PlanIdentity, id: string, outcome: { state: Exclude<MergeJobState, 'running'>; reason?: string | null; url?: string | null }): boolean {
+    return this.#changeMergeJob(identity, id, job => job.state === 'running'
+      ? { ...job, state: outcome.state, step: null, reason: outcome.reason ?? null, url: outcome.url ?? job.url } : null) !== null;
+  }
+  #changeMergeJob(identity: PlanIdentity, id: string, change: (job: MergeJob) => MergeJob | null): MergeJob | null {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const row = this.#get('SELECT data FROM merge_jobs WHERE id=? AND plan_key=?', id, key);
+      if (!row) throw new Error('Unknown merge job.');
+      const next = change(decode<MergeJob>(row.data));
+      if (!next) return null;
+      // Each saved change is strictly later than the one before, whatever the clock says.
+      const job = { ...next, revision: (Number.isSafeInteger(next.revision) ? next.revision : 1) + 1, updatedAt: new Date().toISOString() };
+      this.#run('UPDATE merge_jobs SET data=? WHERE id=?', encode(job), id);
+      return job;
+    });
+  }
+  getMergeJob(identity: PlanIdentity, id: string): MergeJob | null {
+    const row = this.#get('SELECT data FROM merge_jobs WHERE id=? AND plan_key=?', id, identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  /** The task's latest job. A refused click started none: its refusal is replayed to that click alone, never shown here. */
+  latestMergeJob(identity: PlanIdentity): MergeJob | null {
+    const row = this.#get(`SELECT data FROM merge_jobs WHERE plan_key=? AND json_extract(data,'$.refused') IS NOT 1
+      ORDER BY rowid DESC LIMIT 1`, identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  runningMergeJob(identity: PlanIdentity): MergeJob | null {
+    const row = this.#get(`SELECT data FROM merge_jobs WHERE plan_key=? AND json_extract(data,'$.state')='running' ORDER BY rowid DESC LIMIT 1`,
+      identityKey(identity));
+    return row ? decode<MergeJob>(row.data) : null;
+  }
+  /**
+   * At startup: a job the server stopped running cannot continue. If it had asked GitHub to merge, its merge attempt's
+   * recorded state is its outcome (a refusal blocks the task, as the job would have); otherwise it fails, and the person
+   * merges again.
+   */
+  settleInterruptedMergeJobs(identity: PlanIdentity): void {
+    const running = this.runningMergeJob(identity);
+    if (!running) return;
+    const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
+    if (!attempt || attempt.actionId !== running.mergeActionId) {
+      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
+      return;
+    }
+    if (attempt.state === 'merged' || attempt.state === 'queued') {
+      this.finishMergeJob(identity, running.id, { state: attempt.state, url: attempt.url });
+      return;
+    }
+    if (attempt.state === 'submitting') {
+      this.finishMergeJob(identity, running.id, { state: 'submitted',
+        reason: 'The server restarted while GitHub\'s merge outcome was unknown; it reconciles from GitHub.' });
+      return;
+    }
+    if (attempt.requiresFreshReview) {
+      // The head changed: the task needs a fresh review, so it is not moved to approved, merge blocked.
+      this.finishMergeJob(identity, running.id, { state: 'failed',
+        reason: `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'} Review the new head first.` });
+      return;
+    }
+    this.blockMergeJob(identity, running.id, `GitHub refused the merge: ${attempt.reason ?? 'no reason given.'}`, undefined, FIX_THEN_RETRY);
+  }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {
     const snapshot = this.getSnapshot(identity);
@@ -2060,12 +2377,22 @@ export class Store {
       number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
       ownerVersion: row.owner_version as number, ownerReviewVersion: row.owner_review_version as number,
       refresh: row.refresh_head === null ? null : { head: row.refresh_head as string, draft: row.refresh_draft === 1, stateVersion: row.refresh_version as number },
+      checkId: (row.check_id as string | null | undefined) ?? null,
     };
   }
   /** Every PR codeboost opened or started to open for the task, oldest first. */
   taskPullRequests(identity: PlanIdentity): TaskPullRequest[] {
     const key = identityKey(identity); this.#task(key);
     return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
+  }
+  /**
+   * The task's already-fixed check with this ID, or null if it has none with that ID. The guarded merge reads the check the
+   * task's first opening into the base branch recorded (`task_pull_requests.check_id`, schema v19) to decide where its
+   * already-fixed scan starts.
+   */
+  getAlreadyFixed(identity: PlanIdentity, id: string): AlreadyFixedCheck | null {
+    const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? AND id=?', identityKey(identity), id);
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   latestAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
     const key = identityKey(identity); this.#task(key);
@@ -2132,9 +2459,9 @@ export class Store {
       if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
       const openingId = randomUUID(), now = new Date().toISOString();
       this.#touch(key);
-      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
-        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now);
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at,check_id)
+        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
+        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now, input.checkId);
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }

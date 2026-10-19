@@ -2590,7 +2590,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
-    it('runs the authenticated Claude startup path with only its OAuth token', async () => {
+    it('runs the authenticated Claude startup path with only its OAuth token (live Claude)', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       // Questions answer in plain text; a planning command would also carry the schema as --json-schema.
