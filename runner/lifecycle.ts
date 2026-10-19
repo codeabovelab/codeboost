@@ -39,7 +39,11 @@ export function assertUuidV4(value: unknown, name: string): asserts value is str
 
 /** A guard refused the action. Refusals are definite outcomes and are recorded for replay. */
 export class GuardRefusal extends Error {}
-/** A definite failure from a read-only external dependency. Saved action replays preserve its HTTP 502 classification. */
+/**
+ * A failure from a read-only external dependency, answered with HTTP 502 and preserved as 502 by saved action replays.
+ * One caused by a `RemoteTimeout` is not definite: the server answers it with 503, and the runner-action gate and merge
+ * admission do not save it; merge preparation and publishing record it in their own outcomes (#48).
+ */
 export class UpstreamFailure extends Error {}
 /** A malformed request, refused before any transaction and never recorded. The server maps it to HTTP 400. */
 export class BadRequest extends GuardRefusal {}

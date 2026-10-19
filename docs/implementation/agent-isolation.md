@@ -15,13 +15,16 @@ npm test
 `vitest.config.ts` finishes the ordinary test project first, then runs the Docker-backed
 files one at a time because they share one image tag and daemon. Use
 `npx vitest run --project docker` to rerun only that serial project. The `Agent isolation`
-workflow runs the complete gate. The main `CI` workflow skips the Docker project so that
-it can cover the ordinary project independently.
+workflow's `real-docker` job runs the complete gate on every pull request. The main `CI`
+workflow's `test` job skips the Docker-backed files so that it can cover the ordinary
+project independently. [CI](ci.md) describes both jobs.
 
-The live vendor probes need real credentials, so CI does not run them. To run them,
-set `CODEBOOST_RUN_AUTH_PROBES=1` and `CLAUDE_CODE_OAUTH_TOKEN`. Codex has no live
-probe while it is refused (#93). Do not put credentials in an issue, a pull request
-or chat.
+The live vendor probes need real credentials, so pull requests do not run them. The
+`Live probes` workflow runs them every night and when started by hand, with the
+repository secret `CLAUDE_CODE_OAUTH_TOKEN` ([CI](ci.md#live-probes)). To run them
+locally, set `CODEBOOST_RUN_AUTH_PROBES=1` and `CLAUDE_CODE_OAUTH_TOKEN`. Codex has no
+live probe while it is refused (#93). Do not put credentials in an issue, a pull
+request or chat.
 
 ## What the gate proves
 
@@ -407,10 +410,16 @@ against real Docker, including two reviews with different Ask owners on one daem
 
 ## Limits of this gate
 
-- CI does not run the live vendor probes. Run them locally with credentials before
-  a release that changes the image, the adapters or the prompts. Codex has no live
-  probe while it is refused in every phase (#93).
-- T9 as a whole is complete only when lane F runs every suite in required CI (F6).
+- Pull requests do not run the live vendor probes. The `Live probes` workflow runs them
+  every night and by hand, and fails if the `CLAUDE_CODE_OAUTH_TOKEN` secret is missing.
+  A pull request can therefore merge before a probe shows that it broke the Claude
+  startup path. Start the workflow by hand, or run the probes locally, before a release
+  that changes the image, the adapters or the prompts. Codex has no live probe while it
+  is refused in every phase (#93).
+- T9 as a whole is complete as of 2026-10-19. `test` and `real-docker` are
+  required on `main`, both passed on the same head (before the checks were required),
+  and a `Live probes` run passed. [CI](ci.md#t9-status) gives the evidence and says how
+  to keep it green.
 - Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
   is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
   as review. Running an item's `cmd` in a writable task filesystem is not built yet; when it is, each run must call

@@ -1,6 +1,7 @@
 import { ghEnvironment } from './gh-env.ts';
 import { dataJSON, MAX_PROMPT_BYTES } from '../core/planning-author.ts';
-import { runWithInput } from './run-with-input.ts';
+import { ghAnswered, runWithInput } from './run-with-input.ts';
+import { RemoteTimeout } from './timeout.ts';
 
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
@@ -25,7 +26,7 @@ export async function withIssueReadDeadline<T>(signal: AbortSignal,
   signal.throwIfAborted();
   const deadline = new AbortController();
   const shared = AbortSignal.any([signal, deadline.signal]);
-  const timer = setTimeout(() => deadline.abort(new Error('Issue retrieval timed out.')), ISSUE_READ_ACTIVE_MS);
+  const timer = setTimeout(() => deadline.abort(new RemoteTimeout('Issue retrieval timed out.')), ISSUE_READ_ACTIVE_MS);
   try {
     const value = await read(shared, ISSUE_READ_ACTIVE_MS);
     shared.throwIfAborted();
@@ -373,14 +374,15 @@ export class GhIssueGateway implements IssueGateway {
     const controller = new AbortController();
     const relay = () => controller.abort(options.signal?.reason);
     options.signal?.addEventListener('abort', relay, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error('Issue retrieval timed out.')), timeoutMs);
+    const timer = setTimeout(() => controller.abort(new RemoteTimeout('Issue retrieval timed out.')), timeoutMs);
     try {
       const value = await load(controller.signal);
       controller.signal.throwIfAborted();
       return value;
     } catch (error) {
-      if (options.signal?.aborted) throw options.signal.reason;
-      if (controller.signal.aborted) throw new Error('Issue retrieval timed out.');
+      // The controller keeps the reason of whichever abort came first, the caller's or the timeout's. A CommandFailed is
+      // gh's own answer, given before the abort, and is reported as itself (#48).
+      if (controller.signal.aborted && !ghAnswered(error)) throw controller.signal.reason;
       throw error;
     } finally {
       clearTimeout(timer);

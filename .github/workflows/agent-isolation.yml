@@ -1,44 +1,9 @@
 name: Agent isolation
+# Runs on every pull request and on pushes to the same branches as CI, so `real-docker` can be a required check.
 on:
   push:
-    branches: [main]
-    paths:
-      - 'agents/**'
-      - 'git/clone.ts'
-      - 'test/agent-*.test.ts'
-      - 'runner/question-*.ts'
-      - 'runner/questions.ts'
-      - 'runner/planning*.ts'
-      - 'runner/workspace.ts'
-      - 'runner/runner-repository.ts'
-      - 'runner/execution.ts'
-      - 'core/run-audit.ts'
-      - 'runner/review.ts'
-      - 'runner/store.ts'
-      - 'git/history.ts'
-      - 'test/runner-workspace.test.ts'
-      - 'test/vitest-config.test.ts'
-      - 'vitest.config.ts'
-      - '.github/workflows/agent-isolation.yml'
+    branches: [main, 'codex/**']
   pull_request:
-    paths:
-      - 'agents/**'
-      - 'git/clone.ts'
-      - 'test/agent-*.test.ts'
-      - 'runner/question-*.ts'
-      - 'runner/questions.ts'
-      - 'runner/planning*.ts'
-      - 'runner/workspace.ts'
-      - 'runner/runner-repository.ts'
-      - 'runner/execution.ts'
-      - 'core/run-audit.ts'
-      - 'runner/review.ts'
-      - 'runner/store.ts'
-      - 'git/history.ts'
-      - 'test/runner-workspace.test.ts'
-      - 'test/vitest-config.test.ts'
-      - 'vitest.config.ts'
-      - '.github/workflows/agent-isolation.yml'
 permissions:
   contents: read
 jobs:

@@ -64,7 +64,8 @@ const settleBudgetMs: Record<string, number | undefined> = {
 
 describe('gh stop waits', () => {
   it('keep each deadline plus its stop wait below the 15-second serving request budget', () => {
-    // A merge click admitted just before shutdown must also settle inside the shutdown drain.
+    // A merge click stopped in one of the merge gateway's gh calls settles inside the shutdown drain. One stopped in its
+    // issue-trust read or a review load can settle just after it (docs/implementation/merge-queue.md, #48).
     expect(MERGE_OPERATION_TIMEOUT_MS + MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS).toBeLessThan(MAX_SHUTDOWN_DRAIN_MS);
     expect(MAX_SHUTDOWN_DRAIN_MS).toBeLessThan(15_000);
     // A merge-state or queue inspection, including the polls a browser makes.

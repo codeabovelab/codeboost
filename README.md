@@ -14,7 +14,7 @@ npm run typecheck
 npm test
 ```
 
-Tests create disposable local repositories and exercise command checks in disposable credential-free containers. They do not invoke model providers or access GitHub.
+Tests create disposable local repositories and exercise command checks in disposable credential-free containers. They do not invoke model providers or access GitHub. [CI](docs/implementation/ci.md) lists the workflows, the required checks and the live Claude probes.
 
 ## Guarded GitHub merge
 

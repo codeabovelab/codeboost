@@ -119,6 +119,33 @@ describe('GitBranchPusher', () => {
     expect(remoteRefs(s)).toBe(`${s.base} ${REF}`);
   });
 
+  it('with an expected head, overwrites exactly that commit, even one codeboost did not make', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one');
+    personPushes(s, REF);
+    await pusher(s).instance.push(IDENTITY, { head, branch: BRANCH, expected: s.base });
+    expect(remoteRefs(s)).toBe(`${head} ${REF}`);
+  });
+
+  it('with an expected head, refuses any other value, even a commit codeboost made, and pushes nothing', async () => {
+    const s = await setup(), first = await runnerCommit(s, 'one'), second = await runnerCommit(s, 'two');
+    await pusher(s).instance.push(IDENTITY, { head: first, branch: BRANCH });
+    const p = pusher(s, { owned: () => [first] });
+    await expect(p.instance.push(IDENTITY, { head: second, branch: BRANCH, expected: s.base }))
+      .rejects.toThrow(`holds ${first}, not the rebased head ${s.base}`);
+    await expect(p.instance.push(IDENTITY, { head: second, branch: 'codeboost/absent-1', expected: s.base }))
+      .rejects.toThrow(BranchPushRefused);
+    expect(remoteRefs(s)).toBe(`${first} ${REF}`);
+  });
+
+  it('reads the task branch for push settlement, and null when it does not exist', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one'), p = pusher(s);
+    await expect(p.instance.readBranch(IDENTITY, BRANCH)).resolves.toBeNull();
+    await p.instance.push(IDENTITY, { head, branch: BRANCH });
+    await expect(p.instance.readBranch(IDENTITY, BRANCH)).resolves.toBe(head);
+    await expect(p.instance.readBranch(IDENTITY, 'main')).rejects.toThrow(/codeboost\/ task branch/);
+    await expect(p.instance.readBranch({ ...IDENTITY, repositoryId: 'other' }, BRANCH)).rejects.toThrow(/another repository/);
+  });
+
   it('refuses when the branch moves between the read and the push: the lease is the value read', async () => {
     const s = await setup(), first = await runnerCommit(s, 'one'), second = await runnerCommit(s, 'two');
     await pusher(s).instance.push(IDENTITY, { head: first, branch: BRANCH });
@@ -283,6 +310,60 @@ describe('GitBranchPusher', () => {
     expect(error.message).not.toContain('has no commit');
     expect(remoteRefs(s)).toBe('');
   });
+
+  it('fails a branch read promptly when a process outside Git\'s group holds its output', async () => {
+    const s = await setup(), bin = join(s.root, 'fake-bin'), pidFile = join(s.root, 'escaped.pid');
+    mkdirSync(bin);
+    // Git's place on PATH: `ls-remote` leaves a process in a new session holding the inherited output, then exits.
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+      `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`
+      + `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`)}\n`, { mode: 0o755 });
+    try {
+      const began = performance.now();
+      const read = pusher(s, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }).instance.readBranch(IDENTITY, BRANCH);
+      await expect(read).rejects.toThrow(/outside its group still holds its output/);
+      expect(performance.now() - began).toBeLessThan(20_000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 40_000);
+
+  it('fails a commit check promptly when a process outside Git\'s group holds its output', async () => {
+    const s = await setup(), bin = join(s.root, 'fake-bin-cat'), pidFile = join(s.root, 'escaped-cat.pid');
+    mkdirSync(bin);
+    // Git's place on PATH: other commands succeed at once with no output; `cat-file` leaves a process in a new session
+    // holding its output.
+    // Each cat-file call leaves its own process, so every PID is appended and every one is killed afterwards.
+    const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`
+      + `require('node:fs').appendFileSync(${JSON.stringify(pidFile)}, c.pid + '\\n'); c.unref();`;
+    const escaped = () => { try { return readFileSync(pidFile, 'utf8').split('\n').filter(Boolean).map(Number); } catch { return []; } };
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase " $* " in *" cat-file "*) exec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(escape)} ;; esac\nexit 0\n`, { mode: 0o755 });
+    try {
+      const began = performance.now();
+      const instance = pusher(s, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }).instance;
+      await expect(instance.fetchCommits([s.base])).rejects.toThrow(/outside its group still holds its output/);
+      // A push checks its head with cat-file before anything is written: that read is bounded the same way.
+      await expect(instance.push(IDENTITY, { head: s.base, branch: BRANCH })).rejects.toThrow(/outside its group still holds its output/);
+      expect(performance.now() - began).toBeLessThan(30_000);
+      // One holder per cat-file call: both are recorded, so the cleanup below reaches both.
+      expect(escaped()).toHaveLength(2);
+    } finally {
+      for (const pid of escaped()) try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 40_000);
+
+  it('waits for a process that stays in Git\'s group before a branch read returns', async () => {
+    const s = await setup(), bin = join(s.root, 'fake-bin-group');
+    mkdirSync(bin);
+    // Git's place on PATH: `ls-remote` answers nothing and exits, leaving a child in its own group for 12 s more, past
+    // the 10 s bounded group drain an unsettled return would stop at.
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+      `require('node:child_process').spawn('sleep', ['12'], { stdio: 'ignore' }).unref();`)}\n`, { mode: 0o755 });
+    const began = performance.now();
+    await expect(pusher(s, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }).instance.readBranch(IDENTITY, BRANCH)).resolves.toBeNull();
+    // A member of Git's group is never abandoned: the read returned only after it had gone.
+    expect(performance.now() - began).toBeGreaterThanOrEqual(11_500);
+  }, 60_000);
 
   it('removes a configured enterprise token of any shape from Git\'s error text', async () => {
     const s = await setup(), head = await runnerCommit(s, 'one'), token = 'enterprise-secret-0123456789';

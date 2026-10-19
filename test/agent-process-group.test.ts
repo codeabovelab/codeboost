@@ -260,6 +260,34 @@ describe('runInProcessGroup', () => {
     }
   }, 30_000);
 
+  it('with boundEscapedOutput, returns failed promptly while a process outside the group holds its output pipe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'escaped-bounded-')), pidFile = join(dir, 'pid');
+    const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, `
+      + `stdio: ['ignore', 'inherit', 'inherit'] }); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, `
+      + `String(c.pid)); c.unref(); console.log('leader done');`;
+    try {
+      const began = performance.now();
+      const outcome = await runInProcessGroup(process.execPath, ['-e', escape], { env, timeoutMs: 30_000, boundEscapedOutput: true });
+      expect(outcome).toMatchObject({ status: null, stdout: 'leader done\n' });
+      expect((outcome.error as NodeJS.ErrnoException).code).toBe('ESTDIOHELD');
+      expect(performance.now() - began).toBeLessThan(10_000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('with boundEscapedOutput, still waits for a member that stays in the group after the leader exits', async () => {
+    // The leader leaves a child in its own group (not detached, no inherited output) that outlives the 10 s bounded
+    // group drain an unsettled return would stop at.
+    const linger = `require('node:child_process').spawn('sleep', ['12'], { stdio: 'ignore' }).unref(); console.log('leader done');`;
+    const began = performance.now();
+    const outcome = await runInProcessGroup(process.execPath, ['-e', linger], { env, timeoutMs: 30_000, boundEscapedOutput: true });
+    expect(performance.now() - began).toBeGreaterThanOrEqual(11_500);
+    expect(outcome).toMatchObject({ status: 0, stdout: 'leader done\n' });
+    expect(outcome.error).toBeUndefined();
+  }, 60_000);
+
   it('does not release an untracked caller while a process outside the group holds its output pipe', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'escaped-untracked-')), pidFile = join(dir, 'pid');
     const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, `
