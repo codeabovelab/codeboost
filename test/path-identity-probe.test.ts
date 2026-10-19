@@ -21,7 +21,10 @@ beforeAll(() => {
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm of a container that exists refuses as Docker does while an auto-remove is in
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
-  // that stopped); each such call is logged in the hung file. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
+  // that stopped); each such call is logged in the hung file. Of rm and inspect, the code reads only the exit status
+  // and, for a missing name, the "No such container" text; for an existing container this fake prints less stdout
+  // than Docker (the name; the full inspect array), which nothing reads. `lost` is the client's own exit 125 when the
+  // connection drops after the create was sent (wording as Docker 27's CLI, not reproduced here). Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
   // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
   // CLIs before 20.10 did by the docker/cli changelog (not run here).
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
@@ -31,6 +34,7 @@ if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) echo 'codeboost-path-identity true none';;
+    lost) echo 'error during connect: Post "http://docker.example/v1.47/containers/create": EOF' >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
     late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
@@ -124,7 +128,9 @@ describe('task storage probe against Docker answers', () => {
     expect((failure as Error).message).toBe('docker run failed (client killed or not started): docker run ETIMEDOUT after 500 ms.'
       + ` The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`);
     const cause = (failure as Error).cause as AggregateError;
-    expect(cause.errors.map((error: Error) => error.message)).toEqual([expect.stringMatching(/^docker run failed/), `Docker still reports ${name} after removing it.`]);
+    expect(cause.errors.map((error: Error) => error.message)).toEqual([expect.stringMatching(/^docker run failed/), `Docker did not confirm that ${name} is gone.`]);
+    // The last thing Docker said: the inspect still found the container.
+    expect((cause.errors[1].cause as { status: number | null }).status).toBe(0);
   }, 60_000);
   it('removes nothing when the client was refused before it started', async () => {
     writeFileSync(mode, 'answer');
@@ -159,13 +165,22 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(hangAt, String(Math.floor(Date.now() / 1000) + 12));
     const failure = await probeTaskStoragePathIdentity(imageId, 500, 4_000).catch((error: Error) => error);
     expect(readFileSync(hung, 'utf8').trim().split('\n')).toHaveLength(1);
-    // Docker had reported the container present; the hung call that followed does not hide that.
-    expect(((failure as Error).cause as AggregateError).errors[1].message).toBe(`Docker still reports ${probeName()} after removing it.`);
+    expect(((failure as Error).cause as AggregateError).errors[1].message).toBe(`Docker did not confirm that ${probeName()} is gone.`);
   }, 60_000);
-  it('reports a daemon that stopped answering, not an earlier absent answer', async () => {
-    // Absent at every answered ask (a killed client whose create never landed), then no answer before the window ends.
+  it('gives up with the last outcome, not an earlier absent answer, when the daemon stops answering', async () => {
+    // Absent at every answered ask (a killed client whose create never landed), then no answer before the window ends:
+    // absence inside the settle window proves nothing, so this is a give-up whose cause is the unanswered call.
     writeFileSync(mode, 'hang'); writeFileSync(hangAt, String(Math.floor(Date.now() / 1000) + 5));
     const failure = await probeTaskStoragePathIdentity(imageId, 500, 2_000).catch((error: Error) => error);
-    expect(((failure as Error).cause as AggregateError).errors[1].message).toMatch(/^docker (rm|container) failed \(client killed or not started\): docker (rm|container) ETIMEDOUT/);
+    const cleanup = ((failure as Error).cause as AggregateError).errors[1] as Error;
+    expect(cleanup.message).toBe(`Docker did not confirm that ${probeName()} is gone.`);
+    expect(cleanup.cause).toMatchObject({ status: null, error: { code: 'ETIMEDOUT' } });
+  }, 60_000);
+  it('waits out the settle window when docker run exits without a daemon answer', async () => {
+    // Exit 125 from the client itself (a connection lost after the create was sent): the create may still land.
+    writeFileSync(mode, 'lost');
+    const started = performance.now();
+    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): error during connect');
+    expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
   }, 60_000);
 });

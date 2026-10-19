@@ -438,9 +438,11 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     // A client that never started sent nothing to the daemon, so there is nothing to remove.
     const error = outcome.error as NodeJS.ErrnoException | undefined;
     if (outcome.status === null && (error?.code === NOT_STARTED || error?.syscall?.startsWith('spawn'))) throw failure;
-    // A client that did not finish leaves the daemon's outcome unknown: a killed create may still land, so only absence
-    // after the settle window counts. A daemon answer settles at once.
-    try { await removeProbeContainer(name, outcome.status === null ? CREATE_SETTLE_MS : 0, cleanupMs); }
+    // Only a refusal from the daemon itself settles at once. Any other outcome (a killed client, a connection lost after
+    // the create was sent, exit 125 from the client) leaves the daemon's outcome unknown: a create may still land, so
+    // only absence after the settle window counts.
+    const refused = outcome.status !== null && /Error response from daemon/.test(outcome.stderr);
+    try { await removeProbeContainer(name, refused ? 0 : CREATE_SETTLE_MS, cleanupMs); }
     catch (error) {
       throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
         { cause: new AggregateError([failure, error]) });
@@ -458,34 +460,21 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
  */
 async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
+  let last: DockerOutcome | undefined;
   // Each call gets the time left before giving up (at least 1 s, so the last ask can still be answered), and after the
-  // first ask no call starts once that time has passed: a daemon that stops answering stretches the bound by at most
-  // one call's floor and its stop grace.
-  const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(),
-    timeoutMs: Math.min(10_000, Math.max(1_000, Math.ceil(giveUpAt - performance.now()))) });
-  const remove = ['rm', '--force', '--volumes', name], inspect = ['container', 'inspect', name];
-  // The latest outcome of either call, and the latest inspect that found the container.
-  let last: { args: readonly string[]; outcome: DockerOutcome } | undefined, present: DockerOutcome | undefined;
-  const giveUp = (): never => {
-    // Docker stopping answering after it reported the container present does not hide that it was present.
-    if (present && last!.outcome.status === null) throw new Error(`Docker still reports ${name} after removing it.`);
-    const { args, outcome } = last!;
-    throw outcome.status === 0 ? new Error(`Docker still reports ${name} after removing it.`) : new DockerError(args, outcome);
+  // first call none starts once that time has passed: a daemon that stops answering stretches the bound by at most one
+  // call's floor and its stop grace.
+  const ask = async (args: readonly string[]) => {
+    if (last && performance.now() >= giveUpAt)
+      throw new Error(`Docker did not confirm that ${name} is gone.`, { cause: last });
+    return last = await runInProcessGroup('docker', args, { env: dockerEnvironment(),
+      timeoutMs: Math.min(10_000, Math.max(1_000, Math.ceil(giveUpAt - performance.now()))) });
   };
   for (;;) {
-    if (last && performance.now() >= giveUpAt) giveUp();
     // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
-    const removal = await docker(remove);
-    // Only an unanswered rm is worth reporting: what it answers is never read.
-    if (removal.status === null) last = { args: remove, outcome: removal };
-    if (last && performance.now() >= giveUpAt) giveUp();
-    const found = await docker(inspect);
-    last = { args: inspect, outcome: found };
-    if (found.status === 0) present = found;
-    else if (absent(found)) present = undefined;
-    if (absent(found) && performance.now() >= settleBy) return;
+    await ask(['rm', '--force', '--volumes', name]);
+    if (absent(await ask(['container', 'inspect', name])) && performance.now() >= settleBy) return;
     // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
-    if (performance.now() >= giveUpAt) giveUp();
     await pause(250);
   }
 }
