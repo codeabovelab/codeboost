@@ -413,12 +413,14 @@ export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(p
 /**
  * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
  * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
- * container hardened like the seeder. The volume is anonymous and the container `--rm`, so once the container has
+ * container hardened like the keeper. The volume is anonymous and the container `--rm`, so once the container has
  * started the daemon removes both when it exits, even if this process does not live to see it. A client stopped before
- * then (its deadline) may leave the container created but never started, which `--rm` does not remove: every failed
- * probe therefore removes its container, and that volume, by the unique name it gave it.
+ * then (its deadline) may leave the container created but never started, which `--rm` does not remove, so a failed
+ * probe removes its container, and that volume, by the unique name it gave it. Not covered: a create that lands after
+ * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
+ * find that container (`docker ps -a --filter name=codeboost-path-identity-` does).
  */
-export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000): Promise<PathIdentity> {
+export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = 30_000): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
   assertBuiltAgentImage(imageId);
   const volume = ['type=volume', 'target=/work', 'volume-driver=local',
@@ -437,7 +439,7 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     if (outcome.status === null && (error?.code === NOT_STARTED || error?.syscall?.startsWith('spawn'))) throw failure;
     // A client that did not finish leaves the daemon's outcome unknown: a killed create may still land, so only absence
     // after the settle window counts. A daemon answer settles at once.
-    try { await removeProbeContainer(name, outcome.status === null ? CREATE_SETTLE_MS : 0); }
+    try { await removeProbeContainer(name, outcome.status === null ? CREATE_SETTLE_MS : 0, cleanupMs); }
     catch (error) {
       throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
         { cause: new AggregateError([failure, error]) });
@@ -453,8 +455,8 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
  * Remove a failed probe's container and its anonymous volume by name. `rm --force` exits 0 for a name that does not
  * exist, so only an inspect that reports the name absent, after the settle window, proves the probe is gone.
  */
-async function removeProbeContainer(name: string, settleMs: number): Promise<void> {
-  const settleBy = performance.now() + settleMs, giveUpAt = settleBy + 30_000;
+async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
+  const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
   const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
   for (;;) {
     let args: readonly string[] = ['rm', '--force', '--volumes', name];
@@ -465,7 +467,8 @@ async function removeProbeContainer(name: string, settleMs: number): Promise<voi
       if (absent(result) && performance.now() >= settleBy) return;
     }
     // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
-    if (performance.now() >= giveUpAt) throw new DockerError(args, result);
+    if (performance.now() >= giveUpAt)
+      throw result.status === 0 ? new Error(`Docker still reports ${name} after removing it.`) : new DockerError(args, result);
     await pause(250);
   }
 }

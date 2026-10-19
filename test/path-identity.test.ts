@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -48,5 +48,12 @@ describe('task storage probe script', () => {
     const out = execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' });
     const expected = probePathIdentity(root);
     expect(out).toBe(`codeboost-path-identity ${expected.caseSensitive} ${expected.unicodeNormalization}\n`);
+  });
+  it('reports what it finds, on any host: names that already answer to CASE and NFD read as folded', () => {
+    // On Linux CI the honest answer above is the same constant task storage gives; this one is not, so a script that
+    // printed a constant instead of looking fails here everywhere.
+    const root = directory();
+    writeFileSync(join(root, 'CASE'), ''); writeFileSync(join(root, 'cafe\u0301'), '');
+    expect(execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' })).toBe('codeboost-path-identity false NFC\n');
   });
 });
