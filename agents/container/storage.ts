@@ -418,7 +418,7 @@ export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(p
  * then (its deadline) may leave the container created but never started, which `--rm` does not remove, so a failed
  * probe removes its container, and that volume, by the unique name it gave it. Not covered: a create that lands after
  * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
- * find that container (`docker ps -a --filter name=codeboost-path-identity-` does).
+ * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). A recovery sweep is #181.
  */
 export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = 30_000): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
