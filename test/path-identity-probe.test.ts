@@ -9,7 +9,7 @@ import { probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const busy = join(root, 'busy'), stuck = join(root, 'stuck');
+const busy = join(root, 'busy'), stuck = join(root, 'stuck'), oldCli = join(root, 'old-cli');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -20,7 +20,8 @@ beforeAll(() => {
   // create lands two seconds later, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm refuses as Docker does during an auto-remove; with the stuck file, a removed
-  // container is still reported.
+  // container is still reported. Checked against Docker 27.4.0. With the old-cli file, rm of a missing name exits 1, as
+  // CLIs before 20.10 did by the docker/cli changelog (not run here).
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
 exists() { { [ ! -e '${removed}' ] || [ -e '${stuck}' ]; } && [ -e '${landAt}' ] && [ "$(date +%s)" -ge "$(cat '${landAt}')" ]; }
@@ -39,7 +40,9 @@ if [ "$1" = rm ]; then
     echo $(( $(cat '${busy}') - 1 )) > '${busy}'
     echo "Error response from daemon: removal of container $4 is already in progress" >&2; exit 1
   fi
-  if exists; then : > '${removed}'; else echo "Error response from daemon: No such container: $4" >&2; fi
+  if exists; then : > '${removed}'; exit 0; fi
+  echo "Error response from daemon: No such container: $4" >&2
+  if [ -e '${oldCli}' ]; then exit 1; fi
   exit 0
 fi
 if [ "$1 $2" = "container inspect" ]; then
@@ -53,7 +56,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, busy, stuck]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, busy, stuck, oldCli]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -135,4 +138,11 @@ describe('task storage probe against Docker answers', () => {
     expect(removals().filter(call => call.startsWith('rm ')).length).toBeGreaterThanOrEqual(3);
     expect(left()).toBe(false);
   }, 60_000);
+  it('settles at once on a CLI whose rm exits non-zero for a missing name', async () => {
+    writeFileSync(mode, 'refused'); writeFileSync(oldCli, '');
+    const started = performance.now();
+    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125)');
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(removals()).toEqual([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]);
+  });
 });
