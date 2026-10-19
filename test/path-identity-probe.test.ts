@@ -9,7 +9,7 @@ import { probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const busy = join(root, 'busy'), stuck = join(root, 'stuck'), oldCli = join(root, 'old-cli');
+const busy = join(root, 'busy'), stuck = join(root, 'stuck'), oldCli = join(root, 'old-cli'), unanswered = join(root, 'unanswered');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -36,6 +36,7 @@ if [ "$1" = run ]; then
     hang) exec sleep 30;;
   esac
 fi
+if [ -e '${unanswered}' ] && { [ "$1" = rm ] || [ "$1 $2" = "container inspect" ]; }; then exec sleep 30; fi
 if [ "$1" = rm ]; then
   if [ -s '${busy}' ] && [ "$(cat '${busy}')" -gt 0 ]; then
     echo $(( $(cat '${busy}') - 1 )) > '${busy}'
@@ -57,7 +58,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, busy, stuck, oldCli]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, busy, stuck, oldCli, unanswered]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -147,4 +148,11 @@ describe('task storage probe against Docker answers', () => {
     expect(performance.now() - started).toBeLessThan(5_000);
     expect(removals()).toEqual([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]);
   });
+  it('gives up on time when the daemon stops answering the cleanup', async () => {
+    // Every rm and inspect hangs: each call must be cut at the time left, not at its own 10 s deadline.
+    writeFileSync(mode, 'refused'); writeFileSync(unanswered, '');
+    const started = performance.now();
+    await expect(probeTaskStoragePathIdentity(imageId, 60_000, 1_000)).rejects.toThrow('may remain');
+    expect(performance.now() - started).toBeLessThan(4_000);
+  }, 60_000);
 });

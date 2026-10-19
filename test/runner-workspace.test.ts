@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
+import { PROBE_VOLUME_MOUNT, probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SafetyFindings, executionDeps, type ExecutionSources } from '../runner/execution.ts';
@@ -155,6 +156,16 @@ describe('task storage path identity (#162)', () => {
     expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
     // In any state: a container created but never started would outlive --rm.
     expect(docker('ps', '-aq', '--filter', 'name=codeboost-path-identity-')).toBe('');
+    expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
+  }, 120_000);
+  it('removes a never-started probe container and its volume with the cleanup\'s own rm', () => {
+    // The failure path's claim: a container created but never started (a killed client) loses its anonymous volume to
+    // `rm --force --volumes`. Made with the probe's exact mount; removed with the exact command the cleanup runs.
+    const volumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean));
+    const before = volumes(), name = `codeboost-path-identity-${randomUUID()}`;
+    docker('create', '--name', name, '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'true', imageId);
+    try { expect([...volumes()].filter(volume => !before.has(volume))).toHaveLength(1); }
+    finally { docker('rm', '--force', '--volumes', name); }
     expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
   }, 120_000);
   it('runs only the image the trusted builder produced', async () => {

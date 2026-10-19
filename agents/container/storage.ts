@@ -410,6 +410,11 @@ export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: Task
 export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(printf \'caf\\303\\251\')"',
   'if [ -e CASE ]; then c=false; else c=true; fi', 'if [ -e "$(printf \'cafe\\314\\201\')" ]; then u=NFC; else u=none; fi',
   'printf \'codeboost-path-identity %s %s\\n\' "$c" "$u"'].join('; ');
+/** The probe's `/work`: an anonymous local volume with task storage's tmpfs options, as one `--mount` value. */
+export const PROBE_VOLUME_MOUNT = ['type=volume', 'target=/work', 'volume-driver=local',
+  ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
+  // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
+  .map(field => field.includes(',') ? `"${field}"` : field).join(',');
 /**
  * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
  * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
@@ -423,14 +428,10 @@ export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(p
 export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = 30_000): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
   assertBuiltAgentImage(imageId);
-  const volume = ['type=volume', 'target=/work', 'volume-driver=local',
-    ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
-    // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
-    .map(field => field.includes(',') ? `"${field}"` : field).join(',');
   const name = `codeboost-path-identity-${randomUUID()}`;
   const args = ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
-    '--cpus=.25', '--mount', volume, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
+    '--cpus=.25', '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
   const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
   if (outcome.status !== 0) {
     const failure = new DockerError(args, outcome);
@@ -457,15 +458,23 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
  */
 async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
-  const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
+  // Each call gets the time left before giving up (at least 1 s, so the last ask can still be answered): a daemon that
+  // stops answering stretches the bound by at most that floor and the stop grace of one call.
+  const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(),
+    timeoutMs: Math.min(10_000, Math.max(1_000, Math.ceil(giveUpAt - performance.now()))) });
+  const args = ['container', 'inspect', name];
+  let answered: DockerOutcome | undefined, last: DockerOutcome;
   for (;;) {
     // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
     await docker(['rm', '--force', '--volumes', name]);
-    const args = ['container', 'inspect', name], result = await docker(args);
-    if (absent(result) && performance.now() >= settleBy) return;
+    last = await docker(args);
+    if (last.status !== null) answered = last;
+    if (absent(last) && performance.now() >= settleBy) return;
     // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
-    if (performance.now() >= giveUpAt)
-      throw result.status === 0 ? new Error(`Docker still reports ${name} after removing it.`) : new DockerError(args, result);
+    if (performance.now() >= giveUpAt) {
+      const report = answered ?? last;
+      throw report.status === 0 ? new Error(`Docker still reports ${name} after removing it.`) : new DockerError(args, report);
+    }
     await pause(250);
   }
 }
