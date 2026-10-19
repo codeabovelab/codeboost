@@ -1,9 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { identityKey, type PlanIdentity } from './identity.ts';
 import { parseV1 } from './parse-v1.ts';
-import { applySuggestion, assertEditReply, importPlan, validateContinuationPlan, validatePlan, PlanError,
-  type Diagnostic, type EditReply, type Plan, type PlanContext } from './plan.ts';
-import registry from '../schema/versions.json' with { type: 'json' };
+import { applySuggestion, assertEditReply, CURRENT_SCHEMA_VERSION, importPlan, retainedSchemaPath, validateContinuationPlan,
+  validatePlan, PlanError, type Diagnostic, type EditReply, type Plan, type PlanContext } from './plan.ts';
 
 export const MAX_PROMPT_BYTES = 32 * 1024;
 const template = readFileSync(new URL('../prompts/plan-author.md', import.meta.url), 'utf8')
@@ -110,7 +109,8 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     if (input.revision !== previous.revision + (mode === 'draft' ? 1 : 0)) throw new Error('Previous plan revision mismatch.');
   } else if (mode === 'suggest') throw new Error('Suggestions require a previous plan.');
   else if (input.revision !== 1) throw new Error('Initial draft must use revision one.');
-  const schemaPath = registry.versions['1'][mode === 'draft' ? 'plan' : 'edit'];
+  // A new draft uses the current schema; suggestions edit the previous plan in its own retained version.
+  const schemaPath = mode === 'draft' ? retainedSchemaPath(CURRENT_SCHEMA_VERSION, 'plan') : retainedSchemaPath(previous!.schema_version, 'edit');
   const schemaText = boundedText(readFileSync(new URL('../schema/' + schemaPath, import.meta.url), 'utf8'), 'Schema');
   const slots: Record<string, string> = {
     output_instruction: mode === 'draft'

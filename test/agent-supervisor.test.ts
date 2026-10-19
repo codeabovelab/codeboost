@@ -173,6 +173,30 @@ describe('container invocation supervisor', () => {
     expect(result.stderr).toContain('bad-');
   }, 60_000);
 
+  // The probe writes 13 stdout and 13 stderr bytes; the decoder's text replaces stdout. Decoded text is bounded by the
+  // stdout limit, and with the captured stderr by the combined limit, each up to the exact byte. Without deferred
+  // output, decoding runs after the container exits, so all 13 stderr bytes are counted first.
+  it.each([
+    ['stdout', { stdoutBytes: 64, stderrBytes: 64, combinedBytes: 256 }, 64],
+    ['combined', { stdoutBytes: 256, stderrBytes: 64, combinedBytes: 96 }, 96 - 13],
+  ] as const)('accepts decoded output at the %s limit and stops one byte over it', async (limit, limits, maximum) => {
+    for (const bytes of [maximum, maximum + 1]) {
+      const attemptId = `decoded-limit-${limit}-${bytes}`;
+      const result = await startProfileInvocation(await profile(fixture(), 'finite-output', attemptId), {
+        limits, decode: () => ({ text: 'x'.repeat(bytes) }),
+      }).settled;
+      if (bytes === maximum) {
+        expect(result).toMatchObject({ exitCode: 0, signal: null, stdout: 'x'.repeat(bytes) });
+        expect(result.stopReason).toBeUndefined();
+      } else {
+        expect(result.stopReason).toBe('output-limit');
+        // The decoded text is discarded; the result keeps the probe's raw stdout.
+        expect(result.stdout).toBe('stdout-marker');
+      }
+      expect(isInvocationActive(attemptId)).toBe(false);
+    }
+  }, 120_000);
+
   it('stops buffering deferred newline-free stderr after the limit is reached', async () => {
     const attemptId = 'deferred-stderr-limit';
     const handle = startProfileInvocation(await profile(fixture(), 'infinite-stderr', attemptId, 2 * 60_000, true), {

@@ -91,6 +91,8 @@ Validation began with 60 passing tests. The added v1 regressions reproduced 18 f
 
 Issue #6 remains open for the library and runner contract it tracks. Remaining runner work must obtain typed base entries and actual filesystem identity from a trusted checkout; audit actual occupancy, new symlinks/conversions, link targets and target mutations after execution; and enforce prompt budgets/profiles, output limits, container mounts, and process termination. The library only checks declared/projected state and trusted supplied context. In particular an edit may repair an unsafe existing link, but only the future runtime audit can validate its new target and accepted filesystem state. This original library slice did not add an application or runtime safety boundary; persistent request IDs, cancellation, replay prevention, concurrent CAS, and the review screen were implemented later under #2 and #3.
 
+*Later:* [plan-library-alignment.md](plan-library-alignment.md) records how each remaining obligation was met when #6 closed, and which moved to their own issues.
+
 ## Merged-contract review round 1
 
 Updated README import/linking examples to supply the new required context. Declined the scored-rename report: the raw-diff regex captures only `([A-Z])` and consumes the score separately with `\d*`, so the existing branch receives `R`, not `R100`. A focused real-Git test observed a scored rename followed by an added-file record and loaded both correctly before any parser change. Retained that regression. A separate locally discovered C1-control regression failed first, then passed after using the complete Unicode control category for commands/paths.
