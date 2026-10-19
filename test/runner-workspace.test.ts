@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import type { TaskFilesystems } from '../agents/container/storage.ts';
+import { probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SafetyFindings, executionDeps, type ExecutionSources } from '../runner/execution.ts';
@@ -144,4 +144,20 @@ describe('real task workspace (#87)', () => {
     expect(s.store.continuationRevision(identity, outcome.checkpointId)).toBe(revision);
     review.close();
   }, 600_000);
+});
+
+describe('task storage path identity (#162)', () => {
+  it('measures the tmpfs the agent edits, whatever the host folds, and leaves no container or volume behind', async () => {
+    const volumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean));
+    const before = volumes();
+    // Task storage is a tmpfs in the daemon's Linux kernel: case-sensitive, and names are compared as bytes. A macOS
+    // host folder would report the reverse, which is why the probe does not read the host.
+    expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
+    expect(docker('ps', '-aq', '--filter', `ancestor=${imageId}`, '--filter', 'status=exited')).toBe('');
+    expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
+  }, 120_000);
+  it('runs only the image the trusted builder produced', async () => {
+    await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
+    await expect(probeTaskStoragePathIdentity('alpine')).rejects.toThrow('requires the immutable built image ID');
+  });
 });

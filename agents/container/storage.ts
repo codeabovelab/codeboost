@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TaskClone } from '../contract.ts';
+import type { PathIdentity } from '../../core/path-identity.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
@@ -265,6 +266,10 @@ function* allocationObjects(allocationId: string, expected: number, remaining: (
   }
 }
 
+/** The local-driver options of every task storage volume: a size- and inode-limited tmpfs owned by the storage user. */
+const TASK_VOLUME_OPTIONS = (bytes: number, inodes: number): readonly string[] =>
+  ['type=tmpfs', 'device=tmpfs', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`];
+
 /** The allocation, as a sequence of Docker calls. Both variants run these same steps; only how each call runs differs. */
 function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: string, owner: ResourceOwner,
   timeoutMs: number): Steps<TaskFilesystems> {
@@ -306,8 +311,7 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
   try {
     for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
       ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
-      yield* allocate(name, ['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
-        '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
+      yield* allocate(name, ['volume', 'create', '--driver', 'local', ...TASK_VOLUME_OPTIONS(bytes, inodes).flatMap(option => ['--opt', option]),
         '--label', `io.codeboost.task-storage=${kind}`, ...labels, name]);
       // The check above and this create are not atomic across processes. Once our first object exists, it must be
       // the only one carrying the ID: of two racing allocations, the later check sees both and backs out.
@@ -398,6 +402,34 @@ export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: Task
         { name: 'AbortError', code: 'ABORT_ERR' });
     throw error;
   }
+}
+
+// Writes `case` and NFC `caf\u00e9`, then asks whether `CASE` and NFD `cafe\u0301` name the same entries. printf
+// writes the UTF-8 bytes, so the script itself stays ASCII.
+const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd /work', ': > case', ': > "$(printf \'caf\\303\\251\')"',
+  'if [ -e CASE ]; then c=false; else c=true; fi', 'if [ -e "$(printf \'cafe\\314\\201\')" ]; then u=NFC; else u=none; fi',
+  'printf \'codeboost-path-identity %s %s\\n\' "$c" "$u"'].join('; ');
+/**
+ * The path identity of task storage (#162): how the filesystem the agent edits and the runner inspects tells two
+ * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
+ * container hardened like the seeder. The volume is anonymous and the container `--rm`, so the daemon removes both when
+ * the probe exits, even if this process does not live to see it.
+ */
+export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000): Promise<PathIdentity> {
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
+  assertBuiltAgentImage(imageId);
+  const volume = ['type=volume', 'target=/work', 'volume-driver=local',
+    ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
+    // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
+    .map(field => field.includes(',') ? `"${field}"` : field).join(',');
+  const args = ['run', '--rm', '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
+    '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
+    '--cpus=.25', '--mount', volume, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT];
+  const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
+  if (outcome.status !== 0) throw new DockerError(args, outcome);
+  const answer = /^codeboost-path-identity (true|false) (none|NFC)$/.exec(outcome.stdout.trim());
+  if (!answer) throw new Error('The path identity probe did not report an identity.');
+  return { caseSensitive: answer[1] === 'true', unicodeNormalization: answer[2] as PathIdentity['unicodeNormalization'] };
 }
 
 /**
