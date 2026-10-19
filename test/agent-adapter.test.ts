@@ -137,7 +137,11 @@ describe('production agent adapters', () => {
     const answer = JSON.stringify({ summary: 'x'.repeat(4 * 1024 * 1024) });
     const raw = structuredEnvelope(answer, OUTPUT_LIMITS.stdoutBytes);
     expect(raw.length).toBe(OUTPUT_LIMITS.stdoutBytes);
-    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
+    // Compared without a diff: on a mismatch, vitest would spend minutes diffing megabyte strings instead of failing.
+    const decoded = parseClaudeOutput(raw, true);
+    expect(decoded.providerFailed).toBe(false);
+    expect(decoded.text.length).toBe(answer.length);
+    expect(decoded.text === answer).toBe(true);
   });
 
   it('returns a structured answer as the exact text of structured_output in the envelope, whatever surrounds it', () => {
@@ -145,7 +149,11 @@ describe('production agent adapters', () => {
     const answer = '{ "summary" : "caf\\u00e9 } ] \\" \\\\", "n": [1e20, 1.0, -0E+0],\n "nested": {"a": [{}, []]} }';
     const raw = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"text with } and \\" in it",'
       + `"structured_output":\t${answer}\n, "usage": {"input_tokens": 1}, "end": null}`);
-    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
+    // Compared without a diff: on a mismatch, vitest would spend minutes diffing megabyte strings instead of failing.
+    const decoded = parseClaudeOutput(raw, true);
+    expect(decoded.providerFailed).toBe(false);
+    expect(decoded.text.length).toBe(answer.length);
+    expect(decoded.text === answer).toBe(true);
     expect(parseClaudeOutput(Buffer.from(`{"subtype":"success","is_error":false,"structured_output":${answer}}`), true).text)
       .toBe(answer);
   });
@@ -163,7 +171,9 @@ describe('production agent adapters', () => {
     ['an inexact integer', JSON.stringify(validPlan).replace('"revision":1', '"revision":1.0000000000000001'), 'Integer is not exactly representable.'],
   ])('lets draft validation refuse %s in a structured answer', (_case, answer, refusal) => {
     const { text } = parseClaudeOutput(structuredEnvelope(answer, answer.length + 256), true);
-    expect(text).toBe(answer);
+    // Compared without a diff, so a broken decoder fails at once rather than in a minutes-long diff of a large string.
+    expect(text.length).toBe(answer.length);
+    expect(text === answer).toBe(true);
     expect(() => draft().validate(text)).toThrow(refusal);
     // The same plan without the defect is accepted, so the refusal is the defect's.
     const valid = JSON.stringify(validPlan);
@@ -198,7 +208,9 @@ describe('production agent adapters', () => {
     const answer = `{ "summary": "x" ${' '.repeat(MAX_SOURCE_BYTES)}}`;
     expect(Buffer.byteLength(JSON.stringify(JSON.parse(answer)))).toBeLessThan(MAX_SOURCE_BYTES);
     const { text } = parseClaudeOutput(structuredEnvelope(answer, answer.length + 256), true);
-    expect(text).toBe(answer);
+    // Compared without a diff, so a broken decoder fails at once rather than in a minutes-long diff of a large string.
+    expect(text.length).toBe(answer.length);
+    expect(text === answer).toBe(true);
     expect(() => draft().validate(text)).toThrow('Input size exceeds 1 MiB.');
   });
 
