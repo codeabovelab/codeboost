@@ -459,13 +459,10 @@ async function removeProbeContainer(name: string, settleMs: number, cleanupMs: n
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
   const docker = (args: readonly string[]) => runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
   for (;;) {
-    let args: readonly string[] = ['rm', '--force', '--volumes', name];
-    let result = await docker(args);
-    if (result.status === 0) {
-      args = ['container', 'inspect', name];
-      result = await docker(args);
-      if (absent(result) && performance.now() >= settleBy) return;
-    }
+    // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
+    await docker(['rm', '--force', '--volumes', name]);
+    const args = ['container', 'inspect', name], result = await docker(args);
+    if (absent(result) && performance.now() >= settleBy) return;
     // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
     if (performance.now() >= giveUpAt)
       throw result.status === 0 ? new Error(`Docker still reports ${name} after removing it.`) : new DockerError(args, result);

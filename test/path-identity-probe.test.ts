@@ -108,10 +108,11 @@ describe('task storage probe against Docker answers', () => {
     expect(performance.now() - started).toBeLessThan(2_000);
     expect(existsSync(calls)).toBe(false);
   });
-  it('asks again while Docker refuses the removal for now, and keeps the probe failure as the error', async () => {
+  it('confirms by inspect even when rm exits non-zero, and keeps the probe failure as the error', async () => {
     writeFileSync(mode, 'refused'); writeFileSync(busy, '2');
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125)');
-    expect(removals()).toEqual([...Array(3).fill(`rm --force --volumes ${probeName()}`), `container inspect ${probeName()}`]);
+    // Each refused rm is followed by an inspect; the container never existed, so the first inspect settles it.
+    expect(removals()).toEqual([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]);
   });
   it('gives up when Docker keeps reporting the container, and names it for the person to remove', async () => {
     writeFileSync(mode, 'created'); writeFileSync(stuck, '');
@@ -128,4 +129,10 @@ describe('task storage probe against Docker answers', () => {
     await expect(probeTaskStoragePathIdentity(imageId, 0)).rejects.toThrow('Process deadline must be a positive integer');
     expect(existsSync(calls)).toBe(false);
   });
+  it('asks again while Docker refuses the removal of a container that exists', async () => {
+    writeFileSync(mode, 'created'); writeFileSync(busy, '2');
+    await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('client killed or not started');
+    expect(removals().filter(call => call.startsWith('rm ')).length).toBeGreaterThanOrEqual(3);
+    expect(left()).toBe(false);
+  }, 60_000);
 });
