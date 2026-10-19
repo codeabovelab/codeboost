@@ -29,9 +29,11 @@ function review(github: Record<string, unknown> | null = { baseBranch: 'main' },
   /**
    * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile, and the
    * path identity of a Linux tmpfs to the startup probe) once the hold file is gone: startup recovery waits on it, as on
-   * a slow daemon, for as long as the test keeps the file. It models only the calls a successful startup makes; the
-   * probe's failure cleanup, whose rm and inspect answers matter, is tested against a Docker-27 fake in
-   * path-identity-probe.test.ts.
+   * a slow daemon, for as long as the test keeps the file. It models only the calls a successful startup makes, checked
+   * against Docker 27.4.0: recovery's label listings (`ps --all --quiet`, `volume ls --quiet`) with nothing to list
+   * answer as here, exit 0 and no output, and the probe on real task storage prints the line given here
+   * (runner-workspace.test.ts). The probe's failure cleanup, whose rm and inspect answers matter, is tested against its
+   * own fake in path-identity-probe.test.ts.
    */
   const fakeDocker = () => {
     const bin = join(root, 'bin'), hold = join(bin, 'hold'), image = JSON.stringify([{ Id: `sha256:${'a'.repeat(64)}`, Config: { User: '10001:10001',
