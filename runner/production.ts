@@ -272,9 +272,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   service.store.settleInterruptedMergeJobs(identity);
   const repository = await getRepository();
   const imageId = image();
-  // #162: plan path keys follow pathIdentity, so it must match the filesystem the agent edits and the runner inspects.
-  // That is task storage in the Docker daemon's kernel, not the host folder the staging clone is made in, so it is
-  // probed there, with the built image, before anything is admitted.
+  // #162: plan path keys follow pathIdentity, so it must match the filesystem the agent edits, where the runner inspects
+  // and commits task changes. That is task storage in the Docker daemon's kernel, not the host folder the staging clone
+  // is made in, so it is probed there, with the built image, before anything is admitted. Host checkouts (the staging
+  // clone, the rebase worktree) are #179.
   assertPathIdentity(review.pathIdentity, await (o.probeTaskStorage ?? probeTaskStoragePathIdentity)(imageId),
     'the task storage the agent edits');
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,

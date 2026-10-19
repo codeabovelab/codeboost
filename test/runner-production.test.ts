@@ -110,7 +110,7 @@ describe('runner startup', () => {
         probeTaskStorage: async imageId => { calls.push(`probe ${imageId}`); return probed; } }))
         .rejects.toThrow(`pathIdentity (caseSensitive ${configured.caseSensitive}, unicodeNormalization ${configured.unicodeNormalization}) does not match `
           + `the task storage the agent edits (caseSensitive ${probed.caseSensitive}, unicodeNormalization ${probed.unicodeNormalization})`);
-      // Probed with the built image, after recovery and the image build; refused before the workspace is assembled.
+      // Probed with the built image, after recovery and the image build.
       expect(calls).toEqual(['verify', 'deps', 'recover', 'image', 'probe sha256:x']);
     }
     // A probe that fails stops startup too: an identity that cannot be measured is not assumed.

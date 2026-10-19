@@ -404,13 +404,14 @@ export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: Task
   }
 }
 
-// Writes `case` and NFC `caf\u00e9`, then asks whether `CASE` and NFD `cafe\u0301` name the same entries. printf
-// writes the UTF-8 bytes, so the script itself stays ASCII.
-const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd /work', ': > case', ': > "$(printf \'caf\\303\\251\')"',
+// In the directory given as $1, writes `case` and NFC `caf\u00e9`, then asks whether `CASE` and NFD `cafe\u0301` name
+// the same entries. printf writes the UTF-8 bytes, so the script itself stays ASCII. Exported so a test can run it on a
+// host folder whose answer is known.
+export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(printf \'caf\\303\\251\')"',
   'if [ -e CASE ]; then c=false; else c=true; fi', 'if [ -e "$(printf \'cafe\\314\\201\')" ]; then u=NFC; else u=none; fi',
   'printf \'codeboost-path-identity %s %s\\n\' "$c" "$u"'].join('; ');
 /**
- * The path identity of task storage (#162): how the filesystem the agent edits and the runner inspects tells two
+ * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
  * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
  * container hardened like the seeder. The volume is anonymous and the container `--rm`, so the daemon removes both when
  * the probe exits, even if this process does not live to see it.
@@ -424,7 +425,7 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     .map(field => field.includes(',') ? `"${field}"` : field).join(',');
   const args = ['run', '--rm', '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
-    '--cpus=.25', '--mount', volume, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT];
+    '--cpus=.25', '--mount', volume, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
   const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
   if (outcome.status !== 0) throw new DockerError(args, outcome);
   const answer = /^codeboost-path-identity (true|false) (none|NFC)$/.exec(outcome.stdout.trim());

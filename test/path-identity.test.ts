@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { PATH_IDENTITY_SCRIPT } from '../agents/container/storage.ts';
 import { assertPathIdentity, probePathIdentity } from '../runner/path-identity.ts';
 
 const roots: string[] = [];
@@ -35,5 +37,16 @@ describe('path identity check', () => {
       .toThrow('pathIdentity (caseSensitive true, unicodeNormalization none) does not match the storage (caseSensitive false, unicodeNormalization none). Set pathIdentity to the probed values.');
     expect(() => assertPathIdentity(identity, { ...identity, unicodeNormalization: 'NFC' }, 'the storage'))
       .toThrow('does not match the storage (caseSensitive true, unicodeNormalization NFC)');
+  });
+});
+
+describe('task storage probe script', () => {
+  // The container probe runs this script; here it runs on a host folder whose answer the host probe knows. On a macOS
+  // host (APFS folds both) a script that stopped measuring, and printed a constant, would disagree.
+  it('reports what the host probe reports for the same folder', () => {
+    const root = directory();
+    const out = execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' });
+    const expected = probePathIdentity(root);
+    expect(out).toBe(`codeboost-path-identity ${expected.caseSensitive} ${expected.unicodeNormalization}\n`);
   });
 });
