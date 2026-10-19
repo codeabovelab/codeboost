@@ -149,11 +149,7 @@ describe('production agent adapters', () => {
     const answer = '{ "summary" : "caf\\u00e9 } ] \\" \\\\", "n": [1e20, 1.0, -0E+0],\n "nested": {"a": [{}, []]} }';
     const raw = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"text with } and \\" in it",'
       + `"structured_output":\t${answer}\n, "usage": {"input_tokens": 1}, "end": null}`);
-    // Compared without a diff: on a mismatch, vitest would spend minutes diffing megabyte strings instead of failing.
-    const decoded = parseClaudeOutput(raw, true);
-    expect(decoded.providerFailed).toBe(false);
-    expect(decoded.text.length).toBe(answer.length);
-    expect(decoded.text === answer).toBe(true);
+    expect(parseClaudeOutput(raw, true)).toEqual({ text: answer, providerFailed: false });
     expect(parseClaudeOutput(Buffer.from(`{"subtype":"success","is_error":false,"structured_output":${answer}}`), true).text)
       .toBe(answer);
   });

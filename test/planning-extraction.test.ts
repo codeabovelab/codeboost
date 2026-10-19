@@ -75,7 +75,8 @@ it('returns structured_output as JSON text and ignores Claude\'s prose result', 
 it('extracts 1 MiB of structured output, E2\'s size limit, byte for byte', () => {
   const answer = replyOfSize(MIB), text = extract(structured(answer)).text;
   expect(Buffer.byteLength(text)).toBe(MIB);
-  expect(text).toBe(JSON.stringify(answer));
+  // Compared without a diff, so a broken decoder fails at once rather than in a minutes-long diff of a 1 MiB string.
+  expect(text === JSON.stringify(answer)).toBe(true);
 });
 
 it('passes exactly 1 MiB of extracted text to schema validation, not the size limit', async () => {
