@@ -9,7 +9,7 @@ import { probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung');
+const busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -23,10 +23,11 @@ beforeAll(() => {
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
   // that stopped); each such call is logged in the hung file. Of rm and inspect, the code reads only the exit status
   // and, for a missing name, the "No such container" text; for an existing container this fake prints less stdout
-  // than Docker (the name; the full inspect array), which nothing reads. `unreachable` is the client's own exit 125
-  // with no daemon answer, as Docker 27.4.0 prints it with DOCKER_HOST=tcp://127.0.0.1:1. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
+  // than Docker (the name; the full inspect array), which nothing reads. `unreachable` is a daemon the client cannot
+  // reach: run, rm and inspect answer as Docker 27.4.0 does with DOCKER_HOST=tcp://127.0.0.1:1 (run exit 125; rm
+  // exit 1; inspect `[]` and exit 1, all with "Cannot connect"). `garbled` exits 0 with output that is not one line. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
   // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
-  // CLIs before 20.10 did by the docker/cli changelog (not run here).
+  // CLIs before 20.10 did by the Docker 20.10.0 release notes (docker/cli#2678); no such CLI was run here.
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
 exists() { [ ! -e '${removed}' ] && [ -e '${landAt}' ] && [ "$(date +%s)" -ge "$(cat '${landAt}')" ]; }
@@ -34,7 +35,8 @@ if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) echo 'codeboost-path-identity true none';;
-    unreachable) printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
+    garbled) printf '%s\\n' 'codeboost-path-identity true none' 'extra';;
+    unreachable) echo 1 > '${unreach}'; printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
     late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
@@ -43,6 +45,10 @@ if [ "$1" = run ]; then
 fi
 if [ -e '${hangAt}' ] && [ "$(date +%s)" -ge "$(cat '${hangAt}')" ] && { [ "$1" = rm ] || [ "$1 $2" = "container inspect" ]; }; then
   echo "$1" >> '${hung}'; exec sleep 30
+fi
+if [ -e '${unreach}' ] && { [ "$1" = rm ] || [ "$1 $2" = "container inspect" ]; }; then
+  [ "$1" = rm ] || echo '[]'
+  echo 'Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?' >&2; exit 1
 fi
 if [ "$1" = rm ]; then
   if exists && [ -s '${busy}' ] && [ "$(cat '${busy}')" -gt 0 ]; then
@@ -65,7 +71,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, busy, oldCli, hangAt, hung]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, busy, oldCli, hangAt, hung, unreach]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -178,11 +184,17 @@ describe('task storage probe against Docker answers', () => {
     expect(cleanup.message).toBe(`Docker did not confirm that ${probeName()} is gone.`);
     expect(cleanup.cause).toMatchObject({ status: null, error: { code: 'ETIMEDOUT' } });
   }, 60_000);
-  it('waits out the settle window when docker run exits without a daemon answer', async () => {
-    // Exit 125 from the client itself: with no daemon answer, a create may have been sent and may still land.
+  it('waits out the settle window, then gives up, when docker run exits without a daemon answer', async () => {
+    // Exit 125 from the client itself: with no daemon answer, the probe cannot know no create was sent, and with the
+    // daemon still unreachable nothing can confirm the container is gone.
     writeFileSync(mode, 'unreachable');
     const started = performance.now();
-    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): docker: Cannot connect to the Docker daemon');
+    const failure = await probeTaskStoragePathIdentity(imageId, 60_000, 1_000).catch((error: Error) => error);
+    expect((failure as Error).message).toMatch(/^docker run failed \(exit 125\): docker: Cannot connect to the Docker daemon[^]* The probe container codeboost-path-identity-[0-9a-f-]+ may remain;/);
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
   }, 60_000);
+  it('refuses a probe that exits 0 without exactly one identity line', async () => {
+    writeFileSync(mode, 'garbled');
+    await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('The path identity probe did not report an identity.');
+  });
 });
