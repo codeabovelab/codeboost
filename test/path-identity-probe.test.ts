@@ -66,6 +66,18 @@ describe('task storage probe against Docker answers', () => {
     expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
     expect(removals()).toEqual([]);
   });
+  it('runs on a volume made like task storage, in a container hardened like the keeper', async () => {
+    // Any Linux volume would answer `true none`, so only the arguments show the probe measures what task storage is.
+    writeFileSync(mode, 'answer');
+    await probeTaskStoragePathIdentity(imageId);
+    const run = logged()[0]!, script = run.slice(run.indexOf(' -c ') + 4);
+    expect(run.slice(0, run.indexOf(' -c '))).toBe(`run --rm --name ${probeName()} --read-only --user 10001:10001 --network=none --cap-drop=ALL`
+      + ' --security-opt=no-new-privileges --security-opt=seccomp=builtin --runtime=runc --pids-limit=32 --memory=128m --cpus=.25'
+      + ' --mount type=volume,target=/work,volume-driver=local,volume-opt=type=tmpfs,volume-opt=device=tmpfs,'
+      + '"volume-opt=o=size=1048576,nr_inodes=64,uid=10001,gid=10001,mode=0755,nosuid,nodev"'
+      + ` --entrypoint sh ${imageId}`);
+    expect(script.endsWith(' probe /work')).toBe(true);
+  });
   it('removes its container and volume by name when the daemon refuses the run, and confirms it is gone', async () => {
     writeFileSync(mode, 'refused');
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('docker run failed (exit 125): docker: Error response from daemon: no such runtime');
