@@ -413,8 +413,10 @@ export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(p
 /**
  * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
  * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
- * container hardened like the seeder. The volume is anonymous and the container `--rm`, so the daemon removes both when
- * the probe exits, even if this process does not live to see it.
+ * container hardened like the seeder. The volume is anonymous and the container `--rm`, so once the container has
+ * started the daemon removes both when it exits, even if this process does not live to see it. A client stopped before
+ * then (its deadline) may leave the container created but never started, which `--rm` does not remove: every failed
+ * probe therefore removes its container, and that volume, by the unique name it gave it.
  */
 export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
@@ -423,14 +425,40 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
     // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
     .map(field => field.includes(',') ? `"${field}"` : field).join(',');
-  const args = ['run', '--rm', '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
+  const name = `codeboost-path-identity-${randomUUID()}`;
+  const args = ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
     '--cpus=.25', '--mount', volume, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
   const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
-  if (outcome.status !== 0) throw new DockerError(args, outcome);
+  if (outcome.status !== 0) {
+    const failure = new DockerError(args, outcome);
+    // A client that did not finish leaves the daemon's outcome unknown: a killed create may still land, so only absence
+    // after the settle window counts. A daemon answer settles at once.
+    try { await removeProbeContainer(name, outcome.status === null ? CREATE_SETTLE_MS : 0); }
+    catch (error) {
+      throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
+        { cause: new AggregateError([failure, error]) });
+    }
+    throw failure;
+  }
   const answer = /^codeboost-path-identity (true|false) (none|NFC)$/.exec(outcome.stdout.trim());
   if (!answer) throw new Error('The path identity probe did not report an identity.');
   return { caseSensitive: answer[1] === 'true', unicodeNormalization: answer[2] as PathIdentity['unicodeNormalization'] };
+}
+
+/** Remove a failed probe's container and its anonymous volume by name, until Docker reports it absent. */
+async function removeProbeContainer(name: string, settleMs: number): Promise<void> {
+  const settleBy = performance.now() + settleMs, giveUpAt = performance.now() + settleMs + 30_000;
+  for (;;) {
+    const args = ['rm', '--force', '--volumes', name];
+    const result = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs: 10_000 });
+    // Removed: nothing else can create this name, so the probe is gone.
+    if (result.status === 0) return;
+    if (absent(result) && performance.now() >= settleBy) return;
+    // Absent within the settle window, or a removal Docker refused for now (one already in progress): ask again.
+    if (performance.now() >= giveUpAt) throw new DockerError(args, result);
+    await pause(250);
+  }
 }
 
 /**

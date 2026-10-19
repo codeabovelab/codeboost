@@ -153,7 +153,8 @@ describe('task storage path identity (#162)', () => {
     // Task storage is a tmpfs in the daemon's Linux kernel: case-sensitive, and names are compared as bytes. A macOS
     // host folder would report the reverse, which is why the probe does not read the host.
     expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
-    expect(docker('ps', '-aq', '--filter', `ancestor=${imageId}`, '--filter', 'status=exited')).toBe('');
+    // In any state: a container created but never started would outlive --rm.
+    expect(docker('ps', '-aq', '--filter', 'name=codeboost-path-identity-')).toBe('');
     expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
   }, 120_000);
   it('runs only the image the trusted builder produced', async () => {
