@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION, buildAgentImage } from '../agents/container/image.ts';
-import { probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
+import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 
 // The probe's own handling of Docker's answers (#162), against a `docker` on PATH that answers as the daemon would. The
 // measurement itself runs against real Docker in runner-workspace.test.ts.
@@ -94,7 +94,8 @@ describe('task storage probe against Docker answers', () => {
       + ' --mount type=volume,target=/work,volume-driver=local,volume-opt=type=tmpfs,volume-opt=device=tmpfs,'
       + '"volume-opt=o=size=1048576,nr_inodes=64,uid=10001,gid=10001,mode=0755,nosuid,nodev"'
       + ` --entrypoint sh ${imageId}`);
-    expect(script.endsWith(' probe /work')).toBe(true);
+    // The measuring script itself: a constant printed instead would pass on any Linux volume.
+    expect(script).toBe(`${PATH_IDENTITY_SCRIPT} probe /work`);
   });
   it('removes its container and volume by name when the daemon refuses the run, and confirms it is gone', async () => {
     writeFileSync(mode, 'refused');
