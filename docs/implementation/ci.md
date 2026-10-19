@@ -212,7 +212,7 @@ To run the live probes locally, set `CODEBOOST_RUN_AUTH_PROBES=1` and
 ## T9 status
 
 T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
-2026-10-19. The evidence:
+2026-10-19. All dates here are UTC. The evidence:
 
 1. Since 2026-10-19, the active repository ruleset "main checks" requires
    `test` and `real-docker` on `main`. It does not require `live-probes`, by
@@ -225,8 +225,8 @@ T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
 3. The `CLAUDE_CODE_OAUTH_TOKEN` secret exists. A `live-probes` run started by
    hand on 2026-10-19 on `main` at `ba8294d`
    [passed](https://github.com/codeabovelab/codeboost/actions/runs/39206371497),
-   and its report check printed "All 4 live Claude probes passed." The nightly
-   runs are now scheduled.
+   and its report check printed "All 4 live Claude probes passed." Nightly
+   runs start at 06:23 UTC.
 
 The probes are Claude-only, because Codex is refused in every phase (#93).
 
