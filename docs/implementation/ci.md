@@ -212,7 +212,7 @@ To run the live probes locally, set `CODEBOOST_RUN_AUTH_PROBES=1` and
 ## T9 status
 
 T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
-2026-10-19. All dates here are UTC. The evidence:
+2026-10-19. The evidence:
 
 1. Since 2026-10-19, the active repository ruleset "main checks" requires
    `test` and `real-docker` on `main`. It does not require `live-probes`, by
@@ -220,8 +220,9 @@ T9 in the [plan](../designs/codeboost-plan-indexed-review.md) is complete as of
 2. Both required jobs passed on the same head, `ba8294d` on `main` (the F6c
    merge, PR #177): [`test`](https://github.com/codeabovelab/codeboost/actions/runs/39115311602)
    and [`real-docker`](https://github.com/codeabovelab/codeboost/actions/runs/39115311588).
-   These runs came before the ruleset existed. From the pull request that
-   records this status on, every merge into `main` must pass both under it.
+   These runs came before the ruleset existed. Every merge into `main` from
+   now on, starting with the pull request that records this status, must pass
+   both required checks.
 3. The `CLAUDE_CODE_OAUTH_TOKEN` secret exists. A `live-probes` run started by
    hand on 2026-10-19 on `main` at `ba8294d`
    [passed](https://github.com/codeabovelab/codeboost/actions/runs/39206371497),

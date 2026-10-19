@@ -416,7 +416,7 @@ against real Docker, including two reviews with different Ask owners on one daem
   startup path. Start the workflow by hand, or run the probes locally, before a release
   that changes the image, the adapters or the prompts. Codex has no live probe while it
   is refused in every phase (#93).
-- T9 as a whole is complete as of 2026-10-19 (UTC). `test` and `real-docker` are
+- T9 as a whole is complete as of 2026-10-19. `test` and `real-docker` are
   required on `main`, both passed on the same head (before the checks were required),
   and a `Live probes` run passed. [CI](ci.md#t9-status) gives the evidence and says how
   to keep it green.
