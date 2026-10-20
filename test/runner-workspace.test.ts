@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
-import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -14,11 +14,13 @@ import { attemptRef, openRunnerRepository } from '../runner/runner-repository.ts
 import { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import { createTaskWorkspace } from '../runner/workspace.ts';
+import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
 import { fixtureGit as git } from './fixtures/git.ts';
 
 // F2b against the real lane D (#87): each item runs in fresh task storage cloned from the runner-owned repository, an
 // agent edits the work volume, and the runner's audited commit is taken into that repository for the next item.
-const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+// Each run has its own runner owner, so the sweep after this file removes only what this run left behind.
+const RUNNER_OWNER = randomBytes(16).toString('hex');
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const plan: Plan = { schema_version: 1, issue: 1, revision: 1, summary: 'Two items', questions: [], items: [
   { id: 'P1', title: 'First', intent: 'Change a', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'x' }], acceptance: [{ type: 'check', text: 'a' }], depends_on: [] },
@@ -29,9 +31,15 @@ let imageId = '';
 const roots: string[] = [], stores: Store[] = [];
 beforeAll(() => { imageId = buildAgentImage(); }, 10 * 60_000);
 afterAll(() => {
-  for (const store of stores) store.close();
-  for (const root of roots) rmSync(root, { recursive: true, force: true });
-});
+  try {
+    for (const store of stores) store.close();
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  } finally {
+    // Then remove the task storage this run still owns, even when a test failed or the cleanup above threw. The path
+    // identity probe carries no owner labels, so it is not found here. It may not run before a hook timeout.
+    removeRunnerObjects(RUNNER_OWNER);
+  }
+}, 4 * 60_000);
 const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 async function setup(agent: Record<string, string>) {
@@ -148,22 +156,62 @@ describe('real task workspace (#87)', () => {
 });
 
 describe('task storage path identity (#162)', () => {
-  // Only volumes made with the probe's own tmpfs options count, so other users of the daemon do not change the result.
-  // Precondition: no other probe runs on this daemon during the test (another runner's startup, or this file run from
-  // another checkout); its short-lived container and volume would match too. The docker project runs files one at a
-  // time, and no other file probes.
-  const probeVolumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean).filter(volume => {
-    try { return docker('volume', 'inspect', '--format', '{{json .Options}}', volume).includes('size=1048576,nr_inodes=64,'); }
-    catch { return false; } // removed between the listing and the inspect
-  }));
+  // The probe names its container itself and gives it an anonymous volume, with no labels. This test finds both from
+  // the name the probe gave: a shim on PATH records it, and the daemon's events give that container's ID and the
+  // volumes mounted in it. Another probe on the daemon (another runner's startup, or this file run from another
+  // checkout) or a container a dead runner left behind does not count.
+  async function watchedProbe() {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')); roots.push(shim);
+    const names = join(shim, 'names'), realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // Not a fake: it records each `--name` value and runs the real docker with the same arguments, so every exit
+    // status, stdout and stderr the probe reads is Docker's own.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'prev=',
+      `for arg; do if [ "$prev" = --name ]; then printf '%s\\n' "$arg" >> '${names}'; fi; prev="$arg"; done`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    // --since replays from the daemon's event buffer, so nothing between this call and the stream's start is lost. The
+    // minute of margin covers a daemon clock behind this one; it is harmless, as events are matched by the probe's own
+    // name and IDs.
+    const events: { Type: string; Action: string; Actor: { ID: string; Attributes: Record<string, string> } }[] = [];
+    const stream = spawn(realDocker, ['events', '--since', String(Math.floor(Date.now() / 1000) - 60), '--format',
+      '{{json .}}', '--filter', 'type=container', '--filter', 'type=volume'], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let buffered = '';
+    stream.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      const lines = (buffered + chunk).split('\n'); buffered = lines.pop()!;
+      for (const line of lines) if (line) events.push(JSON.parse(line));
+    });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try {
+      const identity = await probeTaskStoragePathIdentity(imageId);
+      const recorded = readFileSync(names, 'utf8').split('\n').filter(Boolean);
+      expect(recorded).toEqual([expect.stringMatching(/^codeboost-path-identity-[0-9a-f-]{36}$/)]);
+      const container = () => events.find(event => event.Type === 'container' && event.Action === 'create'
+        && event.Actor.Attributes.name === recorded[0])?.Actor.ID;
+      const volumes = () => [...new Set(events.filter(event => event.Type === 'volume' && event.Action === 'mount'
+        && event.Actor.Attributes.container === container()).map(event => event.Actor.ID))];
+      // Wait for the daemon to report the container and its volumes destroyed, for up to 10 s; absence is still
+      // proved by inspect below, so a destroy that never comes fails there.
+      const destroyed = (type: string, id: string | undefined) =>
+        events.some(event => event.Type === type && event.Action === 'destroy' && event.Actor.ID === id);
+      for (const until = performance.now() + 10_000; performance.now() < until;) {
+        if (container() && volumes().length && destroyed('container', container())
+          && volumes().every(volume => destroyed('volume', volume))) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      return { identity, container: container(), volumes: volumes() };
+    } finally { process.env.PATH = path; stream.kill(); }
+  }
   it('measures the tmpfs the agent edits, whatever the host folds, and leaves no container or volume behind', async () => {
-    const before = probeVolumes();
+    const probe = await watchedProbe();
     // Task storage is a tmpfs in the daemon's Linux kernel: case-sensitive, and names are compared as bytes. A macOS
     // host folder would report the reverse, which is why the probe does not read the host.
-    expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
+    expect(probe.identity).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
+    // The events found the probe's container and its one volume, so the absence checks below look at real objects.
+    expect(probe.container).toMatch(/^[0-9a-f]{64}$/);
+    expect(probe.volumes).toEqual([expect.stringMatching(/^[0-9a-f]{64}$/)]);
     // In any state: a container created but never started would outlive --rm.
-    expect(docker('ps', '-aq', '--filter', 'name=codeboost-path-identity-')).toBe('');
-    expect([...probeVolumes()].filter(volume => !before.has(volume))).toEqual([]);
+    expect(() => docker('container', 'inspect', probe.container!)).toThrow(/No such container/);
+    expect(() => docker('volume', 'inspect', probe.volumes[0]!)).toThrow(/no such volume/i);
   }, 120_000);
   it('removes a never-started probe container and its volume with the cleanup\'s own rm', () => {
     // The failure path's claim: a container created but never started (a killed client) loses its anonymous volume to
