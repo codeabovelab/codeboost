@@ -265,7 +265,8 @@ describe('task storage probe against Docker answers', () => {
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('may remain');
     const elapsed = performance.now() - started;
+    // 10 s settle + 30 s of asks; each fake call answers at once, so the overshoot is the last pause and call.
     expect(elapsed).toBeGreaterThanOrEqual(40_000);
-    expect(elapsed).toBeLessThan(50_000);
+    expect(elapsed).toBeLessThan(43_000);
   }, 90_000);
 });
