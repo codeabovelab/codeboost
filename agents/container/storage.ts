@@ -425,7 +425,7 @@ export const PROBE_VOLUME_MOUNT = ['type=volume', 'target=/work', 'volume-driver
  * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
  * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). A recovery sweep is #181.
  */
-export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = 30_000): Promise<PathIdentity> {
+export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = PROBE_CLEANUP_MS): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
   assertBuiltAgentImage(imageId);
   const name = `codeboost-path-identity-${randomUUID()}`;
@@ -442,7 +442,7 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     // the create was sent, exit 125 from the client) leaves the daemon's outcome unknown: a create may still land, so
     // only absence after the settle window counts.
     const refused = outcome.status !== null && /Error response from daemon/.test(outcome.stderr);
-    try { await removeProbeContainer(name, refused ? 0 : CREATE_SETTLE_MS, cleanupMs); }
+    try { await removeProbeContainer(name, refused ? 0 : PROBE_SETTLE_MS, cleanupMs); }
     catch (error) {
       throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
         { cause: new AggregateError([failure, error]) });
@@ -454,12 +454,16 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
   return { caseSensitive: answer[1] === 'true', unicodeNormalization: answer[2] as PathIdentity['unicodeNormalization'] };
 }
 
+/** One cleanup call's deadline: the time left before giving up, capped at 10 s and at least 1 s. */
+export const probeCleanupCallMs = (leftMs: number): number => Math.min(10_000, Math.max(1_000, Math.ceil(leftMs)));
+/** How long a failed probe's cleanup waits for an outcome Docker did not report (a killed client's create may land). */
+export const PROBE_SETTLE_MS = CREATE_SETTLE_MS;
+/** How long a failed probe's cleanup keeps asking after its settle window before it gives up. */
+export const PROBE_CLEANUP_MS = 30_000;
 /**
  * Remove a failed probe's container and its anonymous volume by name. `rm --force` exits 0 for a name that does not
  * exist, so only an inspect that reports the name absent, after the settle window, proves the probe is gone.
  */
-/** One cleanup call's deadline: the time left before giving up, capped at 10 s and at least 1 s. */
-export const probeCleanupCallMs = (leftMs: number): number => Math.min(10_000, Math.max(1_000, Math.ceil(leftMs)));
 async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
   let last: DockerOutcome | undefined;
