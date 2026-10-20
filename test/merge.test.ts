@@ -1781,7 +1781,9 @@ it.each([
   ['the 404 a token without admin rights gets', ghExit('gh: Not Found (HTTP 404)',
     `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), false],
   ['a 404 whose body is not JSON', ghExit('gh: Branch not protected (HTTP 404)', ''), false],
-  ['a 404 message that gh did not answer', new Error('HTTP 404: Branch not protected'), false],
+  // Not a gh exit, though it carries GitHub's body: only gh's own answer confirms the absence.
+  ['a 404 message that gh did not answer', Object.assign(new Error('HTTP 404: Branch not protected'),
+    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), false],
 ] as const)('reads a protected branch\'s classic protection as absent only for %s', async (_case, answer, known) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
