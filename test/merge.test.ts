@@ -944,10 +944,11 @@ it('parses required checks from both rule sources and pins the gh merge head', a
 /**
  * The hand-written gh answers of the T6 and T12 tests below (`changingRules`, the required-reviews test and the
  * classic-protection 404 table) follow the shapes in test/fixtures/gh/, recorded with gh 2.102.0: exit 0 with the JSON
- * on stdout, or, for an HTTP error, a CommandFailed as runWithInput reports it (`ghExit`). Each answer carries only the
- * fields the gateway reads on that test's path, and leaves out:
- * - the pull request's `url` (read when present, only for display) and rollup fields such as `__typename`, `detailsUrl`
- *   and `workflowName`;
+ * on stdout, or, for an HTTP error, a CommandFailed as runWithInput reports it (`ghExit`). Each answer carries the
+ * fields the gateway reads on that test's path, with a few it ignores (such as a branch's `name`, a rollup entry's
+ * `__typename`, or the review rules a test is about), and leaves out:
+ * - the pull request's `url` (read when present, only for display) and, unless given, rollup fields such as
+ *   `__typename`, `detailsUrl` and `workflowName`;
  * - each rule's `ruleset_source_type`, `ruleset_source`, `ruleset_id` and, for checks, `do_not_enforce_on_create`;
  * - the branch's `commit` and links, and its `protection` where the protection read succeeds (the gateway reads
  *   `protection.enabled` only after that read answers "Branch not protected");
