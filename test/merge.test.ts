@@ -946,7 +946,8 @@ it('parses required checks from both rule sources and pins the gh merge head', a
  * and `rules.classic` are the required check names each rule source returns now; `ci` runs fail and `lint` statuses pass.
  * Shaped as gh 2.102.0 answers (test/fixtures/gh/): ruleset checks any app may report carry no `integration_id`. Left out,
  * as the gateway does not read them: the branch's fields other than `protected`, protection's fields other than
- * `required_status_checks`, and rollup fields other than name, status, conclusion and times.
+ * `required_status_checks`, rollup fields other than name, status, conclusion and times, and `gh pr merge`'s stderr
+ * (it answers exit 0 with empty output; the gateway reads only the exit status).
  */
 function changingRules(rules: { ruleset: string[]; classic: string[] }) {
   const reads = { ruleset: 0, classic: 0, merges: 0 };
@@ -1808,26 +1809,32 @@ it('does not let an inspection started before merge repopulate the cache', async
 const ghExit = (stderr: string, stdout: string) =>
   new CommandFailed(`gh failed (exit 1): ${stderr}${stdout ? `\n${stdout}` : ''}`, stderr, stdout);
 const PROTECTION_DOCS = 'https://docs.github.com/rest/branches/branch-protection#get-branch-protection';
+const NOT_PROTECTED = ghExit('gh: Branch not protected (HTTP 404)', `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}`);
+/** The branch read's `protection` as GitHub gives it for a branch with classic protection off (recorded in test/fixtures/gh/). */
+const CLASSIC_OFF = { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } };
 it.each([
   // As recorded in test/fixtures/gh/ for a branch only a ruleset covers.
-  ['GitHub\'s "Branch not protected" answer', 'absent', ghExit('gh: Branch not protected (HTTP 404)',
-    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), true],
+  ['GitHub\'s "Branch not protected" answer with classic protection off', 'absent', NOT_PROTECTED, CLASSIC_OFF, true],
+  // The branch read must agree: a "Branch not protected" answer alone does not show that no classic rule applies.
+  ['a "Branch not protected" answer while the branch shows classic protection on', 'unknown (fail closed)', NOT_PROTECTED,
+    { ...CLASSIC_OFF, enabled: true }, false],
+  ['a "Branch not protected" answer while the branch read has no protection', 'unknown (fail closed)', NOT_PROTECTED, undefined, false],
   // GitHub's answer to a token without admin rights on a protected branch (cli/cli trunk, read 2026-10-20).
   ['the 404 a token without admin rights gets', 'unknown (fail closed)', ghExit('gh: Not Found (HTTP 404)',
-    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), false],
+    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), CLASSIC_OFF, false],
   ['a "Branch not protected" body without a 404 status', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)',
-    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), false],
-  ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), false],
+    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_OFF, false],
+  ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), CLASSIC_OFF, false],
   // Not a gh exit, though it carries GitHub's body: only gh's own answer confirms the absence.
   ['a 404 message that gh did not answer', 'unknown (fail closed)', Object.assign(new Error('HTTP 404: Branch not protected'),
-    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), false],
-] as const)('for %s, reads a protected branch\'s classic protection as %s', async (_case, _reads, answer, known) => {
+    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), CLASSIC_OFF, false],
+] as const)('for %s, reads a protected branch\'s classic protection as %s', async (_case, _reads, answer, protection, known) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     // A ruleset check with no `integration_id`, as GitHub sends one that any app may report.
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test' }] } }]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true, ...(protection ? { protection } : {}) });
     if (joined.endsWith('/protection')) throw answer;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);

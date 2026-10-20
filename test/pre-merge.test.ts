@@ -132,8 +132,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringCommand?: (service: ReviewService) => void;
   /** Runs after a command check's terminal write, while the runner releases its workspace. */
   duringRelease?: (service: ReviewService) => void;
-  /** The exit code of each command check, read when it runs; replaces `commandExit` when given. */
-  commandResult?: () => number;
+  /** The exit code of each command check, given the head it checks; replaces `commandExit` when given. */
+  commandResult?: (head: string) => number;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -239,7 +239,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
           signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
       } } satisfies InvocationHandle;
     }
-    const exitCode = options.commandResult?.() ?? commandExit ?? 0;
+    const exitCode = options.commandResult?.(checkedHeads.at(-1)!) ?? commandExit ?? 0;
     return { attemptId: input.attemptId,
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode,
         signal: null, stdout: '', stderr: exitCode ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
@@ -1862,6 +1862,24 @@ it('fails the job when a command check breaks on the rewritten head', async () =
   const f = await mergeJob('feature\n', 1);
   await f.start();
   expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
+it('fails the job when the moved base itself breaks the command check on the rewritten head', async () => {
+  // The check fails only on a head that holds the base's new file b.txt, as a test would that main's change breaks.
+  const hasFile = (repository: string, head: string, path: string) => {
+    try { fixtureGit(repository, 'cat-file', '-e', `${head}:${path}`); return true; } catch { return false; }
+  };
+  let repository = '';
+  const f = await mergeJob('feature\n', 0, { commandResult: head => hasFile(repository, head, 'b.txt') ? 1 : 0 });
+  repository = f.service.config.repository;
+  // The reviewed head does not hold it, so the check would pass there; the rebase brings it in.
+  expect(hasFile(repository, (await f.service.load()).snapshot.head, 'b.txt')).toBe(false);
+  expect(hasFile(repository, f.rebased, 'b.txt')).toBe(true);
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
+  expect(f.checkedHeads).toEqual([f.rebased]);
   expect(f.merged).toEqual([]);
   await f.close();
 });

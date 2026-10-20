@@ -21,7 +21,7 @@
         "repos/codeabovelab/codeboost/branches/main"
       ],
       "exitCode": 0,
-      "stdout": "{\"name\":\"main\",\"protected\":true}",
+      "stdout": "{\"name\":\"main\",\"protected\":true,\"protection\":{\"enabled\":false,\"required_status_checks\":{\"enforcement_level\":\"off\",\"contexts\":[],\"checks\":[]}}}",
       "stderr": ""
     },
     {

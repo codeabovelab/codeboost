@@ -21,7 +21,7 @@
         "repos/codeabovelab/codeboost/branches/feat%2Fd-gitlink-mounts-81"
       ],
       "exitCode": 0,
-      "stdout": "{\"name\":\"feat/d-gitlink-mounts-81\",\"protected\":false}",
+      "stdout": "{\"name\":\"feat/d-gitlink-mounts-81\",\"protected\":false,\"protection\":{\"enabled\":false,\"required_status_checks\":{\"enforcement_level\":\"off\",\"contexts\":[],\"checks\":[]}}}",
       "stderr": ""
     },
     {

@@ -347,7 +347,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     let classic: unknown | null = null;
     try {
       rules = flattenPages(await this.#json(['api','--paginate','--slurp',`repos/${this.config.repository}/rules/branches/${branch}`], signal));
-      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as { protected?: unknown };
+      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as
+        { protected?: unknown; protection?: { enabled?: unknown } | null };
       if (typeof branchState.protected !== 'boolean') throw new Error('GitHub returned an incomplete branch state.');
       let protection: unknown | null = null, unprotected = false;
       try { protection = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}/protection`], signal); }
@@ -356,10 +357,12 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         unprotected = branchNotProtected(error);
       }
       if (protection === null) {
-        // `protected` is also true when only a ruleset applies; GitHub then answers 404 "Branch not protected" here
-        // (recorded in test/fixtures/gh/). Any other 404 on a protected branch may hide classic rules (a token without
-        // admin rights gets "Not Found"): fail closed.
-        if (branchState.protected && !unprotected) throw new Error('Branch protection is present but unreadable.');
+        // `protected` is also true when only a ruleset applies; GitHub then answers 404 "Branch not protected" here, and
+        // the branch read shows classic protection off (`protection.enabled` false; both recorded in test/fixtures/gh/).
+        // Anything else on a protected branch may hide classic rules (a token without admin rights gets "Not Found"):
+        // fail closed.
+        const classicOff = unprotected && branchState.protection?.enabled === false;
+        if (branchState.protected && !classicOff) throw new Error('Branch protection is present but unreadable.');
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
         throw new Error('GitHub returned incomplete branch protection.');
       } else {
