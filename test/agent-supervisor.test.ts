@@ -77,16 +77,20 @@ afterAll(async () => {
     }
   } finally {
     // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
-    // ignores SIGTERM, or storage whose removal did not settle. A hook timeout skips this. Containers go first, as
-    // they hold the others in use. Each removal is reported, so a leak is not hidden.
+    // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout. Containers go
+    // first, as they hold the others in use. What it finds, and any Docker call that fails, is reported.
+    const run = (args: string[]) => {
+      const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
+      if (result.status !== 0) console.warn(`afterAll: docker ${args.slice(0, 2).join(' ')} failed:`,
+        result.error?.message ?? result.stderr.trim());
+      return result.status === 0 ? result.stdout.split('\n').filter(Boolean) : [];
+    };
     for (const kind of ['container', 'network', 'volume'] as const) {
-      const ids = spawnSync('docker', [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter',
-        `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' })
-        .stdout?.split('\n').filter(Boolean) ?? [];
+      const ids = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter',
+        `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`]);
       if (!ids.length) continue;
       console.warn(`afterAll removes this run's leftover ${kind}s: ${ids.join(' ')}`);
-      spawnSync('docker', [kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids],
-        { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
+      run([kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids]);
     }
   }
 }, 3 * 60_000);

@@ -636,15 +636,13 @@ describe('real Docker agent isolation', () => {
   };
 
   it('rejects a vendor network or proxy without its runner label, and removes them', async () => {
-    // Counted by allocation, not by runner: these networks are created without the runner label on purpose.
+    // Counted by allocation, not by runner: first the network, then the proxy, is made without the runner label.
     const data = fixture(), allocations = [randomUUID(), randomUUID()];
-    const egress = () => allocations.map(allocation => docker('network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress',
-      '--filter', `label=io.codeboost.allocation=${allocation}`)).join('');
     await withoutRunnerLabel([['network', 'create']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
       imageId, allocations[0]!)).rejects.toThrow('changed after allocation'));
     await withoutRunnerLabel([['create', '--name']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
       imageId, allocations[1]!)).rejects.toThrow('changed after allocation'));
-    expect(egress()).toBe('');
+    expect(allocations.flatMap(byAllocation)).toEqual([]);
   }, 120_000);
 
   // Storage has no captured IDs, so cleanup refuses an object without every owner label; the test removes its own.
