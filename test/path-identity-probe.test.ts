@@ -128,7 +128,8 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(mode, 'late');
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('client killed or not started');
-    expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
+    // The window starts when the client is stopped (its 2 s deadline), not when it was started.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(2_000 + 10_000);
     // The interleaving this test is about: nothing at the first rm, and a later rm removed what landed.
     const rms = readFileSync(rmLog, 'utf8').trim().split('\n');
     expect(rms[0]).toBe('missing');
