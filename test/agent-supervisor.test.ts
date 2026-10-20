@@ -54,9 +54,9 @@ function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlin
       referencedCodeHash: 'code', stateVersion: 1 } });
 }
 async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
-  attempt: string | InvocationInput = `attempt-${Math.random()}`, deadlineMs = 2 * 60_000, deferredOutput = false) {
+  attemptId: string | InvocationInput = `attempt-${Math.random()}`, deadlineMs = 2 * 60_000, deferredOutput = false) {
   // An attempt can be captured once, so a duplicate-attempt profile reuses the captured invocation.
-  const captured = typeof attempt === 'string' ? invocation(data, attempt, deadlineMs) : attempt;
+  const captured = typeof attemptId === 'string' ? invocation(data, attemptId, deadlineMs) : attemptId;
   const policy = createPhasePolicy(captured);
   const network = await createVendorNetwork(captured, imageId, randomUUID());
   const value = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
@@ -76,13 +76,16 @@ afterAll(async () => {
       rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   } finally {
-    // Then remove whatever this run still owns, even when a test or the cleanup above failed first: an agent that
-    // ignores SIGTERM, or storage whose removal did not settle. Containers go first, as they hold the others in use.
+    // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
+    // ignores SIGTERM, or storage whose removal did not settle. A hook timeout skips this. Containers go first, as
+    // they hold the others in use. Each removal is reported, so a leak is not hidden.
     for (const kind of ['container', 'network', 'volume'] as const) {
       const ids = spawnSync('docker', [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter',
         `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' })
         .stdout?.split('\n').filter(Boolean) ?? [];
-      if (ids.length) spawnSync('docker', [kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids],
+      if (!ids.length) continue;
+      console.warn(`afterAll removes this run's leftover ${kind}s: ${ids.join(' ')}`);
+      spawnSync('docker', [kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids],
         { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
     }
   }
