@@ -9,14 +9,15 @@ import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/co
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable');
+const busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
   mkdirSync(bin, { mode: 0o700 });
   const image = JSON.stringify([{ Id: `sha256:${'b'.repeat(64)}`, Config: { User: '10001:10001', Labels: { 'org.opencontainers.image.base.name': BASE_IMAGE,
     'io.codeboost.codex.version': CODEX_VERSION, 'io.codeboost.claude.version': CLAUDE_VERSION, 'io.codeboost.profile.version': '1' } } }]);
-  // `run`: per the mode file, answer, refuse as the daemon does, or hang until the client is killed. In `late` mode the
+  // `run`: per the mode file, answer (the identity file's line if there is one, as a filesystem other than tmpfs would
+  // answer; otherwise tmpfs's), refuse as the daemon does, or hang until the client is killed. In `late` mode the
   // create lands two seconds later, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm of a container that exists refuses as Docker does while an auto-remove is in
@@ -34,7 +35,7 @@ exists() { [ ! -e '${removed}' ] && [ -e '${landAt}' ] && [ "$(date +%s)" -ge "$
 if [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; exit 0; fi
 if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
-    answer) echo 'codeboost-path-identity true none';;
+    answer) if [ -e '${identity}' ]; then cat '${identity}'; else echo 'codeboost-path-identity true none'; fi;;
     garbled) printf '%s\\n' 'codeboost-path-identity true none' 'extra';;
     unreachable) echo 1 > '${unreach}'; printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
@@ -71,7 +72,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, busy, oldCli, hangAt, hung, unreach]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -198,4 +199,20 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(mode, 'garbled');
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('The path identity probe did not report an identity.');
   });
+  it.each([
+    ['false none', { caseSensitive: false, unicodeNormalization: 'none' }],
+    ['true NFC', { caseSensitive: true, unicodeNormalization: 'NFC' }],
+    ['false NFC', { caseSensitive: false, unicodeNormalization: 'NFC' }],
+  ] as const)('reports what the container measured: %s', async (line, expected) => {
+    // Each field on its own: a probe that returned tmpfs's answer whatever the container said would fail here.
+    writeFileSync(mode, 'answer'); writeFileSync(identity, `codeboost-path-identity ${line}\n`);
+    expect(await probeTaskStoragePathIdentity(imageId)).toEqual(expected);
+  });
+  it('cuts each cleanup call at 10 s, so a daemon that answers again is asked again', async () => {
+    // A killed client (10 s settle window), then every rm and inspect hangs. With the cap the first call is cut at
+    // 10 s and a second runs until giving up; without it the first would hang all the way to the give-up time.
+    writeFileSync(mode, 'hang'); writeFileSync(hangAt, '0');
+    await expect(probeTaskStoragePathIdentity(imageId, 500, 2_000)).rejects.toThrow('may remain');
+    expect(readFileSync(hung, 'utf8').trim().split('\n')).toEqual(['rm', 'container']);
+  }, 60_000);
 });
