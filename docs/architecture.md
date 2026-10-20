@@ -269,7 +269,7 @@ sequenceDiagram
 ### Flow 3: approve and merge (built)
 
 1. You approve each plan item. The store saves a fingerprint of the lines, file-change metadata, the item's definition and its function context.
-2. You press **Merge PR** (the design's Approve & merge). The browser sends only the state token.
+2. You press **Merge PR** (the design's Approve & merge). The browser sends only the state token and an action ID. With a runner, the click starts one merge job: it prepares the merge (rebase if needed, push, `cmd:` checks) and waits up to 30 minutes for required checks, then runs steps 3–6 ([merge handoff](implementation/merge-handoff.md)). Without a runner, steps 3–6 run at once.
 3. `runner/merge.ts` reloads everything itself and checks local blockers: unapproved or stale items, out-of-scope files, Ambiguous or Unplanned segments, open change requests, missing `cmd:` results.
 4. `github/merge.ts` reads the pull request, rulesets, branch protection and required checks, and runs the same already-fixed check as the pre-PR step (`github/already-fixed.ts`). Anything unreadable or malformed blocks the merge.
 5. The coordinator runs the gate a second time, confirms the same base and head, and re-reads the local generation.
