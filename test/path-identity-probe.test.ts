@@ -128,8 +128,10 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(mode, 'late');
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('client killed or not started');
-    // The window starts when the client is stopped (its 2 s deadline), not when it was started.
-    expect(performance.now() - started).toBeGreaterThanOrEqual(2_000 + 10_000);
+    // The window starts when the client is stopped and ends 10 s later: the first absent answer after it is accepted.
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(2_000 + 10_000);
+    expect(elapsed).toBeLessThan(2_000 + 10_000 + 2_500);
     // The interleaving this test is about: nothing at the first rm, and a later rm removed what landed.
     const rms = readFileSync(rmLog, 'utf8').trim().split('\n');
     expect(rms[0]).toBe('missing');
@@ -149,7 +151,10 @@ describe('task storage probe against Docker answers', () => {
   });
   it('gives up when Docker keeps reporting the container, and names it for the person to remove', async () => {
     writeFileSync(mode, 'created'); writeFileSync(busy, '100000');
+    const started = performance.now();
     const failure = await probeTaskStoragePathIdentity(imageId, 2_000, 1_000).catch((error: Error) => error);
+    // Giving up is counted from the end of the settle window, which starts when the client is stopped.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(2_000 + 10_000 + 1_000);
     // The interleaving this test is about: the create landed before the client was killed.
     expect(existsSync(landAt)).toBe(true);
     const name = probeName();
