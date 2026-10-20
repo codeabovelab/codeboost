@@ -163,8 +163,9 @@ describe('task storage path identity (#162)', () => {
   async function watchedProbe() {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')); roots.push(shim);
     const names = join(shim, 'names'), realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
-    // Not a fake: it records each `--name` value and runs the real docker with the same arguments, so every exit
-    // status, stdout and stderr the probe reads is Docker's own.
+    // Not a fake: it records the argument after each separate `--name` (the form the probe uses; if that changed, no name
+    // is recorded and the test fails) and runs the real docker with the same arguments, so every exit status, stdout
+    // and stderr the probe reads is Docker's own.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'prev=',
       `for arg; do if [ "$prev" = --name ]; then printf '%s\\n' "$arg" >> '${names}'; fi; prev="$arg"; done`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });

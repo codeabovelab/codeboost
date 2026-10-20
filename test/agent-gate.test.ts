@@ -31,14 +31,20 @@ const probeScript = (phase: Phase, probe: IsolationProbe) => {
 const seedRepository = 'git init -q /work && git -C /work -c user.name=gate -c user.email=gate@example.com '
   + 'commit -q --allow-empty -m seed';
 // A client killed by SIGTERM passes the signal to the container's shell, which ignores it, and waits; SIGKILL ends the
-// client at the timeout instead, and leaves the container to the sweep, which finds it by its runner label.
-const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => spawnSync('docker', ['run',
-  '--rm', '--label', `${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`, '--network=none', '--user', '10001:10001',
-  '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
-  ...(mounts.some(mount => mount.startsWith('/home/codeboost:')) ? []
-    : ['--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700']),
-  '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
-{ encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
+// client at the timeout instead, and leaves the container to the sweep, which finds it by its runner label. A killed
+// client has no exit status, which the cases' `not.toBe(0)` checks would accept, so it throws: a hung probe fails.
+const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => {
+  const result = spawnSync('docker', ['run', '--rm', '--label', `${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`,
+    '--network=none', '--user', '10001:10001', '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
+    ...(mounts.some(mount => mount.startsWith('/home/codeboost:')) ? []
+      : ['--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700']),
+    '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
+  { encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (result.error || result.status === null)
+    throw new Error(`docker run did not exit: ${result.error?.message ?? `signal ${result.signal}`}`,
+      { cause: result.error });
+  return result;
+};
 const tmpfs = (target: string, options: string) => ['--tmpfs', `${target}:rw,uid=10001,gid=10001,${options}`];
 const bounded = tmpfs('/work', 'size=16m,nr_inodes=512');
 const writableMetadata = tmpfs('/work/.git', 'size=16m,nr_inodes=512');
