@@ -112,8 +112,8 @@ async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) 
   const merges: string[][] = [], unrecorded: string[][] = [], ruleReads = { ruleset: 0, classic: 0 };
   const run: RunGh = async (args, options) => {
     // `gh pr merge` was not recorded: it would merge the pull request. This fake answers exit 0 with empty stdout and
-    // stderr, leaving out whatever gh prints; the gateway reads only the exit status (github/merge.ts `merge`), checked
-    // against gh 2.102.0, the version of the recordings.
+    // stderr, leaving out whatever gh prints; the gateway reads only the exit status (github/merge.ts `merge`). It
+    // stands for gh 2.102.0, the recordings' version, which exits 0 only when its command succeeds.
     if (args[0] === 'pr' && args[1] === 'merge') { merges.push([...args]); return ''; }
     if (args[0] === 'pr' && args[1] === 'view') pullViews++;
     if (args.some(arg => arg.includes('/rules/branches/'))) ruleReads.ruleset++;
