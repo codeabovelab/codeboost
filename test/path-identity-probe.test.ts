@@ -9,7 +9,7 @@ import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/co
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
+const slow = join(root, 'slow'), busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -22,11 +22,11 @@ beforeAll(() => {
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm of a container that exists refuses as Docker does while an auto-remove is in
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
-  // that stopped); each such call is logged in the hung file. Of rm and inspect, the code reads only the exit status
+  // that stopped); each such call is logged in the hung file. With the slow file, rm and inspect answer after 300 ms. Of rm and inspect, the code reads only the exit status
   // and, for a missing name, the "No such container" text; for an existing container this fake prints less stdout
   // than Docker (the name; the full inspect array), which nothing reads. `unreachable` is a daemon the client cannot
   // reach: run, rm and inspect answer as Docker 27.4.0 does with DOCKER_HOST=tcp://127.0.0.1:1 (run exit 125; rm
-  // exit 1; inspect `[]` and exit 1, all with "Cannot connect"). `garbled` exits 0 with output that is not one line. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
+  // exit 1; inspect `[]` and exit 1, all with "Cannot connect"). `garbled` and `preceded` exit 0 with output that is not one line. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
   // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
   // CLIs before 20.10 did by the Docker 20.10.0 release notes (docker/cli#2678); no such CLI was run here.
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
@@ -37,6 +37,7 @@ if [ "$1" = run ]; then
   case "$(cat '${mode}')" in
     answer) if [ -e '${identity}' ]; then cat '${identity}'; else echo 'codeboost-path-identity true none'; fi;;
     garbled) printf '%s\\n' 'codeboost-path-identity true none' 'extra';;
+    preceded) printf '%s\\n' 'noise' 'codeboost-path-identity true none';;
     unreachable) echo 1 > '${unreach}'; printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
@@ -51,6 +52,7 @@ if [ -e '${unreach}' ] && { [ "$1" = rm ] || [ "$1 $2" = "container inspect" ]; 
   [ "$1" = rm ] || echo '[]'
   echo 'Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?' >&2; exit 1
 fi
+if [ -e '${slow}' ] && { [ "$1" = rm ] || [ "$1 $2" = "container inspect" ]; }; then sleep 0.3; fi
 if [ "$1" = rm ]; then
   if exists && [ -s '${busy}' ] && [ "$(cat '${busy}')" -gt 0 ]; then
     echo $(( $(cat '${busy}') - 1 )) > '${busy}'
@@ -72,7 +74,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, slow, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -106,7 +108,9 @@ describe('task storage probe against Docker answers', () => {
   });
   it('removes a container a killed client left created but never started', async () => {
     writeFileSync(mode, 'created');
-    await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('docker run failed (client killed or not started)');
+    await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('docker run failed (client killed or not started)');
+    // The interleaving this test is about: the create landed before the client was killed.
+    expect(existsSync(landAt)).toBe(true);
     expect(removals()).toContain(`rm --force --volumes ${probeName()}`);
     expect(left()).toBe(false);
   }, 60_000);
@@ -114,7 +118,9 @@ describe('task storage probe against Docker answers', () => {
     // The first removals find nothing (rm still exits 0); only asking until the window closes catches the late create.
     writeFileSync(mode, 'late');
     const started = performance.now();
-    await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('client killed or not started');
+    await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('client killed or not started');
+    // The interleaving this test is about: the create landed before the client was killed.
+    expect(existsSync(landAt)).toBe(true);
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
     expect(existsSync(removed)).toBe(true);
     expect(new Set(removals())).toEqual(new Set([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]));
@@ -131,9 +137,11 @@ describe('task storage probe against Docker answers', () => {
   });
   it('gives up when Docker keeps reporting the container, and names it for the person to remove', async () => {
     writeFileSync(mode, 'created'); writeFileSync(busy, '100000');
-    const failure = await probeTaskStoragePathIdentity(imageId, 500, 1_000).catch((error: Error) => error);
+    const failure = await probeTaskStoragePathIdentity(imageId, 2_000, 1_000).catch((error: Error) => error);
+    // The interleaving this test is about: the create landed before the client was killed.
+    expect(existsSync(landAt)).toBe(true);
     const name = probeName();
-    expect((failure as Error).message).toBe('docker run failed (client killed or not started): docker run ETIMEDOUT after 500 ms.'
+    expect((failure as Error).message).toBe('docker run failed (client killed or not started): docker run ETIMEDOUT after 2000 ms.'
       + ` The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`);
     const cause = (failure as Error).cause as AggregateError;
     expect(cause.errors.map((error: Error) => error.message)).toEqual([expect.stringMatching(/^docker run failed/), `Docker did not confirm that ${name} is gone.`]);
@@ -150,7 +158,9 @@ describe('task storage probe against Docker answers', () => {
   });
   it('asks again while Docker refuses the removal of a container that exists', async () => {
     writeFileSync(mode, 'created'); writeFileSync(busy, '2');
-    await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('client killed or not started');
+    await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('client killed or not started');
+    // The interleaving this test is about: the create landed before the client was killed.
+    expect(existsSync(landAt)).toBe(true);
     expect(removals().filter(call => call.startsWith('rm ')).length).toBeGreaterThanOrEqual(3);
     expect(left()).toBe(false);
   }, 60_000);
@@ -173,7 +183,9 @@ describe('task storage probe against Docker answers', () => {
     // call that was running then may hang; starting another would stretch the bound by a second floor.
     writeFileSync(mode, 'created'); writeFileSync(busy, '100000');
     writeFileSync(hangAt, String(Math.floor(Date.now() / 1000) + 12));
-    const failure = await probeTaskStoragePathIdentity(imageId, 500, 4_000).catch((error: Error) => error);
+    const failure = await probeTaskStoragePathIdentity(imageId, 2_000, 4_000).catch((error: Error) => error);
+    // The interleaving this test is about: the create landed before the client was killed.
+    expect(existsSync(landAt)).toBe(true);
     expect(readFileSync(hung, 'utf8').trim().split('\n')).toHaveLength(1);
     expect(((failure as Error).cause as AggregateError).errors[1].message).toBe(`Docker did not confirm that ${probeName()} is gone.`);
   }, 60_000);
@@ -195,8 +207,8 @@ describe('task storage probe against Docker answers', () => {
     expect((failure as Error).message).toMatch(/^docker run failed \(exit 125\): docker: Cannot connect to the Docker daemon[^]* The probe container codeboost-path-identity-[0-9a-f-]+ may remain;/);
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
   }, 60_000);
-  it('refuses a probe that exits 0 without exactly one identity line', async () => {
-    writeFileSync(mode, 'garbled');
+  it.each(['garbled', 'preceded'])('refuses a probe that exits 0 without exactly one identity line (%s)', async garble => {
+    writeFileSync(mode, garble);
     await expect(probeTaskStoragePathIdentity(imageId)).rejects.toThrow('The path identity probe did not report an identity.');
   });
   it.each([
@@ -214,5 +226,12 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(mode, 'hang'); writeFileSync(hangAt, '0');
     await expect(probeTaskStoragePathIdentity(imageId, 500, 2_000)).rejects.toThrow('may remain');
     expect(readFileSync(hung, 'utf8').trim().split('\n')).toEqual(['rm', 'container']);
+  }, 60_000);
+  it('gives each cleanup call at least 1 s, so a slow daemon is still heard at the give-up time', async () => {
+    // Almost no time left: without the floor the first call would be cut before Docker could answer it.
+    writeFileSync(mode, 'refused'); writeFileSync(slow, '');
+    const failure = await probeTaskStoragePathIdentity(imageId, 60_000, 1).catch((error: Error) => error);
+    const cleanup = ((failure as Error).cause as AggregateError).errors[1] as Error;
+    expect((cleanup.cause as { status: number | null }).status).not.toBeNull();
   }, 60_000);
 });

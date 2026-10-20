@@ -48,6 +48,8 @@ describe('task storage probe script', () => {
     const out = execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' });
     const expected = probePathIdentity(root);
     expect(out).toBe(`codeboost-path-identity ${expected.caseSensitive} ${expected.unicodeNormalization}\n`);
+    // What it wrote, as the host lists it: `case` and the NFC spelling, on any host (both are stored as given).
+    expect(readdirSync(root).sort()).toEqual(['caf\u00e9', 'case']);
   });
   it('reports what it finds, on any host: names that already answer to CASE and NFD read as folded', () => {
     // On Linux CI the honest answer above is the same constant task storage gives; this one is not, so a script that
