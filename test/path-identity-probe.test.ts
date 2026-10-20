@@ -9,7 +9,7 @@ import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/co
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const slow = join(root, 'slow'), busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
+const lateMark = join(root, 'late'), rmLog = join(root, 'rm-log'), slow = join(root, 'slow'), busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -18,7 +18,7 @@ beforeAll(() => {
     'io.codeboost.codex.version': CODEX_VERSION, 'io.codeboost.claude.version': CLAUDE_VERSION, 'io.codeboost.profile.version': '1' } } }]);
   // `run`: per the mode file, answer (the identity file's line if there is one, as a filesystem other than tmpfs would
   // answer; otherwise tmpfs's), refuse as the daemon does, or hang until the client is killed. In `late` mode the
-  // create lands two seconds later, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
+  // create lands just after the first inspect has answered that it is absent, after the client is gone. `rm --force` and `container inspect` answer as Docker 27
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm of a container that exists refuses as Docker does while an auto-remove is in
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
@@ -41,7 +41,7 @@ if [ "$1" = run ]; then
     unreachable) echo 1 > '${unreach}'; printf '%s\\n' 'docker: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?.' "See 'docker run --help'." >&2; exit 125;;
     refused) printf '%s\\n' 'docker: Error response from daemon: unknown or invalid runtime name: x.' "See 'docker run --help'." >&2; exit 125;;
     created) echo 0 > '${landAt}'; exec sleep 30;;
-    late) echo $(( $(date +%s) + 2 )) > '${landAt}'; exec sleep 30;;
+    late) : > '${lateMark}'; exec sleep 30;;
     hang) exec sleep 30;;
   esac
 fi
@@ -58,13 +58,15 @@ if [ "$1" = rm ]; then
     echo $(( $(cat '${busy}') - 1 )) > '${busy}'
     echo "Error response from daemon: removal of container $4 is already in progress" >&2; exit 1
   fi
-  if exists; then : > '${removed}'; exit 0; fi
+  if exists; then echo found >> '${rmLog}'; : > '${removed}'; exit 0; fi
+  echo missing >> '${rmLog}'
   echo "Error response from daemon: No such container: $4" >&2
   if [ -e '${oldCli}' ]; then exit 1; fi
   exit 0
 fi
 if [ "$1 $2" = "container inspect" ]; then
   if exists; then echo '[{}]'; exit 0; fi
+  if [ -e '${lateMark}' ] && [ ! -e '${landAt}' ]; then echo 0 > '${landAt}'; fi
   echo '[]'; echo "Error response from daemon: No such container: $3" >&2; exit 1
 fi
 exit 0
@@ -74,7 +76,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, slow, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, lateMark, rmLog, slow, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -115,13 +117,16 @@ describe('task storage probe against Docker answers', () => {
     expect(left()).toBe(false);
   }, 60_000);
   it('removes a create that lands after the killed client, within the settle window', async () => {
-    // The first removals find nothing (rm still exits 0); only asking until the window closes catches the late create.
+    // The first rm and inspect find nothing (rm still exits 0); the create lands after that, so only asking again,
+    // rm included, until the window closes removes it.
     writeFileSync(mode, 'late');
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId, 2_000)).rejects.toThrow('client killed or not started');
-    // The interleaving this test is about: the create landed before the client was killed.
-    expect(existsSync(landAt)).toBe(true);
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
+    // The interleaving this test is about: nothing at the first rm, and a later rm removed what landed.
+    const rms = readFileSync(rmLog, 'utf8').trim().split('\n');
+    expect(rms[0]).toBe('missing');
+    expect(rms).toContain('found');
     expect(existsSync(removed)).toBe(true);
     expect(new Set(removals())).toEqual(new Set([`rm --force --volumes ${probeName()}`, `container inspect ${probeName()}`]));
   }, 60_000);
