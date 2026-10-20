@@ -940,6 +940,67 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(pullReads).toBe(2);
 });
 
+/**
+ * T6: GitHub where PR 7 never moves (base sha('a'), head sha('b')) but the rules may change between reads. `rules.ruleset`
+ * and `rules.classic` are the required check names each rule source returns now; `ci` runs fail and `lint` statuses pass.
+ */
+function changingRules(rules: { ruleset: string[]; classic: string[] }) {
+  const reads = { ruleset: 0, classic: 0, merges: 0 };
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+      { name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z' },
+      { context: 'lint', state: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z' },
+    ] });
+    if (joined.includes('/rules/branches/')) { reads.ruleset++; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true,
+      required_status_checks: rules.ruleset.map(context => ({ context, integration_id: null })) } }]]); }
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) { reads.classic++; return JSON.stringify({ required_status_checks: { strict: true,
+      checks: rules.classic.map(context => ({ context, app_id: null })), contexts: rules.classic } }); }
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    if (joined.startsWith('pr merge 7')) { reads.merges++; return ''; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  return { reads, client: new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run) };
+}
+
+it('reads both rule sources again on a fresh inspection when base and head are unchanged', async () => {
+  const rules = { ruleset: [] as string[], classic: [] as string[] }, { reads, client } = changingRules(rules);
+  const first = await client.inspect();
+  expect(first).toMatchObject({ base: sha('a'), head: sha('b'), rulesKnown: true, requiredChecks: [] });
+  expect(reads).toMatchObject({ ruleset: 1, classic: 1 });
+  rules.ruleset = ['ci']; rules.classic = ['lint'];
+  // Within the cache's lifetime an inspection that is not fresh is served from the cache: no rule source is read.
+  expect(await client.inspect()).toBe(first);
+  expect(reads).toMatchObject({ ruleset: 1, classic: 1 });
+  // A fresh one reads both again, though the pull request's base and head match the cached state.
+  const fresh = await client.inspect({ fresh: true });
+  expect(fresh).toMatchObject({ base: sha('a'), head: sha('b') });
+  expect(reads).toMatchObject({ ruleset: 2, classic: 2 });
+  expect(fresh.requiredChecks).toEqual([
+    { context: 'ci', appId: null, state: 'failure' },
+    { context: 'lint', appId: null, state: 'success' },
+  ]);
+});
+
+it.each([
+  ['ruleset', { ruleset: ['ci'], classic: ['lint'] }],
+  ['classic branch protection', { ruleset: [], classic: ['lint', 'ci'] }],
+] as const)('refuses a guarded merge when the %s adds a failing required check after a cached ready status', async (_source, changed) => {
+  // A passing strict `lint` gives the atomic base guard a ready merge needs.
+  const rules = { ruleset: [] as string[], classic: ['lint'] }, { reads, client } = changingRules(rules);
+  const view = readyView(), coordinator = new MergeCoordinator(serviceFor(view), client);
+  // The page's status read (not fresh) caches a ready state whose only required check passes.
+  expect(await coordinator.status(view)).toMatchObject({ ready: true });
+  const before = { ...reads };
+  Object.assign(rules, { ruleset: [...changed.ruleset], classic: [...changed.classic] });
+  // The pull request's base and head are unchanged, so only a fresh read of both rule sources can see the new check.
+  await expect(coordinator.merge(view.token)).rejects.toThrow(/^ci is failure/);
+  expect(reads.ruleset).toBeGreaterThan(before.ruleset);
+  expect(reads.classic).toBeGreaterThan(before.classic);
+  expect(reads.merges).toBe(0);
+});
+
 /** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
 async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
   const run = async (args: readonly string[]) => {

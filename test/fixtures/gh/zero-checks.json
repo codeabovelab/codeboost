@@ -1,0 +1,51 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "codeabovelab/codeboost",
+  "pullRequest": 104,
+  "recordedAt": "2026-10-20T17:34:41.271Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/codeabovelab/codeboost/rules/branches/feat%2Fd-gitlink-mounts-81"
+      ],
+      "exitCode": 0,
+      "stdout": "[[]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/feat%2Fd-gitlink-mounts-81"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"name\":\"feat/d-gitlink-mounts-81\",\"commit\":{\"sha\":\"86bccd02e79dc9a40a978cbdb708db5d61bf2098\",\"node_id\":\"C_kwDOUmQE7toAKDg2YmNjZDAyZTc5ZGM5YTQwYTk3OGNiZGI3MDhkYjVkNjFiZjIwOTg\",\"commit\":{\"author\":{\"name\":\"mchwang\",\"email\":\"mchwang@gmail.com\",\"date\":\"2026-10-03T00:14:45Z\"},\"committer\":{\"name\":\"mchwang\",\"email\":\"mchwang@gmail.com\",\"date\":\"2026-10-03T00:14:45Z\"},\"message\":\"Docs: gitlink masking applies to writable invocations (review round 3)\\n\\nplan-format.md asked for it before every invocation; #81 decided on\\nexecute and fix (and future cmd runs) only. Read-only invocations get\\na fresh non-recursive clone mounted read-only, so a gitlink there stays\\nempty.\\n\\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\",\"tree\":{\"sha\":\"c2dd0ee9f0538f0b4b267c44fe2c45c96c3ebbf4\",\"url\":\"https://api.github.com/repos/codeabovelab/codeboost/git/trees/c2dd0ee9f0538f0b4b267c44fe2c45c96c3ebbf4\"},\"url\":\"https://api.github.com/repos/codeabovelab/codeboost/git/commits/86bccd02e79dc9a40a978cbdb708db5d61bf2098\",\"comment_count\":0,\"verification\":{\"verified\":false,\"reason\":\"unsigned\",\"signature\":null,\"payload\":null,\"verified_at\":null}},\"url\":\"https://api.github.com/repos/codeabovelab/codeboost/commits/86bccd02e79dc9a40a978cbdb708db5d61bf2098\",\"html_url\":\"https://github.com/codeabovelab/codeboost/commit/86bccd02e79dc9a40a978cbdb708db5d61bf2098\",\"comments_url\":\"https://api.github.com/repos/codeabovelab/codeboost/commits/86bccd02e79dc9a40a978cbdb708db5d61bf2098/comments\",\"author\":{\"login\":\"mchwang\",\"id\":962133,\"node_id\":\"MDQ6VXNlcjk2MjEzMw==\",\"avatar_url\":\"https://avatars.githubusercontent.com/u/962133?v=4\",\"gravatar_id\":\"\",\"url\":\"https://api.github.com/users/mchwang\",\"html_url\":\"https://github.com/mchwang\",\"followers_url\":\"https://api.github.com/users/mchwang/followers\",\"following_url\":\"https://api.github.com/users/mchwang/following{/other_user}\",\"gists_url\":\"https://api.github.com/users/mchwang/gists{/gist_id}\",\"starred_url\":\"https://api.github.com/users/mchwang/starred{/owner}{/repo}\",\"subscriptions_url\":\"https://api.github.com/users/mchwang/subscriptions\",\"organizations_url\":\"https://api.github.com/users/mchwang/orgs\",\"repos_url\":\"https://api.github.com/users/mchwang/repos\",\"events_url\":\"https://api.github.com/users/mchwang/events{/privacy}\",\"received_events_url\":\"https://api.github.com/users/mchwang/received_events\",\"type\":\"User\",\"user_view_type\":\"public\",\"site_admin\":false},\"committer\":{\"login\":\"mchwang\",\"id\":962133,\"node_id\":\"MDQ6VXNlcjk2MjEzMw==\",\"avatar_url\":\"https://avatars.githubusercontent.com/u/962133?v=4\",\"gravatar_id\":\"\",\"url\":\"https://api.github.com/users/mchwang\",\"html_url\":\"https://github.com/mchwang\",\"followers_url\":\"https://api.github.com/users/mchwang/followers\",\"following_url\":\"https://api.github.com/users/mchwang/following{/other_user}\",\"gists_url\":\"https://api.github.com/users/mchwang/gists{/gist_id}\",\"starred_url\":\"https://api.github.com/users/mchwang/starred{/owner}{/repo}\",\"subscriptions_url\":\"https://api.github.com/users/mchwang/subscriptions\",\"organizations_url\":\"https://api.github.com/users/mchwang/orgs\",\"repos_url\":\"https://api.github.com/users/mchwang/repos\",\"events_url\":\"https://api.github.com/users/mchwang/events{/privacy}\",\"received_events_url\":\"https://api.github.com/users/mchwang/received_events\",\"type\":\"User\",\"user_view_type\":\"public\",\"site_admin\":false},\"parents\":[{\"sha\":\"3d51d184282c40cf188d203ddd753c20743ba1a4\",\"url\":\"https://api.github.com/repos/codeabovelab/codeboost/commits/3d51d184282c40cf188d203ddd753c20743ba1a4\",\"html_url\":\"https://github.com/codeabovelab/codeboost/commit/3d51d184282c40cf188d203ddd753c20743ba1a4\"}]},\"_links\":{\"self\":\"https://api.github.com/repos/codeabovelab/codeboost/branches/feat/d-gitlink-mounts-81\",\"html\":\"https://github.com/codeabovelab/codeboost/tree/feat/d-gitlink-mounts-81\"},\"protected\":false,\"protection\":{\"enabled\":false,\"required_status_checks\":{\"enforcement_level\":\"off\",\"contexts\":[],\"checks\":[]}},\"protection_url\":\"https://api.github.com/repos/codeabovelab/codeboost/branches/feat/d-gitlink-mounts-81/protection\"}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/feat%2Fd-gitlink-mounts-81/protection"
+      ],
+      "exitCode": 1,
+      "stdout": "{\"message\":\"Branch not protected\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+      "stderr": "gh: Branch not protected (HTTP 404)"
+    },
+    {
+      "args": [
+        "pr",
+        "view",
+        "104",
+        "--repo",
+        "codeabovelab/codeboost",
+        "--json",
+        "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"baseRefName\":\"feat/d-gitlink-mounts-81\",\"baseRefOid\":\"1dd118232466af7e2c1197d43900c8982399e30e\",\"headRefName\":\"feat/d-gitlink-parents-99\",\"headRefOid\":\"3d51d184282c40cf188d203ddd753c20743ba1a4\",\"isDraft\":false,\"mergeable\":\"UNKNOWN\",\"number\":104,\"state\":\"MERGED\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T17:35:40Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37039794093/job/110946806982\",\"name\":\"real-docker\",\"startedAt\":\"2026-10-02T17:18:20Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Agent isolation\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-03T00:11:03Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37079690241/job/111077240630\",\"name\":\"real-docker\",\"startedAt\":\"2026-10-02T23:53:45Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Agent isolation\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T17:22:09Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37039794074/job/110946806853\",\"name\":\"test\",\"startedAt\":\"2026-10-02T17:18:21Z\",\"status\":\"COMPLETED\",\"workflowName\":\"CI\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T23:57:02Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37079690323/job/111077241017\",\"name\":\"test\",\"startedAt\":\"2026-10-02T23:53:45Z\",\"status\":\"COMPLETED\",\"workflowName\":\"CI\"}],\"url\":\"https://github.com/codeabovelab/codeboost/pull/104\"}\n",
+      "stderr": ""
+    }
+  ]
+}
