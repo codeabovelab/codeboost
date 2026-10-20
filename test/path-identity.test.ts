@@ -41,8 +41,9 @@ describe('path identity check', () => {
 });
 
 describe('task storage probe script', () => {
-  // The container probe runs this script; here it runs on a host folder whose answer the host probe knows. On a macOS
-  // host (APFS folds both) a script that stopped measuring, and printed a constant, would disagree.
+  // The container probe runs this script; here it runs on a host folder whose answer the host probe knows. A script
+  // that stopped measuring and printed a constant fails here unless the constant is this host's own answer (`false NFC`
+  // on macOS APFS, `true none` on Linux CI).
   it('reports what the host probe reports for the same folder', () => {
     const root = directory();
     const out = execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' });
@@ -52,8 +53,9 @@ describe('task storage probe script', () => {
     expect(readdirSync(root).sort()).toEqual(['caf\u00e9', 'case']);
   });
   it('reports what it finds, on any host: names that already answer to CASE and NFD read as folded', () => {
-    // On Linux CI the honest answer above is the same constant task storage gives; this one is not, so a script that
-    // printed a constant instead of looking fails here everywhere.
+    // Pre-seeded names make the honest answer `false NFC` on any host, so a constant other than that fails here
+    // everywhere. A script printing `false NFC` itself passes both tests on macOS; Linux CI (above) and the real-Docker
+    // test (task storage answers `true none`) catch it.
     const root = directory();
     writeFileSync(join(root, 'CASE'), ''); writeFileSync(join(root, 'cafe\u0301'), '');
     expect(execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' })).toBe('codeboost-path-identity false NFC\n');
