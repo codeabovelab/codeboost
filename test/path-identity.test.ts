@@ -60,4 +60,15 @@ describe('task storage probe script', () => {
     writeFileSync(join(root, 'CASE'), ''); writeFileSync(join(root, 'cafe\u0301'), '');
     expect(execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' })).toBe('codeboost-path-identity false NFC\n');
   });
+  it.each([
+    ['CASE', 'case'],
+    ['cafe\u0301', 'Unicode'],
+  ] as const)('reads each field from its own name: only %s present folds only %s', (seed, field) => {
+    // One seeded name at a time, so a script whose case check looked at the NFD name (or the reverse) fails on a host
+    // that folds neither (Linux CI); the other field must read as this host reads it.
+    const root = directory(), host = probePathIdentity(directory());
+    writeFileSync(join(root, seed), '');
+    const expected = field === 'case' ? `false ${host.unicodeNormalization}` : `${host.caseSensitive} NFC`;
+    expect(execFileSync('sh', ['-c', PATH_IDENTITY_SCRIPT, 'probe', root], { encoding: 'utf8' })).toBe(`codeboost-path-identity ${expected}\n`);
+  });
 });

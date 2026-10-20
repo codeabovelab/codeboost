@@ -180,6 +180,9 @@ describe('task storage probe against Docker answers', () => {
     expect(existsSync(landAt)).toBe(true);
     expect(removals().filter(call => call.startsWith('rm ')).length).toBeGreaterThanOrEqual(3);
     expect(left()).toBe(false);
+    // The interleaving this test is about: both refusals were answered, and a later rm then removed the container.
+    expect(readFileSync(busy, 'utf8').trim()).toBe('0');
+    expect(readFileSync(rmLog, 'utf8').trim().split('\n')).toContain('found');
   }, 60_000);
   it('settles at once on a CLI whose rm exits non-zero for a missing name', async () => {
     writeFileSync(mode, 'refused'); writeFileSync(oldCli, '');
