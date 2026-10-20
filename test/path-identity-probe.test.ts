@@ -196,7 +196,8 @@ describe('task storage probe against Docker answers', () => {
     writeFileSync(mode, 'refused'); writeFileSync(hangAt, '0');
     const started = performance.now();
     await expect(probeTaskStoragePathIdentity(imageId, 60_000, 1_000)).rejects.toThrow('may remain');
-    expect(performance.now() - started).toBeLessThan(4_000);
+    // One hung call, cut at the 1 s floor, then the give-up: a floor much over 1 s at the call site fails here.
+    expect(performance.now() - started).toBeLessThan(2_500);
   }, 60_000);
   it('starts no call after giving up is due, when the daemon stops answering partway', async () => {
     // Present (removal in progress) at first, then no answer from about four seconds before the give-up time. Only the
@@ -280,7 +281,7 @@ describe('task storage probe against Docker answers', () => {
   }, 90_000);
   it('gives each cleanup call the time left, capped at exactly 10 s and at least exactly 1 s', () => {
     // The helper's values, exactly. The timing tests above show the cleanup calls use it, to within about 1–2 s (a cap
-    // of roughly 9–12 s and a floor of roughly 0.4–3 s), not exactly.
+    // of roughly 9–12 s and a floor of roughly 0.4–2.5 s), not exactly.
     expect([-5, 0, 1, 999, 999.2, 1_000, 1_001, 4_200.5, 9_999, 10_000, 10_001, 40_000].map(probeCleanupCallMs))
       .toEqual([1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_001, 4_201, 9_999, 10_000, 10_000, 10_000]);
   });
