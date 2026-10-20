@@ -279,4 +279,19 @@ describe('task storage probe against Docker answers', () => {
     // The values the cleanup uses (the default-bound timing test shows they are the ones in effect, to within 3 s).
     expect([PROBE_SETTLE_MS, PROBE_CLEANUP_MS]).toEqual([10_000, 30_000]);
   });
+  it('removes nothing, and does not wait, when spawning docker throws (E2BIG)', async () => {
+    // Node throws from spawn itself (syscall `spawn`) for an environment the OS refuses: nothing reached Docker.
+    writeFileSync(mode, 'answer');
+    const saved = process.env.DOCKER_HOST;
+    process.env.DOCKER_HOST = 'x'.repeat(4 * 1024 * 1024);
+    const started = performance.now();
+    let failure: Error | undefined;
+    try { await probeTaskStoragePathIdentity(imageId); } catch (error) { failure = error as Error; }
+    finally { if (saved === undefined) delete process.env.DOCKER_HOST; else process.env.DOCKER_HOST = saved; }
+    // The path this test is about: the synchronous throw, not the asynchronous `spawn docker` error event.
+    expect((failure!.cause as NodeJS.ErrnoException).syscall).toBe('spawn');
+    expect(failure!.message).toMatch(/^docker run failed \(client killed or not started\): spawn E2BIG/);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(existsSync(calls)).toBe(false);
+  });
 });
