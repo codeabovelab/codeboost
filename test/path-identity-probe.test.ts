@@ -28,7 +28,8 @@ beforeAll(() => {
   // reach: run, rm and inspect answer as Docker 27.4.0 does with DOCKER_HOST=tcp://127.0.0.1:1 (run exit 125; rm
   // exit 1; inspect `[]` and exit 1, all with "Cannot connect"). `garbled` and `preceded` exit 0 with output that is not one line. Checked against Docker 27.4.0, as are `build` (only its exit status is read) and `image
   // inspect` (a one-element array; only `Id`, `Config.User` and `Config.Labels` are read, given in Docker's shape). With the old-cli file, rm of a missing name exits 1, as
-  // CLIs before 20.10 did by the Docker 20.10.0 release notes (docker/cli#2678); no such CLI was run here.
+  // CLIs before 20.10 did by the Docker 20.10.0 release notes (docker/cli#2678); no such CLI was run here, so its
+  // stderr text (Docker 27's wording here) is not checked.
   writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
 exists() { [ ! -e '${removed}' ] && [ -e '${landAt}' ] && [ "$(date +%s)" -ge "$(cat '${landAt}')" ]; }
@@ -184,7 +185,7 @@ describe('task storage probe against Docker answers', () => {
     expect(performance.now() - started).toBeLessThan(4_000);
   }, 60_000);
   it('starts no call after giving up is due, when the daemon stops answering partway', async () => {
-    // Present (removal in progress) at first, then no answer from about two seconds before the give-up time. Only the
+    // Present (removal in progress) at first, then no answer from about four seconds before the give-up time. Only the
     // call that was running then may hang; starting another would stretch the bound by a second floor.
     writeFileSync(mode, 'created'); writeFileSync(busy, '100000');
     writeFileSync(hangAt, String(Math.floor(Date.now() / 1000) + 12));
@@ -199,6 +200,8 @@ describe('task storage probe against Docker answers', () => {
     // absence inside the settle window proves nothing, so this is a give-up whose cause is the unanswered call.
     writeFileSync(mode, 'hang'); writeFileSync(hangAt, String(Math.floor(Date.now() / 1000) + 5));
     const failure = await probeTaskStoragePathIdentity(imageId, 500, 2_000).catch((error: Error) => error);
+    // The interleaving this test is about: an ask was answered "absent" before Docker stopped answering.
+    expect(readFileSync(rmLog, 'utf8').trim().split('\n')[0]).toBe('missing');
     const cleanup = ((failure as Error).cause as AggregateError).errors[1] as Error;
     expect(cleanup.message).toBe(`Docker did not confirm that ${probeName()} is gone.`);
     expect(cleanup.cause).toMatchObject({ status: null, error: { code: 'ETIMEDOUT' } });
