@@ -576,7 +576,7 @@ The numbers below identify delivery milestones, not a requirement to implement t
 
 ### Build step 4: scope and progress
 
-**Numbering.** Build steps above identify delivery milestones; the parallel lanes define execution order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Use “Build step 4, increment 1” when referring to the current work, rather than “Task 4.”
+**Numbering.** Build steps above identify delivery milestones; the parallel lanes define execution order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Say “build step 4” (or “build step 4, increment 1” for PR #23), not “Task 4.”
 
 **Increment 1 — guarded merge gate (merged 2026-09-24 in [PR #23](https://github.com/codeabovelab/codeboost/pull/23), [#21](https://github.com/codeabovelab/codeboost/issues/21); see `docs/implementation/guarded-merge.md`).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
 
@@ -589,7 +589,7 @@ Increment 1 alone did not rebase or run acceptance commands: a moved base or a m
 - [x] Integrate runner-controlled, containerized execution of approved `cmd:` argv and bind results to the resulting head (T6; depends on the agent isolation and phase enforcement work in build step 5, including T1, T2, and T9). *Done in F5 (PR #149).*
 - [ ] Validate the complete pre-merge sequence, including the already-fixed check, approval freshness, refreshed required checks, guarded merge, and races involving either base or head changes (T6, T7, T12). *Built in F6a–F6c (PRs #153, #161, #177), and T7 is verified.* Open: the T6 and T12 Verify gaps under Implementation Tasks, #174 and #176.
 
-**Sequencing decision.** The guarded gate can land before the agent runner. Build step 5 supplied the execution prerequisites for the pre-merge automation, and build step 4 was marked complete only after they were integrated (F3–F6, #22). The safe refusal in increment 1 was an intentional interim behavior, not evidence that the automation had shipped. Optional human validation in #19 remains non-blocking.
+**Sequencing decision.** The guarded gate can land before the agent runner. Build step 5 supplied the execution prerequisites, and the pre-merge automation shipped only after they were integrated (F3–F6, #22). Build step 4 stays open until the T6 and T12 Verify gaps are closed. The safe refusal in increment 1 was an intentional interim behavior, not evidence that the automation had shipped. Optional human validation in #19 remains non-blocking.
 
 ## Open questions
 
@@ -2019,7 +2019,7 @@ These `T` IDs are requirement identifiers, not the build-order numbers. Build st
   - Surfaced by: O4 (D14: A)
   - Files: github/merge
   - Verify: a head or base push between validation and merge is refused or revalidated by the server-side guarded merge; a backend without atomic base protection blocks automatic merge, including with zero required checks
-  - Evidence (2026-10-20): `test/merge.test.ts` ("refuses a base or head race after the initial validation", "parses required checks from both rule sources and pins the gh merge head", "blocks the %s remote condition" row `base-guard` with zero required checks, "does not treat empty strict check policies as an atomic base guard"); `test/merge-job.test.ts` ("ends failed, leaving the task in review, when GitHub refuses because the head changed"). GitHub's own refusal is simulated
+  - Evidence (2026-10-20): `test/merge.test.ts` ("refuses a base or head race after the initial validation", "parses required checks from both rule sources and pins the gh merge head", "blocks the %s remote condition" row `base-guard` with zero required checks, "does not treat empty strict check policies as an atomic base guard"); `test/merge-job.test.ts` ("ends failed, leaving the task in review, when GitHub refuses because the head changed", "words the guarded merge's refusal as what merging does when the base moves after the job's last ready inspection"). GitHub's own refusal is simulated
 - [x] **T8 (P1, historical estimate: human ~2 days / CC ~30 min)** — process — Cancelled before timed results; optional future validation moved to #19
   - Surfaced by: R3 (D4: A), O5, O9 (D19: A)
   - Files: scripts/plant.ts, docs/experiments/review-protocol.md
