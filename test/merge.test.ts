@@ -942,12 +942,22 @@ it('parses required checks from both rule sources and pins the gh merge head', a
 });
 
 /**
+ * The hand-written gh answers of the T6 and T12 tests below (`changingRules`, the required-reviews test and the
+ * classic-protection 404 table) follow the shapes in test/fixtures/gh/, recorded with gh 2.102.0: exit 0 with the JSON
+ * on stdout, or, for an HTTP error, a CommandFailed as runWithInput reports it (`ghExit`). Each answer carries only the
+ * fields the gateway reads on that test's path, and leaves out:
+ * - the pull request's `url` (read when present, only for display) and rollup fields such as `__typename`, `detailsUrl`
+ *   and `workflowName`;
+ * - each rule's `ruleset_source_type`, `ruleset_source`, `ruleset_id` and, for checks, `do_not_enforce_on_create`;
+ * - the branch's `commit` and links, and its `protection` where the protection read succeeds (the gateway reads
+ *   `protection.enabled` only after that read answers "Branch not protected");
+ * - classic protection's fields other than `required_status_checks`, and the URLs inside it;
+ * - all output of `gh pr merge`, which answers exit 0 with nothing printed (the gateway reads only the exit status).
+ */
+/**
  * T6: GitHub where PR 7 never moves (base sha('a'), head sha('b')) but the rules may change between reads. `rules.ruleset`
  * and `rules.classic` are the required check names each rule source returns now; `ci` runs fail and `lint` statuses pass.
- * Shaped as gh 2.102.0 answers (test/fixtures/gh/): ruleset checks any app may report carry no `integration_id`. Left out,
- * as the gateway does not read them: the branch's fields other than `protected`, protection's fields other than
- * `required_status_checks`, rollup fields other than name, status, conclusion and times, and `gh pr merge`'s stderr
- * (it answers exit 0 with empty output; the gateway reads only the exit status).
+ * Ruleset checks any app may report carry no `integration_id`, as recorded. What it leaves out: see above.
  */
 function changingRules(rules: { ruleset: string[]; classic: string[] }) {
   const reads = { ruleset: 0, classic: 0, merges: 0 };
@@ -1008,9 +1018,7 @@ it.each([
 
 // T12: reviews are not checks. Both rule sources here also require approving reviews, shaped as GitHub's REST reference
 // (2022-11-28) gives a ruleset `pull_request` rule and classic `required_pull_request_reviews`; no recording has them.
-// The other answers are shaped as gh 2.102.0 gives them (test/fixtures/gh/). Left out, as the gateway does not read
-// them: the branch's fields other than `name` and `protected`, protection's fields other than the two above, the review
-// rule's other parameters, and rollup fields other than name or context, status, conclusion, state and times.
+// The review rule's other parameters are left out too; for the rest, see the note above `changingRules`.
 it('ignores required reviews in both rule sources and reads only their required checks', async () => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
@@ -1804,7 +1812,8 @@ it('does not let an inspection started before merge repopulate the cache', async
 
 /**
  * gh 2.102.0 exits 1 on an HTTP error, printing `gh: <message> (HTTP <status>)` to stderr and GitHub's JSON body to
- * stdout. runWithInput reports both, trimmed, in a CommandFailed whose message is built as below.
+ * stdout. runWithInput reports both, trimmed, in a CommandFailed whose message is built as below. The table's other
+ * answers (an empty rollup, no required check observed) leave out what the note above `changingRules` lists.
  */
 const ghExit = (stderr: string, stdout: string) =>
   new CommandFailed(`gh failed (exit 1): ${stderr}${stdout ? `\n${stdout}` : ''}`, stderr, stdout);
