@@ -1007,6 +1007,9 @@ it.each([
 
 // T12: reviews are not checks. Both rule sources here also require approving reviews, shaped as GitHub's REST reference
 // (2022-11-28) gives a ruleset `pull_request` rule and classic `required_pull_request_reviews`; no recording has them.
+// The other answers are shaped as gh 2.102.0 gives them (test/fixtures/gh/). Left out, as the gateway does not read
+// them: the branch's fields other than `name` and `protected`, protection's fields other than the two above, the review
+// rule's other parameters, and rollup fields other than name or context, status, conclusion, state and times.
 it('ignores required reviews in both rule sources and reads only their required checks', async () => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
