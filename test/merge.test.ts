@@ -1202,6 +1202,14 @@ it.each([
   expect(await requiredTestState([...rollup])).toEqual([expected]);
 });
 
+// #176, until it is fixed: gh's rollup never carries a check run's app (test/fixtures/gh/, gh 2.102.0), so a requirement
+// pinned to an app finds no matching run and reads as missing. That fails closed: a passing run from any app never
+// satisfies it.
+it('reads a requirement pinned to an app as missing against gh\'s app-less check runs', async () => {
+  expect(await requiredTestState([{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
+    startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z', workflowName: 'CI' }], 10)).toEqual(['missing']);
+});
+
 it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
   expect(await requiredTestState([
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z', app: { databaseId: 10 } },
