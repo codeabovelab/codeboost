@@ -423,7 +423,8 @@ export const PROBE_VOLUME_MOUNT = ['type=volume', 'target=/work', 'volume-driver
  * then (its deadline) may leave the container created but never started, which `--rm` does not remove, so a failed
  * probe removes its container, and that volume, by the unique name it gave it. Not covered: a create that lands after
  * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
- * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). A recovery sweep is #181.
+ * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). Nor is the volume's removal
+ * confirmed: `--rm` and `rm --volumes` remove it, but Docker only logs a failure to. A recovery sweep is #181.
  */
 export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = PROBE_CLEANUP_MS): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
@@ -469,7 +470,7 @@ async function removeProbeContainer(name: string, settleMs: number, cleanupMs: n
   let last: DockerOutcome | undefined;
   // Each call gets the time left before giving up, capped at 10 s and at least 1 s (so the last ask can still be
   // answered), and after the first call none starts once that time has passed: a daemon that stops answering
-  // stretches the bound by at most one call's floor and its stop grace.
+  // stretches the bound by at most one call's floor, its stop grace and one 250 ms pause.
   const ask = async (args: readonly string[]) => {
     if (last && performance.now() >= giveUpAt)
       throw new Error(`Docker did not confirm that ${name} is gone.`, { cause: last });
