@@ -1,0 +1,51 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "sveltejs/svelte",
+  "pullRequest": 19050,
+  "recordedAt": "2026-10-20T20:50:33.643Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/sveltejs/svelte/rules/branches/main"
+      ],
+      "exitCode": 0,
+      "stdout": "[[{\"type\":\"creation\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"update\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"deletion\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"deletion\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"non_fast_forward\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"pull_request\",\"parameters\":{\"required_approving_review_count\":1,\"dismiss_stale_reviews_on_push\":false,\"required_reviewers\":[],\"require_code_owner_review\":false,\"dismissal_restriction\":{\"enabled\":false,\"allowed_actors\":[]},\"require_last_push_approval\":false,\"required_review_thread_resolution\":false,\"require_extra_approval_for_unattributed_changes\":true,\"allowed_merge_methods\":[\"merge\",\"squash\",\"rebase\"]},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"do_not_enforce_on_create\":false,\"required_status_checks\":[{\"context\":\"vite-ecosystem-ci\",\"integration_id\":2935623}]},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282}]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/sveltejs/svelte/branches/main"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"name\":\"main\",\"protected\":true,\"protection\":{\"enabled\":true,\"required_status_checks\":{\"enforcement_level\":\"non_admins\",\"contexts\":[\"vite-ecosystem-ci\"],\"checks\":[{\"context\":\"vite-ecosystem-ci\",\"app_id\":2935623}]}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/sveltejs/svelte/branches/main/protection"
+      ],
+      "exitCode": 1,
+      "stdout": "{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+      "stderr": "gh: Not Found (HTTP 404)"
+    },
+    {
+      "args": [
+        "pr",
+        "view",
+        "19050",
+        "--repo",
+        "sveltejs/svelte",
+        "--json",
+        "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"baseRefName\":\"main\",\"baseRefOid\":\"40bb08482f4857d91221638dec544a532bc35389\",\"headRefName\":\"fix/print-keep-nbsp\",\"headRefOid\":\"111cc6411c9c647f691a159862da2b74212791e3\",\"isDraft\":false,\"mergeable\":\"UNKNOWN\",\"number\":19050,\"state\":\"OPEN\",\"statusCheckRollup\":[{\"__typename\":\"StatusContext\",\"context\":\"svelte.dev / preview deployments\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"state\":\"PENDING\",\"targetUrl\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:24Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/sveltejs\",\"name\":\"vite-ecosystem-ci\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:42:40Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com/github\",\"name\":\"Vercel Agent Review\",\"startedAt\":\"2026-10-20T12:41:26Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:49Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com\",\"name\":\"Vercel Internal Security Review\",\"startedAt\":\"2026-10-20T12:41:25Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"}],\"url\":\"https://github.com/sveltejs/svelte/pull/19050\"}\n",
+      "stderr": ""
+    }
+  ]
+}
