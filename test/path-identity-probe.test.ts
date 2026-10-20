@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION, buildAgentImage } from '../agents/container/image.ts';
-import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
+import { PATH_IDENTITY_SCRIPT, probeCleanupCallMs, probeTaskStoragePathIdentity } from '../agents/container/storage.ts';
 
 // The probe's own handling of Docker's answers (#162), against a `docker` on PATH that answers as the daemon would. The
 // measurement itself runs against real Docker in runner-workspace.test.ts.
@@ -269,4 +269,9 @@ describe('task storage probe against Docker answers', () => {
     expect(elapsed).toBeGreaterThanOrEqual(40_000);
     expect(elapsed).toBeLessThan(43_000);
   }, 90_000);
+  it('gives each cleanup call the time left, capped at exactly 10 s and at least exactly 1 s', () => {
+    // Pinned in both directions; the timing tests above show the call actually uses this deadline.
+    expect([-5, 0, 1, 999, 999.2, 1_000, 1_001, 4_200.5, 9_999, 10_000, 10_001, 40_000].map(probeCleanupCallMs))
+      .toEqual([1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_001, 4_201, 9_999, 10_000, 10_000, 10_000]);
+  });
 });

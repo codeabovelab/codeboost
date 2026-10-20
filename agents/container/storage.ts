@@ -458,6 +458,8 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
  * Remove a failed probe's container and its anonymous volume by name. `rm --force` exits 0 for a name that does not
  * exist, so only an inspect that reports the name absent, after the settle window, proves the probe is gone.
  */
+/** One cleanup call's deadline: the time left before giving up, capped at 10 s and at least 1 s. */
+export const probeCleanupCallMs = (leftMs: number): number => Math.min(10_000, Math.max(1_000, Math.ceil(leftMs)));
 async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
   const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
   let last: DockerOutcome | undefined;
@@ -468,7 +470,7 @@ async function removeProbeContainer(name: string, settleMs: number, cleanupMs: n
     if (last && performance.now() >= giveUpAt)
       throw new Error(`Docker did not confirm that ${name} is gone.`, { cause: last });
     return last = await runInProcessGroup('docker', args, { env: dockerEnvironment(),
-      timeoutMs: Math.min(10_000, Math.max(1_000, Math.ceil(giveUpAt - performance.now()))) });
+      timeoutMs: probeCleanupCallMs(giveUpAt - performance.now()) });
   };
   for (;;) {
     // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
