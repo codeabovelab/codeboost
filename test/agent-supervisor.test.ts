@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -77,21 +78,8 @@ afterAll(async () => {
     }
   } finally {
     // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
-    // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout. Containers go
-    // first, as they hold the others in use. What it finds, and any Docker call that fails, is reported.
-    const run = (args: string[]) => {
-      const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
-      if (result.status !== 0) console.warn(`afterAll: docker ${args.slice(0, 2).join(' ')} failed:`,
-        result.error?.message ?? result.stderr.trim());
-      return result.status === 0 ? result.stdout.split('\n').filter(Boolean) : [];
-    };
-    for (const kind of ['container', 'network', 'volume'] as const) {
-      const ids = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter',
-        `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`]);
-      if (!ids.length) continue;
-      console.warn(`afterAll removes this run's leftover ${kind}s: ${ids.join(' ')}`);
-      run([kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids]);
-    }
+    // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout.
+    removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 3 * 60_000);
 

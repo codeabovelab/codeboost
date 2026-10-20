@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -132,13 +133,20 @@ afterEach(async () => {
   for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
 }, 120_000);
 afterAll(async () => {
-  for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
-  for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
-  for (const profile of profiles) await disposeContainerProfile(profile);
-  for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
-  for (const root of roots.reverse()) {
-    chmodSync(join(root, 'input'), 0o700);
-    rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  try {
+    for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
+    for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
+    for (const profile of profiles) await disposeContainerProfile(profile);
+    for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
+    for (const root of roots.reverse()) {
+      chmodSync(join(root, 'input'), 0o700);
+      rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  } finally {
+    // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
+    // makes under another owner or without the runner label are not found here; those tests remove their own. It may
+    // not run before a hook timeout.
+    removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 120_000);
 
