@@ -6,6 +6,8 @@ import type { RunGh } from '../../../github/merge.ts';
  * What `scripts/record-merge-gh.ts` saves: every `gh` call of one real merge inspection, as gh answered it and
  * `runWithInput` (github/run-with-input.ts) reports it to the gateway: stdout in full on exit 0, where stderr is not kept
  * and is saved as ''; on another exit, stderr and stdout with surrounding whitespace trimmed, as runWithInput keeps them.
+ * One part is left out: a branch read (`api repos/<repo>/branches/<branch>`) keeps only `name` and `protected` of
+ * GitHub's answer, since the gateway reads only `protected`.
  */
 export interface RecordedGh {
   gh: string;

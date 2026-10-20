@@ -5,8 +5,9 @@
 // The production GhMergeGateway runs one fresh inspection of the pull request through the real `gh`, signed in as you.
 // Every `gh` call it makes (the pull request, the ruleset, the branch and its classic protection) is saved with its exit
 // status, stdout and stderr, as runWithInput reports them (trimmed on a failure), to test/fixtures/gh/<name>.json. The
-// already-fixed check is replaced by a stub, so its reads are not recorded. Use a public repository: the saved answers
-// are committed. Read the file before committing it.
+// already-fixed check is replaced by a stub, so its reads are not recorded. A branch read keeps only `name` and
+// `protected` (the gateway reads only `protected`), dropping the commit and its authors' emails. Use a public
+// repository: the saved answers are committed. Read the file before committing it.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -21,12 +22,17 @@ if (!name || !/^[a-z0-9-]+$/.test(name) || !number || !/^\d+$/.test(number)) {
   process.exit(2);
 }
 const calls: RecordedGh['calls'] = [];
+const branchRead = (args: readonly string[]) => args.length === 2 && args[0] === 'api' && /\/branches\/[^/]+$/.test(args[1]!);
+const keepProtected = (stdout: string) => {
+  const branch = JSON.parse(stdout) as { name: unknown; protected: unknown };
+  return JSON.stringify({ name: branch.name, protected: branch.protected });
+};
 const gateway = new GhMergeGateway({ repository, pullRequest: Number(number), issue: 1 }, async (args, options) => {
   // The same options as the gateway's own runner.
   try {
     const stdout = await runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal,
       env: ghEnvironment(), killGraceMs: MERGE_KILL_GRACE_MS, pipeGraceMs: MERGE_PIPE_GRACE_MS });
-    calls.push({ args: [...args], exitCode: 0, stdout, stderr: '' });
+    calls.push({ args: [...args], exitCode: 0, stdout: branchRead(args) ? keepProtected(stdout) : stdout, stderr: '' });
     return stdout;
   } catch (error) {
     const exit = error instanceof CommandFailed ? /\(exit (\d+)\)/.exec(error.message) : null;
