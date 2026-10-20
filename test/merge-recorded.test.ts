@@ -123,7 +123,8 @@ async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) 
 
 it('ends the job for a person, before waiting, against the repository\'s real non-strict ruleset', async () => {
   const store = taskAt(pending);
-  const { job, merges } = await runJob(store, () => [passing]);
+  // Pending checks: a job that waited on them before reading the guard would end blocked at the time limit instead.
+  const { job, merges } = await runJob(store, () => [pending]);
   expect(job).toMatchObject({ state: 'failed', reason: 'GitHub does not expose a server-enforced guard for the validated base.' });
   expect(merges).toEqual([]);
 });

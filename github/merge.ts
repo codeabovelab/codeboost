@@ -355,7 +355,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
       if (protection === null) {
         // `protected` is also true when only a ruleset applies; GitHub then answers 404 "Branch not protected" here
-        // (recorded in test/fixtures/gh/). Any other 404 on a protected branch may hide classic rules: fail closed.
+        // (recorded in test/fixtures/gh/). Any other 404 on a protected branch may hide classic rules (a token without
+        // admin rights gets "Not Found"): fail closed.
         if (branchState.protected && !unprotected) throw new Error('Branch protection is present but unreadable.');
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
         throw new Error('GitHub returned incomplete branch protection.');

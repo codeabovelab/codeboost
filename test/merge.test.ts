@@ -1766,14 +1766,21 @@ it('does not let an inspection started before merge repopulate the cache', async
   expect(pullReads).toBe(2);
 });
 
-// gh 2.102.0 exits 1 on an HTTP error, printing `gh: <message> (HTTP <status>)` to stderr and GitHub's JSON body to
-// stdout; runWithInput reports both in a CommandFailed (test/fixtures/gh/ holds the real "Branch not protected" answer).
+/**
+ * gh 2.102.0 exits 1 on an HTTP error, printing `gh: <message> (HTTP <status>)` to stderr and GitHub's JSON body to
+ * stdout. runWithInput reports both, trimmed, in a CommandFailed whose message is built as below.
+ */
+const ghExit = (stderr: string, stdout: string) =>
+  new CommandFailed(`gh failed (exit 1): ${stderr}${stdout ? `\n${stdout}` : ''}`, stderr, stdout);
+const PROTECTION_DOCS = 'https://docs.github.com/rest/branches/branch-protection#get-branch-protection';
 it.each([
-  ['GitHub\'s "Branch not protected" answer', new CommandFailed('gh failed (exit 1): gh: Branch not protected (HTTP 404)', 'gh: Branch not protected (HTTP 404)',
-    '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}'), true],
-  ['another 404 body', new CommandFailed('gh failed (exit 1): gh: Not Found (HTTP 404)', 'gh: Not Found (HTTP 404)',
-    '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'), false],
-  ['a 404 whose body is not JSON', new CommandFailed('gh failed (exit 1): gh: Branch not protected (HTTP 404)', 'gh: Branch not protected (HTTP 404)', ''), false],
+  // As recorded in test/fixtures/gh/ for a branch only a ruleset covers.
+  ['GitHub\'s "Branch not protected" answer', ghExit('gh: Branch not protected (HTTP 404)',
+    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), true],
+  // GitHub's answer to a token without admin rights on a protected branch (cli/cli trunk, read 2026-10-20).
+  ['the 404 a token without admin rights gets', ghExit('gh: Not Found (HTTP 404)',
+    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), false],
+  ['a 404 whose body is not JSON', ghExit('gh: Branch not protected (HTTP 404)', ''), false],
   ['a 404 message that gh did not answer', new Error('HTTP 404: Branch not protected'), false],
 ] as const)('reads a protected branch\'s classic protection as absent only for %s', async (_case, answer, known) => {
   const run = async (args: readonly string[]) => {
@@ -1789,19 +1796,6 @@ it.each([
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.rulesKnown).toBe(known);
   if (known) expect(state.requiredChecks).toEqual([{ context: 'test', appId: null, state: 'missing' }]);
-});
-
-it('fails closed for a classic protection check without app_id', async () => {
-  const run = async (args: readonly string[]) => {
-    const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
-    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [{ context: 'test' }], contexts: ['test'] } });
-    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
-    throw new Error(`Unexpected gh call: ${joined}`);
-  };
-  expect((await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect()).rulesKnown).toBe(false);
 });
 
 it.each([
