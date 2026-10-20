@@ -148,8 +148,10 @@ describe('real task workspace (#87)', () => {
 });
 
 describe('task storage path identity (#162)', () => {
-  // Only volumes made with the probe's own tmpfs options count, so another run on the same daemon cannot change the
-  // result.
+  // Only volumes made with the probe's own tmpfs options count, so other users of the daemon do not change the result.
+  // Precondition: no other probe runs on this daemon during the test (another runner's startup, or this file run from
+  // another checkout); its short-lived container and volume would match too. The docker project runs files one at a
+  // time, and no other file probes.
   const probeVolumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean).filter(volume => {
     try { return docker('volume', 'inspect', '--format', '{{json .Options}}', volume).includes('size=1048576,nr_inodes=64,'); }
     catch { return false; } // removed between the listing and the inspect
