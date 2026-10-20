@@ -1,0 +1,51 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "codeabovelab/codeboost",
+  "pullRequest": 183,
+  "recordedAt": "2026-10-20T18:01:25.681Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/codeabovelab/codeboost/rules/branches/main"
+      ],
+      "exitCode": 0,
+      "stdout": "[[{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"do_not_enforce_on_create\":false,\"required_status_checks\":[{\"context\":\"test\"},{\"context\":\"real-docker\"}]},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"codeabovelab/codeboost\",\"ruleset_id\":25374312}]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/main"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"name\":\"main\",\"protected\":true,\"protection\":{\"enabled\":false,\"required_status_checks\":{\"enforcement_level\":\"off\",\"contexts\":[],\"checks\":[]}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/main/protection"
+      ],
+      "exitCode": 1,
+      "stdout": "{\"message\":\"Branch not protected\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+      "stderr": "gh: Branch not protected (HTTP 404)"
+    },
+    {
+      "args": [
+        "pr",
+        "view",
+        "183",
+        "--repo",
+        "codeabovelab/codeboost",
+        "--json",
+        "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"baseRefName\":\"main\",\"baseRefOid\":\"42abf4a0fd8f65588054120fb315a3db325ec759\",\"headRefName\":\"test/t6-t12-evidence\",\"headRefOid\":\"ba80fb0489e87194f3a21db57af75d58609409ac\",\"isDraft\":false,\"mergeable\":\"MERGEABLE\",\"number\":183,\"state\":\"OPEN\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T18:00:27Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/39467382420/job/118782197979\",\"name\":\"real-docker\",\"startedAt\":\"2026-10-20T17:35:19Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Agent isolation\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T17:56:33Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/39467382360/job/118782197157\",\"name\":\"test\",\"startedAt\":\"2026-10-20T17:35:18Z\",\"status\":\"COMPLETED\",\"workflowName\":\"CI\"}],\"url\":\"https://github.com/codeabovelab/codeboost/pull/183\"}\n",
+      "stderr": ""
+    }
+  ]
+}

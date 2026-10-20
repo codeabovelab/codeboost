@@ -89,8 +89,10 @@ them. They do not call a vendor or GitHub.
 
 - Recorded Claude planning output: `test/fixtures/planning/recorded/`, replayed
   by `test/planning-recorded.test.ts`.
-- GitHub (`gh`) responses: fixtures inside `test/merge.test.ts` and the other
-  merge and publishing tests.
+- Recorded GitHub (`gh`) answers to the merge inspection's reads:
+  `test/fixtures/gh/`, replayed by `test/merge-recorded.test.ts` (T12).
+  Hand-written `gh` responses: fixtures inside `test/merge.test.ts` and the
+  other merge and publishing tests.
 - Hostile issue texts: `test/fixtures/hostile-issues.json`, used by
   `test/execution-prompt.test.ts`.
 
@@ -194,6 +196,26 @@ CODEBOOST_RUN_AUTH_PROBES=1 CLAUDE_CODE_OAUTH_TOKEN=... node scripts/record-plan
 Read each file in `test/fixtures/planning/recorded/` before you commit it. No
 workflow records fixtures. [Planning acceptance](planning-acceptance.md#recorded-vendor-output)
 describes the recordings.
+
+## Record the gh merge fixtures again
+
+`scripts/record-merge-gh.ts` runs one fresh merge inspection of a pull request
+through the production gateway and the real `gh`, signed in as you, and saves
+every `gh` call it makes (argv, exit status, stdout, stderr) to
+`test/fixtures/gh/<name>.json`. `test/merge-recorded.test.ts` fails when the
+gateway asks GitHub something no recording holds: each test asserts that every
+`gh` call had a recorded answer, apart from `gh pr merge` in the job tests,
+which a fake answers because recording it would merge the pull request.
+
+```sh
+node scripts/record-merge-gh.ts checks-pending 183
+```
+
+Record only from a public repository: the answers are committed. The three
+recordings are `zero-checks` (pull request 104, into a branch no rule
+covers), and `checks-pending` and `checks-passing` (pull request 183 at one
+head, while its required checks ran and after they passed). Read each file
+before you commit it. No workflow records fixtures.
 
 ## Run the same checks locally
 

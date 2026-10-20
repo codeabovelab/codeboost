@@ -6,6 +6,7 @@ import { GhMergeGateway, MERGE_CHECK_SETTLE_MS, MERGE_KILL_GRACE_MS, MERGE_PIPE_
 import { Store, mergeActionResponse } from '../runner/store.ts';
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
 
 type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
 const sha = (digit: string) => digit.repeat(40);
@@ -940,6 +941,112 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(pullReads).toBe(2);
 });
 
+/**
+ * The hand-written gh answers of the T6 and T12 tests below (`changingRules`, the required-reviews test and the
+ * classic-protection 404 table) follow the shapes in test/fixtures/gh/, recorded with gh 2.102.0: exit 0 with the JSON
+ * on stdout, or, for an HTTP error, a CommandFailed as runWithInput reports it (`ghExit`). Each answer carries the
+ * fields the gateway reads on that test's path, with a few it ignores (such as a branch's `name`, a rollup entry's
+ * `__typename`, or the review rules a test is about), and leaves out:
+ * - the pull request's `url` (read when present, only for display) and, unless given, rollup fields such as
+ *   `__typename`, `detailsUrl` and `workflowName`;
+ * - each rule's `ruleset_source_type`, `ruleset_source`, `ruleset_id` and, for checks, `do_not_enforce_on_create`;
+ * - the branch's `commit` and links, and its `protection` where the protection read succeeds (the gateway reads
+ *   `protection.enabled` only after that read answers "Branch not protected");
+ * - classic protection's fields other than `required_status_checks`, and the URLs inside it;
+ * - all output of `gh pr merge`, which answers exit 0 with nothing printed (the gateway reads only the exit status).
+ */
+/**
+ * T6: GitHub where PR 7 never moves (base sha('a'), head sha('b')) but the rules may change between reads. `rules.ruleset`
+ * and `rules.classic` are the required check names each rule source returns now; `ci` runs fail and `lint` statuses pass.
+ * Ruleset checks any app may report carry no `integration_id`, as recorded. What it leaves out: see above.
+ */
+function changingRules(rules: { ruleset: string[]; classic: string[] }) {
+  const reads = { ruleset: 0, classic: 0, merges: 0 };
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+      { name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z' },
+      { context: 'lint', state: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z' },
+    ] });
+    if (joined.includes('/rules/branches/')) { reads.ruleset++; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true,
+      required_status_checks: rules.ruleset.map(context => ({ context })) } }]]); }
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true });
+    if (joined.endsWith('/protection')) { reads.classic++; return JSON.stringify({ required_status_checks: { strict: true,
+      checks: rules.classic.map(context => ({ context, app_id: null })), contexts: rules.classic } }); }
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    if (joined.startsWith('pr merge 7')) { reads.merges++; return ''; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  return { reads, client: new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run) };
+}
+
+it('reads both rule sources again on a fresh inspection when base and head are unchanged', async () => {
+  const rules = { ruleset: [] as string[], classic: [] as string[] }, { reads, client } = changingRules(rules);
+  const first = await client.inspect();
+  expect(first).toMatchObject({ base: sha('a'), head: sha('b'), rulesKnown: true, requiredChecks: [] });
+  expect(reads).toMatchObject({ ruleset: 1, classic: 1 });
+  rules.ruleset = ['ci']; rules.classic = ['lint'];
+  // Within the cache's lifetime an inspection that is not fresh is served from the cache: no rule source is read.
+  expect(await client.inspect()).toBe(first);
+  expect(reads).toMatchObject({ ruleset: 1, classic: 1 });
+  // A fresh one reads both again, though the pull request's base and head match the cached state.
+  const fresh = await client.inspect({ fresh: true });
+  expect(fresh).toMatchObject({ base: sha('a'), head: sha('b') });
+  expect(reads).toMatchObject({ ruleset: 2, classic: 2 });
+  expect(fresh.requiredChecks).toEqual([
+    { context: 'ci', appId: null, state: 'failure' },
+    { context: 'lint', appId: null, state: 'success' },
+  ]);
+});
+
+it.each([
+  ['ruleset', { ruleset: ['ci'], classic: ['lint'] }],
+  ['classic branch protection', { ruleset: [], classic: ['lint', 'ci'] }],
+] as const)('refuses a guarded merge when the %s adds a failing required check after a cached ready status', async (_source, changed) => {
+  // A passing strict `lint` gives the atomic base guard a ready merge needs.
+  const rules = { ruleset: [] as string[], classic: ['lint'] }, { reads, client } = changingRules(rules);
+  const view = readyView(), coordinator = new MergeCoordinator(serviceFor(view), client);
+  // The page's status read (not fresh) caches a ready state whose only required check passes.
+  expect(await coordinator.status(view)).toMatchObject({ ready: true });
+  const before = { ...reads };
+  Object.assign(rules, { ruleset: [...changed.ruleset], classic: [...changed.classic] });
+  // The pull request's base and head are unchanged, so only a fresh read of both rule sources can see the new check.
+  await expect(coordinator.merge(view.token)).rejects.toThrow(/^ci is failure/);
+  expect(reads.ruleset).toBeGreaterThan(before.ruleset);
+  expect(reads.classic).toBeGreaterThan(before.classic);
+  expect(reads.merges).toBe(0);
+});
+
+// T12: reviews are not checks. Both rule sources here also require approving reviews, shaped as GitHub's REST reference
+// (2022-11-28) gives a ruleset `pull_request` rule and classic `required_pull_request_reviews`; no recording has them.
+// The review rule's other parameters are left out too; for the rest, see the note above `changingRules`.
+it('ignores required reviews in both rule sources and reads only their required checks', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z' },
+      { __typename: 'StatusContext', context: 'lint', state: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z' },
+    ] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[
+      { type: 'pull_request', parameters: { dismiss_stale_reviews_on_push: true, require_code_owner_review: true, require_last_push_approval: true,
+        required_approving_review_count: 2, required_review_thread_resolution: true } },
+      { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test' }] } },
+    ]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({
+      required_status_checks: { strict: true, checks: [{ context: 'lint', app_id: null }], contexts: ['lint'] },
+      required_pull_request_reviews: { dismiss_stale_reviews: true, require_code_owner_reviews: true, required_approving_review_count: 2 } });
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: true, requiredChecks: [
+    { context: 'test', appId: null, state: 'success' }, { context: 'lint', appId: null, state: 'success' }] });
+  const view = readyView();
+  expect(await new MergeCoordinator(serviceFor(view), new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run)).status(view))
+    .toMatchObject({ ready: true, blockers: [] });
+});
+
 /** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
 async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
   const run = async (args: readonly string[]) => {
@@ -1093,6 +1200,14 @@ it.each([
   ['only a commit status', [{ context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:00:00Z' }], 'failure'],
 ] as const)('requires both a check run and a commit status with the required name: %s', async (_case, rollup, expected) => {
   expect(await requiredTestState([...rollup])).toEqual([expected]);
+});
+
+// #176, until it is fixed: gh's rollup never carries a check run's app (test/fixtures/gh/, gh 2.102.0), so a requirement
+// pinned to an app finds no matching run and reads as missing. That fails closed: a passing run from any app never
+// satisfies it.
+it('reads a requirement pinned to an app as missing against gh\'s app-less check runs', async () => {
+  expect(await requiredTestState([{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
+    startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z', workflowName: 'CI' }], 10)).toEqual(['missing']);
 });
 
 it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
@@ -1702,6 +1817,49 @@ it('does not let an inspection started before merge repopulate the cache', async
   await staleInspection;
   await client.inspect();
   expect(pullReads).toBe(2);
+});
+
+/**
+ * gh 2.102.0 exits 1 on an HTTP error, printing `gh: <message> (HTTP <status>)` to stderr and GitHub's JSON body to
+ * stdout. runWithInput reports both, trimmed, in a CommandFailed whose message is built as below. The table's other
+ * answers (an empty rollup, no required check observed) leave out what the note above `changingRules` lists.
+ */
+const ghExit = (stderr: string, stdout: string) =>
+  new CommandFailed(`gh failed (exit 1): ${stderr}${stdout ? `\n${stdout}` : ''}`, stderr, stdout);
+const PROTECTION_DOCS = 'https://docs.github.com/rest/branches/branch-protection#get-branch-protection';
+const NOT_PROTECTED = ghExit('gh: Branch not protected (HTTP 404)', `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}`);
+/** The branch read's `protection` as GitHub gives it for a branch with classic protection off (recorded in test/fixtures/gh/). */
+const CLASSIC_OFF = { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } };
+it.each([
+  // As recorded in test/fixtures/gh/ for a branch only a ruleset covers.
+  ['GitHub\'s "Branch not protected" answer with classic protection off', 'absent', NOT_PROTECTED, CLASSIC_OFF, true],
+  // The branch read must agree: a "Branch not protected" answer alone does not show that no classic rule applies.
+  ['a "Branch not protected" answer while the branch shows classic protection on', 'unknown (fail closed)', NOT_PROTECTED,
+    { ...CLASSIC_OFF, enabled: true }, false],
+  ['a "Branch not protected" answer while the branch read has no protection', 'unknown (fail closed)', NOT_PROTECTED, undefined, false],
+  // GitHub's answer to a token without admin rights on a protected branch (cli/cli trunk, read 2026-10-20).
+  ['the 404 a token without admin rights gets', 'unknown (fail closed)', ghExit('gh: Not Found (HTTP 404)',
+    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), CLASSIC_OFF, false],
+  ['a "Branch not protected" body without a 404 status', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)',
+    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_OFF, false],
+  ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), CLASSIC_OFF, false],
+  // Not a gh exit, though it carries GitHub's body: only gh's own answer confirms the absence.
+  ['a 404 message that gh did not answer', 'unknown (fail closed)', Object.assign(new Error('HTTP 404: Branch not protected'),
+    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), CLASSIC_OFF, false],
+] as const)('for %s, reads a protected branch\'s classic protection as %s', async (_case, _reads, answer, protection, known) => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    // A ruleset check with no `integration_id`, as GitHub sends one that any app may report.
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test' }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true, ...(protection ? { protection } : {}) });
+    if (joined.endsWith('/protection')) throw answer;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(known);
+  if (known) expect(state.requiredChecks).toEqual([{ context: 'test', appId: null, state: 'missing' }]);
 });
 
 it.each([

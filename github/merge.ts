@@ -1,7 +1,7 @@
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
 import { ghEnvironment } from './gh-env.ts';
 import { markerOf } from './pull-requests.ts';
-import { ghAnswered, runWithInput } from './run-with-input.ts';
+import { CommandFailed, ghAnswered, runWithInput } from './run-with-input.ts';
 import { RemoteTimeout } from './timeout.ts';
 import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
@@ -188,6 +188,14 @@ function observedCheckStart(check: Record<string, unknown>): number {
 function observedCheckOlderThan(check: Record<string, unknown>): number {
   return Number.isNaN(observedCheckStart(check)) ? observedTime(check.completedAt) : NaN;
 }
+/** GitHub's own 404 answer for a branch with no classic protection: the body gh prints, not only its message. */
+function branchNotProtected(error: Error): boolean {
+  if (!(error instanceof CommandFailed)) return false;
+  try {
+    const body = JSON.parse(error.stdout) as { message?: unknown; status?: unknown } | null;
+    return body?.message === 'Branch not protected' && body.status === '404';
+  } catch { return false; }
+}
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
 
@@ -236,14 +244,6 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const output = await this.run(args, { signal });
     try { return JSON.parse(output); }
     catch { throw new Error('GitHub returned invalid JSON.'); }
-  }
-
-  async #optionalJson(args: readonly string[], signal?: AbortSignal): Promise<unknown | null> {
-    try { return await this.#json(args, signal); }
-    catch (error) {
-      if (error instanceof Error && /HTTP 404|not found/i.test(error.message)) return null;
-      throw error;
-    }
   }
 
   /**
@@ -347,11 +347,22 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     let classic: unknown | null = null;
     try {
       rules = flattenPages(await this.#json(['api','--paginate','--slurp',`repos/${this.config.repository}/rules/branches/${branch}`], signal));
-      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as { protected?: unknown };
+      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as
+        { protected?: unknown; protection?: { enabled?: unknown } | null };
       if (typeof branchState.protected !== 'boolean') throw new Error('GitHub returned an incomplete branch state.');
-      const protection = await this.#optionalJson(['api',`repos/${this.config.repository}/branches/${branch}/protection`], signal);
+      let protection: unknown | null = null, unprotected = false;
+      try { protection = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}/protection`], signal); }
+      catch (error) {
+        if (!(error instanceof Error) || !/HTTP 404|not found/i.test(error.message)) throw error;
+        unprotected = branchNotProtected(error);
+      }
       if (protection === null) {
-        if (branchState.protected) throw new Error('Branch protection is present but unreadable.');
+        // `protected` is also true when only a ruleset applies; GitHub then answers 404 "Branch not protected" here, and
+        // the branch read shows classic protection off (`protection.enabled` false; both recorded in test/fixtures/gh/).
+        // Anything else on a protected branch may hide classic rules (a token without admin rights gets "Not Found"):
+        // fail closed.
+        const classicOff = unprotected && branchState.protection?.enabled === false;
+        if (branchState.protected && !classicOff) throw new Error('Branch protection is present but unreadable.');
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
         throw new Error('GitHub returned incomplete branch protection.');
       } else {
@@ -376,8 +387,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         for (const check of parameters.required_status_checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;
-          if (!Object.hasOwn(check, 'integration_id')) { rulesKnown = false; break; }
-          const app = (check as { integration_id: unknown }).integration_id;
+          // GitHub leaves `integration_id` out for a check any app may report (recorded in test/fixtures/gh/).
+          const app = Object.hasOwn(check, 'integration_id') ? (check as { integration_id: unknown }).integration_id : null;
           if (app !== null && (!Number.isSafeInteger(app) || (app as number) < 1)) { rulesKnown = false; break; }
           const appId = app as number | null;
           requirements.set(`${context}\0${appId ?? ''}`, { context, appId });

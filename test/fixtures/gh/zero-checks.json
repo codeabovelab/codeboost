@@ -1,0 +1,51 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "codeabovelab/codeboost",
+  "pullRequest": 104,
+  "recordedAt": "2026-10-20T17:34:41.271Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/codeabovelab/codeboost/rules/branches/feat%2Fd-gitlink-mounts-81"
+      ],
+      "exitCode": 0,
+      "stdout": "[[]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/feat%2Fd-gitlink-mounts-81"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"name\":\"feat/d-gitlink-mounts-81\",\"protected\":false,\"protection\":{\"enabled\":false,\"required_status_checks\":{\"enforcement_level\":\"off\",\"contexts\":[],\"checks\":[]}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/branches/feat%2Fd-gitlink-mounts-81/protection"
+      ],
+      "exitCode": 1,
+      "stdout": "{\"message\":\"Branch not protected\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+      "stderr": "gh: Branch not protected (HTTP 404)"
+    },
+    {
+      "args": [
+        "pr",
+        "view",
+        "104",
+        "--repo",
+        "codeabovelab/codeboost",
+        "--json",
+        "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"baseRefName\":\"feat/d-gitlink-mounts-81\",\"baseRefOid\":\"1dd118232466af7e2c1197d43900c8982399e30e\",\"headRefName\":\"feat/d-gitlink-parents-99\",\"headRefOid\":\"3d51d184282c40cf188d203ddd753c20743ba1a4\",\"isDraft\":false,\"mergeable\":\"UNKNOWN\",\"number\":104,\"state\":\"MERGED\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T17:35:40Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37039794093/job/110946806982\",\"name\":\"real-docker\",\"startedAt\":\"2026-10-02T17:18:20Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Agent isolation\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-03T00:11:03Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37079690241/job/111077240630\",\"name\":\"real-docker\",\"startedAt\":\"2026-10-02T23:53:45Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Agent isolation\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T17:22:09Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37039794074/job/110946806853\",\"name\":\"test\",\"startedAt\":\"2026-10-02T17:18:21Z\",\"status\":\"COMPLETED\",\"workflowName\":\"CI\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-02T23:57:02Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/codeabovelab/codeboost/actions/runs/37079690323/job/111077241017\",\"name\":\"test\",\"startedAt\":\"2026-10-02T23:53:45Z\",\"status\":\"COMPLETED\",\"workflowName\":\"CI\"}],\"url\":\"https://github.com/codeabovelab/codeboost/pull/104\"}\n",
+      "stderr": ""
+    }
+  ]
+}

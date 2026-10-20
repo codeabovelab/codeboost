@@ -132,6 +132,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringCommand?: (service: ReviewService) => void;
   /** Runs after a command check's terminal write, while the runner releases its workspace. */
   duringRelease?: (service: ReviewService) => void;
+  /** The exit code of each command check, given the head it checks; replaces `commandExit` when given. */
+  commandResult?: (head: string) => number;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -237,9 +239,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
           signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
       } } satisfies InvocationHandle;
     }
+    const exitCode = options.commandResult?.(checkedHeads.at(-1)!) ?? commandExit ?? 0;
     return { attemptId: input.attemptId,
-      settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
-        signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
+      settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode,
+        signal: null, stdout: '', stderr: exitCode ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair: { base: string; head: string; branch?: string } = { base: onto, head, branch: BRANCH };
   const pushes: { branch: string; from: string; to: string }[] = [];
@@ -1863,6 +1866,24 @@ it('fails the job when a command check breaks on the rewritten head', async () =
   await f.close();
 });
 
+it('fails the job when the moved base itself breaks the command check on the rewritten head', async () => {
+  // The check fails only on a head that holds the base's new file b.txt, as a test would that main's change breaks.
+  const hasFile = (repository: string, head: string, path: string) => {
+    try { fixtureGit(repository, 'cat-file', '-e', `${head}:${path}`); return true; } catch { return false; }
+  };
+  let repository = '';
+  const f = await mergeJob('feature\n', 0, { commandResult: head => hasFile(repository, head, 'b.txt') ? 1 : 0 });
+  repository = f.service.config.repository;
+  // The reviewed head does not hold it, so the check would pass there; the rebase brings it in.
+  expect(hasFile(repository, (await f.service.load()).snapshot.head, 'b.txt')).toBe(false);
+  expect(hasFile(repository, f.rebased, 'b.txt')).toBe(true);
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'failed', reason: expect.stringMatching(/command checks did not pass/) });
+  expect(f.checkedHeads).toEqual([f.rebased]);
+  expect(f.merged).toEqual([]);
+  await f.close();
+});
+
 it('stops the job for review when a collaborator pushed to the pull request', async () => {
   const f = await mergeJob('feature\n');
   const repository = f.service.config.repository;
@@ -1874,6 +1895,57 @@ it('stops the job for review when a collaborator pushed to the pull request', as
   expect(f.merged).toEqual([]);
   await f.close();
 });
+
+// T6: a head-only collaborator push is reviewed again, then the next job reruns the `cmd:` checks on that head. The design
+// (docs/implementation/merge-handoff.md, Outcomes: `review-required`) reruns them only after the person reviews it.
+it.each([[0, 'merged'], [1, 'failed']] as const)('reruns command checks on a collaborator head after review when the base did not move (exit %i)', async (exit, ending) => {
+  let commandExit = 0, refuse = true;
+  const f = await mergeJob('feature\n', 0, { commandResult: () => commandExit }, () => refuse);
+  const identity = f.service.config.identity, repository = f.service.config.repository;
+  // A first job rebases onto the moved base, pushes, passes the check on the rewritten head, and GitHub refuses the merge.
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+  expect(f.checkedHeads).toEqual([f.rebased]);
+  const reviewed = (await f.service.load()).snapshot;
+  expect(reviewed.head).toBe(f.rebased);
+  expect(f.service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check').map(attempt => attempt.state)).toEqual(['completed']);
+  // A collaborator pushes on top of the reviewed head, which has a passing check. Only the head moves.
+  const work = join(repository, '..', 'collaborator');
+  fixtureGit(repository, 'worktree', 'add', '-q', work, f.rebased);
+  writeFileSync(join(work, 'a.txt'), 'feature, changed by a collaborator\n');
+  fixtureGit(work, 'commit', '-qam', 'collaborator');
+  const collaborator = fixtureGit(work, 'rev-parse', 'HEAD');
+  f.moveRemote({ base: reviewed.base, head: collaborator });
+  refuse = false;
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/head moved/) });
+  expect(f.checkedHeads).toEqual([f.rebased]);
+  // The review was recomputed for the new head: the collaborator's lines are Unplanned and P1 is no longer approved.
+  let view = await f.service.load();
+  expect(view.snapshot).toMatchObject({ base: reviewed.base, head: collaborator });
+  const unplanned = view.segments.filter(segment => segment.row === 'Unplanned');
+  expect(unplanned.length).toBeGreaterThan(0);
+  expect(view.items.find(item => item.id === 'P1')?.state).not.toBe('approved');
+  // The person attributes the collaborator's change to P1 and approves it again, then merges again.
+  for (const segment of unplanned) view = await f.service.act({ action: 'assign', key: segment.key, item: 'P1', token: view.token });
+  view = await f.service.act({ action: 'approve', item: 'P1', token: view.token });
+  expect(view.items.find(item => item.id === 'P1')?.state).toBe('approved');
+  commandExit = exit;
+  await f.start();
+  const job = await f.settled();
+  expect(job).toMatchObject({ state: ending });
+  // The check ran again, on the collaborator head, with no rebase or push in between: the earlier pass on the reviewed
+  // head did not count for it.
+  expect(f.checkedHeads).toEqual([f.rebased, collaborator]);
+  expect(f.rebaseRuns()).toBe(1);
+  expect(f.pushes).toHaveLength(1);
+  const checks = f.service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check');
+  expect(checks).toHaveLength(2);
+  expect(checks.map(check => f.service.store.getSnapshot(identity, check.context.snapshotId).head)).toEqual([f.rebased, collaborator]);
+  if (ending === 'merged') expect(f.merged).toEqual([f.rebased, collaborator]);
+  else { expect(job.reason).toMatch(/command checks did not pass/); expect(f.merged).toEqual([f.rebased]); }
+  await f.close();
+}, 60_000);
 
 it('stops a retry for review when its preparation rebases after GitHub refused the merge', async () => {
   let refuse = true;
