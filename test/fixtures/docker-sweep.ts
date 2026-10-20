@@ -2,10 +2,11 @@ import { spawnSync } from 'node:child_process';
 import { RUNNER_LABEL } from '../../agents/labels.ts';
 
 /**
- * Force-removes every container, network and volume labelled with one runner owner, containers first, as they hold
- * the others in use. It reports what it finds and any Docker call that fails, and never throws, so a test file's
- * afterAll can call it in a finally block without hiding an error from its ordinary cleanup. Each call has a 30 s
- * limit, so all six can take up to 3 minutes.
+ * Removes the containers, networks and volumes labelled with one runner owner, containers first, as they hold the
+ * others in use. Containers and volumes go by force; a network that another container still uses stays. It reports
+ * what it finds and any Docker call that fails, and never throws, so a test file's afterAll can call it in a finally
+ * block without hiding an error from its ordinary cleanup. Each call has a 30 s limit, so all six can take up to
+ * 3 minutes.
  */
 export function removeRunnerObjects(runnerOwner: string): void {
   const run = (args: string[]) => {
