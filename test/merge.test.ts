@@ -1812,6 +1812,8 @@ it.each([
   // GitHub's answer to a token without admin rights on a protected branch (cli/cli trunk, read 2026-10-20).
   ['the 404 a token without admin rights gets', 'unknown (fail closed)', ghExit('gh: Not Found (HTTP 404)',
     `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), false],
+  ['a "Branch not protected" body without a 404 status', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)',
+    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), false],
   ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), false],
   // Not a gh exit, though it carries GitHub's body: only gh's own answer confirms the absence.
   ['a 404 message that gh did not answer', 'unknown (fail closed)', Object.assign(new Error('HTTP 404: Branch not protected'),

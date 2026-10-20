@@ -191,8 +191,10 @@ function observedCheckOlderThan(check: Record<string, unknown>): number {
 /** GitHub's own 404 answer for a branch with no classic protection: the body gh prints, not only its message. */
 function branchNotProtected(error: Error): boolean {
   if (!(error instanceof CommandFailed)) return false;
-  try { return (JSON.parse(error.stdout) as { message?: unknown } | null)?.message === 'Branch not protected'; }
-  catch { return false; }
+  try {
+    const body = JSON.parse(error.stdout) as { message?: unknown; status?: unknown } | null;
+    return body?.message === 'Branch not protected' && body.status === '404';
+  } catch { return false; }
 }
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;

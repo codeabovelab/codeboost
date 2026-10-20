@@ -22,6 +22,8 @@ if (!name || !/^[a-z0-9-]+$/.test(name) || !number || !/^\d+$/.test(number)) {
   process.exit(2);
 }
 const calls: RecordedGh['calls'] = [];
+// A call that did not end with gh's own exit (a signal or timeout) has no answer to record.
+let unanswered: unknown = null;
 const branchRead = (args: readonly string[]) => args.length === 2 && args[0] === 'api' && /\/branches\/[^/]+$/.test(args[1]!);
 const keepProtected = (stdout: string) => {
   const branch = JSON.parse(stdout) as { name: unknown; protected: unknown };
@@ -36,12 +38,16 @@ const gateway = new GhMergeGateway({ repository, pullRequest: Number(number), is
     return stdout;
   } catch (error) {
     const exit = error instanceof CommandFailed ? /\(exit (\d+)\)/.exec(error.message) : null;
-    if (!(error instanceof CommandFailed) || !exit) throw error;
+    if (!(error instanceof CommandFailed) || !exit) { unanswered ??= error; throw error; }
     calls.push({ args: [...args], exitCode: Number(exit[1]), stdout: error.stdout, stderr: error.stderr });
     throw error;
   }
 }, { repository, check: async () => ({ outcome: 'clear', baseHead: '0'.repeat(40) }) });
 const state = await gateway.inspect({ fresh: true });
+if (unanswered) {
+  console.error(`Not saved: a gh call did not finish with an answer: ${unanswered instanceof Error ? unanswered.message : String(unanswered)}`);
+  process.exit(1);
+}
 const recording: RecordedGh = {
   gh: execFileSync('gh', ['--version'], { encoding: 'utf8' }).split('\n', 1)[0]!,
   repository, pullRequest: Number(number), recordedAt: new Date().toISOString(),
