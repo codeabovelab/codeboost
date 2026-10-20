@@ -970,7 +970,7 @@ function changingRules(rules: { ruleset: string[]; classic: string[] }) {
     ] });
     if (joined.includes('/rules/branches/')) { reads.ruleset++; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true,
       required_status_checks: rules.ruleset.map(context => ({ context })) } }]]); }
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true });
     if (joined.endsWith('/protection')) { reads.classic++; return JSON.stringify({ required_status_checks: { strict: true,
       checks: rules.classic.map(context => ({ context, app_id: null })), contexts: rules.classic } }); }
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
