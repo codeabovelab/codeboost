@@ -271,7 +271,8 @@ describe('task storage probe against Docker answers', () => {
     expect(elapsed).toBeLessThan(43_000);
   }, 90_000);
   it('gives each cleanup call the time left, capped at exactly 10 s and at least exactly 1 s', () => {
-    // Pinned in both directions; the timing tests above show the call actually uses this deadline.
+    // The helper's values, exactly. The timing tests above show the cleanup calls use it, to within about 1–2 s (a cap
+    // of roughly 9–12 s and a floor of roughly 0.4–3 s), not exactly.
     expect([-5, 0, 1, 999, 999.2, 1_000, 1_001, 4_200.5, 9_999, 10_000, 10_001, 40_000].map(probeCleanupCallMs))
       .toEqual([1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_001, 4_201, 9_999, 10_000, 10_000, 10_000]);
   });

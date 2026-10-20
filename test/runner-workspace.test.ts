@@ -148,25 +148,34 @@ describe('real task workspace (#87)', () => {
 });
 
 describe('task storage path identity (#162)', () => {
+  // Only volumes made with the probe's own tmpfs options count, so another run on the same daemon cannot change the
+  // result.
+  const probeVolumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean).filter(volume => {
+    try { return docker('volume', 'inspect', '--format', '{{json .Options}}', volume).includes('size=1048576,nr_inodes=64,'); }
+    catch { return false; } // removed between the listing and the inspect
+  }));
   it('measures the tmpfs the agent edits, whatever the host folds, and leaves no container or volume behind', async () => {
-    const volumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean));
-    const before = volumes();
+    const before = probeVolumes();
     // Task storage is a tmpfs in the daemon's Linux kernel: case-sensitive, and names are compared as bytes. A macOS
     // host folder would report the reverse, which is why the probe does not read the host.
     expect(await probeTaskStoragePathIdentity(imageId)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });
     // In any state: a container created but never started would outlive --rm.
     expect(docker('ps', '-aq', '--filter', 'name=codeboost-path-identity-')).toBe('');
-    expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
+    expect([...probeVolumes()].filter(volume => !before.has(volume))).toEqual([]);
   }, 120_000);
   it('removes a never-started probe container and its volume with the cleanup\'s own rm', () => {
     // The failure path's claim: a container created but never started (a killed client) loses its anonymous volume to
     // `rm --force --volumes`. Made with the probe's exact mount; removed with the exact command the cleanup runs.
-    const volumes = () => new Set(docker('volume', 'ls', '-q').split('\n').filter(Boolean));
-    const before = volumes(), name = `codeboost-path-identity-${randomUUID()}`;
+    const name = `codeboost-path-identity-${randomUUID()}`;
     docker('create', '--name', name, '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'true', imageId);
-    try { expect([...volumes()].filter(volume => !before.has(volume))).toHaveLength(1); }
-    finally { docker('rm', '--force', '--volumes', name); }
-    expect([...volumes()].filter(volume => !before.has(volume))).toEqual([]);
+    let volume = '';
+    try {
+      // This container's own volume, by name: the anonymous volume the mount made.
+      volume = docker('container', 'inspect', '--format', '{{range .Mounts}}{{.Name}}{{end}}', name);
+      expect(volume).toMatch(/^[0-9a-f]{64}$/);
+      expect(docker('volume', 'inspect', '--format', '{{json .Options}}', volume)).toContain('size=1048576,nr_inodes=64,');
+    } finally { docker('rm', '--force', '--volumes', name); }
+    expect(() => docker('volume', 'inspect', volume)).toThrow();
   }, 120_000);
   it('runs only the image the trusted builder produced', async () => {
     await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
