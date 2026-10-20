@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,8 +18,13 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
 import type { ProcessGroupLifecycle, ProcessGroupOwner } from '../agents/tracked-docker.ts';
+import { RUNNER_LABEL } from '../agents/labels.ts';
 import { createTaskClone } from '../git/clone.ts';
-const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+// Container names come from attempt IDs, so each run gets its own suffix and runner owner: a container a failed or
+// concurrent run leaves behind can neither take this run's names nor count as this run's resources.
+const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
+const RUN = randomBytes(4).toString('hex');
+const attempt = (name: string) => `${name}-${RUN}`;
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
@@ -44,7 +49,7 @@ function fixture(schema = '{"probe":"codeboost-adapter-schema-marker"}\n') {
 function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlineMs = 2 * 60_000,
   vendor: InvocationInput['vendor'] = 'codex', phase: Phase = 'planning'): InvocationInput {
   return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase, vendor, approvedArgv: [],
-    deadline: Date.now() + deadlineMs, attemptId,
+    deadline: Date.now() + deadlineMs, attemptId: attempt(attemptId),
     context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
       referencedCodeHash: 'code', stateVersion: 1 } });
 }
@@ -63,11 +68,23 @@ async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
 
 beforeAll(async () => { imageId = buildAgentImage(); }, 10 * 60_000);
 afterAll(async () => {
-  for (const profile of profiles) await disposeContainerProfile(profile);
-  for (const allocation of allocations.reverse()) removeTaskFilesystems(allocation);
-  for (const root of roots.reverse()) {
-    chmodSync(join(root, 'input'), 0o700);
-    rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  try {
+    for (const profile of profiles) await disposeContainerProfile(profile);
+    for (const allocation of allocations.reverse()) removeTaskFilesystems(allocation);
+    for (const root of roots.reverse()) {
+      chmodSync(join(root, 'input'), 0o700);
+      rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  } finally {
+    // Then remove whatever this run still owns, even when a test or the cleanup above failed first: an agent that
+    // ignores SIGTERM, or storage whose removal did not settle. Containers go first, as they hold the others in use.
+    for (const kind of ['container', 'network', 'volume'] as const) {
+      const ids = spawnSync('docker', [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter',
+        `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' })
+        .stdout?.split('\n').filter(Boolean) ?? [];
+      if (ids.length) spawnSync('docker', [kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids],
+        { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
+    }
   }
 }, 3 * 60_000);
 
@@ -86,18 +103,18 @@ describe('container invocation supervisor', () => {
     expect(result.stopReason).toBe('shutdown');
     expect(result.stderr).toContain('[codeboost: shutdown:');
     expect(attempts).toBe(1);
-    expect(isInvocationActive('cancel-setup-cleanup')).toBe(false);
-  });
+    expect(isInvocationActive(attempt('cancel-setup-cleanup'))).toBe(false);
+  }, 60_000); // the fixture creates task storage in Docker, which can take longer than Vitest's 5 s default
 
   it('captures finite output and releases ownership only after cleanup', async () => {
     const current = await profile(fixture(), 'finite-output', 'finite');
     const handle = startProfileInvocation(current);
-    expect(isInvocationActive('finite')).toBe(true);
+    expect(isInvocationActive(attempt('finite'))).toBe(true);
     const result = await handle.settled;
-    expect(result).toMatchObject({ attemptId: 'finite', exitCode: 0, signal: null,
+    expect(result).toMatchObject({ attemptId: attempt('finite'), exitCode: 0, signal: null,
       stdout: 'stdout-marker', stderr: 'stderr-marker' });
     expect(result.stopReason).toBeUndefined();
-    expect(isInvocationActive('finite')).toBe(false);
+    expect(isInvocationActive(attempt('finite'))).toBe(false);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
     expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
   }, 60_000);
@@ -133,7 +150,7 @@ describe('container invocation supervisor', () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limits.stdoutBytes);
     expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.stderrBytes);
     expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.combinedBytes);
-    expect(isInvocationActive(attemptId)).toBe(false);
+    expect(isInvocationActive(attempt(attemptId))).toBe(false);
   }, 60_000);
 
   it('drains finite command diagnostics past their capture limits without changing exit-0 success', async () => {
@@ -193,7 +210,7 @@ describe('container invocation supervisor', () => {
         // The decoded text is discarded; the result keeps the probe's raw stdout.
         expect(result.stdout).toBe('stdout-marker');
       }
-      expect(isInvocationActive(attemptId)).toBe(false);
+      expect(isInvocationActive(attempt(attemptId))).toBe(false);
     }
   }, 120_000);
 
@@ -207,7 +224,7 @@ describe('container invocation supervisor', () => {
     const result = await handle.settled;
     expect(result.stopReason).toBe('output-limit');
     expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32 * 1024);
-    expect(isInvocationActive(attemptId)).toBe(false);
+    expect(isInvocationActive(attempt(attemptId))).toBe(false);
   }, 60_000);
 
   it('preserves the first cancellation reason until an ignored SIGTERM fully settles', async () => {
@@ -218,11 +235,11 @@ describe('container invocation supervisor', () => {
     handle.cancel('cancelled'); handle.cancel('shutdown');
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(isInvocationActive('cancelled')).toBe(true);
+    expect(isInvocationActive(attempt('cancelled'))).toBe(true);
     const result = await handle.settled;
     expect(result.stopReason).toBe('cancelled');
     expect(result.stderr).toContain('[codeboost: cancelled]');
-    expect(isInvocationActive('cancelled')).toBe(false);
+    expect(isInvocationActive(attempt('cancelled'))).toBe(false);
   }, 60_000);
 
   // A rejected start settles (after releasing the profile) instead of throwing.
@@ -281,7 +298,7 @@ describe('container invocation supervisor', () => {
     expect(result.stopReason).toBe('shutdown');
     expect(result.stderr).toContain('cleanup was not confirmed within 60 s');
     expect(result.unreleased).toEqual(expected);
-    expect(isInvocationActive('unreachable-daemon')).toBe(false);
+    expect(isInvocationActive(attempt('unreachable-daemon'))).toBe(false);
     expect(() => startProfileInvocation(current)).toThrow('settled without confirmed cleanup');
     // Every launch path refuses it, before touching the leftover container that recovery still owns.
     await expect(startValidatedContainer(current)).rejects.toThrow('settled without confirmed cleanup');
@@ -335,7 +352,7 @@ describe('container invocation supervisor', () => {
       const started = performance.now();
       const handle = startProfileInvocation(current, { timeoutMs: 2 * 60_000 });
       expect(performance.now() - started).toBeLessThan(250);
-      expect(isInvocationActive('setup-cancel')).toBe(true);
+      expect(isInvocationActive(attempt('setup-cancel'))).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 1_000)); // the create is now hanging
       expect(await loopLag()).toBeLessThan(250);
       handle.cancel('shutdown');
@@ -343,7 +360,7 @@ describe('container invocation supervisor', () => {
     });
     expect(result.stopReason).toBe('shutdown');
     expect(result.unreleased).toBeUndefined();
-    expect(isInvocationActive('setup-cancel')).toBe(false);
+    expect(isInvocationActive(attempt('setup-cancel'))).toBe(false);
     expect(isContainerProfileAuthentic(current)).toBe(false);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
     expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
@@ -351,15 +368,15 @@ describe('container invocation supervisor', () => {
 
   it('returns the adapter handle at once and cancels it during network creation', async () => {
     const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'claude', 'review');
-    const egress = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress'],
-      { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort();
+    const egress = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress',
+      '--filter', `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort();
     const before = egress();
     const result = await withEnvironment('PATH', hangingDocker('network\\ create*'), async () => {
       const started = performance.now();
       const handle = startClaudeInvocation({ invocation: captured, filesystems: data.filesystems,
         inputDirectory: data.input, imageId, prompt: 'unused', networkAllocationId: randomUUID() }, 'unused', { timeoutMs: 2 * 60_000 });
       expect(performance.now() - started).toBeLessThan(250);
-      expect(isInvocationActive('adapter-setup-cancel')).toBe(true);
+      expect(isInvocationActive(attempt('adapter-setup-cancel'))).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 1_000));
       expect(await loopLag()).toBeLessThan(250);
       handle.cancel('cancelled');
@@ -367,7 +384,7 @@ describe('container invocation supervisor', () => {
     });
     expect(result.stopReason).toBe('cancelled');
     expect(result.unreleased).toBeUndefined();
-    expect(isInvocationActive('adapter-setup-cancel')).toBe(false);
+    expect(isInvocationActive(attempt('adapter-setup-cancel'))).toBe(false);
     expect(egress()).toEqual(before);
   }, 2 * 60_000);
 
@@ -380,7 +397,7 @@ describe('container invocation supervisor', () => {
       expect(result.stopReason).toBe('capture-failure');
       expect(result.stderr).toMatch(/already in use|Conflict/);
       expect(result.unreleased).toBeUndefined();
-      expect(isInvocationActive('foreign-name')).toBe(false);
+      expect(isInvocationActive(attempt('foreign-name'))).toBe(false);
       expect(isContainerProfileAuthentic(current)).toBe(false);
       expect(spawnSync('docker', ['network', 'inspect', current.network.name], { stdio: 'ignore' }).status).not.toBe(0);
       expect(execFileSync('docker', ['container', 'inspect', '--format',
@@ -396,7 +413,7 @@ describe('container invocation supervisor', () => {
     const result = await handle.settled;
     expect(result.stopReason).toBe('timeout');
     expect(Date.now() - started).toBeLessThan(20_000);
-    expect(isInvocationActive('timeout')).toBe(false);
+    expect(isInvocationActive(attempt('timeout'))).toBe(false);
   }, 60_000);
 
   it('records timeout when close delivery resumes after the monotonic deadline', async () => {
@@ -437,7 +454,7 @@ describe('container invocation supervisor', () => {
     const data = fixture(), duplicate = invocation(data, 'duplicate');
     const first = startProfileInvocation(await profile(data, 'ignore-term', duplicate), { timeoutMs: 30_000 });
     await expectRejected(startProfileInvocation(await profile(data, 'finite-output', duplicate)), 'still active');
-    expect(isInvocationActive('duplicate')).toBe(true);
+    expect(isInvocationActive(attempt('duplicate'))).toBe(true);
     first.cancel('shutdown');
     expect((await first.settled).stopReason).toBe('shutdown');
   }, 60_000);
@@ -446,7 +463,7 @@ describe('container invocation supervisor', () => {
     const current = await profile(fixture(), 'ignore-term', 'same-profile-duplicate');
     const first = startProfileInvocation(current, { timeoutMs: 30_000 });
     expect(() => startProfileInvocation(current)).toThrow('already owns the active invocation');
-    expect(isInvocationActive('same-profile-duplicate')).toBe(true);
+    expect(isInvocationActive(attempt('same-profile-duplicate'))).toBe(true);
     await waitRunning(current.name);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
     first.cancel('shutdown');
@@ -460,7 +477,7 @@ describe('container invocation supervisor', () => {
     const clone = Object.freeze({ ...current });
     await expect(disposeValidatedContainer(clone)).rejects.toThrow('not created by the trusted profile builder');
     expect(() => startProfileInvocation(clone)).toThrow('not created by the trusted profile builder');
-    expect(isInvocationActive('cloned-profile')).toBe(true);
+    expect(isInvocationActive(attempt('cloned-profile'))).toBe(true);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
     first.cancel('shutdown');
     expect((await first.settled).stopReason).toBe('shutdown');
@@ -473,7 +490,7 @@ describe('container invocation supervisor', () => {
     const result = await handle.settled;
     expect(result.stopReason).toBe('capture-failure');
     expect(result.stderr).toContain('[codeboost: capture-failure');
-    expect(isInvocationActive('capture-failure')).toBe(false);
+    expect(isInvocationActive(attempt('capture-failure'))).toBe(false);
   }, 60_000);
 
   it('preserves cancellation while post-close decoding is still unsettled', async () => {
@@ -500,7 +517,7 @@ describe('container invocation supervisor', () => {
     }).settled;
     expect(result.stopReason).toBe('timeout');
     expect(Date.now() - started).toBeLessThan(15_000);
-    expect(isInvocationActive('decode-timeout')).toBe(false);
+    expect(isInvocationActive(attempt('decode-timeout'))).toBe(false);
   }, 30_000);
 
   it('does not wedge when an injected decoder ignores abort', async () => {
@@ -511,7 +528,7 @@ describe('container invocation supervisor', () => {
     }).settled;
     expect(result.stopReason).toBe('timeout');
     expect(Date.now() - started).toBeLessThan(15_000);
-    expect(isInvocationActive('decode-ignores-abort')).toBe(false);
+    expect(isInvocationActive(attempt('decode-ignores-abort'))).toBe(false);
   }, 30_000);
 
   it('settles cancellation promptly when an injected decoder ignores abort', async () => {
@@ -527,7 +544,7 @@ describe('container invocation supervisor', () => {
     const result = await handle.settled;
     expect(result.stopReason).toBe('cancelled');
     expect(performance.now() - cancelledAt).toBeLessThan(5_000);
-    expect(isInvocationActive('cancel-ignored-decode')).toBe(false);
+    expect(isInvocationActive(attempt('cancel-ignored-decode'))).toBe(false);
   }, 15_000);
 
   it('does not publish a synchronous decode that finishes after the monotonic deadline', async () => {

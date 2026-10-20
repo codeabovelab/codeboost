@@ -39,7 +39,8 @@ vi.mock('node:fs', async importOriginal => {
     return actual.realpathSync(path);
   }) as typeof actual.realpathSync };
 });
-const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+// Each run has its own runner owner, so counting the storage it owns ignores what a concurrent or failed run holds.
+const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
 const roots: string[] = [];
@@ -282,8 +283,8 @@ describe('real Docker agent isolation', () => {
         symlinkSync(target, join(source, 'L'));
       }] as const),
   ] as const)('refuses to seed a repository with %s, and leaves no storage behind', async (_label, hostile) => {
-    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
-      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`),
+      docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`)].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
     const refused = (() => { try { fixture({ hostile }); } catch (error) { return error; } })();
     // Its own error type, so a caller can tell an unusable repository from a Docker failure, with the reason first.
@@ -307,8 +308,8 @@ describe('real Docker agent isolation', () => {
       head: git(data.source, 'rev-parse', 'HEAD') });
     // /work/.git is mounted read-only, which stops writes but not reads through a link.
     symlinkSync('/run/codeboost-auth/codex/auth.json', join(clone.directory, '.git', 'credential'));
-    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
-      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`),
+      docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`)].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
     const refused = (() => {
       try { prepareTaskFilesystems(clone, { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024,
@@ -336,8 +337,8 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('fails closed without leaving storage when a repository exceeds its allocation', async () => {
-    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
-      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`),
+      docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`)].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
     expect(() => fixture({ historyBytes: 4 * 1024 * 1024, limits: {
       workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 1024 * 1024, metadataInodes: 512,
@@ -634,13 +635,15 @@ describe('real Docker agent isolation', () => {
   };
 
   it('rejects a vendor network or proxy without its runner label, and removes them', async () => {
-    const data = fixture(), egress = () => docker('network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress');
-    const before = egress();
+    // Counted by allocation, not by runner: these networks are created without the runner label on purpose.
+    const data = fixture(), allocations = [randomUUID(), randomUUID()];
+    const egress = () => allocations.map(allocation => docker('network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress',
+      '--filter', `label=io.codeboost.allocation=${allocation}`)).join('');
     await withoutRunnerLabel([['network', 'create']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
-      imageId, randomUUID())).rejects.toThrow('changed after allocation'));
+      imageId, allocations[0]!)).rejects.toThrow('changed after allocation'));
     await withoutRunnerLabel([['create', '--name']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
-      imageId, randomUUID())).rejects.toThrow('changed after allocation'));
-    expect(egress()).toBe(before);
+      imageId, allocations[1]!)).rejects.toThrow('changed after allocation'));
+    expect(egress()).toBe('');
   }, 120_000);
 
   // Storage has no captured IDs, so cleanup refuses an object without every owner label; the test removes its own.
@@ -2382,8 +2385,9 @@ describe('real Docker agent isolation', () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-late',
       head: git(data.source, 'rev-parse', 'HEAD') });
-    const keepers = () => new Set(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=keeper')
-      .split('\n').filter(Boolean));
+    // Only this run's keepers: the orphans found are force-removed, so another run's must never be among them.
+    const keepers = () => new Set(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=keeper',
+      '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`).split('\n').filter(Boolean));
     const before = keepers();
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
