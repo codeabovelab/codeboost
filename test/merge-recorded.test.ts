@@ -22,7 +22,7 @@ const clearCheck = (repository: string) => ({ repository, check: async () => ({ 
 const gatewayFor = (recording: RecordedGh, run: RunGh) =>
   new GhMergeGateway({ repository: recording.repository, pullRequest: recording.pullRequest, issue: 1 }, run, clearCheck(recording.repository));
 
-it('reads the recordings as one pull request at one head', () => {
+it('reads pending and passing at one pull request head, and no app in any recorded rollup', () => {
   expect([pending.gh, passing.gh, zero.gh]).toEqual(Array(3).fill('gh version 2.102.0 (2026-09-30)'));
   expect(pullOf(passing)).toMatchObject({ number: 183, baseRefOid: pullOf(pending).baseRefOid, headRefOid: pullOf(pending).headRefOid });
   // gh's statusCheckRollup never carries a check's app (#176), in any recording.
