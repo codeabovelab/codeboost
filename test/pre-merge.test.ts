@@ -1881,18 +1881,27 @@ it('stops the job for review when a collaborator pushed to the pull request', as
 // T6: a head-only collaborator push is reviewed again, then the next job reruns the `cmd:` checks on that head. The design
 // (docs/implementation/merge-handoff.md, Outcomes: `review-required`) reruns them only after the person reviews it.
 it.each([[0, 'merged'], [1, 'failed']] as const)('reruns command checks on a collaborator head after review when the base did not move (exit %i)', async (exit, ending) => {
-  let commandExit = 0;
-  const f = await mergeJob('feature\n', 0, { commandResult: () => commandExit });
+  let commandExit = 0, refuse = true;
+  const f = await mergeJob('feature\n', 0, { commandResult: () => commandExit }, () => refuse);
   const identity = f.service.config.identity, repository = f.service.config.repository;
+  // A first job rebases onto the moved base, pushes, passes the check on the rewritten head, and GitHub refuses the merge.
+  await f.start();
+  expect(await f.settled()).toMatchObject({ state: 'blocked', reason: expect.stringMatching(/^GitHub refused the merge/) });
+  expect(f.checkedHeads).toEqual([f.rebased]);
   const reviewed = (await f.service.load()).snapshot;
-  writeFileSync(join(repository, 'a.txt'), 'feature, changed by a collaborator\n');
-  fixtureGit(repository, 'commit', '-qam', 'collaborator');
-  const collaborator = fixtureGit(repository, 'rev-parse', 'HEAD');
-  // Only the head moved: GitHub reports the base the review was made against.
+  expect(reviewed.head).toBe(f.rebased);
+  expect(f.service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check').map(attempt => attempt.state)).toEqual(['completed']);
+  // A collaborator pushes on top of the reviewed head, which has a passing check. Only the head moves.
+  const work = join(repository, '..', 'collaborator');
+  fixtureGit(repository, 'worktree', 'add', '-q', work, f.rebased);
+  writeFileSync(join(work, 'a.txt'), 'feature, changed by a collaborator\n');
+  fixtureGit(work, 'commit', '-qam', 'collaborator');
+  const collaborator = fixtureGit(work, 'rev-parse', 'HEAD');
   f.moveRemote({ base: reviewed.base, head: collaborator });
+  refuse = false;
   await f.start();
   expect(await f.settled()).toMatchObject({ state: 'review-required', reason: expect.stringMatching(/head moved/) });
-  expect(f.checkedHeads).toEqual([]);
+  expect(f.checkedHeads).toEqual([f.rebased]);
   // The review was recomputed for the new head: the collaborator's lines are Unplanned and P1 is no longer approved.
   let view = await f.service.load();
   expect(view.snapshot).toMatchObject({ base: reviewed.base, head: collaborator });
@@ -1907,15 +1916,16 @@ it.each([[0, 'merged'], [1, 'failed']] as const)('reruns command checks on a col
   await f.start();
   const job = await f.settled();
   expect(job).toMatchObject({ state: ending });
-  // The check ran again, on the collaborator head, with no rebase or push in between.
-  expect(f.checkedHeads).toEqual([collaborator]);
-  expect(f.rebaseRuns()).toBe(0);
-  expect(f.pushes).toEqual([]);
-  const check = f.service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check');
-  expect(check).toHaveLength(1);
-  expect(f.service.store.getSnapshot(identity, check[0]!.context.snapshotId).head).toBe(collaborator);
-  if (ending === 'merged') expect(f.merged).toEqual([collaborator]);
-  else { expect(job.reason).toMatch(/command checks did not pass/); expect(f.merged).toEqual([]); }
+  // The check ran again, on the collaborator head, with no rebase or push in between: the earlier pass on the reviewed
+  // head did not count for it.
+  expect(f.checkedHeads).toEqual([f.rebased, collaborator]);
+  expect(f.rebaseRuns()).toBe(1);
+  expect(f.pushes).toHaveLength(1);
+  const checks = f.service.store.getAttempts(identity).filter(attempt => attempt.kind === 'check');
+  expect(checks).toHaveLength(2);
+  expect(checks.map(check => f.service.store.getSnapshot(identity, check.context.snapshotId).head)).toEqual([f.rebased, collaborator]);
+  if (ending === 'merged') expect(f.merged).toEqual([f.rebased, collaborator]);
+  else { expect(job.reason).toMatch(/command checks did not pass/); expect(f.merged).toEqual([f.rebased]); }
   await f.close();
 }, 60_000);
 
