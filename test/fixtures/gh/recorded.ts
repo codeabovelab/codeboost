@@ -26,16 +26,17 @@ export function loadRecording(name: string): RecordedGh {
  * CommandFailed with the same message, stderr and stdout. A call no recording holds fails the test: the gateway now asks
  * GitHub something that was not recorded. When several recordings hold one call, the first listed answers.
  */
-export function replayGh(...recordings: RecordedGh[]): RunGh & { calls: string[][] } {
-  const calls: string[][] = [];
+export function replayGh(...recordings: RecordedGh[]): RunGh & { calls: string[][]; unrecorded: string[][] } {
+  const calls: string[][] = [], unrecorded: string[][] = [];
   const run = async (args: readonly string[]) => {
     calls.push([...args]);
     const joined = JSON.stringify(args);
     const answer = recordings.flatMap(recording => recording.calls).find(call => JSON.stringify(call.args) === joined);
-    if (!answer) throw new Error(`No recorded answer for gh ${args.join(' ')}`);
+    // The gateway may turn this failure into unknown rules, so callers also assert `unrecorded` is empty.
+    if (!answer) { unrecorded.push([...args]); throw new Error(`No recorded answer for gh ${args.join(' ')}`); }
     if (answer.exitCode === 0) return answer.stdout;
     throw new CommandFailed(`gh failed (exit ${answer.exitCode}): ${answer.stderr.slice(0, 2000)}${answer.stdout ? `\n${answer.stdout.slice(0, 2000)}` : ''}`,
       answer.stderr, answer.stdout);
   };
-  return Object.assign(run, { calls });
+  return Object.assign(run, { calls, unrecorded });
 }

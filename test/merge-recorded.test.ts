@@ -11,7 +11,8 @@ import { loadRecording, replayGh, type RecordedGh } from './fixtures/gh/recorded
 
 // T12: required checks read from GitHub's real answers, recorded by scripts/record-merge-gh.ts with gh 2.102.0 from the
 // public codeabovelab/codeboost repository:
-// - zero-checks: PR 104, into a branch no ruleset or classic protection covers;
+// - zero-checks: PR 104, into a branch no ruleset or classic protection covers (merged since, so it is read here only for
+//   its required checks);
 // - checks-pending: PR 183, while its two required checks (`test`, `real-docker`, from the "main checks" ruleset) ran;
 // - checks-passing: PR 183 at the same head, after both passed.
 // The already-fixed check's reads are not recorded: every gateway here gets a stub check that answers clear.
@@ -33,17 +34,20 @@ it('reads pending and passing at one pull request head, and no app in any record
 });
 
 it('reads zero required checks from a branch with no rules', async () => {
-  const state = await gatewayFor(zero, replayGh(zero)).inspect({ fresh: true });
+  const run = replayGh(zero), state = await gatewayFor(zero, run).inspect({ fresh: true });
+  expect(run.unrecorded).toEqual([]);
   expect(state).toMatchObject({ base: pullOf(zero).baseRefOid, head: pullOf(zero).headRefOid, rulesKnown: true, requiredChecks: [],
     atomicBaseGuard: false, mergeQueue: false });
 });
 
 it('reads the ruleset\'s required checks as pending, then as passing at the same head', async () => {
-  const before = await gatewayFor(pending, replayGh(pending)).inspect({ fresh: true });
+  const runPending = replayGh(pending), runPassing = replayGh(passing);
+  const before = await gatewayFor(pending, runPending).inspect({ fresh: true });
   // The ruleset names its checks with no `integration_id`, and the branch reads as protected with no classic protection.
   expect(before).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, mergeQueue: false, requiredChecks: [
     { context: 'test', appId: null, state: 'pending' }, { context: 'real-docker', appId: null, state: 'pending' }] });
-  const after = await gatewayFor(passing, replayGh(passing)).inspect({ fresh: true });
+  const after = await gatewayFor(passing, runPassing).inspect({ fresh: true });
+  expect([...runPending.unrecorded, ...runPassing.unrecorded]).toEqual([]);
   expect(after).toMatchObject({ base: before.base, head: before.head, rulesKnown: true, requiredChecks: [
     { context: 'test', appId: null, state: 'success' }, { context: 'real-docker', appId: null, state: 'success' }] });
 });
@@ -105,14 +109,15 @@ function strictRuleset(recording: RecordedGh): RecordedGh {
 /** Runs one job; `answer(n)` picks the recordings that answer the n-th `gh pr view`. */
 async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) {
   let pullViews = 0;
-  const merges: string[][] = [], ruleReads = { ruleset: 0, classic: 0 };
+  const merges: string[][] = [], unrecorded: string[][] = [], ruleReads = { ruleset: 0, classic: 0 };
   const run: RunGh = async (args, options) => {
     // `gh pr merge` was not recorded: it would merge the pull request. The gateway reads only its exit status.
     if (args[0] === 'pr' && args[1] === 'merge') { merges.push([...args]); return ''; }
     if (args[0] === 'pr' && args[1] === 'view') pullViews++;
     if (args.some(arg => arg.includes('/rules/branches/'))) ruleReads.ruleset++;
     if (args.some(arg => arg.endsWith('/protection'))) ruleReads.classic++;
-    return replayGh(...answer(Math.max(pullViews, 1)))(args, options);
+    const replay = replayGh(...answer(Math.max(pullViews, 1)));
+    try { return await replay(args, options); } finally { unrecorded.push(...replay.unrecorded); }
   };
   const review = reviewOf(store), recording = pending;
   const merge = new MergeCoordinator(review, gatewayFor(recording, run));
@@ -120,6 +125,8 @@ async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) 
   jobs.push(coordinator);
   await coordinator.start('review-token', crypto.randomUUID());
   await coordinator.current;
+  // Every gh call the job made had a recorded answer.
+  expect(unrecorded).toEqual([]);
   return { job: coordinator.latest()!, merges, ruleReads, pullViews: () => pullViews };
 }
 
@@ -136,7 +143,8 @@ it('waits while the recorded checks are pending, then merges once they pass', as
   const strictPending = strictRuleset(pending), strictPassing = strictRuleset(passing);
   const { job, merges, ruleReads, pullViews } = await runJob(store, view => view <= 2 ? [strictPending] : [strictPassing]);
   expect(job).toMatchObject({ state: 'merged', url: 'https://github.com/codeabovelab/codeboost/pull/183' });
-  // The wait read the pending answer twice, then the passing one; the guarded merge read it again at least twice.
+  // Reads 1-2 answer pending and later ones passing. The job merged, so its wait saw the checks pending, then passing;
+  // it stops reading once they pass, so at least five reads mean the guarded merge read GitHub again after it.
   expect(pullViews()).toBeGreaterThanOrEqual(5);
   // Every one of those inspections read both rule sources again, though base and head never changed.
   expect(ruleReads).toEqual({ ruleset: pullViews(), classic: pullViews() });
