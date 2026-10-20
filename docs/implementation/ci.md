@@ -204,7 +204,8 @@ through the production gateway and the real `gh`, signed in as you, and saves
 every `gh` call it makes (argv, exit status, stdout, stderr) to
 `test/fixtures/gh/<name>.json`. `test/merge-recorded.test.ts` fails when the
 gateway asks GitHub something no recording holds: each test asserts that every
-`gh` call had a recorded answer.
+`gh` call had a recorded answer, apart from `gh pr merge` in the job tests,
+which a fake answers because recording it would merge the pull request.
 
 ```sh
 node scripts/record-merge-gh.ts checks-pending 183
