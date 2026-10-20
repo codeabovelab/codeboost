@@ -80,6 +80,8 @@ const recovery = (calls: string[], over: Partial<RecoveryDeps> = {}): RecoveryDe
 });
 const lock = (calls: string[], fail = false) => ({ file: { dev: 1n, ino: 2n }, verify: () => { calls.push('verify'); if (fail) throw new Error('The database path changed while opening. Refusing to start.'); } });
 const capability = { run: <T>(fn: () => T) => fn() };
+// Task storage that agrees with the configured identity, so these tests need no Docker (the real probe is in runner-workspace).
+const matching = (service: ReviewService) => async () => ({ ...service.config.pathIdentity });
 
 describe('runner configuration', () => {
   it('accepts a complete block and refuses relative paths, bad committers and unknown limits', () => {
@@ -98,9 +100,30 @@ describe('runner configuration', () => {
 });
 
 describe('runner startup', () => {
+  it('refuses to start when pathIdentity disagrees with the task storage the agent edits (#162)', async () => {
+    const { root, service } = fixture(), configured = service.config.pathIdentity;
+    for (const probed of [{ ...configured, caseSensitive: !configured.caseSensitive },
+      { ...configured, unicodeNormalization: configured.unicodeNormalization === 'NFC' ? 'none' as const : 'NFC' as const }]) {
+      const calls: string[] = [];
+      await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+        buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); },
+        probeTaskStorage: async imageId => { calls.push(`probe ${imageId}`); return probed; } }))
+        .rejects.toThrow(`pathIdentity (caseSensitive ${configured.caseSensitive}, unicodeNormalization ${configured.unicodeNormalization}) does not match `
+          + `the task storage the agent edits (caseSensitive ${probed.caseSensitive}, unicodeNormalization ${probed.unicodeNormalization})`);
+      // Probed with the built image, after recovery and the image build.
+      expect(calls).toEqual(['verify', 'deps', 'recover', 'image', 'probe sha256:x']);
+    }
+    // A probe that fails stops startup too: an identity that cannot be measured is not assumed.
+    await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'sha256:x', recovery: () => recovery([]), probeTaskStorage: () => Promise.reject(new Error('docker run failed')) }))
+      .rejects.toThrow('docker run failed');
+    // The probed identity itself starts.
+    await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'sha256:x', recovery: () => recovery([]), probeTaskStorage: async () => ({ ...configured }) })).resolves.toBeDefined();
+  });
   it('verifies the lock, recovers, then builds the image, before it assembles anything', async () => {
     const { root, service } = fixture(), calls: string[] = [];
-    const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const assembly = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } });
     // D's recovery stops every leftover agent before the (possibly long) image build.
     expect(calls).toEqual(['verify', 'deps', 'recover', 'image']);
@@ -128,14 +151,14 @@ describe('runner startup', () => {
     const { root, service } = fixture(), calls: string[] = [];
     const actionId = randomUUID();
     service.store.beginMergeJob(service.config.identity, { actionId, token: 'review-token' });
-    await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'sha256:x', recovery: () => recovery(calls) });
     expect(service.store.getMergeJob(service.config.identity, actionId)).toMatchObject({ state: 'failed',
       reason: expect.stringMatching(/server restarted/) });
   });
   it('pushes a prepared rewrite only under an exact lease on the PR head it rewrote', async () => {
     const { root, service } = fixture(), calls: string[] = [];
-    const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const assembly = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'sha256:x', recovery: () => recovery(calls) });
     const push = vi.spyOn(GitBranchPusher.prototype, 'push').mockResolvedValue();
     const read = vi.spyOn(GitBranchPusher.prototype, 'readBranch').mockResolvedValue(null);
@@ -160,7 +183,7 @@ describe('runner startup', () => {
     const { root, service } = fixture();
     service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
       authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     issueReads.length = 0;
     const signal = new AbortController().signal, identity = service.config.identity;
@@ -179,7 +202,7 @@ describe('runner startup', () => {
   });
   it('does not reuse collaborator-filtered comments without a complete collaborator snapshot', async () => {
     const { root, service } = fixture();
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     issueReads.length = 0;
     collaboratorComments = ['Former collaborator note.'];
@@ -197,7 +220,7 @@ describe('runner startup', () => {
     issueAuthor = 'outside'; issueCollaborator = false;
     service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
       authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: ['Outside note.'] } });
     service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
@@ -206,7 +229,7 @@ describe('runner startup', () => {
   });
   it('refuses when access changes between the execute admission and text read', async () => {
     const { root, service } = fixture();
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     // The gateway's first read admits the collaborator; its text read observes the changed current access and refuses.
     afterIssueAccess = () => { issueCollaborator = false; };
@@ -217,7 +240,7 @@ describe('runner startup', () => {
     issueAuthor = 'outside'; issueCollaborator = false;
     const issue = service.store.getPlan(service.config.identity).issue;
     service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     issueReads.length = 0;
     beforeIssueTextReturn = () => { service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor,
@@ -233,7 +256,7 @@ describe('runner startup', () => {
     issueAuthor = 'outside'; issueCollaborator = false;
     const issue = service.store.getPlan(service.config.identity).issue;
     service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
-    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    const { sources } = await setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     const guarded = await sources.issue(service.config.identity, new AbortController().signal);
     expect(guarded.text.comments).toEqual(['Outside note.']);
@@ -244,7 +267,7 @@ describe('runner startup', () => {
     for (const [patch, env, message] of [[{ github: undefined }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /github block/], [{}, {}, RUNNER_CREDENTIAL_MISSING], [{ demo: true }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /Demos never/]] as const) {
       const { root, service, config } = fixture(), calls: string[] = [];
       service.config = { ...config, ...patch };
-      await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env,
+      await expect(setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock(calls), env,
         buildImage: () => { calls.push('image'); return 'x'; }, recovery: () => recovery(calls) })).rejects.toThrow(message);
       expect(calls).toEqual([]);
       expect(existsSync(join(root, 'runner'))).toBe(false);
@@ -252,16 +275,16 @@ describe('runner startup', () => {
   });
   it('stops startup when the lock no longer names the database, or recovery fails, and admits nothing', async () => {
     const { root, service } = fixture(), calls: string[] = [];
-    await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls, true), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    await expect(setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock(calls, true), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => { calls.push('image'); return 'x'; }, recovery: () => recovery(calls) })).rejects.toThrow(/path changed/);
     expect(calls).toEqual(['verify']);
-    await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    await expect(setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([], { recoverLeftovers: async () => { throw new Error('docker down'); } }) })).rejects.toThrow(/docker down/);
   });
   it('refuses a configured runnerRepository that is not the runner\'s own', async () => {
     const { root, service, config } = fixture();
     service.config = { ...config, runnerRepository: join(root, 'elsewhere.git') };
-    await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    await expect(setUpRunner({ service, capability, probeTaskStorage: matching(service), config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) })).rejects.toThrow(/is not the runner's repository/);
   });
 });

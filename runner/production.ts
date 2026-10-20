@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } from '../agents/container/storage.ts';
+import { exportTaskDiff, probeTaskStoragePathIdentity, removeTaskFilesystemsAsync, type TaskStorageLimits } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startRunnerCommandInvocation } from '../agents/adapters/runner.ts';
@@ -26,6 +26,8 @@ import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 import { commandCheckDeps } from './checks.ts';
 import { PreMergeCoordinator, type PreMergeAuthorization } from './pre-merge.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
+import { assertPathIdentity } from './path-identity.ts';
+import type { PathIdentity } from '../core/path-identity.ts';
 
 /**
  * The production runner (#91): D's real workspace, launcher, recovery, export and removal, under the database's runner
@@ -196,13 +198,16 @@ export interface RunnerAssembly {
 /**
  * Startup with a runner, after the Store opened and before the server admits anything (runner-lifecycle.md, "Startup
  * recovery"): verify the lock still names the database, run recovery under the database's runner token, build the
- * agent image (once D's recovery returns, if it found any storage; otherwise after recovery), then assemble the
- * execution deps. Any failure stops startup; the caller closes the Store.
+ * agent image (once D's recovery returns, if it found any storage; otherwise after recovery), check pathIdentity against
+ * task storage with that image (#162), then assemble the execution deps. Any failure stops startup; the caller closes
+ * the Store.
  */
 export async function setUpRunner(o: { service: ReviewService; capability: ShutdownCapability; config: RunnerConfig; lock: Pick<RunnerLock, 'file' | 'verify'>;
   env: Readonly<Record<string, string | undefined>>; buildImage?: () => string; recovery?: (image: () => string) => RecoveryDeps;
   /** Told before the slow part (recovery and the image build) starts. */
-  onSlowStart?: () => void }): Promise<RunnerAssembly> {
+  onSlowStart?: () => void;
+  /** Measures task storage's path identity with the built image; Docker's own by default. */
+  probeTaskStorage?: (imageId: string) => Promise<PathIdentity> }): Promise<RunnerAssembly> {
   const { service, config } = o, review = service.config;
   if (review.demo) throw new Error('Demos never run the runner.');
   if (!review.github) throw new Error(RUNNER_NEEDS_GITHUB);
@@ -267,6 +272,12 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   service.store.settleInterruptedMergeJobs(identity);
   const repository = await getRepository();
   const imageId = image();
+  // #162: plan path keys follow pathIdentity, so it must match the filesystem the agent edits, where the runner inspects
+  // and commits task changes. That is task storage in the Docker daemon's kernel, not the host folder the staging clone
+  // is made in, so it is probed there, with the built image, before anything is admitted. Host checkouts (the staging
+  // clone, the rebase worktree) are #179.
+  assertPathIdentity(review.pathIdentity, await (o.probeTaskStorage ?? probeTaskStoragePathIdentity)(imageId),
+    'the task storage the agent edits');
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
     limits: { ...EXECUTE_STORAGE, ...config.limits }, committer: config.committer });
   const issues = new GhIssueGateway(review.github.repository);

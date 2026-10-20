@@ -17,22 +17,32 @@ const cli = fileURLToPath(new URL('../web/cli.ts', import.meta.url));
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 /** A non-demo review with a runner block, and a HOME of its own so the lock directory is the test's. */
-function review(github: Record<string, unknown> | null = { baseBranch: 'main' }) {
+function review(github: Record<string, unknown> | null = { baseBranch: 'main' },
+  pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' } = { caseSensitive: true, unicodeNormalization: 'none' }) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-cli-')); roots.push(root);
   const demo = createDemo(join(root, 'demo')), store = new Store(demo.database), issue = store.getPlan(demo.identity).issue; store.close();
   mkdirSync(join(root, 'runner'), { mode: 0o700 }); mkdirSync(join(root, 'home'), { mode: 0o700 });
   const config = join(root, 'review.json');
-  writeFileSync(config, JSON.stringify({ ...demo, demo: false, ...(github ? { github: { repository: 'owner/repo', pullRequest: 1, issue, ...github } } : {}),
+  // What task storage reports (a Linux tmpfs), and what the fake docker below answers the startup probe with (#162).
+  writeFileSync(config, JSON.stringify({ ...demo, demo: false, pathIdentity, ...(github ? { github: { repository: 'owner/repo', pullRequest: 1, issue, ...github } } : {}),
     runner: { root: join(root, 'runner'), committer: { name: 'codeboost', email: 'runner@codeboost.invalid' } } }));
   /**
-   * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile) once the hold
-   * file is gone: startup recovery waits on it, as on a slow daemon, for as long as the test keeps the file.
+   * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile, and the
+   * path identity of a Linux tmpfs to the startup probe) once the hold file is gone: startup recovery waits on it, as on
+   * a slow daemon, for as long as the test keeps the file. It models only the calls a successful startup makes, checked
+   * against Docker 27.4.0: recovery's label listings (`ps --all --quiet --no-trunc`, `volume ls --quiet`,
+   * `network ls --quiet --no-trunc`) with nothing to list answer as here, exit 0 and no output; of `build` only the exit
+   * status is read; `image inspect` answers a one-element array, of which the image builder reads only `Id`,
+   * `Config.User` and `Config.Labels`, given here in Docker's shape; and the probe on real task storage prints the line
+   * given here (runner-workspace.test.ts). The probe's failure cleanup, whose rm and inspect answers matter, is tested against its
+   * own fake in path-identity-probe.test.ts.
    */
   const fakeDocker = () => {
     const bin = join(root, 'bin'), hold = join(bin, 'hold'), image = JSON.stringify([{ Id: `sha256:${'a'.repeat(64)}`, Config: { User: '10001:10001',
       Labels: { 'org.opencontainers.image.base.name': BASE_IMAGE, 'io.codeboost.codex.version': CODEX_VERSION, 'io.codeboost.claude.version': CLAUDE_VERSION, 'io.codeboost.profile.version': '1' } } }]);
     mkdirSync(bin, { mode: 0o700 }); writeFileSync(hold, '');
-    writeFileSync(join(bin, 'docker'), `#!/bin/sh\nwhile [ -e '${hold}' ]; do sleep 0.05; done\nif [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; fi\nexit 0\n`);
+    writeFileSync(join(bin, 'docker'), `#!/bin/sh\nwhile [ -e '${hold}' ]; do sleep 0.05; done\nif [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; fi\n`
+      + `if [ "$1" = run ]; then case "$*" in *codeboost-path-identity*) echo 'codeboost-path-identity true none';; esac; fi\nexit 0\n`);
     chmodSync(join(bin, 'docker'), 0o755);
     return { path: `${bin}:${process.env.PATH}`, release: () => { if (existsSync(hold)) unlinkSync(hold); } };
   };
@@ -187,6 +197,17 @@ exit 1
     expect(await cli.exited).toBe(0);
     const reopened = new Store(database);
     try { expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'failed', draft: true }); } finally { reopened.close(); }
+  } finally { cli.child.kill('SIGKILL'); }
+});
+it('refuses with a message, not a stack, when pathIdentity disagrees with task storage (#162)', async () => {
+  // A macOS host folder would report this; the agent edits a Linux tmpfs, which the fake docker reports as Docker would.
+  const { fakeDocker, start } = review(undefined, { caseSensitive: false, unicodeNormalization: 'NFC' }), docker = fakeDocker();
+  docker.release();
+  const cli = start(docker);
+  try {
+    expect(await cli.exited).toBe(1);
+    expect(cli.err().trim()).toBe('pathIdentity (caseSensitive false, unicodeNormalization NFC) does not match the task storage the agent edits '
+      + '(caseSensitive true, unicodeNormalization none). Set pathIdentity to the probed values.');
   } finally { cli.child.kill('SIGKILL'); }
 });
 it('refuses with a message, not a stack, when the database path changes during a runner startup', async () => {

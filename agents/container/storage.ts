@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TaskClone } from '../contract.ts';
+import type { PathIdentity } from '../../core/path-identity.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
-import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
+import { DockerError, NOT_STARTED, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
 import { MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, TREE_SCRIPT } from './tree-script.ts';
@@ -265,6 +266,10 @@ function* allocationObjects(allocationId: string, expected: number, remaining: (
   }
 }
 
+/** The local-driver options of every task storage volume: a size- and inode-limited tmpfs owned by the storage user. */
+const TASK_VOLUME_OPTIONS = (bytes: number, inodes: number): readonly string[] =>
+  ['type=tmpfs', 'device=tmpfs', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`];
+
 /** The allocation, as a sequence of Docker calls. Both variants run these same steps; only how each call runs differs. */
 function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: string, owner: ResourceOwner,
   timeoutMs: number): Steps<TaskFilesystems> {
@@ -306,8 +311,7 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
   try {
     for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
       ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
-      yield* allocate(name, ['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
-        '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
+      yield* allocate(name, ['volume', 'create', '--driver', 'local', ...TASK_VOLUME_OPTIONS(bytes, inodes).flatMap(option => ['--opt', option]),
         '--label', `io.codeboost.task-storage=${kind}`, ...labels, name]);
       // The check above and this create are not atomic across processes. Once our first object exists, it must be
       // the only one carrying the ID: of two racing allocations, the later check sees both and backs out.
@@ -397,6 +401,90 @@ export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: Task
       throw Object.assign(new Error('Task storage allocation was cancelled.', { cause: error }),
         { name: 'AbortError', code: 'ABORT_ERR' });
     throw error;
+  }
+}
+
+// In the directory given as $1, writes `case` and NFC `caf\u00e9`, then asks whether `CASE` and NFD `cafe\u0301` name
+// the same entries. printf writes the UTF-8 bytes, so the script itself stays ASCII. Exported so a test can run it on a
+// host folder whose answer is known.
+export const PATH_IDENTITY_SCRIPT = ['set -eu', 'cd "$1"', ': > case', ': > "$(printf \'caf\\303\\251\')"',
+  'if [ -e CASE ]; then c=false; else c=true; fi', 'if [ -e "$(printf \'cafe\\314\\201\')" ]; then u=NFC; else u=none; fi',
+  'printf \'codeboost-path-identity %s %s\\n\' "$c" "$u"'].join('; ');
+/** The probe's `/work`: an anonymous local volume with task storage's tmpfs options, as one `--mount` value. */
+export const PROBE_VOLUME_MOUNT = ['type=volume', 'target=/work', 'volume-driver=local',
+  ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
+  // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
+  .map(field => field.includes(',') ? `"${field}"` : field).join(',');
+/**
+ * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
+ * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
+ * container hardened like the keeper. The volume is anonymous and the container `--rm`, so once the container has
+ * started the daemon removes both when it exits, even if this process does not live to see it. A client stopped before
+ * then (its deadline) may leave the container created but never started, which `--rm` does not remove, so a failed
+ * probe removes its container, and that volume, by the unique name it gave it. Not covered: a create that lands after
+ * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
+ * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). Nor is the volume's removal
+ * confirmed: `--rm` and `rm --volumes` remove it, but Docker only logs a failure to. A recovery sweep is #181.
+ */
+export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = PROBE_CLEANUP_MS): Promise<PathIdentity> {
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
+  assertBuiltAgentImage(imageId);
+  const name = `codeboost-path-identity-${randomUUID()}`;
+  const args = ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
+    '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
+    '--cpus=.25', '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
+  const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
+  if (outcome.status !== 0) {
+    const failure = new DockerError(args, outcome);
+    // A client that never started sent nothing to the daemon, so there is nothing to remove.
+    const error = outcome.error as NodeJS.ErrnoException | undefined;
+    if (outcome.status === null && (error?.code === NOT_STARTED || error?.syscall?.startsWith('spawn'))) throw failure;
+    // Only a refusal from the daemon itself settles at once. Any other outcome (a killed client, a connection lost after
+    // the create was sent, exit 125 from the client) leaves the daemon's outcome unknown: a create may still land, so
+    // only absence after the settle window counts.
+    const refused = outcome.status !== null && /Error response from daemon/.test(outcome.stderr);
+    try { await removeProbeContainer(name, refused ? 0 : PROBE_SETTLE_MS, cleanupMs); }
+    catch (error) {
+      throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
+        { cause: new AggregateError([failure, error]) });
+    }
+    throw failure;
+  }
+  const answer = /^codeboost-path-identity (true|false) (none|NFC)$/.exec(outcome.stdout.trim());
+  if (!answer) throw new Error('The path identity probe did not report an identity.');
+  return { caseSensitive: answer[1] === 'true', unicodeNormalization: answer[2] as PathIdentity['unicodeNormalization'] };
+}
+
+/** One cleanup call's deadline: the time left before giving up, capped at 10 s and at least 1 s. */
+export const probeCleanupCallMs = (leftMs: number): number => Math.min(10_000, Math.max(1_000, Math.ceil(leftMs)));
+/** How long a failed probe's cleanup waits for an outcome Docker did not report (a killed client's create may land). */
+export const PROBE_SETTLE_MS = CREATE_SETTLE_MS;
+/** How long a failed probe's cleanup keeps asking after its settle window before it gives up. */
+export const PROBE_CLEANUP_MS = 30_000;
+/**
+ * Remove a failed probe's container and its anonymous volume by name. `rm --force` exits 0 for a name that does not
+ * exist, so only an inspect that reports the name absent, after the settle window, proves the probe is gone.
+ */
+async function removeProbeContainer(name: string, settleMs: number, cleanupMs: number): Promise<void> {
+  const settleBy = performance.now() + settleMs, giveUpAt = settleBy + cleanupMs;
+  let last: DockerOutcome | undefined;
+  // Each call gets the time left before giving up, capped at 10 s and at least 1 s (so the last ask can still be
+  // answered), and after the first call none starts once that time has passed: a daemon that stops answering
+  // stretches the bound by at most one call's floor, its stop grace and one 250 ms pause.
+  const ask = async (args: readonly string[]) => {
+    if (last && performance.now() >= giveUpAt)
+      throw new Error(`Docker did not confirm that ${name} is gone.`, { cause: last });
+    return last = await runInProcessGroup('docker', args, { env: dockerEnvironment(),
+      timeoutMs: probeCleanupCallMs(giveUpAt - performance.now()) });
+  };
+  for (;;) {
+    // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
+    await ask(['rm', '--force', '--volumes', name]);
+    // The window is judged by when the inspect was asked: a slow answer to an ask made inside it proves nothing.
+    const asked = performance.now();
+    if (absent(await ask(['container', 'inspect', name])) && asked >= settleBy) return;
+    // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
+    await pause(250);
   }
 }
 
