@@ -105,11 +105,13 @@ function strictRuleset(recording: RecordedGh): RecordedGh {
 /** Runs one job; `answer(n)` picks the recordings that answer the n-th `gh pr view`. */
 async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) {
   let pullViews = 0;
-  const merges: string[][] = [];
+  const merges: string[][] = [], ruleReads = { ruleset: 0, classic: 0 };
   const run: RunGh = async (args, options) => {
     // `gh pr merge` was not recorded: it would merge the pull request. The gateway reads only its exit status.
     if (args[0] === 'pr' && args[1] === 'merge') { merges.push([...args]); return ''; }
     if (args[0] === 'pr' && args[1] === 'view') pullViews++;
+    if (args.some(arg => arg.includes('/rules/branches/'))) ruleReads.ruleset++;
+    if (args.some(arg => arg.endsWith('/protection'))) ruleReads.classic++;
     return replayGh(...answer(Math.max(pullViews, 1)))(args, options);
   };
   const review = reviewOf(store), recording = pending;
@@ -118,7 +120,7 @@ async function runJob(store: Store, answer: (pullView: number) => RecordedGh[]) 
   jobs.push(coordinator);
   await coordinator.start('review-token', crypto.randomUUID());
   await coordinator.current;
-  return { job: coordinator.latest()!, merges, pullViews: () => pullViews };
+  return { job: coordinator.latest()!, merges, ruleReads, pullViews: () => pullViews };
 }
 
 it('ends the job for a person, before waiting, against the repository\'s real non-strict ruleset', async () => {
@@ -132,10 +134,12 @@ it('ends the job for a person, before waiting, against the repository\'s real no
 it('waits while the recorded checks are pending, then merges once they pass', async () => {
   const store = taskAt(pending);
   const strictPending = strictRuleset(pending), strictPassing = strictRuleset(passing);
-  const { job, merges, pullViews } = await runJob(store, view => view <= 2 ? [strictPending] : [strictPassing]);
+  const { job, merges, ruleReads, pullViews } = await runJob(store, view => view <= 2 ? [strictPending] : [strictPassing]);
   expect(job).toMatchObject({ state: 'merged', url: 'https://github.com/codeabovelab/codeboost/pull/183' });
   // The wait read the pending answer twice, then the passing one; the guarded merge read it again at least twice.
   expect(pullViews()).toBeGreaterThanOrEqual(5);
+  // Every one of those inspections read both rule sources again, though base and head never changed.
+  expect(ruleReads).toEqual({ ruleset: pullViews(), classic: pullViews() });
   expect(merges).toEqual([['pr', 'merge', '183', '--repo', 'codeabovelab/codeboost', '--merge', '--match-head-commit', pullOf(pending).headRefOid]]);
 });
 

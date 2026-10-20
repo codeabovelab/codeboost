@@ -1005,6 +1005,35 @@ it.each([
   expect(reads.merges).toBe(0);
 });
 
+// T12: reviews are not checks. Both rule sources here also require approving reviews, shaped as GitHub's REST reference
+// (2022-11-28) gives a ruleset `pull_request` rule and classic `required_pull_request_reviews`; no recording has them.
+it('ignores required reviews in both rule sources and reads only their required checks', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z' },
+      { __typename: 'StatusContext', context: 'lint', state: 'SUCCESS', startedAt: '2026-10-20T00:00:00Z' },
+    ] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[
+      { type: 'pull_request', parameters: { dismiss_stale_reviews_on_push: true, require_code_owner_review: true, require_last_push_approval: true,
+        required_approving_review_count: 2, required_review_thread_resolution: true } },
+      { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test' }] } },
+    ]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({
+      required_status_checks: { strict: true, checks: [{ context: 'lint', app_id: null }], contexts: ['lint'] },
+      required_pull_request_reviews: { dismiss_stale_reviews: true, require_code_owner_reviews: true, required_approving_review_count: 2 } });
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: true, requiredChecks: [
+    { context: 'test', appId: null, state: 'success' }, { context: 'lint', appId: null, state: 'success' }] });
+  const view = readyView();
+  expect(await new MergeCoordinator(serviceFor(view), new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run)).status(view))
+    .toMatchObject({ ready: true, blockers: [] });
+});
+
 /** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
 async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
   const run = async (args: readonly string[]) => {
