@@ -9,7 +9,7 @@ import { PATH_IDENTITY_SCRIPT, probeTaskStoragePathIdentity } from '../agents/co
 // measurement itself runs against real Docker in runner-workspace.test.ts.
 const root = mkdtempSync(join(tmpdir(), 'codeboost-probe-')), bin = join(root, 'bin');
 const calls = join(root, 'calls'), mode = join(root, 'mode'), landAt = join(root, 'land-at'), removed = join(root, 'removed');
-const lateMark = join(root, 'late'), rmLog = join(root, 'rm-log'), slow = join(root, 'slow'), busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
+const slowLand = join(root, 'slow-land'), inspects = join(root, 'inspects'), lateMark = join(root, 'late'), rmLog = join(root, 'rm-log'), slow = join(root, 'slow'), busy = join(root, 'busy'), oldCli = join(root, 'old-cli'), hangAt = join(root, 'hang-at'), hung = join(root, 'hung'), unreach = join(root, 'unreachable'), identity = join(root, 'identity');
 const savedPath = process.env.PATH;
 let imageId = '';
 beforeAll(() => {
@@ -22,7 +22,7 @@ beforeAll(() => {
   // does: rm exits 0 whether or not the name exists (printing "No such container" when it does not); inspect exits 1.
   // While the busy file holds a count, rm of a container that exists refuses as Docker does while an auto-remove is in
   // progress, and inspect still reports it. From the time in the hang-at file, rm and inspect never answer (a daemon
-  // that stopped); each such call is logged in the hung file. With the slow file, rm and inspect answer after 300 ms. Of rm and inspect, the code reads only the exit status
+  // that stopped); each such call is logged in the hung file. With the slow file, rm and inspect answer after 300 ms. With the slow-land file, the sixth inspect finds nothing, then the create lands while that answer takes 9.5 s to arrive (a daemon under load). Of rm and inspect, the code reads only the exit status
   // and, for a missing name, the "No such container" text; for an existing container this fake prints less stdout
   // than Docker (the name; the full inspect array), which nothing reads. `unreachable` is a daemon the client cannot
   // reach: run, rm and inspect answer as Docker 27.4.0 does with DOCKER_HOST=tcp://127.0.0.1:1 (run exit 125; rm
@@ -66,6 +66,11 @@ if [ "$1" = rm ]; then
   exit 0
 fi
 if [ "$1 $2" = "container inspect" ]; then
+  echo x >> '${inspects}'
+  if [ -e '${slowLand}' ] && [ "$(wc -l < '${inspects}')" -eq 6 ]; then
+    echo 0 > '${landAt}'; sleep 9.5
+    echo '[]'; echo "Error response from daemon: No such container: $3" >&2; exit 1
+  fi
   if exists; then echo '[{}]'; exit 0; fi
   if [ -e '${lateMark}' ] && [ ! -e '${landAt}' ]; then echo 0 > '${landAt}'; fi
   echo '[]'; echo "Error response from daemon: No such container: $3" >&2; exit 1
@@ -77,7 +82,7 @@ exit 0
   imageId = buildAgentImage();
 });
 afterAll(() => { process.env.PATH = savedPath; rmSync(root, { recursive: true, force: true }); });
-beforeEach(() => { for (const file of [calls, landAt, removed, lateMark, rmLog, slow, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
+beforeEach(() => { for (const file of [calls, landAt, removed, slowLand, inspects, lateMark, rmLog, slow, busy, oldCli, hangAt, hung, unreach, identity]) if (existsSync(file)) rmSync(file); });
 const logged = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '').trim().split('\n').filter(line => !line.startsWith('build ') && !line.startsWith('image '));
 const probeName = () => /--name (codeboost-path-identity-[0-9a-f-]{36}) /.exec(logged()[0]!)![1]!;
 
@@ -241,5 +246,15 @@ describe('task storage probe against Docker answers', () => {
     const failure = await probeTaskStoragePathIdentity(imageId, 60_000, 1).catch((error: Error) => error);
     const cleanup = ((failure as Error).cause as AggregateError).errors[1] as Error;
     expect((cleanup.cause as { status: number | null }).status).not.toBeNull();
+  }, 60_000);
+  it('judges the settle window by when an inspect was asked, not when it answered', async () => {
+    // An absent answer asked inside the window, but arriving after it, while the create lands: not proof of absence.
+    writeFileSync(mode, 'hang'); writeFileSync(slowLand, '');
+    await expect(probeTaskStoragePathIdentity(imageId, 500)).rejects.toThrow('client killed or not started');
+    // The interleaving this test is about: the slow inspect ran, and the create landed during it.
+    expect(Number(readFileSync(inspects, 'utf8').split('\n').filter(Boolean).length)).toBeGreaterThan(6);
+    expect(existsSync(landAt)).toBe(true);
+    // And a later rm removed it.
+    expect(existsSync(removed)).toBe(true);
   }, 60_000);
 });

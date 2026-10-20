@@ -473,7 +473,9 @@ async function removeProbeContainer(name: string, settleMs: number, cleanupMs: n
   for (;;) {
     // Whatever rm answered (older CLIs exit non-zero for a missing name, newer ones 0), the inspect decides.
     await ask(['rm', '--force', '--volumes', name]);
-    if (absent(await ask(['container', 'inspect', name])) && performance.now() >= settleBy) return;
+    // The window is judged by when the inspect was asked: a slow answer to an ask made inside it proves nothing.
+    const asked = performance.now();
+    if (absent(await ask(['container', 'inspect', name])) && asked >= settleBy) return;
     // Still there (a removal already in progress), not yet landed, or Docker did not answer: ask again.
     await pause(250);
   }
