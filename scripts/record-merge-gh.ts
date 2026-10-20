@@ -4,8 +4,9 @@
 //
 // The production GhMergeGateway runs one fresh inspection of the pull request through the real `gh`, signed in as you.
 // Every `gh` call it makes (the pull request, the ruleset, the branch and its classic protection) is saved with its exit
-// status, stdout and stderr to test/fixtures/gh/<name>.json. The already-fixed check is replaced by a stub, so its
-// reads are not recorded. Use a public repository: the saved answers are committed. Read the file before committing it.
+// status, stdout and stderr, as runWithInput reports them (trimmed on a failure), to test/fixtures/gh/<name>.json. The
+// already-fixed check is replaced by a stub, so its reads are not recorded. Use a public repository: the saved answers
+// are committed. Read the file before committing it.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

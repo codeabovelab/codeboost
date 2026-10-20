@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs';
 import { CommandFailed } from '../../../github/run-with-input.ts';
 import type { RunGh } from '../../../github/merge.ts';
 
-/** What `scripts/record-merge-gh.ts` saves: every `gh` call of one real merge inspection, as gh answered it. */
+/**
+ * What `scripts/record-merge-gh.ts` saves: every `gh` call of one real merge inspection, as gh answered it and
+ * `runWithInput` (github/run-with-input.ts) reports it to the gateway: stdout in full on exit 0; on another exit, stderr
+ * and stdout with surrounding whitespace trimmed, as runWithInput keeps them.
+ */
 export interface RecordedGh {
   gh: string;
   repository: string;

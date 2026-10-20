@@ -6,6 +6,7 @@ import { GhMergeGateway, MERGE_CHECK_SETTLE_MS, MERGE_KILL_GRACE_MS, MERGE_PIPE_
 import { Store, mergeActionResponse } from '../runner/store.ts';
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
 
 type ReviewView = Awaited<ReturnType<ReviewService['load']>>;
 const sha = (digit: string) => digit.repeat(40);
@@ -1763,6 +1764,44 @@ it('does not let an inspection started before merge repopulate the cache', async
   await staleInspection;
   await client.inspect();
   expect(pullReads).toBe(2);
+});
+
+// gh 2.102.0 exits 1 on an HTTP error, printing `gh: <message> (HTTP <status>)` to stderr and GitHub's JSON body to
+// stdout; runWithInput reports both in a CommandFailed (test/fixtures/gh/ holds the real "Branch not protected" answer).
+it.each([
+  ['GitHub\'s "Branch not protected" answer', new CommandFailed('gh failed (exit 1): gh: Branch not protected (HTTP 404)', 'gh: Branch not protected (HTTP 404)',
+    '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}'), true],
+  ['another 404 body', new CommandFailed('gh failed (exit 1): gh: Not Found (HTTP 404)', 'gh: Not Found (HTTP 404)',
+    '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'), false],
+  ['a 404 whose body is not JSON', new CommandFailed('gh failed (exit 1): gh: Branch not protected (HTTP 404)', 'gh: Branch not protected (HTTP 404)', ''), false],
+  ['a 404 message that gh did not answer', new Error('HTTP 404: Branch not protected'), false],
+] as const)('reads a protected branch\'s classic protection as absent only for %s', async (_case, answer, known) => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    // A ruleset check with no `integration_id`, as GitHub sends one that any app may report.
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test' }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) throw answer;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(known);
+  if (known) expect(state.requiredChecks).toEqual([{ context: 'test', appId: null, state: 'missing' }]);
+});
+
+it('fails closed for a classic protection check without app_id', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [{ context: 'test' }], contexts: ['test'] } });
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  expect((await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect()).rulesKnown).toBe(false);
 });
 
 it.each([
