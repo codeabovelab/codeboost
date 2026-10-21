@@ -73,11 +73,13 @@ function fixture() {
   return { root, service, config, demo };
 }
 const recovery = (calls: string[], over: Partial<RecoveryDeps> = {}): RecoveryDeps => ({
-  recoverLeftovers: async () => { calls.push('recover'); return { storage: [], unowned: [] }; },
+  recoverLeftovers: async runnerOwner => { calls.push('recover'); owners.push(runnerOwner); return { storage: [], unowned: [] }; },
   exportTaskDiff: async () => ({ diff: Buffer.alloc(0), truncated: false }),
   removeTaskFilesystems: async () => undefined,
   ...over,
 });
+/** The runner tokens recovery ran under, in order. */
+const owners: string[] = [];
 const lock = (calls: string[], fail = false) => ({ file: { dev: 1n, ino: 2n }, verify: () => { calls.push('verify'); if (fail) throw new Error('The database path changed while opening. Refusing to start.'); } });
 const capability = { run: <T>(fn: () => T) => fn() };
 // Task storage that agrees with the configured identity, so these tests need no Docker (the real probe is in runner-workspace).
@@ -107,11 +109,12 @@ describe('runner startup', () => {
       const calls: string[] = [];
       await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
         buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); },
-        probeTaskStorage: async imageId => { calls.push(`probe ${imageId}`); return probed; } }))
+        probeTaskStorage: async (imageId, runnerOwner) => { calls.push(`probe ${imageId} ${runnerOwner}`); return probed; } }))
         .rejects.toThrow(`pathIdentity (caseSensitive ${configured.caseSensitive}, unicodeNormalization ${configured.unicodeNormalization}) does not match `
           + `the task storage the agent edits (caseSensitive ${probed.caseSensitive}, unicodeNormalization ${probed.unicodeNormalization})`);
-      // Probed with the built image, after recovery and the image build.
-      expect(calls).toEqual(['verify', 'deps', 'recover', 'image', 'probe sha256:x']);
+      // Probed with the built image, after recovery and the image build, labelled with the token recovery swept (#181).
+      expect(calls).toEqual(['verify', 'deps', 'recover', 'image', `probe sha256:x ${owners.at(-1)}`]);
+      expect(owners.at(-1)).toMatch(/^[0-9a-f]{32}$/);
     }
     // A probe that fails stops startup too: an identity that cannot be measured is not assumed.
     await expect(setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
