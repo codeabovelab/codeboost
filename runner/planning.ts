@@ -32,8 +32,8 @@ export function isPlanningProbeAnswer(text: string): boolean {
  * The production planning provider (#117): every request runs in planning's own worker thread, so lane D's synchronous
  * setup never blocks the server. The worker's TMPDIR is a planning root recorded in a ledger beside the review
  * database, and every Docker object it creates carries the database's planning owner. The first job of a process that
- * can sign in (the planning check at startup, or the first request) removes what earlier sessions left, by that owner
- * only, so Ask's and the runner's agents are never touched.
+ * can sign in (the planning check at startup, or the first check a request starts) removes what earlier sessions left,
+ * by that owner only, so Ask's and the runner's agents are never touched.
  *
  * The code is the review's repository at the current snapshot's head; E3 discards a reply whose snapshot or revision
  * changed meanwhile. The vendor is the one chosen in Settings for Ask; Codex is refused (#93).
@@ -94,7 +94,7 @@ type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?:
   abort: AbortController; replaced?: boolean };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. The first check after `
-  + 'codeboost starts can take several minutes while the agent image is built. Retry shortly.';
+  + 'codeboost starts can take several minutes while the agent image is built. Retry in a minute.';
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : `${Math.max(1, Math.round(ms / 1_000))} s`;
 /**
  * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at

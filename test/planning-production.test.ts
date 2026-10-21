@@ -559,7 +559,7 @@ describe('the planning check (#164)', () => {
     const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
-    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent\\. .* Retry shortly\\.$`));
+    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent\\. .* Retry in a minute\\.$`));
     expect(issueAccess).not.toHaveBeenCalled();
     pass();
     await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
