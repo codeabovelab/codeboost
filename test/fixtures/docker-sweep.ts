@@ -9,8 +9,8 @@ export const TEST_RUN_LABEL = 'io.codeboost.test-run';
 
 /**
  * Removes the containers, networks and volumes labelled with one runner owner, and every container that holds one of
- * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it in a
- * finally block.
+ * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it, after
+ * its other cleanup.
  */
 export function removeRunnerObjects(runnerOwner: string): void {
   removeLabelledObjects(RUNNER_LABEL, runnerOwner, 'afterAll');
@@ -33,6 +33,10 @@ export function removeLabelledObjects(label: string, value: string, when: string
     // that exited by itself is read whatever its status. A killed call's output may be cut short, so it is not.
     return result.error || result.status === null ? [] : result.stdout.split('\n').filter(Boolean);
   };
+  // A line Docker printed that is not JSON is reported and skipped, so the sweep never throws.
+  const parsed = <T>(text: string): T[] => {
+    try { return [JSON.parse(text) as T]; } catch { console.warn(`${when}: docker printed a line that is not JSON:`, text); return []; }
+  };
   for (const kind of ['container', 'network', 'volume'] as const) {
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
     // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
@@ -40,7 +44,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
-      .map(line => kind === 'network' ? JSON.parse(line) as { ID: string; Name: string } : { ID: line, Name: line });
+      .flatMap(line => kind === 'network' ? parsed<{ ID: string; Name: string }>(line) : [{ ID: line, Name: line }]);
     const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
@@ -51,9 +55,9 @@ export function removeLabelledObjects(label: string, value: string, when: string
       const candidates = run(['ps', '--all', '--quiet', '--no-trunc',
         ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
       const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
-        '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).map(line => {
-        const at = line.indexOf(' ');
-        return { id: JSON.parse(line.slice(0, at)) as string, on: Object.keys(JSON.parse(line.slice(at + 1)) ?? {}) };
+        '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
+        const at = line.indexOf(' '), id = parsed<string>(line.slice(0, at)), on = parsed<Record<string, unknown>>(line.slice(at + 1));
+        return id.length && on.length ? [{ id: id[0]!, on: Object.keys(on[0] ?? {}) }] : [];
       }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);

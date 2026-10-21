@@ -888,21 +888,20 @@ describe('real Docker agent isolation', () => {
       'result = run(args);',
       "process.kill(process.pid, 'SIGKILL');",
     ].join('\n');
-    const created = await withDockerShim(['network', 'create'], foreign, () =>
-      createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    // Listed in the finally too: the network carries another runner's label, so no sweep of this run finds it (#189).
     const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--no-trunc', '--filter',
       `label=io.codeboost.allocation=${allocationId}`], { encoding: 'utf8' }).stdout?.trim() ?? '';
     let left = '';
     try {
+      const created = await withDockerShim(['network', 'create'], foreign, () =>
+        createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
       left = listed();
       expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
       const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
       expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
       expect(left).not.toBe('');
     } finally {
-      const remaining = listed();
-      if (remaining) spawnSync('docker', ['network', 'rm', ...remaining.split('\n')], { stdio: 'ignore' });
+      // The network carries another runner's label, so no sweep of this run finds it: removed by its allocation (#189).
+      removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
     }
   }, 60_000);
 
@@ -2472,11 +2471,8 @@ describe('real Docker agent isolation', () => {
       for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
         expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
     } finally {
-      // Never throws, so a failure above is the one reported.
-      const labelled = (...args: string[]) => spawnSync('docker', [...args, '--quiet', '--filter',
-        `label=io.codeboost.allocation=${owner.allocationId}`], { encoding: 'utf8' }).stdout?.split('\n').filter(Boolean) ?? [];
-      for (const name of labelled('ps', '--all')) spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' });
-      for (const name of labelled('volume', 'ls')) spawnSync('docker', ['volume', 'rm', '--force', name], { stdio: 'ignore' });
+      // Never throws, so a failure above is the one reported. By full ID: Docker resolves a name before an ID prefix.
+      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
   }, 180_000);
 
@@ -2499,15 +2495,20 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('refuses task storage that belongs to another runner', async () => {
-    const data = fixture();
-    const foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
-      metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
-    { runnerOwner: 'f'.repeat(32), attemptId: 'other-runner', allocationId: randomUUID() });
-    // Removed here: it carries another runner's label, so no sweep of this run finds it (#189).
+    const data = fixture(), allocationId = randomUUID();
+    let foreign: ReturnType<typeof prepareTaskFilesystems> | undefined;
+    // Removed here: it carries another runner's label, so no sweep of this run finds it (#189). Then whatever still
+    // carries its allocation, should its creation or removal not settle.
     try {
+      foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
+        metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
+      { runnerOwner: 'f'.repeat(32), attemptId: 'other-runner', allocationId });
       await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
         inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
-    } finally { removeTaskFilesystems(foreign); }
+    } finally {
+      try { if (foreign) removeTaskFilesystems(foreign); }
+      finally { removeLabelledObjects('io.codeboost.allocation', allocationId, 'test'); }
+    }
   }, 60_000);
 
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
