@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeLabelledObjects, removeRunnerObjects, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { REAL_DOCKER, removeLabelledObjects, removeRunnerObjects, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -47,7 +47,10 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
-/** Put, beside its test-run ID, on every object this file makes without the runner label (#189): afterAll sweeps it. */
+/**
+ * Put, beside its test-run ID, on every object the `withoutRunnerLabel` wrapper makes and on the holder test's swept
+ * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `volumes`).
+ */
 const TEST_FILE_RUN = randomUUID();
 /** Volumes a test makes without labels, removed in afterAll if the test did not remove them (it may have timed out). */
 const volumes = new Set<string>();
@@ -139,7 +142,8 @@ afterEach(async () => {
 afterAll(async () => {
   try {
     for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
-    for (const volume of volumes) spawnSync('docker', ['volume', 'rm', '--force', volume], { stdio: 'ignore' });
+    for (const volume of volumes)
+      spawnSync(REAL_DOCKER, ['volume', 'rm', '--force', volume], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
     // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
     // every failure is reported.
     const failures: unknown[] = [];
@@ -835,8 +839,8 @@ describe('real Docker agent isolation', () => {
   it('removed the keeper that a test without its runner label left when it stopped', () => {
     expect(stoppedEarly, 'the test before did not reach its deliberate stop').toBeDefined();
     const left = stoppedEarly!.filesystems, allocationId = taskFilesystemOwner(left).allocationId;
-    // First, so afterAll does not refuse a keeper this test finds left: its test-run sweep removes that keeper, then its
-    // runner sweep the volumes.
+    // First, so afterAll does not refuse a keeper this test finds left: its file-label sweep removes that keeper, then
+    // its runner sweep the volumes.
     taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
     expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore' }).status).not.toBe(0);
     // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
@@ -891,6 +895,8 @@ describe('real Docker agent isolation', () => {
 
   it('backs out of a vendor network when a concurrent process claims the same allocation ID', async () => {
     const data = fixture(), allocationId = randomUUID(), rival = `codeboost-race-${randomUUID()}`;
+    // Tracked for afterAll should the test time out: the rival carries another runner's label (#189).
+    volumes.add(rival);
     try {
       await withDockerShim(['network', 'create'], racer(rival), () => expect(createVendorNetwork(
         invocation(data.clone, 'planning'), imageId, allocationId)).rejects.toThrow('still labels a Docker object'));
@@ -2402,6 +2408,8 @@ describe('real Docker agent isolation', () => {
       const mine = crashed(runners[0]), theirs = await live(runners[1]);
       // An object from a build before runner labels.
       const legacy = `codeboost-work-legacy-${randomUUID()}`;
+      // Tracked for afterAll too, should the test time out: it has no runner label (#189).
+      volumes.add(legacy);
       undo.push(quietly('volume', 'rm', '--force', legacy));
       docker('volume', 'create', '--label', `io.codeboost.allocation=${randomUUID()}`, legacy);
       // A runner with live storage in this process is refused: its agents would be removed under it.
