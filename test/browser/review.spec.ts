@@ -655,10 +655,9 @@ const runnerMerge=(merge:Record<string,unknown>,fields:Record<string,unknown>={}
 /** A merge job record with every field the server sends (runner/merge-job.ts mergeJobView: the store's record without its
  * token), `fields` overriding the defaults. A job saves its merge action ID before the guarded merge, so one in that step or
  * past it (merged, queued, submitted) carries one by default. Every saved change adds one to a job's revision
- * (runner/store.ts #changeMergeJob): the job is saved at 1 while it prepares, moves to checks at 2 with no waiting checks,
- * saves each inspection that finds checks waiting (runner/merge-job.ts), then moves to merging and ends with one more
- * save each. By default a record follows the course preparing 1, checks 2 (none waiting) or 3 (first wait), merging 4,
- * ended 5; a test that sends a further inspection, a shorter course, or an older record on purpose passes its revision. */
+ * (runner/store.ts #changeMergeJob), including each step-list write and each change in the waiting checks, so a real job
+ * reaches each step at a higher revision than these defaults. The defaults keep only the order: preparing 1, checks 2
+ * (none waiting) or 3 (waiting), merging 4, ended 5. A test that needs another order passes its revision. */
 const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  const state=fields.state??'running',step=fields.step===undefined?(state==='running'?'preparing':null):fields.step;
  const mergeActionId=step==='merging'||['merged','queued','submitted'].includes(state)?'0f6b0000-0000-4000-8000-00000000ac01':null;
@@ -1016,6 +1015,42 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
   await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
   await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
  }
+});
+test('keeps focus on Merge status while the poll follows a running job with no blockers (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let revision=4;const merging=()=>mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000dd',state:'running',step:'merging',revision,steps:mergeSteps(['done','skipped','skipped','skipped','done','running'])});
+ let polls=0;
+ // The review the page loads has no blockers (as after a Refresh during the merging step); each poll answers a later record.
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:false,action:null,job:merging(),blockers:[]});await route.fulfill({response,json:body});});
+ await page.route('**/api/merge',async route=>{polls++;revision++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:merging()})});});
+ await page.goto(app.url);
+ await expect(page.locator('#merge-details')).toBeVisible({timeout:10_000});
+ await page.locator('#merge-details').focus();
+ await expect.poll(()=>polls,{timeout:15_000}).toBeGreaterThanOrEqual(2);
+ await page.waitForTimeout(200);
+ await expect(page.locator('#merge-details')).toBeFocused();
+});
+test('moves focus off the blockers button to Merge PR when a reload clears the last blocker (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let reloaded=false;
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null,blockers:reloaded?[]:[...body.merge.blockers,...jobResolvedBlockers]});await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ await expect(page.locator('#merge-details')).toBeVisible({timeout:10_000});
+ await page.locator('#merge-details').focus();
+ reloaded=true;
+ const answered=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ await page.locator('#review-link').dispatchEvent('click');
+ await answered;
+ await expect(page.locator('#merge-details')).toBeHidden();
+ await expect(page.locator('#merge')).toBeVisible();
+ await expect(page.locator('#merge')).toBeFocused();
 });
 for (const control of ['merge','merge-details'] as const) for (const reload of ['unavailable','failed'] as const) test(`moves focus off ${control==='merge'?'Merge PR':'the blockers button'} to Refresh when a reload ${reload==='failed'?'fails':'makes merging unavailable'} (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);

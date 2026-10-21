@@ -182,7 +182,9 @@ function renderMerge() {
   // blockers button) moves focus to what is still shown (AGENTS.md).
   const focused = document.activeElement;
   $("merge").hidden = !merge?.available;
-  $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
+  // Decided once: a running job shows Merge status even with no blockers, and hiding then showing the focused button
+  // would blur it (and move focus) on every poll.
+  $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue && merge.job?.state !== "running");
   if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) ($("merge").hidden ? $("reload") : $("merge")).focus();
   renderMergeSteps();
   if (!merge?.available) return;
