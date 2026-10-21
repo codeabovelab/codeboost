@@ -9,7 +9,7 @@ import { createDemo } from '../scripts/demo.ts';
 import { AgentWorker } from '../runner/question-agent.ts';
 import { ASK_NAMING, createWorkerRoot, LeftoverLedger, PLANNING_NAMING } from '../runner/question-leftovers.ts';
 import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
-import { isPlanningProbeAnswer, NO_PLANNING_AGENT, PlanningAgent } from '../runner/planning.ts';
+import { isPlanningProbeAnswer, NO_PLANNING_AGENT, PLANNING_PROBE_PROMPT, PLANNING_PROBE_SCHEMA, PlanningAgent } from '../runner/planning.ts';
 import { ReviewService } from '../runner/review.ts';
 
 // Planning's worker, ledger and owner (#117), driven through the stub worker, which reports what reached it.
@@ -169,6 +169,17 @@ it('fails the planning check without a sign-in or with Codex, before the review\
   await expect(unsigned.probe('claude', new AbortController().signal)).rejects.toThrow('CLAUDE_CODE_OAUTH_TOKEN');
   await expect(agent(service).probe('codex', new AbortController().signal)).rejects.toThrow(CODEX_PLANNING_REFUSED);
   expect(acquire).not.toHaveBeenCalled();
+});
+
+it('runs the planning check on the review\'s code at the snapshot\'s head, read-only, with the check\'s prompt and schema', async () => {
+  const service = review(), plan = vi.spyOn(AgentWorker.prototype, 'plan');
+  await agent(service).probe('claude', new AbortController().signal);
+  const run = plan.mock.calls[0]![0], snapshot = service.store.getSnapshot(service.config.identity);
+  expect(run).toMatchObject({ provider: 'claude', repository: service.reviewRepository().path, head: snapshot.head,
+    prompt: PLANNING_PROBE_PROMPT, schemaText: PLANNING_PROBE_SCHEMA,
+    context: { snapshotId: snapshot.id, planId: service.config.identity.planId, referencedCodeHash: snapshot.head } });
+  expect(run.taskId).toMatch(/^planning-probe-[0-9a-f-]{36}$/);
+  expect(run.deadline - Date.now()).toBeGreaterThan(PLANNING_BUDGET_MS - 30_000);
 });
 
 it('fails the planning check when the agent answers anything but the schema\'s answer', async () => {

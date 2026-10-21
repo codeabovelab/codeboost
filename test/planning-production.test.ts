@@ -339,7 +339,7 @@ describe('the planning check (#164)', () => {
     expect(issueAccess).toHaveBeenCalledTimes(2);
   });
 
-  it('refuses a request with the check\'s reason, before it reads the issue, and does not check again within the wait', async () => {
+  it('refuses a request with the check\'s reason, before it reads the issue, and does not check again within the recheck window', async () => {
     const { deps, probe, issueAccess } = checked(async () => { throw new Error('Claude could not sign in.'); });
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
@@ -520,13 +520,13 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
-  it('fails and cancels a check that does not settle in time, and checks again after the wait', async () => {
+  it('fails and cancels a check that does not settle in time, and checks again after the recheck window', async () => {
     let count = 0, late!: () => void;
     const signals: AbortSignal[] = [];
     const check = new PlanningCheck((_vendor, probeSignal) => {
       count += 1; signals.push(probeSignal);
       return count === 1 ? new Promise<void>(resolve => { late = resolve; }) : Promise.resolve();
-    }, () => 'claude', { timeoutMs: 50, recheckMs: 300, waitMs: 1_000 });
+    }, () => 'claude', { timeoutMs: 50, recheckMs: 2_000, waitMs: 1_000 });
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toContain('The planning check did not finish within a moment.');
     expect(signals[0]!.aborted).toBe(true);
@@ -536,9 +536,50 @@ describe('the planning check (#164)', () => {
     await new Promise(resolve => setTimeout(resolve, 10));
     await expect(check.admit(signal())).rejects.toThrow('did not finish');
     expect(count).toBe(1);
-    await new Promise(resolve => setTimeout(resolve, 350));
+    await new Promise(resolve => setTimeout(resolve, 2_100));
     await expect(check.admit(signal())).resolves.toBeUndefined();
     expect(count).toBe(2);
+  });
+
+  it.each([
+    ['a database file with other hard links', 'Planning is off: the review database /r/db has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.'],
+  ])('promises no recheck for %s, which only a restart can change', async (_label, reason) => {
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('only a restart of codeboost can change that');
+  });
+
+  it('keeps the recheck promise when only the vendor\'s output mentions a restart', async () => {
+    const reason = 'Claude could not write the plan. Check its sign-in and usage limits. Claude said: planning is off until codeboost restarts';
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
+  });
+
+  it('reports a Store it cannot read, while waiting, as a failed check, not a stopped wait', async () => {
+    const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+    service.store.setQuestionProvider('claude');
+    const deps = productionPlanning(config, { ...verified, issues: issues(async number => text(number)),
+      agent: () => closable(undefined, (_vendor, probeSignal) => new Promise<void>((_, reject) =>
+        probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true }))) })!(service);
+    vi.spyOn(service.store, 'questionProvider').mockImplementation(() => { throw new Error('database disk image is malformed'); });
+    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost could not check the planning agent: database disk image is malformed`);
+    await deps.close!();
+  });
+
+  it('waits on close for a timed-out check\'s probe to stop, within its bound', async () => {
+    const order: string[] = [];
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>((_, reject) => {
+      // The probe stops a while after the timeout cancels it, as a worker job busy in setup does.
+      probeSignal.addEventListener('abort', () =>
+        setTimeout(() => { order.push('probe stopped'); reject(probeSignal.reason); }, 100), { once: true });
+    }), () => 'claude', { timeoutMs: 20 });
+    await expect(check.admit(signal())).rejects.toThrow('did not finish');
+    await check.close(2_000);
+    order.push('closed');
+    expect(order).toEqual(['probe stopped', 'closed']);
   });
 
   it('promises no recheck when the sign-in is missing, which only a restart can change', async () => {

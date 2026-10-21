@@ -3,6 +3,7 @@ import { setMaxListeners } from 'node:events';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { GuardRefusal } from './lifecycle.ts';
 import { AgentWorker, type Provider } from './question-agent.ts';
+import { StopError } from './question-container.ts';
 import { LeftoverLedger, PLANNING_NAMING } from './question-leftovers.ts';
 import { PLANNING_BUDGET_MS, planningRun } from './planning-provider.ts';
 import type { ReviewService } from './review.ts';
@@ -97,9 +98,11 @@ const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the 
   + 'codeboost starts can take several minutes while the agent image is built. Retry in a minute.';
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
   : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
-// An abandoned worker (question-agent.ts) and unconfirmed cleanup (planning-provider.ts) refuse every job until codeboost
-// restarts, and the worker reads CLAUDE_CODE_OAUTH_TOKEN only when codeboost starts, so a recheck cannot help these.
-const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN/;
+// Reasons a recheck cannot help, so only a restart can: an abandoned worker (question-agent.ts), unconfirmed cleanup
+// (planning-provider.ts), a database file with other hard links (question-leftovers.ts), and a missing token, since
+// codeboost's environment is fixed while it runs. Matched only on codeboost's own text, before any vendor output.
+const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
+const ownText = (message: string) => message.split(' Claude said:')[0]!;
 /**
  * How long one check may take before it fails, so a check that never settles (a stuck recovery, say) cannot keep
  * planning "still checking": a real request's budget, as the probe has, and a minute for the worker to settle.
@@ -165,7 +168,7 @@ export class PlanningCheck {
     const late = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         const error = new Error(`The planning check did not finish within ${duration(this.#timeoutMs)}.`);
-        abort.abort(error); reject(error);
+        reject(error); abort.abort(error);
       }, this.#timeoutMs);
       timer.unref?.();
     });
@@ -174,8 +177,12 @@ export class PlanningCheck {
       check.failure = { error, at: performance.now() };
     }).finally(() => { clearTimeout(timer); this.#abort.signal.removeEventListener('abort', stop); });
     check.done = done;
-    this.#running.add(done);
-    void done.finally(() => this.#running.delete(done));
+    // Close waits for the probe itself too: a check that timed out has settled, but its job may still be in the worker.
+    const settled = probe.then(() => undefined, () => undefined);
+    for (const running of [done, settled]) {
+      this.#running.add(running);
+      void running.finally(() => this.#running.delete(running));
+    }
     this.#current = check;
     this.#events.dispatchEvent(new Event('replaced'));
     return check;
@@ -236,7 +243,7 @@ export class PlanningCheck {
     if (check.passed) return;
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
-    if (check.failure && UNTIL_RESTART.test(messageOf(check.failure.error)))
+    if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
       throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `
         + `of codeboost can change that. The check said: ${messageOf(check.failure.error)}`);
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
@@ -246,7 +253,7 @@ export class PlanningCheck {
   }
   /** Cancel any running check and wait up to `waitMs` for it to stop. No check starts afterwards. */
   async close(waitMs = PLANNING_CHECK_CLOSE_MS): Promise<void> {
-    this.#abort.abort(new Error('Planning stopped.'));
+    this.#abort.abort(new StopError('Planning stopped.', 'shutdown'));
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([Promise.all(this.#running), new Promise(done => { timer = setTimeout(done, waitMs); })]);
     clearTimeout(timer);

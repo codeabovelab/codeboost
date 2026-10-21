@@ -51,8 +51,9 @@ export function productionPlanning(config: ReviewConfig, options: {
         try { await check.admit(signal); }
         catch (error) {
           if (error instanceof GuardRefusal) throw error;
-          throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost stopped waiting for the planning check: `
-            + `${error instanceof Error ? error.message : String(error)}`);
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new GuardRefusal(signal.aborted ? `${PLANNING_UNAVAILABLE} codeboost stopped waiting for the planning check: ${reason}`
+            : `${PLANNING_UNAVAILABLE} codeboost could not check the planning agent: ${reason}`);
         }
         return withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {
           const access = await issues.issueAccess(github.issue, { signal: readSignal, timeoutMs });
