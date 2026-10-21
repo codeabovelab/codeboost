@@ -31,7 +31,7 @@ it('skips output that is not a network, reports what is not JSON, and never thro
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'))).not.toThrow();
-  expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: docker printed a line that is not JSON:');
+  expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: listing networks: docker printed a line that is not JSON:');
   // Nothing it could not read is removed or looked up as a holder.
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);
 });

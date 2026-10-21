@@ -109,8 +109,8 @@ export function removeLabelledObjects(label: string, value: string, when: string
     return result.error || result.status === null ? [] : result.stdout.split('\n').filter(Boolean);
   };
   // A line Docker printed that is not JSON is reported and skipped, so the sweep never throws.
-  const parsed = <T>(text: string): T[] => {
-    try { return [JSON.parse(text) as T]; } catch { console.warn(`${when}: docker printed a line that is not JSON:`, text); return []; }
+  const parsed = <T>(stage: string, text: string): T[] => {
+    try { return [JSON.parse(text) as T]; } catch { console.warn(`${when}: ${stage}: docker printed a line that is not JSON:`, text); return []; }
   };
   for (const kind of ['container', 'network', 'volume'] as const) {
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
@@ -119,7 +119,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const listed = run(`listing ${kind}s`, [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
-      .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>(line)
+      .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>('listing networks', line)
         .filter((object): object is { ID: string; Name: string } => typeof object?.ID === 'string' && typeof object.Name === 'string')
         : [{ ID: line, Name: line }]);
     const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
@@ -133,7 +133,8 @@ export function removeLabelledObjects(label: string, value: string, when: string
         ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
       const holders = kind === 'volume' || !candidates.length ? candidates : run('reading holders', ['container', 'inspect', '--format',
         '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
-        const at = line.indexOf(' '), id = parsed<string>(line.slice(0, at)), on = parsed<Record<string, unknown>>(line.slice(at + 1));
+        const at = line.indexOf(' '), id = parsed<string>('reading holders', line.slice(0, at)),
+          on = parsed<Record<string, unknown>>('reading holders', line.slice(at + 1));
         return typeof id[0] === 'string' && typeof on[0] === 'object' ? [{ id: id[0], on: Object.keys(on[0] ?? {}) }] : [];
       }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {

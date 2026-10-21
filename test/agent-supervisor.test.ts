@@ -390,7 +390,9 @@ describe('container invocation supervisor', () => {
 
   it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
-    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189). Tracked
+    // for afterAll too, should its create land after that.
+    unlabelled.add(current.name);
     onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
     let passed = false;
     try {
@@ -449,7 +451,9 @@ describe('container invocation supervisor', () => {
   it('releases only the profile when rejecting before creation, even if its name is held elsewhere', async () => {
     const current = await profile(fixture(), 'noop');
     // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
-    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189). Tracked
+    // for afterAll too, should its create land after that.
+    unlabelled.add(current.name);
     onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
     try {
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
