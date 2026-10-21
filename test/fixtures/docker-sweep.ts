@@ -10,7 +10,7 @@ export const REAL_DOCKER = spawnSync('sh', ['-c', 'command -v docker'], { encodi
 /**
  * The daemon `docker` talks to when this module loads. A test that times out may leave DOCKER_HOST or DOCKER_CONTEXT
  * changed (agent-supervisor points DOCKER_HOST at a missing socket until its handle settles), so every call here
- * restores them.
+ * runs with the values they had when this module loaded.
  */
 const LOADED_ENV = { DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT };
 const dockerEnv = () => {
@@ -25,8 +25,8 @@ export function requireRealDocker(): string {
 }
 
 /**
- * The label a test's Docker shim adds to an object it makes without the runner label (#189), so the test can still
- * find and remove that object however the test ends. No codeboost code writes or reads it.
+ * The label a test (most often through its Docker shim) adds to an object it makes without the runner label (#189),
+ * so the test can still find and remove that object however the test ends. No codeboost code writes or reads it.
  */
 export const TEST_RUN_LABEL = 'io.codeboost.test-run';
 /** Beside it, one value per test file run, so afterAll removes them all with one sweep. */

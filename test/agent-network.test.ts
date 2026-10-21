@@ -36,12 +36,12 @@ beforeAll(async () => {
 /**
  * Objects a test makes without this run's runner label, by name or by the file its shim records the name in, so
  * afterAll removes them should the test time out before its own removal runs (#189). The record files live in
- * `RECORDS`, not in the shims, so a name a late client adds after the test's own removal is still read here.
+ * `records`, not in the shims, so a name a late client adds after the test's own removal is still read here.
  */
 const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
 // Made by the first test that records, so a run that selects none of this file's tests leaves no directory.
-let RECORDS = '';
-const recordFile = () => join(RECORDS ||= mkdtempSync(join(tmpdir(), 'codeboost-records-')), randomUUID());
+let records = '';
+const recordFile = () => join(records ||= mkdtempSync(join(tmpdir(), 'codeboost-records-')), randomUUID());
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => {
   try {
@@ -59,7 +59,7 @@ afterAll(async () => {
     // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
     // the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
-    if (RECORDS) rmSync(RECORDS, { recursive: true, force: true });
+    if (records) rmSync(records, { recursive: true, force: true });
   }
 }, 7 * 60_000);
 

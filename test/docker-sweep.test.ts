@@ -56,8 +56,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
   // Answers as Docker 27.4 does for `inspect --format '{{json .Id}} {{json .Name}}'` (a volume: '{{json .Name}}') and
   // `rm`, in the parts removeByName reads: stdout of an inspect that succeeded, stderr and the exit status. A missing
   // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and a
-  // failure before the daemon (an unknown context; its meta.json path shortened). The stdout of a failed call, a bare
-  // newline in 27.4, is not read.
+  // failure before the daemon (an unknown context; its meta.json path shortened). The stdout of a failed call (a bare
+  // newline for a missing object in 27.4, nothing for the others) is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     'for arg; do name="$arg"; done',
     'if [ "$2" = inspect ]; then case "$1 $name" in',
