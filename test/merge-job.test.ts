@@ -1759,3 +1759,20 @@ it('refuses a merge-only cancel while the task itself is being cancelled, and th
   held.finish('failed', 'Task cancelled.');
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
 });
+
+it('saves the waiting checks only when they change, so unchanged inspections add no revision for the page to poll on', async () => {
+  let state: 'pending' | 'missing' = 'pending';
+  const f = setup({ checks: () => [{ context: 'ci', appId: null, state }], timing: { checkWaitMs: 60_000, firstDelayMs: 5, maxDelayMs: 5 } });
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ step: 'checks', checks: [{ context: 'ci', state: 'pending' }] }));
+  const revision = f.store.getMergeJob(identity, job.id)!.revision, seen = f.gh.inspections();
+  // Several more inspections answer the same waiting checks: nothing new is saved.
+  await vi.waitFor(() => expect(f.gh.inspections()).toBeGreaterThanOrEqual(seen + 3));
+  expect(f.store.getMergeJob(identity, job.id)!.revision).toBe(revision);
+  // A change in what is waiting is saved.
+  state = 'missing';
+  await vi.waitFor(() => expect(f.store.getMergeJob(identity, job.id)!.checks).toEqual([{ context: 'ci', state: 'missing' }]));
+  expect(f.store.getMergeJob(identity, job.id)!.revision).toBeGreaterThan(revision);
+  f.coordinator.cancelMerge(job.id);
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
+});

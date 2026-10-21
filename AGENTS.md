@@ -32,6 +32,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Preserve completed historical results, but visibly mark them stale when their snapshot, plan revision, assignment, or referenced code no longer matches.
 - When polling updates one part of the screen, update only that state. Preserve scroll position unless the user was already following the bottom.
 - While a request is in flight, do not disable the control that has keyboard focus; disabling it drops focus to the page. Mark it `aria-disabled`, ignore repeat activation with an in-flight guard, and test that focus stays on the control after the response.
+- When a background update (a poll, a reload, an answer) hides or removes the control that has keyboard focus, move focus to a named fallback that is still shown, and test that focus lands there for each way the control can be hidden.
 - When a row or control's visual selection determines the current content or input, expose the same state with the appropriate accessibility attribute, such as `aria-current` or `aria-selected`, and test it across navigation.
 
 ## Required race regressions

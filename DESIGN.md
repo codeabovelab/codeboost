@@ -147,6 +147,8 @@ components:
 | `warning` | Attribution warning, stale | ! plus a word such as "Stale" or "Ambiguous" |
 | `error` | Scope or test failure, blocker, unplanned | ✕ plus a word such as "Fail" or "Unplanned" |
 | `neutral-status` | Not applicable | – plus "N/A" |
+| `neutral-status` | Not started yet (a step that is waiting) | ○ plus "Waiting" |
+| `text` | In progress (a step that is running) | ● plus "Running" |
 
 - `success` is much lighter than `error`. This lets red-green color-blind users still tell them apart by brightness. Never rely on hue alone.
 - **Contrast (checked 2026-09-22):** every text and status color is at least 5.0:1 on every surface. Body text is 14.6:1 on `surface`.
@@ -257,3 +259,4 @@ There are no shadows and no glows. Depth comes from the surface brightness steps
 | 2026-09-22 | The serif "second voice" for the user's own words was not adopted | The user chose variant B. Two faces are enough |
 | 2026-09-22 | Logo: terminal-prompt mark (`>_`) in a rounded square, in `text` color | Taken from the approved review-screen mockup. It was left out of the first HTML screen and restored at the user's request |
 | 2026-09-22 | Contrast-checked values kept instead of values extracted from the mockup image | The extracted values (for example error #DA1E28) failed contrast on dark surfaces |
+| 2026-10-21 | Two progress marks for the merge step list: ○ "Waiting" in `neutral-status` and ● "Running" in `text` | Steps that have not started or are under way are not outcomes, so they take no outcome color. Approved by the user (PR #194) |

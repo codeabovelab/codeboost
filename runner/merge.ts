@@ -355,8 +355,8 @@ export class MergeCoordinator {
    * `actionId` is the click's idempotency key. A resend with the same key (after a lost response) returns the saved
    * attempt's current outcome and never submits again.
    * `onAsking`, for the merge job's step list, is told once every validation pass (the already-fixed check included) has
-   * passed and the attempt is saved (when a store is configured), in the same turn as GitHub is asked. Display only: an error it throws is ignored.
-   * A click that joins or replays another does not call it.
+   * passed and the attempt is saved (when a store is configured), in the same turn as the call that asks GitHub to
+   * merge. Display only: an error it throws is ignored. A click that joins or replays another does not call it.
    */
   async merge(token: unknown, actionId?: unknown, caller?: AbortSignal, onAsking?: () => void): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
