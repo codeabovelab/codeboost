@@ -146,7 +146,9 @@ export class PlanningCheck {
     this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
     this.#timeoutMs = options.timeoutMs ?? PLANNING_CHECK_TIMEOUT_MS;
   }
-  /** Begin the check for the chosen vendor, if any, without waiting for it. */
+  /**
+   * Begin the check for the chosen vendor, if any, without waiting for it. After close it throws "planning is stopping".
+   */
   start(): void {
     const vendor = this.#vendor();
     if (vendor) this.#check(vendor);
@@ -188,6 +190,7 @@ export class PlanningCheck {
     }).finally(() => { clearTimeout(timer); this.#abort.signal.removeEventListener('abort', stop); });
     check.done = done;
     // Close waits for the probe itself too: a check that timed out has settled, but its job may still be in the worker.
+    // (A worker that never ends a job adds one such probe each recheck window; close's bound still holds.)
     const settled = probe.then(() => undefined, () => undefined);
     for (const running of [done, settled]) {
       this.#running.add(running);
@@ -219,17 +222,22 @@ export class PlanningCheck {
       const check = this.#check(vendor);
       // A settled check gives its verdict at once.
       if (check.passed || check.failure) return this.#verdict(check);
-      let release!: () => void, moved!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
-      const stopped = new Promise<'timeout' | 'replaced'>((resolve, reject) => {
+      let release!: () => void, moved!: () => void, closing!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
+      const stopped = new Promise<'timeout' | 'replaced' | 'closing'>((resolve, reject) => {
         release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true });
         moved = () => resolve('replaced'); this.#events.addEventListener('replaced', moved, { once: true });
+        // Close wakes the wait at once, even when its check's probe does not stop: the loop then refuses it as
+        // stopping.
+        closing = () => resolve('closing'); this.#abort.signal.addEventListener('abort', closing, { once: true });
         timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - performance.now()));
       });
-      let outcome: void | 'timeout' | 'replaced';
+      let outcome: void | 'timeout' | 'replaced' | 'closing';
       try { outcome = await Promise.race([check.done, stopped]); }
       finally {
-        signal.removeEventListener('abort', release); this.#events.removeEventListener('replaced', moved); clearTimeout(timer);
+        signal.removeEventListener('abort', release); this.#events.removeEventListener('replaced', moved);
+        this.#abort.signal.removeEventListener('abort', closing); clearTimeout(timer);
       }
+      if (outcome === 'closing') continue;
       // A vendor changed meanwhile is checked (or, if none is chosen now, the request goes on) within what is left of
       // the wait, which has passed: only a check that has already settled gives its verdict.
       if (outcome === 'timeout' && this.#vendor() === vendor) throw new GuardRefusal(STILL_CHECKING);

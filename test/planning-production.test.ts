@@ -706,6 +706,17 @@ describe('the planning check (#164)', () => {
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude']);
   });
 
+  it('wakes a request waiting at close at once, though its check\'s probe never stops', async () => {
+    const check = new PlanningCheck(() => new Promise<void>(() => undefined), () => 'claude');
+    const started = performance.now();
+    const waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setImmediate(resolve));
+    void check.close(10);
+    const refusal = await waiting;
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+
   it('tells a request waiting at close that planning is stopping, even if the check then passes', async () => {
     let pass!: () => void;
     // The probe answers after close cancelled it, as an answer already on its way would.
@@ -785,6 +796,24 @@ describe('the planning check (#164)', () => {
     await new Promise(resolve => setImmediate(resolve));
     expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
     // Once that check passed, the same request is admitted.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(() => described.validate()).not.toThrow();
+  });
+
+  it('refuses at the start while the check for a vendor chosen during the issue read still runs', async () => {
+    let service!: ReviewService, pass!: () => void;
+    const issueText = vi.fn(async (number: number) => {
+      service.store.setQuestionProvider('claude');
+      return text(number);
+    });
+    const made = checked(() => new Promise<void>(resolve => { pass = resolve; }), null, undefined, undefined, issueText);
+    service = made.service;
+    const described = await made.deps.describe(signal());
+    expect(() => described.validate()).toThrow('and codeboost checks it next');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent.`);
+    pass();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(() => described.validate()).not.toThrow();
   });
