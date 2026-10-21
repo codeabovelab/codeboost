@@ -1,6 +1,6 @@
 import { GhIssueGateway, ISSUE_READ_TIMEOUT_MS, withIssueReadDeadline, type IssueTrustGateway } from '../github/issues.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
-import { PlanningAgent, PlanningCheck } from '../runner/planning.ts';
+import { PLANNING_UNAVAILABLE, PlanningAgent, PlanningCheck } from '../runner/planning.ts';
 import type { ReviewConfig, ReviewService } from '../runner/review.ts';
 import type { PlanningSetup } from './server.ts';
 
@@ -46,7 +46,14 @@ export function productionPlanning(config: ReviewConfig, options: {
       // failed.
       provider: { async invoke(request, signal) { check.assertPassed(); return provider.invoke(request, signal); } },
       async describe(signal) {
-        await check.admit(signal);
+        // Only refusals leave the wait: anything else (an aborted request, a Store that cannot be read) would be recorded
+        // by the server as a failed GitHub read, which this wait is not.
+        try { await check.admit(signal); }
+        catch (error) {
+          if (error instanceof GuardRefusal) throw error;
+          throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost stopped waiting for the planning check: `
+            + `${error instanceof Error ? error.message : String(error)}`);
+        }
         return withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {
           const access = await issues.issueAccess(github.issue, { signal: readSignal, timeoutMs });
           const trust = service.store.issueTrust(github.repository, github.issue);

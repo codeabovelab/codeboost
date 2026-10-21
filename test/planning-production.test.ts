@@ -371,7 +371,10 @@ describe('the planning check (#164)', () => {
     }));
     const leaving = new AbortController(), left = deps.describe(leaving.signal), waiting = deps.describe(signal());
     leaving.abort(new Error('The browser went away.'));
-    await expect(left).rejects.toThrow('The browser went away.');
+    // A refusal about the wait, never one the server would record as a failed GitHub read.
+    const stopped = await Promise.resolve(left).catch((error: unknown) => error);
+    expect(stopped).toBeInstanceOf(GuardRefusal);
+    expect((stopped as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost stopped waiting for the planning check: The browser went away.`);
     pass();
     await expect(waiting).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
     expect(probe).toHaveBeenCalledTimes(1);
@@ -517,23 +520,39 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
-  it('fails a check that does not settle in time, so the next request after the wait checks again', async () => {
-    let count = 0;
+  it('fails and cancels a check that does not settle in time, and checks again after the wait', async () => {
+    let count = 0, late!: () => void;
+    const signals: AbortSignal[] = [];
     const check = new PlanningCheck((_vendor, probeSignal) => {
-      count += 1;
-      return count === 1 ? new Promise<void>(() => undefined) : Promise.resolve();
-    }, () => 'claude', { timeoutMs: 50, recheckMs: 0, waitMs: 1_000 });
+      count += 1; signals.push(probeSignal);
+      return count === 1 ? new Promise<void>(resolve => { late = resolve; }) : Promise.resolve();
+    }, () => 'claude', { timeoutMs: 50, recheckMs: 300, waitMs: 1_000 });
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toContain('The planning check did not finish within');
+    expect((refusal as Error).message).toContain('The planning check did not finish within a moment.');
+    expect(signals[0]!.aborted).toBe(true);
+    expect((signals[0]!.reason as Error).message).toContain('did not finish');
+    // A probe that answers after its timeout does not pass the check: within the wait it still refuses.
+    late();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await expect(check.admit(signal())).rejects.toThrow('did not finish');
+    expect(count).toBe(1);
+    await new Promise(resolve => setTimeout(resolve, 350));
     await expect(check.admit(signal())).resolves.toBeUndefined();
     expect(count).toBe(2);
+  });
+
+  it('promises no recheck when the sign-in is missing, which only a restart can change', async () => {
+    const reason = 'Planning with Claude Code needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`.';
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that. The check said: ${reason}`);
   });
 
   it('promises no recheck when the check says planning is off until a restart', async () => {
     const reason = 'The agent container worker stopped. Its containers and storage may still exist, so planning is off until codeboost restarts.';
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. The check said: ${reason}`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that. The check said: ${reason}`);
   });
 
   it('starts no check after close', async () => {

@@ -95,10 +95,11 @@ type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?:
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. The first check after `
   + 'codeboost starts can take several minutes while the agent image is built. Retry in a minute.';
-const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment' : `${Math.round(ms / 1_000)} s`;
+const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
+  : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
 // An abandoned worker (question-agent.ts) and unconfirmed cleanup (planning-provider.ts) refuse every job until codeboost
-// restarts, so a recheck cannot help.
-const UNTIL_RESTART = /until codeboost restarts/;
+// restarts, and the worker reads CLAUDE_CODE_OAUTH_TOKEN only when codeboost starts, so a recheck cannot help these.
+const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN/;
 /**
  * How long one check may take before it fails, so a check that never settles (a stuck recovery, say) cannot keep
  * planning "still checking": a real request's budget, as the probe has, and a minute for the worker to settle.
@@ -163,7 +164,7 @@ export class PlanningCheck {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        const error = new Error(`The planning check did not finish within ${Math.round(this.#timeoutMs / 60_000)} minutes.`);
+        const error = new Error(`The planning check did not finish within ${duration(this.#timeoutMs)}.`);
         abort.abort(error); reject(error);
       }, this.#timeoutMs);
       timer.unref?.();
@@ -236,8 +237,8 @@ export class PlanningCheck {
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(messageOf(check.failure.error)))
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
-        + `The check said: ${messageOf(check.failure.error)}`);
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `
+        + `of codeboost can change that. The check said: ${messageOf(check.failure.error)}`);
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
       + `it checks again on the next request after ${duration(this.#recheckMs)}. `
       + `The check said: ${messageOf(check.failure.error)}`);
