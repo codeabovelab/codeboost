@@ -203,10 +203,10 @@ type Inspect = {
 
 type DaemonLogConfig = { Type?: string; Config?: Record<string, string> | null } | null | undefined;
 /**
- * Whether an inspected `HostConfig.LogConfig` keeps no daemon log (#165): driver `none`, and no option but the `cache-*`
- * ones the daemon copies from its own log options into every container, whatever its driver (moby v27.4.0,
- * `logcache.MergeDefaultLogConfig`). With `none` no logger or cache starts, so those do nothing. The CLI refuses any
- * option with `none`, but the API stores whatever it is given.
+ * Whether an inspected `HostConfig.LogConfig` keeps no daemon log (#165): driver `none`, and only options whose key
+ * starts with `cache-`. A daemon copies its own `cache-*` log options into every container, whatever its driver (moby
+ * v27.4.0, `logcache.MergeDefaultLogConfig`), and with `none` no logger or cache starts, so they do nothing. The CLI
+ * refuses any option with `none`, but the API stores whatever it is given.
  */
 export const keepsNoDaemonLog = (config: DaemonLogConfig): boolean => config?.Type === 'none'
   && Object.keys(config.Config ?? {}).every(key => key.startsWith('cache-'));

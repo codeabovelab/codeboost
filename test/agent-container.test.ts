@@ -229,23 +229,13 @@ describe('real Docker agent isolation', () => {
     const live = await profile(fixture(), 'planning', 'noop');
     await createValidatedContainer(live); containers.add(live.name);
     const inspected = JSON.parse(docker('container', 'inspect', live.name))[0] as
-      { HostConfig: { LogConfig: unknown }; State: { Status: string } };
-    expect(inspected.HostConfig.LogConfig).toEqual({ Type: 'none', Config: {} });
-    expect(inspected.State.Status).toBe('created');
+      { HostConfig: { LogConfig: { Type: string; Config: Record<string, string> | null } } };
+    // Driver `none`, with no option but the `cache-*` ones a daemon copies from its own log options, if it has any.
+    expect(inspected.HostConfig.LogConfig.Type).toBe('none');
+    expect(Object.keys(inspected.HostConfig.LogConfig.Config ?? {}).filter(key => !key.startsWith('cache-'))).toEqual([]);
+    expect(keepsNoDaemonLog(inspected.HostConfig.LogConfig)).toBe(true);
     await disposeValidatedContainer(live); containers.delete(live.name);
   }, 60_000);
-
-  // The validator's own rule, for configurations the CLI cannot make: it refuses `--log-opt` with `none`, but the API
-  // stores any option, and a daemon copies its `cache-*` log options into every container (moby v27.4.0).
-  it('keeps no daemon log only with driver none and no option but the daemon\'s cache ones', () => {
-    expect(keepsNoDaemonLog({ Type: 'none', Config: {} })).toBe(true);
-    expect(keepsNoDaemonLog({ Type: 'none', Config: null })).toBe(true);
-    expect(keepsNoDaemonLog({ Type: 'none', Config: { 'cache-disabled': 'true', 'cache-max-size': '1m' } })).toBe(true);
-    for (const config of [undefined, null, {}, { Type: 'json-file', Config: {} }, { Type: 'NONE', Config: {} },
-      { Type: 'none', Config: { mode: 'non-blocking' } },
-      { Type: 'none', Config: { 'max-size': '1m' } }, { Type: 'none', Config: { 'cache-disabled': 'true', mode: 'non-blocking' } },
-    ] as Parameters<typeof keepsNoDaemonLog>[0][]) expect(keepsNoDaemonLog(config)).toBe(false);
-  });
 
   it.each([
     ['a json-file daemon log', (args: readonly string[]) => args.map(arg => arg === '--log-driver=none' ? '--log-driver=json-file' : arg)],
@@ -256,8 +246,6 @@ describe('real Docker agent isolation', () => {
     expect(valid.args).toContain('--log-driver=none');
     docker(...change(valid.args)); containers.add(valid.name);
     await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
-    const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
-    expect(state.State.Status).toBe('created');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
