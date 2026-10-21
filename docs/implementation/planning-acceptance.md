@@ -90,10 +90,11 @@ real request's budget, since a process's first job may build the agent image. It
 asks for the schema's own answer, `{"ok": true}`, so it covers sign-in, the
 schema-constrained answer and the read-only profile (`PlanningAgent.probe`).
 `PlanningCheck` starts it when the server starts, before it listens, and again
-when the vendor changes. `productionPlanning`'s `describe` waits for it, at most
-30 s, before it reads the issue or records anything, and the request checks again
-just before it starts, so a vendor chosen during the issue read never runs
-unchecked. A failed check refuses the request with a `GuardRefusal` that starts
+on the first request after the vendor changes, cancelling the check it replaces. `productionPlanning`'s `describe` waits for it, at most
+30 s in all, before it reads the issue or records anything, and the request checks
+again just before it starts, so a vendor chosen during the issue read never runs
+unchecked. That last check runs inside the Store's transaction, so it starts no
+check itself: it refuses, and the check it needs starts on the next turn. A failed check refuses the request with a `GuardRefusal` that starts
 "Planning is unavailable:" and names the reason, and so does a check still
 running after the wait; the server records the refusal and starts no agent.
 Requests within a minute of a failure are refused with it; the next request after

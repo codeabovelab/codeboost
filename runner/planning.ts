@@ -88,15 +88,17 @@ export const PLANNING_ADMIT_WAIT_MS = 30_000;
 export const PLANNING_CHECK_CLOSE_MS = 20_000;
 
 /** One run of the planning check, for one vendor. `passed` or `failure` is set once it settles. */
-type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number } };
+type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number };
+  abort: AbortController };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
+const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`;
 /**
  * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at
  * startup, and `admit`, called before anything about a request is recorded, waits for it. The last check is kept: a
  * passed one admits every request for its vendor; a failed one refuses them for `recheckMs`, after which the next
- * request checks again; a check for another vendor starts when the chosen vendor changes. A request waits for a
- * running check for at most `waitMs`, then is refused as still starting. With no vendor chosen nothing is checked,
- * and the request is refused later, as before, with `NO_PLANNING_AGENT`.
+ * request checks again. The first request after the vendor changes starts that vendor's check and cancels the one it
+ * replaces. A request waits for a check for at most `waitMs` in all, then is refused as still starting. With no vendor
+ * chosen nothing is checked, and the request is refused later, as before, with `NO_PLANNING_AGENT`.
  */
 export class PlanningCheck {
   readonly #probe: (vendor: Provider, signal: AbortSignal) => Promise<void>;
@@ -116,20 +118,30 @@ export class PlanningCheck {
     const vendor = this.#vendor();
     if (vendor) this.#check(vendor);
   }
-  // The check that covers `vendor` now: the current one, unless it was for another vendor, or failed `recheckMs` ago.
-  #check(vendor: Provider) {
+  // The current check if it covers `vendor`: for that vendor, and not failed `recheckMs` ago.
+  #covering(vendor: Provider) {
     const current = this.#current;
-    if (current && current.vendor === vendor
-      && !(current.failure && performance.now() - current.failure.at >= this.#recheckMs)) return current;
+    return current && current.vendor === vendor
+      && !(current.failure && performance.now() - current.failure.at >= this.#recheckMs) ? current : undefined;
+  }
+  // The check that covers `vendor`, started now if none does.
+  #check(vendor: Provider) {
+    const covering = this.#covering(vendor);
+    if (covering) return covering;
     if (this.#abort.signal.aborted) throw new GuardRefusal('Planning is stopping.');
-    const check: Check = { vendor, done: Promise.resolve(), passed: false };
+    // A check for another vendor no longer admits anything: stop it, so replaced checks do not pile up in the worker.
+    if (this.#current && !this.#current.passed && !this.#current.failure)
+      this.#current.abort.abort(new Error('The planning agent chosen in Settings changed.'));
+    const abort = new AbortController(), stop = () => abort.abort(this.#abort.signal.reason);
+    this.#abort.signal.addEventListener('abort', stop, { once: true });
+    const check: Check = { vendor, done: Promise.resolve(), passed: false, abort };
     let probe: Promise<void>;
     // Started now, so close can cancel it; a probe that throws instead of rejecting fails the check the same way.
-    try { probe = this.#probe(vendor, this.#abort.signal); } catch (error) { probe = Promise.reject(error); }
+    try { probe = this.#probe(vendor, abort.signal); } catch (error) { probe = Promise.reject(error); }
     // Never rejects: the outcome is kept on the check, so every waiting request gets it.
     const done = probe.then(() => { check.passed = true; }, (error: unknown) => {
       check.failure = { error, at: performance.now() };
-    });
+    }).finally(() => this.#abort.signal.removeEventListener('abort', stop));
     check.done = done;
     this.#running.add(done);
     void done.finally(() => this.#running.delete(done));
@@ -138,10 +150,11 @@ export class PlanningCheck {
   }
   /**
    * Resolve once the check for the vendor chosen now has passed; reject with a `GuardRefusal` naming why when it
-   * failed, or when it is still running after `waitMs`. `signal` stops only this wait, never the check, which other
+   * failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
    * requests may share.
    */
   async admit(signal: AbortSignal): Promise<void> {
+    const deadline = performance.now() + this.#waitMs;
     for (;;) {
       const vendor = this.#vendor();
       if (!vendor) return;
@@ -149,13 +162,14 @@ export class PlanningCheck {
       let release!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
       const stopped = new Promise<'timeout'>((resolve, reject) => {
         release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true });
-        timer = setTimeout(() => resolve('timeout'), this.#waitMs);
+        timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - performance.now()));
       });
       if (signal.aborted) release();
       let outcome: void | 'timeout';
       try { outcome = await Promise.race([check.done, stopped]); }
       finally { signal.removeEventListener('abort', release); clearTimeout(timer); }
-      // Settings changed while this request waited: check the vendor it will run with.
+      if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
+      // Settings changed while this request waited: check the vendor it will run with, within the same wait.
       if (this.#vendor() !== vendor) continue;
       // This request's own check: a recheck started since must not replace the outcome it waited for.
       return PlanningCheck.#verdict(check);
@@ -163,19 +177,22 @@ export class PlanningCheck {
   }
   /**
    * Throw a `GuardRefusal` unless the check for the vendor chosen now has passed (or no vendor is chosen). Requests call
-   * it again just before they start, so a vendor chosen after `admit` is never run unchecked; that vendor's check
-   * starts here.
+   * it again inside the action that starts them, so a vendor chosen after `admit` never runs unchecked. It starts no
+   * check there (that runs inside the Store's transaction): one it needs is started on the next turn.
    */
   assertPassed(): void {
     const vendor = this.#vendor();
     if (!vendor) return;
-    PlanningCheck.#verdict(this.#check(vendor));
+    const covering = this.#covering(vendor);
+    if (covering) return PlanningCheck.#verdict(covering);
+    setImmediate(() => { try { this.#check(vendor); } catch { /* stopping: nothing to start */ } });
+    throw new GuardRefusal(STILL_CHECKING);
   }
   static #verdict(check: Check): void {
     if (check.passed) return;
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
       + `${messageOf(check.failure.error)} codeboost checks again on the next request after a minute.`);
-    throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`);
+    throw new GuardRefusal(STILL_CHECKING);
   }
   /** Cancel any running check and wait up to `waitMs` for it to stop. No check starts afterwards. */
   async close(waitMs = PLANNING_CHECK_CLOSE_MS): Promise<void> {

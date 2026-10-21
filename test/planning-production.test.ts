@@ -416,6 +416,27 @@ describe('the planning check (#164)', () => {
     expect(order).toEqual(['check stopped', 'agent closed']);
   });
 
+  it('fails the check, and refuses with its reason, when the probe throws instead of rejecting', async () => {
+    const check = new PlanningCheck(() => { throw new Error('No worker could start.'); }, () => 'claude');
+    expect(() => check.start()).not.toThrow();
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toContain('No worker could start.');
+  });
+
+  it('cancels a running check that a check for another vendor replaced', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    const signals: AbortSignal[] = [];
+    const check = new PlanningCheck((_vendor, probeSignal) => { signals.push(probeSignal); return new Promise<void>(() => undefined); },
+      () => vendor, { waitMs: 10 });
+    check.start();
+    vendor = 'codex';
+    await expect(check.admit(signal())).rejects.toThrow('still checking');
+    expect(signals.map(probeSignal => probeSignal.aborted)).toEqual([true, false]);
+    await check.close(10);
+    expect(signals[1]!.aborted).toBe(true);
+  });
+
   it('waits a bounded time on close for a check that never stops', async () => {
     const check = new PlanningCheck(() => new Promise<void>(() => undefined), () => 'claude');
     check.start();
@@ -444,10 +465,12 @@ describe('the planning check (#164)', () => {
     const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());
-    expect(() => described.validate()).toThrow(GuardRefusal);
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent.`);
+    // validate runs inside the Store's transaction, so the new vendor's check starts only on the next turn.
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+    await new Promise(resolve => setImmediate(resolve));
     expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
     // Once that check passed, the same request is admitted.
-    await Promise.resolve();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(() => described.validate()).not.toThrow();
   });
