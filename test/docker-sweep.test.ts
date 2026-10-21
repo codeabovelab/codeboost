@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
 import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import type * as Sweep from './fixtures/docker-sweep.ts';
 
 // The test sweep's and `removeByName`'s handling of answers they cannot use (#189), each test with its own fake
 // `docker`, described beside it. The sweep reads only stdout, the exit status, whether a signal killed the call and
@@ -47,7 +48,7 @@ it('reads nothing from a docker call that was killed, whose output may be cut sh
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|network rm) /.test(line))).toEqual([]);
-  expect(warn.mock.calls).toContainEqual(['test: docker network ls failed:', 'killed by SIGKILL']);
+  expect(warn.mock.calls).toContainEqual(['test: listing networks: docker network ls failed:', 'killed by SIGKILL']);
 });
 
 it('removes by name only an object of exactly that name, and reports failures other than no such object', () => {
@@ -113,4 +114,44 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
   const lines = readFileSync(seen, 'utf8').split('\n').filter(Boolean);
   expect(lines.length).toBeGreaterThan(1);
   expect(new Set(lines)).toEqual(new Set([loaded]));
+});
+
+it('takes the daemon set at load, not the default, when one was set', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const seen = join(root, 'seen');
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
+    'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  // A fresh copy of the module, loaded while a daemon is set, as on a machine with Colima or rootless Docker.
+  vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-loaded.sock');
+  vi.stubEnv('DOCKER_CONTEXT', 'codeboost-loaded');
+  vi.resetModules();
+  const fresh = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+  vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-changed.sock');
+  vi.stubEnv('DOCKER_CONTEXT', 'codeboost-changed');
+  try {
+    fresh.removeByName('container', 'x', 'test', join(root, 'docker'));
+    fresh.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  } finally { vi.unstubAllEnvs(); }
+  expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
+});
+
+it.each([
+  ['says nothing of a holder gone since the listing', 'Error response from daemon: No such container: b', []],
+  ['reports any other failure to read the holders', 'permission denied', [['test: reading holders: docker container inspect failed:', 'permission denied']]],
+])('%s, and still removes the holders it read', (_label, stderr, warnings) => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
+  // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
+  // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1" = ps ]; then printf '%s\\n' ${a} ${b}; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '"${a}" {"swept":{}}'; echo '${stderr}' >&2; exit 1; fi`,
+    'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(warn.mock.calls.filter(call => String(call[0]).endsWith('failed:'))).toEqual(warnings);
+  expect(readFileSync(calls, 'utf8').split('\n')).toContain(`rm --force ${a}`);
 });

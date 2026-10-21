@@ -78,9 +78,12 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
  * default (`REAL_DOCKER`).
  */
 export function removeLabelledObjects(label: string, value: string, when: string, docker = REAL_DOCKER): void {
-  const run = (args: string[]) => {
+  const run = (stage: string, args: string[]) => {
     const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: dockerEnv() });
-    if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
+    // A holder gone since the listing is expected: Docker 27.4 answers "No such container" for it, and prints the rest.
+    const holdersGone = stage === 'reading holders' && result.status === 1
+      && result.stderr.trim().split('\n').every(line => line.startsWith('Error response from daemon: No such container: '));
+    if (result.status !== 0 && !holdersGone) console.warn(`${when}: ${stage}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
     // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call
     // that exited by itself is read whatever its status. A killed call's output may be cut short, so it is not.
@@ -94,7 +97,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
     // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
     // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
-    const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
+    const listed = run(`listing ${kind}s`, [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
       .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>(line)
@@ -107,18 +110,18 @@ export function removeLabelledObjects(label: string, value: string, when: string
       // Filters with one key match any of their values. The network filter also matches the start of another network's
       // ID, so a container counts only if it is on one of these networks by name (Docker refuses a second local network
       // of one name). Containers go by full ID: Docker resolves a name before an ID prefix.
-      const candidates = run(['ps', '--all', '--quiet', '--no-trunc',
+      const candidates = run('finding holders', ['ps', '--all', '--quiet', '--no-trunc',
         ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
-      const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
+      const holders = kind === 'volume' || !candidates.length ? candidates : run('reading holders', ['container', 'inspect', '--format',
         '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
         const at = line.indexOf(' '), id = parsed<string>(line.slice(0, at)), on = parsed<Record<string, unknown>>(line.slice(at + 1));
         return typeof id[0] === 'string' && typeof on[0] === 'object' ? [{ id: id[0], on: Object.keys(on[0] ?? {}) }] : [];
       }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
-        run(['rm', '--force', ...holders]);
+        run('removing holders', ['rm', '--force', ...holders]);
       }
     }
-    run([kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids]);
+    run(`removing ${kind}s`, [kind, 'rm', ...(kind === 'network' ? [] : ['--force']), ...ids]);
   }
 }
