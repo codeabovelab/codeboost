@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -393,7 +393,7 @@ describe('container invocation supervisor', () => {
     try {
       // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
-        '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+        '--entrypoint', 'true', imageId], { stdio: 'ignore', ...CLIENT_LIMIT });
       const result = await startProfileInvocation(current).settled;
       expect(result.stopReason).toBe('capture-failure');
       expect(result.stderr).toMatch(/already in use|Conflict/);
@@ -407,8 +407,8 @@ describe('container invocation supervisor', () => {
     } finally {
       // A failure above stays the one reported, whatever exit status this Docker version gives for a missing name. After
       // a pass the container exists, and its removal must succeed, as on main.
-      const removed = spawnSync('docker', ['rm', '--force', current.name], { encoding: 'utf8' });
-      if (passed && removed.status !== 0) throw new Error(`Removing ${current.name} failed: ${removed.error?.message ?? removed.stderr?.trim()}`);
+      const removed = spawnSync('docker', ['rm', '--force', current.name], { encoding: 'utf8', ...CLIENT_LIMIT });
+      if (passed && removed.status !== 0) throw new Error(`Removing ${current.name} failed: ${removed.error?.message ?? (removed.signal ? `killed by ${removed.signal}` : removed.stderr?.trim())}`);
     }
   }, 3 * 60_000);
 
@@ -450,7 +450,7 @@ describe('container invocation supervisor', () => {
     onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
     try {
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
-        '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+        '--entrypoint', 'true', imageId], { stdio: 'ignore', ...CLIENT_LIMIT });
       await expectRejected(startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 }), 'ceiling');
       expect(isContainerProfileAuthentic(current)).toBe(false);
       expect(spawnSync('docker', ['container', 'inspect', current.name], { stdio: 'ignore' }).status).toBe(0);
@@ -658,7 +658,7 @@ describe('container invocation supervisor', () => {
       execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
         '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
         '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
-        imageId, '120'], { stdio: 'ignore' });
+        imageId, '120'], { stdio: 'ignore', ...CLIENT_LIMIT });
       const acknowledge = () => spawnSync('docker', ['exec', '--user', '0', name, 'node', '-e', ACKNOWLEDGEMENT_SCRIPT,
         token], { encoding: 'utf8' });
       const content = () => execFileSync('docker', ['exec', name, 'cat', file], { encoding: 'utf8' });

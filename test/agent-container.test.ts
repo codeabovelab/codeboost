@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -490,8 +490,8 @@ describe('real Docker agent isolation', () => {
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     } finally {
       // The container first: a volume it mounts cannot be removed.
-      spawnSync('docker', ['rm', '--force', valid.name], { stdio: 'ignore' });
-      spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' });
+      spawnSync('docker', ['rm', '--force', valid.name], { stdio: 'ignore', ...CLIENT_LIMIT });
+      spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore', ...CLIENT_LIMIT });
     }
   }, 60_000);
 
@@ -819,7 +819,7 @@ describe('real Docker agent isolation', () => {
       expect(docker('network', 'inspect', '--format', '{{.Id}}', network.slice(0, 12))).toBe(lookalike);
       // And an inspect naming a missing container exits non-zero yet prints the others, the answer the shim below gives.
       const partial = spawnSync('docker', ['container', 'inspect', '--format', '{{.Id}}', holders[0]!, `codeboost-gone-${randomUUID()}`],
-        { encoding: 'utf8' });
+        { encoding: 'utf8', ...CLIENT_LIMIT });
       expect(partial.status).not.toBe(0);
       expect(partial.stdout).toContain(holders[0]);
       expect(partial.stderr).toMatch(/^Error response from daemon: No such container: codeboost-gone-/m);
@@ -846,7 +846,7 @@ describe('real Docker agent isolation', () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
       try {
         for (const [kind, name] of byName) removeByName(kind, name, 'test');
-        expect(byName.filter(([kind, name]) => spawnSync('docker', [kind, 'inspect', name], { stdio: 'ignore' }).status === 0)).toEqual([]);
+        expect(byName.filter(([kind, name]) => spawnSync('docker', [kind, 'inspect', name], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0)).toEqual([]);
         for (const [kind, name] of byName) removeByName(kind, name, 'test');
         expect(warn).not.toHaveBeenCalled();
       } finally { warn.mockRestore(); }
@@ -856,7 +856,7 @@ describe('real Docker agent isolation', () => {
       removeByName('network', lookalike.slice(0, 12), 'test');
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
       removeByName('container', bystanders[0]!.slice(0, 12), 'test');
-      const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
+      const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);
       expect(exists('container', labelled)).toBe(false);
@@ -893,7 +893,7 @@ describe('real Docker agent isolation', () => {
     // First, so afterAll does not refuse a keeper this test finds left: its file-label sweep removes that keeper, then
     // its runner sweep the volumes.
     taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
-    expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore', ...CLIENT_LIMIT }).status).not.toBe(0);
     // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
     removeTaskFilesystems(left);
     expect(byAllocation(allocationId)).toEqual([]);
@@ -2559,7 +2559,7 @@ describe('real Docker agent isolation', () => {
     removeTaskFilesystems(handle);
     expect(isRecoveredTaskStorage(handle)).toBe(false);
     for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
-      expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
+      expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore', ...CLIENT_LIMIT }).status).not.toBe(0);
   }, 180_000);
 
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
@@ -2580,7 +2580,7 @@ describe('real Docker agent isolation', () => {
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
       passed = true;
     } finally {
-      spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
+      spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore', ...CLIENT_LIMIT });
       // A failure above stays the one reported: what the removal leaves, the allocation sweep below removes, the keeper
       // with another runner's label included (#189). After a pass, the storage must release once the foreign keeper is
       // gone, so its failure fails the test. The sweep may take up to 5.5 minutes, which the test's budget allows for.

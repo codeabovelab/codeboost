@@ -21,6 +21,11 @@ const dockerEnv = () => {
   for (const [name, value] of Object.entries(LOADED_ENV)) if (value === undefined) delete env[name]; else env[name] = value;
   return env;
 };
+/**
+ * A Docker client call's own limit, for a test's synchronous calls (#189): no Vitest timer can stop one, so a stalled
+ * daemon would otherwise hold the whole suite.
+ */
+export const CLIENT_LIMIT = { timeout: 60_000, killSignal: 'SIGKILL' as const };
 /** The real `docker` for a shim to call; refuses when none was found, since a shim calling `docker` would call itself. */
 export function requireRealDocker(): string {
   if (!isAbsolute(REAL_DOCKER)) throw new Error('No docker on PATH when the test files loaded.');

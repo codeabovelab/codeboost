@@ -9,7 +9,7 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
@@ -135,7 +135,7 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+      if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
       for (const name of made) removeByName('network', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
@@ -191,7 +191,7 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+      if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
       for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
@@ -247,7 +247,7 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       impostor = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
+      if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
       for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
