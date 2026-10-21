@@ -963,10 +963,14 @@ it('refreshes the moved head against its prior base when the PR base and head ad
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => moved, fetch: async () => undefined, ...unusedPush });
   const task = service.store.getTask(config.identity);
+  const events: string[] = [];
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head },
+  (step, state) => { events.push(`${step}:${state}`); });
   expect(result.reason).toMatch(/head moved/);
   expect(result).toMatchObject({ state: 'review-required', base: initial.base, head: moved.head, checked: [] });
+  // Fetch is still running when the moved head stops preparation, so the job's step list shows it Failed (D16).
+  expect(events).toEqual(['fetch:running']);
   const refreshed = await service.load();
   expect(refreshed.snapshot).toMatchObject({ base: initial.base, head: moved.head });
   expect(refreshed.segments.some(segment => segment.row === 'Unplanned')).toBe(true);
