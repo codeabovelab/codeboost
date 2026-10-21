@@ -299,7 +299,9 @@ async function pollMergeQueue(generation) {
         data = { ...data, merge: { ...data.merge, job } };
         // A cancel's refusal stays in the banner until the job's record changes: it is the only explanation of a Cancel
         // that stayed enabled.
-        if (mergeCancelRefusalFor !== `${job.id}:${job.revision}`) { mergeCancelRefusalFor = null; $("banner").textContent = mergeJobText(job); }
+        // Written again on every poll, so a reload or a failed poll that rewrote the banner meanwhile is corrected.
+        if (mergeCancelRefusal?.key !== `${job.id}:${job.revision}`) mergeCancelRefusal = null;
+        $("banner").textContent = mergeCancelRefusal ? mergeCancelRefusal.text : mergeJobText(job);
         if (!changed) backOffMergePoll();
         renderMerge();
         return;
@@ -353,8 +355,8 @@ const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running
   failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
 /** The ID of the job a cancel request is on its way for, or null. */
 let mergeCancelPending = null;
-/** `id:revision` of the job record whose cancel refusal the banner shows, or null. */
-let mergeCancelRefusalFor = null;
+/** A cancel's refusal and the `id:revision` of the job record it was given for, or null. */
+let mergeCancelRefusal = null;
 let mergeStepTimer = null;
 function mergeStepElapsed(step, now = Date.now()) {
   if (!step.startedAt) return "";
@@ -448,8 +450,8 @@ $("merge-cancel").onclick = async () => {
     // Only while the job this cancel was for is still shown running: an outcome the poll showed meanwhile, or a newer
     // job, says more than the refusal.
     if (data?.merge?.job?.id === job.id && data.merge.job.state === "running") {
-      $("banner").textContent = `Could not cancel the merge. ${error.message}`;
-      mergeCancelRefusalFor = `${job.id}:${data.merge.job.revision}`;
+      mergeCancelRefusal = { key: `${job.id}:${data.merge.job.revision}`, text: `Could not cancel the merge. ${error.message}` };
+      $("banner").textContent = mergeCancelRefusal.text;
     }
   } finally {
     // Only this cancel's own pending state: a later cancel of a newer job keeps its own.

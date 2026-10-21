@@ -1093,7 +1093,9 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
   if(body.action!=='merge'){await route.continue();return;}
   const review=await clickReview(route);
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:merging}),job:merging})});});
- await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:merging})}));
+ let failNext=false;
+ await page.route('**/api/merge',route=>{if(failNext){failNext=false;return route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'GitHub returned HTTP 502.'})});}
+  return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:merging})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
@@ -1106,6 +1108,10 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
  const polled=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
  await polled;await page.waitForTimeout(200);
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.');
+ // One poll fails and rewrites the banner; the next poll, answering the same record, shows the refusal again.
+ failNext=true;
+ await expect(page.locator('#banner')).toHaveText(/^Could not refresh merge status\./,{timeout:15_000});
+ await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.',{timeout:40_000});
 });
 test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
