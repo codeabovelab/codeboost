@@ -67,6 +67,10 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
   const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const, env: dockerEnv() };
   const failed = (result: SpawnSyncReturns<string>, args: string[]) => console.warn(`${when}: removing ${kind} ${name}: docker ${args.join(' ')} failed:`,
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
+  // The name is passed on too: refused if it could read as an option (a volume's must have the shape Docker allows).
+  if (kind === 'volume' ? !VOLUME_NAME.test(name) : name.startsWith('-') || !name) {
+    console.warn(`${when}: removing ${kind} ${name}: refused a name that is not one Docker gives`); return;
+  }
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
   const inspect = [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name];
   const found = spawnSync(docker, inspect, options);
@@ -103,9 +107,10 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
   removeLabelledObjects(RUNNER_LABEL, runnerOwner, when);
 }
 
-// A container's or network's full ID, as `--no-trunc` and inspect give it, and the names Docker 27.4 allows a volume.
+// A container's or network's full ID, as `--no-trunc` and inspect give it, and the names Docker 27.4 allows a volume
+// (two characters at least).
 // Every value the code passes on as an argument has one of these shapes, so none can read as an option.
-const OBJECT_ID = /^[0-9a-f]{64}$/, VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const OBJECT_ID = /^[0-9a-f]{64}$/, VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/;
 /**
  * Removes the containers, networks and volumes that carry `label=value`, containers first, as they hold the others in
  * use. Before it removes a network or a volume it also removes every container attached to it or mounting it, labelled

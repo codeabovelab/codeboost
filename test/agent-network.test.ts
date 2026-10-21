@@ -116,7 +116,8 @@ describe('vendor-only egress', () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
     unlabelled.push({ kind: 'network', file: recorded });
     const realDocker = requireRealDocker();
-    // The name is taken by someone else's network just before our create, so the daemon refuses it.
+    // The name is taken by someone else's network just before our create, so the daemon refuses it. The refusal is
+    // Docker 27.4's own text, and the shim makes the network with the real docker.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
         + `printf '%s\\n' "$last" >> '${recorded}'; '${realDocker}' network create "$last" >/dev/null; `
@@ -232,7 +233,8 @@ describe('vendor-only egress', () => {
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup. Only an exec in a
-    // proxy: any other call passes through, so the shim never makes a stand-in with an empty, random name.
+    // proxy: any other call passes through, so the shim never makes a stand-in with an empty, random name. Its exit 1
+    // with no stderr is invented, as an exec that failed; the code reads only the status.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
       `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" 2>/dev/null | sed 's#^/##')`,
       '  case "$name" in codeboost-proxy-*)',

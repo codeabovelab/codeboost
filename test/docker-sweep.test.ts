@@ -96,7 +96,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
     ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost'],
-    ['network', 'raced'], ['container', 'junk'], ['container', 'odd'], ['container', 'nospace'], ['container', 'optid']] as const;
+    ['network', 'raced'], ['container', 'junk'], ['container', 'odd'], ['container', 'nospace'], ['container', 'optid'],
+    ['container', '--help'], ['volume', '-v']] as const;
   expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
@@ -114,6 +115,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
     ['test: removing container nospace: docker printed what is not JSON:', '"nospace"\n'],
     ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
+    ['test: removing container --help: refused a name that is not one Docker gives'],
+    ['test: removing volume -v: refused a name that is not one Docker gives'],
   ]);
 });
 
