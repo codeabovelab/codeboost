@@ -100,7 +100,8 @@ function dBackedAgent(service: ReviewService, observations: {
       return provider.invoke(request, signal);
     },
     async close() { /* createPlanningProvider has no process-level owner */ },
-    // The planning check (#164) passes here; planning-production and agent-planning test it.
+    // No vendor is chosen in this spec, so the planning check (#164) checks nothing and never calls this;
+    // planning-production and agent-planning test the check.
     async probe() { /* passes */ },
   };
   return agent as PlanningAgent;

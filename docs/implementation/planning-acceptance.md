@@ -92,7 +92,7 @@ schema-constrained answer and the read-only profile (`PlanningAgent.probe`).
 `PlanningCheck` starts it when the server starts, before it listens, and again on
 the first request after the vendor changes, cancelling the check it replaces.
 `productionPlanning`'s `describe` waits for it, at most 30 s in all, before it
-reads the issue or records anything, and the request checks again just before it
+reads the issue or records a planning request, and the request checks again just before it
 starts, so a vendor chosen during the issue read never runs unchecked. That last
 check runs inside the Store's transaction, so it starts no check itself: it
 refuses, and the check it needs starts on the next turn. The provider checks once

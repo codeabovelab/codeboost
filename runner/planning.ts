@@ -254,8 +254,8 @@ export class PlanningCheck {
       // Never throws: an exception here would end the process. A Store that cannot be read starts nothing.
       try { const now = this.#vendor(); if (now) this.#check(now); } catch { /* stopping, or no Store: nothing to start */ }
     });
-    throw new GuardRefusal(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost is `
-      + 'checking it now. Retry in a minute.');
+    throw new GuardRefusal(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost checks `
+      + 'it next. Retry in a minute.');
   }
   #verdict(check: Check): void {
     if (check.passed) return;

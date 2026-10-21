@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { ISSUE_READ_ACTIVE_MS, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
-import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,7 +14,7 @@ import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS, PLANNING_FEATURE, PLANNING_
 import type { InvocationInput } from '../agents/contract.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
-import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
+import { PLANNING_UNAVAILABLE, PlanningCheck, type PlanningAgent } from '../runner/planning.ts';
 import { LeftoverLedger, PLANNING_NAMING } from '../runner/question-leftovers.ts';
 import { abandonedWorkerText } from '../runner/question-agent.ts';
 
@@ -425,11 +424,15 @@ describe('the planning check (#164)', () => {
   it('refuses to invoke an agent whose check has not passed for the vendor chosen at the call', async () => {
     const made = checked(async () => undefined);
     await made.deps.describe(signal());
+    const request = {} as Parameters<typeof made.deps.provider.invoke>[0], forwarded = signal();
+    // Once the check passed, the call goes to the agent as it is.
+    await made.deps.provider.invoke(request, forwarded);
+    expect(made.agent.invoke).toHaveBeenCalledWith(request, forwarded);
+    vi.mocked(made.agent.invoke).mockClear();
     vi.spyOn(made.service.store, 'questionProvider').mockReturnValue('codex');
-    const request = {} as Parameters<typeof made.deps.provider.invoke>[0];
     // A rejection, as `AuthorProvider.invoke` promises: E3 then settles the request as failed with this reason
     // (test/planning-suggestions.test.ts covers a provider whose invoke fails).
-    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('is checking it now');
+    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('and codeboost checks it next');
     expect(made.agent.invoke).not.toHaveBeenCalled();
   });
 
@@ -515,7 +518,7 @@ describe('the planning check (#164)', () => {
     const uncaught = vi.fn();
     process.on('uncaughtException', uncaught);
     try {
-      expect(() => check.assertPassed()).toThrow('is checking it now');
+      expect(() => check.assertPassed()).toThrow('and codeboost checks it next');
       fail = true;
       await new Promise(resolve => setImmediate(resolve));
       expect(uncaught).not.toHaveBeenCalled();
@@ -713,7 +716,7 @@ describe('the planning check (#164)', () => {
     const made = checked(async () => undefined, null, undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());
-    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost is checking it now.`);
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost checks it next.`);
     // validate runs inside the Store's transaction, so the new vendor's check starts only on the next turn.
     expect(made.probe).not.toHaveBeenCalled();
     await new Promise(resolve => setImmediate(resolve));
