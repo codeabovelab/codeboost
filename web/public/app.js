@@ -294,6 +294,7 @@ async function pollMergeQueue(generation) {
     const update = await api("/api/merge");
     current = settle();
     if (!current) return;
+    mergeCancelAwaitingPoll = null;
     if (data.merge.job?.state === "running") {
       // A full review response read before this observation must not restore an older record of this job.
       mergeObservationGeneration++;
@@ -371,6 +372,8 @@ const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running
   failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
 /** The ID of the job a cancel request is on its way for, or null. */
 let mergeCancelPending = null;
+/** The ID of a job whose cancel was answered as ended, until the poll that presents the outcome answers, or null. */
+let mergeCancelAwaitingPoll = null;
 /** A cancel's refusal and the `id:revision` of the job record it was given for, or null. */
 let mergeCancelRefusal = null;
 let mergeStepTimer = null;
@@ -409,12 +412,12 @@ function renderMergeSteps(focused = document.activeElement) {
   cancel.hidden = job.state !== "running";
   // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
   const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
-  const pending = mergeCancelPending === job.id;
+  const pending = mergeCancelPending === job.id || mergeCancelAwaitingPoll === job.id;
   const blocked = asked || job.cancelRequested || pending;
   if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
   cancel.textContent = job.cancelRequested || pending ? "Cancel requested" : "Cancel merge";
   cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
-  // A disabled Cancel ignores clicks, so the reason is also written out, and describes the button only while shown (a
+  // An `aria-disabled` Cancel ignores clicks, so the reason is also written out, and describes the button only while shown (a
   // hidden element named by aria-describedby is still read).
   const noted = asked && job.state === "running";
   $("merge-cancel-note").hidden = !noted;
@@ -472,6 +475,8 @@ $("merge-cancel").onclick = async () => {
   } finally {
     // Only this cancel's own pending state: a later cancel of a newer job keeps its own.
     if (mergeCancelPending === job.id) mergeCancelPending = null;
+    // Answered as ended: Cancel stays unavailable until the poll presents the outcome.
+    if (pollNow) mergeCancelAwaitingPoll = job.id;
     renderMerge();
     if (pollNow) {
       if (mergePollInFlight?.generation === mergeGeneration) {
@@ -500,7 +505,7 @@ const mergeJobReachedMerge = new Set(["merged", "queued", "submitted"]);
 function withEndedMergeJob(view, job, message) {
   const settled = new Set(mergeJobReachedMerge.has(job?.state) ? view.merge.settledBeforeJobMerge ?? [] : []);
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !settled.has(blocker.code));
-  // `endedJobShown` keeps the step list of the job seen ending on screen until Refresh, also once the poll that follows
+  // `endedJobShown` keeps the step list of the job seen ending on screen until the review reloads, also once the poll that follows
   // its queued attempt has replaced the `job-refresh` blocker with the attempt's own status.
   return { ...view, merge: { ...view.merge, ready: false, action: null, job, endedJobShown: job?.id ?? null,
     blockers: [{ code: "job-refresh", message }, ...blockers] } };

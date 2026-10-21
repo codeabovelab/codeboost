@@ -1000,7 +1000,12 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
  hold=true;await inFlight;
  await page.locator('#merge-cancel').click();
  // The refusal is shown while the cancelled job is still the one shown; a newer job is followed at once instead.
- if(answer==='ended') await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. This merge has already ended.');
+ if(answer==='ended'){
+  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. This merge has already ended.');
+  // Until the poll presents the outcome, Cancel stays unavailable rather than offering a cancel that is refused.
+  await expect(page.locator('#merge-cancel')).toHaveAttribute('aria-disabled','true');
+  await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
+ }
  else await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
  const released=Date.now();release();
  // The next poll comes 2 s after the held one, not after its backed-off delay of 16 s or more.
@@ -1227,7 +1232,7 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
  await expect(page.locator('#banner')).not.toHaveText(/^Could not cancel the merge\./);
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.',{timeout:40_000});
 });
-test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
+test('marks Cancel unavailable once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
@@ -1246,7 +1251,7 @@ test('disables Cancel once the merge job asked GitHub to merge (D16)',async({pag
  const cancel=page.locator('#merge-cancel');
  await expect(cancel).toHaveAttribute('aria-disabled','true',{timeout:10_000});
  await expect(cancel).toHaveAttribute('title','GitHub has been asked to merge; wait for its outcome.');
- // A disabled Cancel ignores clicks, so the reason is written beside it and describes it.
+ // An `aria-disabled` Cancel ignores clicks, so the reason is written beside it and describes it.
  await expect(page.locator('#merge-cancel-note')).toBeVisible();
  await expect(cancel).toHaveAccessibleDescription('GitHub has been asked to merge; wait for its outcome.');
  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').nth(1)).toHaveText('– Rebase Skipped');

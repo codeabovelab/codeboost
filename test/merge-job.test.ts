@@ -444,7 +444,10 @@ it('leaves a job running on shutdown, and startup ends it as failed', async () =
 it('ends queued when the merge queue accepted the head', async () => {
   const f = setup({ queue: true });
   await f.coordinator.start('review-token', randomUUID());
-  expect(await settled(f.coordinator)).toMatchObject({ state: 'queued' });
+  const done = await settled(f.coordinator);
+  expect(done).toMatchObject({ state: 'queued' });
+  // A job that ended queued shows its Merge step done, as merged does.
+  expect(done.steps!.find(step => step.name === 'merge')).toMatchObject({ state: 'done', endedAt: expect.any(String) });
   expect(f.store.getMergeAttempt(identity)).toMatchObject({ kind: 'queue', state: 'queued' });
   expect(f.store.getTask(identity).status).toBe('in review');
 });
@@ -1775,4 +1778,15 @@ it('saves the waiting checks only when they change, so unchanged inspections add
   expect(f.store.getMergeJob(identity, job.id)!.revision).toBeGreaterThan(revision);
   f.coordinator.cancelMerge(job.id);
   expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled' });
+});
+
+it('asks GitHub to merge even when the step-list callback throws, since it is display only', async () => {
+  const f = setup();
+  const merge = f.merges.merge.bind(f.merges);
+  let called = 0;
+  f.merges.merge = ((token, actionId, signal) => merge(token, actionId, signal, () => { called++; throw new Error('display failed'); })) as typeof f.merges.merge;
+  await f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
+  expect(called).toBe(1);
+  expect(f.gh.merged).toEqual([oid(2)]);
 });
