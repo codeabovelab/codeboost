@@ -34,8 +34,8 @@ beforeAll(async () => {
   network = await createVendorNetwork(invocation, imageId, randomUUID());
 }, 10 * 60_000);
 /**
- * Objects a test makes without labels, by name or by the file its shim records the name in, so afterAll removes them
- * should the test time out before its own removal runs (#189).
+ * Objects a test makes without this run's runner label, by name or by the file its shim records the name in, so
+ * afterAll removes them should the test time out before its own removal runs (#189).
  */
 const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
 // If setup failed there is no network, and a teardown error would hide the setup failure.

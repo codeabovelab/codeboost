@@ -15,7 +15,7 @@ import { assertContainerProfile, createContainerProfile, disposeContainerProfile
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
   startValidatedContainer, hasExactOptions, keepsNoDaemonLog, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { hasOwnerLabels } from '../agents/labels.ts';
+import { hasOwnerLabels, RUNNER_LABEL } from '../agents/labels.ts';
 import { exportTaskDiff, exportTaskPaths, importTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
 import { checkConflictTree, checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
@@ -52,8 +52,18 @@ const containers = new Set<string>();
  * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `volumes`).
  */
 const TEST_FILE_RUN = randomUUID();
-/** Volumes a test makes without labels, removed in afterAll if the test did not remove them (it may have timed out). */
+/**
+ * Volumes a test makes without this run's runner label, removed in afterAll if the test did not remove them (it may
+ * have timed out).
+ */
 const volumes = new Set<string>();
+/**
+ * For an async test that makes objects under another runner's owner, or its own random one, which no afterAll sweep
+ * finds: removes what carries `label=value` when the test finishes, passed, failed or timed out (a timed-out body runs
+ * on, and its finally may never run), with the sweep's own 6-minute budget (#189).
+ */
+const sweepWhenFinished = (label: string, value: string) =>
+  onTestFinished(() => removeLabelledObjects(label, value, 'onTestFinished'), 6 * 60_000);
 const profiles: Awaited<ReturnType<typeof createContainerProfile>>[] = [];
 let imageId = '';
 const vendorNetworks: VendorNetwork[] = [];
@@ -141,7 +151,8 @@ afterEach(async () => {
 }, 120_000);
 afterAll(async () => {
   try {
-    for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
+    for (const container of containers)
+      spawnSync(REAL_DOCKER, ['rm', '--force', container], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
     for (const volume of volumes)
       spawnSync(REAL_DOCKER, ['volume', 'rm', '--force', volume], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
     // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
@@ -563,7 +574,7 @@ describe('real Docker agent isolation', () => {
   it('releases a killed create once its settle window passes with no container', async () => {
     const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = REAL_DOCKER;
     // The create client hangs until its deadline kills it, so the daemon outcome stays unknown.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = create ]; then exec sleep 30; fi',
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -582,7 +593,7 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const created = join(shim, 'created'), failed = join(shim, 'failed');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = REAL_DOCKER;
     // The create client hangs until killed, and the first inspect after it fails for an unrelated reason, so the
     // create path gives up early, inside the settle window.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -696,7 +707,7 @@ describe('real Docker agent isolation', () => {
     onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 6 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = REAL_DOCKER;
     writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
       "const { spawnSync } = require('node:child_process');",
       'const args = process.argv.slice(2);',
@@ -800,7 +811,7 @@ describe('real Docker agent isolation', () => {
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
       mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-      const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+      const realDocker = REAL_DOCKER;
       writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -861,7 +872,7 @@ describe('real Docker agent isolation', () => {
   const withDockerShim = async <T>(prefix: string[], script: string, run: () => Promise<T> | T): Promise<T> => {
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-shim-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = REAL_DOCKER;
     writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
       "const { spawnSync } = require('node:child_process');",
       'const args = process.argv.slice(2);',
@@ -906,6 +917,8 @@ describe('real Docker agent isolation', () => {
 
   it('never removes a network found by name after a killed create when its runner label differs', async () => {
     const data = fixture(), allocationId = randomUUID();
+    // The network carries another runner's label, so no sweep of this run finds it: removed by its allocation (#189).
+    sweepWhenFinished('io.codeboost.allocation', allocationId);
     // The create lands with another runner's label, and its client is killed before it reports the ID.
     const foreign = [
       `const at = args.findIndex(arg => arg.startsWith('io.codeboost.runner='));`,
@@ -916,20 +929,14 @@ describe('real Docker agent isolation', () => {
     const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--no-trunc', '--filter',
       `label=io.codeboost.allocation=${allocationId}`], { encoding: 'utf8' }).stdout?.trim() ?? '';
     let left = '';
-    try {
-      const created = await withDockerShim(['network', 'create'], foreign, () =>
-        createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-      left = listed();
-      expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
-      const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
-      expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
-      expect(left).not.toBe('');
-    } finally {
-      // The network carries another runner's label, so no sweep of this run finds it: removed by its allocation (#189).
-      // The sweep may take up to 5.5 minutes, which the test's budget allows for.
-      removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
-    }
-  }, 7 * 60_000);
+    const created = await withDockerShim(['network', 'create'], foreign, () =>
+      createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
+    left = listed();
+    expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
+    const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
+    expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
+    expect(left).not.toBe('');
+  }, 60_000);
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
@@ -2317,25 +2324,24 @@ describe('real Docker agent isolation', () => {
   it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
     const owner = { runnerOwner, attemptId: 'unsettled-allocation', allocationId: randomUUID() };
+    // Another runner's objects, so no sweep of this run finds them: removed by allocation when the test finishes (#189).
+    sweepWhenFinished('io.codeboost.allocation', owner.allocationId);
     // The seeder is refused, and every volume removal fails, so the allocation's cleanup does not settle.
     const failing = [
       "if (args[0] === 'run' && args[1] === '--rm') result = { status: 1, stdout: '', stderr: 'refused' };",
       "else if (args[0] === 'volume' && args[1] === 'rm') result = { status: 1, stdout: '', stderr: 'volume is in use' };",
       'else result = run(args);',
     ].join('\n');
-    try {
-      await withDockerShim([], failing, () => expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId,
-        owner)).toThrow('cleanup did not settle'));
-      await expect(recoverLeftovers(runnerOwner)).rejects.toThrow('still holds task storage');
-    } finally {
-      // Another runner's objects, so no sweep of this run finds them: removed by allocation, by full ID, never throwing
-      // (#189). The sweep may take up to 5.5 minutes, which the test's budget allows for.
-      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
-    }
-  }, 7 * 60_000);
+    await withDockerShim([], failing, () => expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId,
+      owner)).toThrow('cleanup did not settle'));
+    await expect(recoverLeftovers(runnerOwner)).rejects.toThrow('still holds task storage');
+  }, 60_000);
 
   it('recovers only its own runner after a restart, keeping its storage for removal by handle', async () => {
     const data = fixture(), runners = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')] as const;
+    // Both runners are this test's own random owners, so no sweep of this run finds what an undo step could not remove
+    // or never recorded: each is swept when the test finishes (#189).
+    for (const runner of runners) sweepWhenFinished(RUNNER_LABEL, runner);
     // Every object is registered for cleanup as soon as it exists, so a failure anywhere in setup leaks nothing.
     // Cleanup runs in reverse: containers go before the networks and volumes they use.
     const undo: (() => unknown)[] = [];
@@ -2445,16 +2451,15 @@ describe('real Docker agent isolation', () => {
       for (const step of undo.reverse()) {
         try { await step(); } catch (error) { failures.push(error); }
       }
-      // Both runners are this test's own random owners, so no sweep of this run finds what an undo step could not
-      // remove or never recorded (#189). Each sweep may take up to 5.5 minutes, which the test's budget allows for.
-      for (const runner of runners) removeRunnerObjects(runner, 'test');
       if (failures.length) throw new AggregateError(failures, 'Recovery test cleanup failed.');
     }
-  }, 15 * 60_000);
+  }, 180_000);
 
   it('exports through a recovery handle after a restart, then removes the storage by that handle', async () => {
     const data = fixture({ hostile: agentBase });
     const owner = { runnerOwner: randomBytes(16).toString('hex'), attemptId: `restart-${randomUUID()}`, allocationId: randomUUID() };
+    // Its own random runner, so no sweep of this run finds what it leaves: removed by allocation when it finishes (#189).
+    sweepWhenFinished('io.codeboost.allocation', owner.allocationId);
     const staging = join(data.root, 'restart-staging'); mkdirSync(staging);
     // An earlier process clones and allocates task storage, then exits without releasing it, as a crash does: this
     // process never held the allocator value.
@@ -2472,40 +2477,34 @@ describe('real Docker agent isolation', () => {
       "process.stdout.write('\\n' + JSON.stringify(prepareTaskFilesystems(clone, limits, imageId, owner)));",
     ].join('\n')], { encoding: 'utf8', timeout: 120_000, env: { ...process.env,
       EARLIER: JSON.stringify({ source: data.source, staging, head: data.clone.head, owner }) } });
-    try {
-      if (earlier.status !== 0) throw new Error(`The earlier process failed (${earlier.status}): ${earlier.stderr}`);
-      const left = JSON.parse(earlier.stdout.trim().split('\n').pop()!) as ReturnType<typeof prepareTaskFilesystems>;
-      agentChanges(left);
-      const report = await recoverLeftovers(owner.runnerOwner);
-      expect(report.removed).toEqual([]);
-      expect(report.storage).toEqual([{ ...owner, workVolume: left.workVolume, metadataVolume: left.metadataVolume,
-        keeper: left.keeper }]);
-      const handle = report.storage[0]!;
-      // D keeps no baseline across a restart: the export needs the one F recorded, and checks the metadata against it.
-      await expect(exportTaskDiff(handle, { base: data.clone.head, imageId })).rejects.toThrow('needs the metadataBaseline');
-      await expect(exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: 'c'.repeat(64) }))
-        .rejects.toThrow('metadata changed');
-      const before = storageSnapshot(left);
-      const exported = await exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: left.metadataBaseline });
-      expect(storageSnapshot(left)).toBe(before);
-      const text = exported.diff.toString('utf8');
-      expect(exported.truncated).toBe(false);
-      for (const expected of ['+committed', '+changed', '+staged only', '+brand new', 'GIT binary patch'])
-        expect(text).toContain(expected);
-      // Every export, refused or not, removed its container: only the keeper is left before release.
-      expect(docker('ps', '--all', '--quiet', '--no-trunc', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`))
-        .toBe(docker('container', 'inspect', '--format', '{{.Id}}', left.keeper));
-      // The handle still releases the storage after the export, once.
-      removeTaskFilesystems(handle);
-      expect(isRecoveredTaskStorage(handle)).toBe(false);
-      for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
-        expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
-    } finally {
-      // Never throws, so a failure above is the one reported. By full ID: Docker resolves a name before an ID prefix. The
-      // sweep may take up to 5.5 minutes, which the test's budget allows for.
-      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
-    }
-  }, 9 * 60_000);
+    if (earlier.status !== 0) throw new Error(`The earlier process failed (${earlier.status}): ${earlier.stderr}`);
+    const left = JSON.parse(earlier.stdout.trim().split('\n').pop()!) as ReturnType<typeof prepareTaskFilesystems>;
+    agentChanges(left);
+    const report = await recoverLeftovers(owner.runnerOwner);
+    expect(report.removed).toEqual([]);
+    expect(report.storage).toEqual([{ ...owner, workVolume: left.workVolume, metadataVolume: left.metadataVolume,
+      keeper: left.keeper }]);
+    const handle = report.storage[0]!;
+    // D keeps no baseline across a restart: the export needs the one F recorded, and checks the metadata against it.
+    await expect(exportTaskDiff(handle, { base: data.clone.head, imageId })).rejects.toThrow('needs the metadataBaseline');
+    await expect(exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: 'c'.repeat(64) }))
+      .rejects.toThrow('metadata changed');
+    const before = storageSnapshot(left);
+    const exported = await exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: left.metadataBaseline });
+    expect(storageSnapshot(left)).toBe(before);
+    const text = exported.diff.toString('utf8');
+    expect(exported.truncated).toBe(false);
+    for (const expected of ['+committed', '+changed', '+staged only', '+brand new', 'GIT binary patch'])
+      expect(text).toContain(expected);
+    // Every export, refused or not, removed its container: only the keeper is left before release.
+    expect(docker('ps', '--all', '--quiet', '--no-trunc', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`))
+      .toBe(docker('container', 'inspect', '--format', '{{.Id}}', left.keeper));
+    // The handle still releases the storage after the export, once.
+    removeTaskFilesystems(handle);
+    expect(isRecoveredTaskStorage(handle)).toBe(false);
+    for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
+      expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
+  }, 180_000);
 
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
@@ -2522,8 +2521,8 @@ describe('real Docker agent isolation', () => {
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
       // Never throws, so a failure above is the one reported: what the removal leaves, the allocation sweep below removes,
-      // the keeper with another runner's label included (#189). The sweep may
-      // take up to 5.5 minutes, which the test's budget allows for.
+      // the keeper with another runner's label included (#189). The sweep may take up to 5.5 minutes, which the test's
+      // budget allows for.
       try { removeTaskFilesystems(filesystems); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
@@ -2532,8 +2531,9 @@ describe('real Docker agent isolation', () => {
   it('refuses task storage that belongs to another runner', async () => {
     const data = fixture(), allocationId = randomUUID();
     let foreign: ReturnType<typeof prepareTaskFilesystems> | undefined;
-    // Removed here: it carries another runner's label, so no sweep of this run finds it (#189). Then whatever still
-    // carries its allocation, should its creation or removal not settle.
+    // It carries another runner's label, so no sweep of this run finds it: removed here, and whatever still carries its
+    // allocation when the test finishes, should its creation or removal not settle or the test time out (#189).
+    sweepWhenFinished('io.codeboost.allocation', allocationId);
     try {
       foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
         metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
@@ -2543,9 +2543,8 @@ describe('real Docker agent isolation', () => {
     } finally {
       // Never throws, so a failure above is the one reported; the sweep removes whatever the removal left.
       try { if (foreign) removeTaskFilesystems(foreign); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
-      removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
     }
-  }, 7 * 60_000);
+  }, 60_000);
 
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
     const data = fixture();
@@ -2585,7 +2584,7 @@ describe('real Docker agent isolation', () => {
       '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`).split('\n').filter(Boolean));
     const before = keepers();
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = REAL_DOCKER;
     // The keeper's create client hangs until killed, and the real create lands in the daemon afterwards.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ]; then ( sleep 10; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
