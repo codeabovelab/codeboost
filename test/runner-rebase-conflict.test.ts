@@ -217,7 +217,7 @@ describe('production rebase conflict resolver', () => {
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
   });
 
-  it('retains resources, with the timeout in its message, when the work deadline passed during a trust read that timed out (#174)', async () => {
+  it('retains resources, with the timeout in its message, when the work deadline passed after a trust read timed out, before its error was handled (#174)', async () => {
     const f = fixture(), x = deps(f), realNow = performance.now.bind(performance);
     const cause = new RemoteTimeout('Issue retrieval timed out.');
     let expired = false, removes = 0;
