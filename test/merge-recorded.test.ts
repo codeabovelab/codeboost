@@ -56,7 +56,8 @@ it('reads the ruleset\'s required checks as pending, then as passing at the same
 // The same reads by a token without admin rights, recorded 2026-10-20 with gh 2.102.0 from public repositories this
 // token may only read. Each classic protection read answers 404 "Not Found", so classic checks come from the branch read.
 // nonadmin-ruleset and nonadmin-mixed were recorded again at the same heads on 2026-10-21 (UTC), when the inspection
-// began to read the runs of checks pinned to an app from GitHub (#176); their other answers did not change.
+// began to read the runs of checks pinned to an app from GitHub (#176). Their other answers did not change, except that
+// svelte's pull request read now says `mergeable` MERGEABLE where it said UNKNOWN (no test reads it from this recording).
 // - nonadmin-ruleset: vitejs/vite PR 23837 into main, which only a ruleset covers (`protection.enabled` false);
 // - nonadmin-classic: cli/cli PR 14716 into trunk, with classic required checks and no ruleset checks;
 // - nonadmin-mixed: sveltejs/svelte PR 19050 into main, where a ruleset and classic protection both require one check.
