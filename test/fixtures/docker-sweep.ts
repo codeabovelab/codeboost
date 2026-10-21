@@ -2,10 +2,19 @@ import { spawnSync } from 'node:child_process';
 import { RUNNER_LABEL } from '../../agents/labels.ts';
 
 /**
+ * The real `docker`, found once when this module loads, before any test puts a shim on PATH. A sweep that runs while a
+ * shim is still on PATH (after a test timed out inside one) would otherwise wait on the shim's own child, which the
+ * call's SIGKILL does not reach.
+ */
+export const REAL_DOCKER = spawnSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).stdout?.trim() || 'docker';
+
+/**
  * The label a test's Docker shim adds to an object it makes without the runner label (#189), so the test can still
  * find and remove that object however the test ends. No codeboost code writes or reads it.
  */
 export const TEST_RUN_LABEL = 'io.codeboost.test-run';
+/** Beside it, one value per test file run, so afterAll removes them all with one sweep. */
+export const TEST_FILE_LABEL = 'io.codeboost.test-file';
 
 /**
  * Removes the containers, networks and volumes labelled with one runner owner, and every container that holds one of
@@ -22,11 +31,12 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
  * or not: a test can make a network or volume with one owner and the container that holds it with another, or without
  * one. Containers and volumes go by force; a network another container joins meanwhile stays. It reports what it finds
  * and any Docker call that fails, prefixed with `when`, and never throws, so cleanup can call it without hiding an
- * earlier error. Each call has a 30 s limit, so all eleven can take up to 5.5 minutes.
+ * earlier error. Each call has a 30 s limit, so all eleven can take up to 5.5 minutes. It runs `docker`, the real one by
+ * default (`REAL_DOCKER`).
  */
-export function removeLabelledObjects(label: string, value: string, when: string): void {
+export function removeLabelledObjects(label: string, value: string, when: string, docker = REAL_DOCKER): void {
   const run = (args: string[]) => {
-    const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
+    const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? result.stderr.trim());
     // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call

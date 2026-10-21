@@ -4,12 +4,12 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 
-// The test sweep's handling of output it cannot read (#189). The `docker` on PATH answers as no real daemon does: for
-// `network ls` it prints a line that is not JSON, a JSON null and one network without a name, and it answers every
-// other call with nothing and exit 0. What Docker 27.4 really prints is covered against the daemon in agent-container.
-const roots: string[] = [], savedPath = process.env.PATH;
+// The test sweep's handling of output it cannot read (#189). The fake `docker` answers as no real daemon does for
+// `network ls`: a line that is not JSON, a JSON null and one network without a name. To every other call it answers
+// nothing and exit 0, as Docker 27.4 does for `ls` with no match; the sweep reads only stdout and the exit status, and
+// stderr only to report a failure. What Docker 27.4 really prints is covered against the daemon in agent-container.
+const roots: string[] = [];
 afterEach(() => {
-  process.env.PATH = savedPath;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -20,9 +20,8 @@ it('skips output that is not a network, reports what is not JSON, and never thro
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' 'not json' 'null' '{"ID":"abc"}'; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
-  process.env.PATH = `${root}:${savedPath}`;
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test')).not.toThrow();
+  expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'))).not.toThrow();
   expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: docker printed a line that is not JSON:');
   // Nothing it could not read is removed or looked up as a holder.
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);

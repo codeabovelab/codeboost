@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeLabelledObjects, removeRunnerObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { removeLabelledObjects, removeRunnerObjects, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -47,8 +47,10 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
-/** The test-run IDs `withoutRunnerLabel` put on objects it made without the runner label (#189). */
-const testRuns: string[] = [];
+/** Put, beside its test-run ID, on every object this file makes without the runner label (#189): afterAll sweeps it. */
+const TEST_FILE_RUN = randomUUID();
+/** Volumes a test makes without labels, removed in afterAll if the test did not remove them (it may have timed out). */
+const volumes = new Set<string>();
 const profiles: Awaited<ReturnType<typeof createContainerProfile>>[] = [];
 let imageId = '';
 const vendorNetworks: VendorNetwork[] = [];
@@ -137,6 +139,7 @@ afterEach(async () => {
 afterAll(async () => {
   try {
     for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
+    for (const volume of volumes) spawnSync('docker', ['volume', 'rm', '--force', volume], { stdio: 'ignore' });
     // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
     // every failure is reported.
     const failures: unknown[] = [];
@@ -152,13 +155,13 @@ afterAll(async () => {
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
-    // volumes or networks: those made through `withoutRunnerLabel` are found by their test-run IDs, and the other tests
-    // remove their own. It may not run before a hook timeout, and its budget does not cover every Docker call taking
-    // its full 30 s (eleven per sweep).
-    for (const testRun of testRuns) removeLabelledObjects(TEST_RUN_LABEL, testRun, 'afterAll');
+    // volumes or networks: those this file labels with its own run ID are found by it, and the other tests remove their
+    // own. It may not run before a hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup
+    // before them.
+    removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 10 * 60_000);
+}, 13 * 60_000);
 
 describe('real Docker agent isolation', () => {
   it.each([
@@ -454,7 +457,9 @@ describe('real Docker agent isolation', () => {
 
     const rogue = `codeboost-work-${randomUUID()}`;
     try {
-      // Inside the try: the volume has no labels, so only the finally below removes it (#189).
+      // Inside the try, and tracked for afterAll should the test time out: the volume has no labels, so nothing else
+      // finds it (#189).
+      volumes.add(rogue);
       docker('volume', 'create', rogue);
       const rogueArgs = valid.args.map(value => value.replace(data.filesystems.workVolume, rogue));
       docker(...rogueArgs); containers.add(valid.name);
@@ -676,14 +681,12 @@ describe('real Docker agent isolation', () => {
   // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup may refuse such
   // an object (task storage has no captured IDs), and afterAll's runner sweep finds such a container only while it
   // holds one of this run's volumes or networks, and such a volume or network never, so the wrapper labels it with a
-  // test-run ID instead (#189). Whatever has that ID is
-  // removed when the test finishes (Vitest runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails`
-  // pair below tests the failure), and again in afterAll, for a create that lands after a timed-out test's removal (its
-  // body runs on).
+  // test-run ID and this file's run ID instead (#189). Whatever has that ID is removed when the test finishes (Vitest
+  // runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails` pair below tests the failure), and again
+  // in afterAll, for a create that lands after a timed-out test's removal (its body runs on).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
-    testRuns.push(testRun);
     // Up to eleven synchronous Docker calls of 30 s each, which a timer cannot cut short: the budget covers them, so a
     // slow removal is not reported as a hook timeout (10 s by default).
     onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 6 * 60_000);
@@ -696,7 +699,7 @@ describe('real Docker agent isolation', () => {
       `const strip = ${JSON.stringify(prefixes)}.some(prefix => prefix.every((word, i) => args[i] === word));`,
       'const out = [];',
       "for (let i = 0; i < args.length; i++) { if (strip && args[i] === '--label' && String(args[i + 1]).startsWith('io.codeboost.runner=')) { i++; continue; } out.push(args[i]); }",
-      `if (strip) out.splice(out.indexOf('create') + 1, 0, '--label', ${JSON.stringify(`${TEST_RUN_LABEL}=${testRun}`)});`,
+      `if (strip) out.splice(out.indexOf('create') + 1, 0, '--label', ${JSON.stringify(`${TEST_RUN_LABEL}=${testRun}`)}, '--label', ${JSON.stringify(`${TEST_FILE_LABEL}=${TEST_FILE_RUN}`)});`,
       `const result = spawnSync(${JSON.stringify(realDocker)}, out, { stdio: 'inherit' });`,
       'process.exit(result.status ?? 1);'].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
@@ -724,6 +727,11 @@ describe('real Docker agent isolation', () => {
 
   it('rejects task volumes without their runner label before the agent starts', async () => {
     const data = await withoutRunnerLabel([['volume', 'create']], () => fixture());
+    // The wrapper labelled the volume for its removal in place of the runner label it dropped.
+    const labels = JSON.parse(docker('volume', 'inspect', '--format', '{{json .Labels}}', data.filesystems.workVolume)) as Record<string, string>;
+    expect(labels).not.toHaveProperty(['io.codeboost.runner']);
+    expect(labels).toHaveProperty([TEST_RUN_LABEL]);
+    expect(labels).toHaveProperty([TEST_FILE_LABEL], TEST_FILE_RUN);
     const live = await profile(data, 'planning', 'must-not-run');
     await expect(createValidatedContainer(live)).rejects.toThrow('bounded tmpfs allocation');
     refuseThenRemove(data.filesystems, [['volume', 'rm', '--force', data.filesystems.workVolume,
@@ -747,10 +755,9 @@ describe('real Docker agent isolation', () => {
   // #189: the sweep removes what holds a swept network or volume, even a container created and never started, and
   // nothing on a network or volume it does not sweep, even one whose ID starts with a swept network's name.
   it('removes the containers that hold a swept network or volume, and nothing else', () => {
-    // The test-run ID goes to afterAll too, and each object is recorded by name before it is made, so a failure here
-    // leaves nothing behind (#189).
-    const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, made: { kind: 'container' | 'network' | 'volume'; ref: string }[] = [];
-    testRuns.push(run);
+    // The swept objects carry this file's run ID too, for afterAll, and each object is recorded by name before it is
+    // made, so a failure here leaves nothing behind (#189).
+    const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, fileLabel = `${TEST_FILE_LABEL}=${TEST_FILE_RUN}`, made: { kind: 'container' | 'network' | 'volume'; ref: string }[] = [];
     const make = (kind: 'container' | 'network' | 'volume', name: string, ...args: string[]) => {
       made.push({ kind, ref: name });
       return docker(...(kind === 'container' ? [args[0]!, '--name', name, ...args.slice(1)] : [kind, args[0]!, ...args.slice(1), name]));
@@ -761,10 +768,10 @@ describe('real Docker agent isolation', () => {
       const bystanderVolume = make('volume', named('bystander'), 'create');
       const bystanders = [make('container', named('bystander'), 'run', '--detach', '--network', bystanderNetwork, '--entrypoint', 'sleep', imageId, '300'),
         make('container', named('bystander'), 'create', '--mount', `type=volume,source=${bystanderVolume},target=/x`, '--entrypoint', 'true', imageId)];
-      const network = make('network', named('swept'), 'create', '--label', label);
+      const network = make('network', named('swept'), 'create', '--label', label, '--label', fileLabel);
       // Named like the start of the bystander network's ID: Docker's network filter also matches that prefix.
-      make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label);
-      const volume = make('volume', named('swept'), 'create', '--label', label);
+      make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label, '--label', fileLabel);
+      const volume = make('volume', named('swept'), 'create', '--label', label, '--label', fileLabel);
       // And a bystander named like the start of the swept network's ID: removing by a short ID would remove it.
       const lookalike = make('network', network.slice(0, 12), 'create');
       const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
@@ -772,7 +779,7 @@ describe('real Docker agent isolation', () => {
         make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
       // The same for containers: Docker resolves a name before an ID prefix. A holder and a swept container each have one.
       const holderLookalike = make('container', holders[0]!.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
-      const labelled = make('container', named('swept'), 'create', '--label', label, '--entrypoint', 'true', imageId);
+      const labelled = make('container', named('swept'), 'create', '--label', label, '--label', fileLabel, '--entrypoint', 'true', imageId);
       const labelledLookalike = make('container', labelled.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
       // The traps are live on this daemon, so the checks below test something: the network filter matches the start of
       // a network's ID, and a name is resolved before an ID prefix, for networks and containers alike.
@@ -793,9 +800,7 @@ describe('real Docker agent isolation', () => {
       writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
-      const path = process.env.PATH;
-      process.env.PATH = `${shim}:${path}`;
-      try { removeLabelledObjects(TEST_RUN_LABEL, run, 'test'); } finally { process.env.PATH = path; }
+      removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
@@ -2508,10 +2513,10 @@ describe('real Docker agent isolation', () => {
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
-      // Never throws, so a failure above is the one reported: the volumes carry the runner label, so afterAll's sweep
-      // removes what this leaves, and the keeper with another runner's label goes by its allocation (#189). The sweep may
+      // Never throws, so a failure above is the one reported: what the removal leaves, the allocation sweep below removes,
+      // the keeper with another runner's label included (#189). The sweep may
       // take up to 5.5 minutes, which the test's budget allows for.
-      try { removeTaskFilesystems(filesystems); } catch { /* removed by afterAll's runner sweep */ }
+      try { removeTaskFilesystems(filesystems); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
   }, 7 * 60_000);
@@ -2529,7 +2534,7 @@ describe('real Docker agent isolation', () => {
         inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
     } finally {
       // Never throws, so a failure above is the one reported; the sweep removes whatever the removal left.
-      try { if (foreign) removeTaskFilesystems(foreign); } catch { /* removed by allocation below */ }
+      try { if (foreign) removeTaskFilesystems(foreign); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
     }
   }, 7 * 60_000);

@@ -33,8 +33,17 @@ beforeAll(async () => {
   });
   network = await createVendorNetwork(invocation, imageId, randomUUID());
 }, 10 * 60_000);
+/**
+ * Objects a test makes without labels, by name or by the file its shim records the name in, so afterAll removes them
+ * should the test time out before its own removal runs (#189).
+ */
+const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => {
+  for (const { kind, name, file } of unlabelled) {
+    const ref = name ?? (file && existsSync(file) ? readFileSync(file, 'utf8') : '');
+    if (ref) spawnSync('docker', kind === 'container' ? ['rm', '--force', ref] : ['network', 'rm', ref], { stdio: 'ignore' });
+  }
   try { if (network) await removeVendorNetwork(network); }
   finally {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
@@ -87,6 +96,7 @@ describe('vendor-only egress', () => {
 
   it('leaves a same-named network alone when the daemon refuses the create', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    unlabelled.push({ kind: 'network', file: recorded });
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -143,6 +153,7 @@ describe('vendor-only egress', () => {
 
   it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -192,6 +203,7 @@ describe('vendor-only egress', () => {
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
+    unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
@@ -227,6 +239,7 @@ describe('vendor-only egress', () => {
     const partial = captureInvocation({ ...invocation, attemptId: `partial-removal-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const created = await createVendorNetwork(partial, imageId, randomUUID()), blocker = `codeboost-blocker-${randomUUID()}`;
+    unlabelled.push({ kind: 'container', name: blocker });
     const [proxy, net] = vendorNetworkResources(created);
     expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
     expect(net).toMatchObject({ kind: 'network', name: created.name });

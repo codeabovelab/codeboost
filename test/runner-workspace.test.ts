@@ -36,9 +36,10 @@ afterAll(() => {
     for (const store of stores) store.close();
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   } finally {
-    // Then remove the task storage and path identity probes this run still owns, even when a test failed or the cleanup
-    // above threw. It may not run before a hook timeout. The hook's 7 minutes leave a minute and a half over this
-    // sweep's worst case (eleven calls of 30 s), for the cleanup before it.
+    // Then remove the task storage and path identity probes this run still owns, and every container that holds one of
+    // their volumes or networks, even when a test failed or the cleanup above threw. It may not run before a hook
+    // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
+    // the cleanup before it.
     removeRunnerObjects(RUNNER_OWNER);
   }
 }, 7 * 60_000);
