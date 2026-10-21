@@ -73,9 +73,9 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
  * use. Before it removes a network or a volume it also removes every container attached to it or mounting it, labelled
  * or not: a test can make a network or volume with one owner and the container that holds it with another, or without
  * one. Containers and volumes go by force; a network another container joins meanwhile stays. It reports what it finds
- * and any Docker call that fails, prefixed with `when`, and never throws, so cleanup can call it without hiding an
- * earlier error. Each call has a 30 s limit, so all eleven can take up to 5.5 minutes. It runs `docker`, the real one by
- * default (`REAL_DOCKER`).
+ * and any Docker call that fails (but not a read of holders that fails only because one has gone since the listing),
+ * prefixed with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s
+ * limit, so all eleven can take up to 5.5 minutes. It runs `docker`, the real one by default (`REAL_DOCKER`).
  */
 export function removeLabelledObjects(label: string, value: string, when: string, docker = REAL_DOCKER): void {
   const run = (stage: string, args: string[]) => {

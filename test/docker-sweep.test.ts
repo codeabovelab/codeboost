@@ -8,8 +8,9 @@ import type * as Sweep from './fixtures/docker-sweep.ts';
 
 // The test sweep's and `removeByName`'s handling of answers they cannot use (#189), each test with its own fake
 // `docker`, described beside it. The sweep reads only stdout, the exit status, whether a signal killed the call and
-// whether it could start, and stderr only to report a failure; `removeByName` also reads an inspect's stderr to tell a
-// missing object from a failure. Against the daemon, agent-container's holder test covers the sweep and removeByName's
+// whether it could start, and stderr to report a failure, and, for its read of holders, to tell one gone since the
+// listing ("No such container") from a failure; `removeByName` also reads an inspect's stderr to tell a missing object
+// from a failure. Against the daemon, agent-container's holder test covers the sweep and removeByName's
 // removal, its silence on a missing name, and its refusal of an object found by an ID prefix.
 const roots: string[] = [];
 afterEach(() => {
@@ -119,6 +120,7 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
 it('takes the daemon set at load, not the default, when one was set', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const seen = join(root, 'seen');
+  // Records the address each call is given, and answers as Docker 27.4 does for a missing container and an empty `ls`.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
     'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
   { mode: 0o755 });

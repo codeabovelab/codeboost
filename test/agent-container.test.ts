@@ -50,7 +50,8 @@ const containers = new Set<string>();
 /**
  * Put, beside its test-run ID, on every object the `withoutRunnerLabel` wrapper makes and on the holder test's swept
  * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`,
- * `volumes`), or found as holders of this run's networks and volumes.
+ * `volumes`), or found as holders of this run's volumes or of networks that afterAll still finds. (Docker 27.4 removes a
+ * network that a created, never started container still names, so such a container is tracked by name.)
  */
 const TEST_FILE_RUN = randomUUID();
 /** Networks a test makes without this run's runner label, removed by name in afterAll as `volumes` are. */
@@ -704,9 +705,10 @@ describe('real Docker agent isolation', () => {
   // holds one of this run's volumes or networks, and such a volume or network never, so the wrapper labels it with a
   // test-run ID and this file's run ID instead (#189). Whatever has that ID is removed when the test finishes (Vitest
   // runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails` pair below tests the failure), and again
-  // in afterAll, for a create that lands after a timed-out test's removal (its body runs on). A timed-out test leaves the
-  // wrapper on PATH while its body runs on, so a later test's matching create is unlabelled too and that test fails;
-  // what it makes carries this file's run ID, so afterAll removes it.
+  // in afterAll, for a create that lands after a timed-out test's removal (its body runs on). A timed-out test can leave
+  // the wrapper on PATH for the rest of the file (a later shim saves the PATH that holds it, and puts it back), so a
+  // later test's matching create is unlabelled too and that test fails; what it makes carries this file's run ID, so
+  // afterAll removes it.
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
@@ -970,6 +972,9 @@ describe('real Docker agent isolation', () => {
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
+    // Tracked for afterAll should the test time out: never started and without the runner label, it is no holder a
+    // sweep finds once its network is gone (#189).
+    containers.add(live.name);
     // The create lands without the runner label, and its client is killed before it reports the ID. Only this
     // container's: should the test time out with the shim still on PATH, other tests' creates pass through.
     const unlabelled = [
