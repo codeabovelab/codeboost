@@ -25,7 +25,7 @@ Issue #6 tracked the v1 plan library contract and the runner obligations that ca
 | Prompt byte budget before spawn | Done before this change | `MAX_PROMPT_BYTES` in `core/planning-author.ts`; `test/planning-author.test.ts` ("accepts exactly the prompt byte limit and rejects the next byte without truncation") |
 | Model budget before spawn | Moved to #163 | — |
 | Planning profile probed at startup | Moved to #164 | — |
-| Docker daemon log limits | Moved to #165. *Later:* fixed in #165 with `--log-driver=none`, checked before launch | `agents/container/profile.ts`, `agents/container/run.ts`; `test/agent-container.test.ts` ("creates the agent container with no Docker daemon log", "refuses an agent container with %s at validation") (real Docker), `test/agent-daemon-log.test.ts`. Agent containers only; the runner's own task-storage script containers keep the daemon's default log until the container is removed |
+| Docker daemon log limits | Moved to #165. *Later:* fixed in #165 with `--log-driver=none`, checked before launch | `agents/container/profile.ts`, `agents/container/run.ts`; `test/agent-container.test.ts` ("creates the agent container with no Docker daemon log", "refuses an agent container with %s at validation") (real Docker), `test/agent-daemon-log.test.ts`. Agent containers only; the runner's other containers (task-storage scripts, the keeper, the egress proxy) keep the daemon's default log |
 | Claude structured output under the v1 parsing contract | Moved to #166 (found during this change). *Later:* fixed in #166 | `agents/adapters/claude.ts`; `test/agent-adapter.test.ts` ("lets draft validation refuse %s in a structured answer") |
 
 ## Schema loading
