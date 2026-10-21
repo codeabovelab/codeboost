@@ -194,8 +194,11 @@ Use only these entry points to run an agent:
        same storage gives the same `head`.
 7. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders, export, inspection and commit containers and networks, and
-   resolves once they are gone. It keeps task storage whole (both volumes and the keeper) and returns one recovery
+   token. It removes agent containers, egress proxies, seeders, export, inspection and commit containers and networks,
+   and the container and anonymous volume a path identity probe left (#181), and resolves once they are gone. A probe
+   is runner-scoped: it carries only the runner label and `io.codeboost.probe=path-identity`, no attempt or allocation,
+   and recovery removes it only with exactly those labels and a name the probe gives (`codeboost-path-identity-<uuid>`,
+   or Docker's 64-hex name for its volume). It keeps task storage whole (both volumes and the keeper) and returns one recovery
    handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts

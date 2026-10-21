@@ -1,9 +1,9 @@
 import { DOCKER_ID } from './client-outcome.ts';
 import { runDocker, type DockerOutcome } from './docker.ts';
-import { ALLOCATION_LABEL, ATTEMPT_LABEL, isAllocationId, isLabelAttemptId, isRunnerOwner,
+import { ALLOCATION_LABEL, ATTEMPT_LABEL, isAllocationId, isLabelAttemptId, isRunnerOwner, PROBE_LABEL,
   RUNNER_LABEL } from './labels.ts';
-import { adoptRecoveredTaskStorage, hasLiveTaskStorage, RecoveredStorageRejected, type RecoveredTaskStorage,
-  type TaskStorageParts } from './container/storage.ts';
+import { adoptRecoveredTaskStorage, hasLiveTaskStorage, PATH_IDENTITY_PROBE_NAME, RecoveredStorageRejected,
+  type RecoveredTaskStorage, type TaskStorageParts } from './container/storage.ts';
 
 /** A Docker object recovery found, with the labels it carries. */
 export interface RecoveredResource {
@@ -26,7 +26,7 @@ export interface UnownedResource extends RecoveredResource {
 export interface RecoveryReport {
   /**
    * Agent containers, egress proxies, seeders, export, inspection and commit containers and networks of this runner,
-   * now confirmed gone.
+   * and its path identity probes' containers and volumes (#181), now confirmed gone.
    */
   readonly removed: readonly RecoveredResource[];
   /** One handle per task-storage allocation of this runner, kept whole for export and `removeTaskFilesystems`. */
@@ -48,7 +48,9 @@ const EGRESS_LABEL = 'io.codeboost.egress';
 const STORAGE_LABEL = 'io.codeboost.task-storage';
 // Every label a codeboost object of any build carries at least one of; used to find objects without a runner label.
 // Each Docker type is scanned for all of them, so an object with a label D never puts on its type is still found.
-const KIND_LABELS = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL, ALLOCATION_LABEL] as const;
+const KIND_LABELS = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL, ALLOCATION_LABEL, PROBE_LABEL] as const;
+// The name Docker gives an anonymous volume, as the path identity probe's is.
+const ANONYMOUS_VOLUME = /^[0-9a-f]{64}$/;
 const DIAGNOSTIC_LIMIT = 1_000;
 // Objects per `docker inspect`, so a daemon with many codeboost objects cannot exceed the argument-size limit.
 const INSPECT_BATCH = 200;
@@ -111,19 +113,22 @@ const inspectBatch = async (kind: Kind, refs: readonly string[], remaining: () =
 };
 const unique = (values: readonly string[]) => [...new Set(values)];
 
-// Remove one object by its full ID, and confirm it is gone.
+// Remove one object by its full ID (a volume by its name, which is its identity), and confirm it is gone.
 const removeById = async (resource: RecoveredResource, remaining: () => number) => {
-  const args = resource.kind === 'network' ? ['network', 'rm', resource.id!] : ['rm', '--force', resource.id!];
+  const ref = resource.kind === 'volume' ? resource.name : resource.id!;
+  const args = resource.kind === 'network' ? ['network', 'rm', ref]
+    : resource.kind === 'volume' ? ['volume', 'rm', '--force', ref] : ['rm', '--force', ref];
   const result = await runDocker(args, { timeoutMs: remaining() });
   if (result.status === 0) return;
-  if (!absent(await runDocker([resource.kind, 'inspect', resource.id!], { timeoutMs: remaining() })))
+  if (!absent(await runDocker([resource.kind, 'inspect', ref], { timeoutMs: remaining() })))
     throw new Error(`Could not remove ${resource.kind} ${resource.name}: ${(result.error?.message ?? result.stderr).trim()}`);
 };
 
 /**
  * Crash recovery for one database (#51 item 4). Acts only on objects whose `io.codeboost.runner` label is
  * `runnerOwner`: it removes agent containers, egress proxies, seeders, export, inspection and commit containers and
- * networks, and resolves only once they are gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
+ * networks, and the containers and anonymous volumes path identity probes left (#181), and resolves only once they are
+ * gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
  * allocation. Objects from older builds without a runner label, and anything it does not recognise, are reported and
  * never touched.
  *
@@ -173,10 +178,15 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     storage.set(allocationId, group);
   };
   // D writes exactly one kind label on each object, with complete owner labels (an egress object's egress label is its
-  // allocation ID). Recovery has no creation-time ID to prove ownership, so any other combination is not D's and is
-  // left alone.
+  // allocation ID). A runner-scoped probe carries the probe label and no attempt or allocation. Recovery has no
+  // creation-time ID to prove ownership, so any other combination is not D's and is left alone.
   const kindOf = (resource: RecoveredResource) => {
     const labels = resource.labels;
+    if (PROBE_LABEL in labels) {
+      const scoped = [ATTEMPT_LABEL, ALLOCATION_LABEL, INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL]
+        .some(label => label in labels);
+      return !scoped && labels[PROBE_LABEL] === 'path-identity' ? 'probe:path-identity' : undefined;
+    }
     if (!isLabelAttemptId(labels[ATTEMPT_LABEL]) || !isAllocationId(labels[ALLOCATION_LABEL])) return undefined;
     const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in labels);
     if (present.length !== 1) return undefined;
@@ -196,12 +206,16 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       || kind === 'storage:inspect' || kind === 'storage:commit'
       || kind === 'agent' || kind === 'egress')
       remove.push(resource);
+    // Only one process holds this runner's token, and it probes after recovery, so a probe found now is left over.
+    else if (kind === 'probe:path-identity' && PATH_IDENTITY_PROBE_NAME.test(resource.name)) remove.push(resource);
     else unknown(resource);
   }
+  const probeVolumes: RecoveredResource[] = [];
   for (const resource of owned.volume) {
     const kind = kindOf(resource);
     if (kind === 'storage:work') keep(resource, 'workVolume');
     else if (kind === 'storage:metadata') keep(resource, 'metadataVolume');
+    else if (kind === 'probe:path-identity' && ANONYMOUS_VOLUME.test(resource.name)) probeVolumes.push(resource);
     else unknown(resource);
   }
   const networks = owned.network.filter(resource => {
@@ -210,10 +224,11 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     return false;
   });
 
-  // Containers first: a network cannot be removed while an agent or proxy is still attached to it.
+  // Containers first: a network cannot be removed while an agent or proxy is still attached to it, nor a probe's
+  // volume while its container still exists.
   const failures: unknown[] = [], confirmed: RecoveredResource[] = [];
-  for (const resource of [...remove, ...networks]) {
-    if (resource.kind === 'network' && failures.length) break;
+  for (const resource of [...remove, ...probeVolumes, ...networks]) {
+    if (resource.kind !== 'container' && failures.length) break;
     try {
       await removeById(resource, remaining);
       confirmed.push(resource);
@@ -242,6 +257,6 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));
     }
   }
-  return Object.freeze({ removed: Object.freeze([...remove, ...networks]), storage: Object.freeze(handles),
+  return Object.freeze({ removed: Object.freeze([...remove, ...probeVolumes, ...networks]), storage: Object.freeze(handles),
     unowned: Object.freeze(unowned) });
 }

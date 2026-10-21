@@ -341,4 +341,69 @@ describe('recoverLeftovers', () => {
     await expect(recoverLeftovers('A'.repeat(32))).rejects.toThrow('32 lowercase hex');
     expect(daemon.calls).toEqual([]);
   });
+
+  // #181: what an interrupted path identity probe leaves, labelled as `pathIdentityProbeArgs` labels it: a container
+  // created but never started, and its anonymous volume.
+  const probe = (runner: string, labels: Record<string, string> = {}, names: { container?: string; volume?: string } = {}) => {
+    const probeLabels = { 'io.codeboost.runner': runner, 'io.codeboost.probe': 'path-identity', ...labels };
+    const objects: [FakeObject, FakeObject] = [
+      { kind: 'container', id: id(), name: names.container ?? `codeboost-path-identity-${randomUUID()}`, labels: probeLabels },
+      { kind: 'volume', name: names.volume ?? id(), labels: { 'com.docker.volume.anonymous': '', ...probeLabels } },
+    ];
+    daemon.objects.push(...objects);
+    return objects;
+  };
+
+  it('removes its own leftover path identity probe and its volume, container first, and no other runner\'s (#181)', async () => {
+    const [container, volume] = probe(A), theirs = probe(B), mine = attempt(A, 'attempt-a');
+    const report = await recoverLeftovers(A);
+    const [work, metadata, keeper, seeder, agent, proxy, network] = mine.objects;
+    expect(report.removed.map(resource => resource.name).sort()).toEqual([container.name, volume.name, seeder!.name,
+      agent!.name, proxy!.name, network!.name].sort());
+    expect(names()).toEqual([work!.name, metadata!.name, keeper!.name, ...theirs.map(object => object.name)].sort());
+    expect(report.unowned).toEqual([]);
+    // The container by its full ID, then its volume by name, which it holds until the container is gone.
+    const removals = daemon.calls.filter(args => args[0] === 'rm' || args[1] === 'rm').map(args => args[args.length - 1]);
+    expect(removals.indexOf(container.id!)).toBeGreaterThanOrEqual(0);
+    expect(removals.indexOf(container.id!)).toBeLessThan(removals.indexOf(volume.name));
+    expect(daemon.calls).toContainEqual(['volume', 'rm', '--force', volume.name]);
+  });
+
+  it.each([
+    ['another probe kind', { 'io.codeboost.probe': 'other' }, {}],
+    ['an attempt label', { 'io.codeboost.attempt': 'attempt-a' }, {}],
+    ['an allocation label', { 'io.codeboost.allocation': randomUUID() }, {}],
+    ['a task-storage label', { 'io.codeboost.task-storage': 'work' }, {}],
+    ['names D does not give a probe', {}, { container: `codeboost-agent-${randomUUID()}`, volume: `codeboost-work-${randomUUID()}` }],
+  ] as const)('leaves probe-labelled objects of its runner with %s, and reports them (#181)', async (_label, labels, named) => {
+    const objects = probe(A, labels, named);
+    const report = await recoverLeftovers(A);
+    expect(report.removed).toEqual([]);
+    expect(names()).toEqual(objects.map(object => object.name).sort());
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(objects.map(object => [object.name, 'unknown-kind']).sort());
+  });
+
+  it('reports a path identity probe without a runner label and never removes it (#181)', async () => {
+    const objects = probe(A).map(object => {
+      const { 'io.codeboost.runner': _runner, ...labels } = object.labels;
+      object.labels = labels;
+      return object;
+    });
+    const report = await recoverLeftovers(A);
+    expect(names()).toEqual(objects.map(object => object.name).sort());
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(objects.map(object => [object.name, 'no-runner-label']).sort());
+  });
+
+  it('fails recovery, and removes no network after it, when a probe volume\'s removal is not confirmed (#181)', async () => {
+    const [container, volume] = probe(A), mine = attempt(A, 'attempt-a'), network = mine.objects[6]!;
+    daemon.refuseRemoval.add(volume.name);
+    const failure = await recoverLeftovers(A).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RecoveryError);
+    expect((failure as Error).message).toContain(`Could not remove volume ${volume.name}`);
+    expect((failure as InstanceType<typeof RecoveryError>).removed.map(resource => resource.name)).toContain(container.name);
+    expect(names()).toContain(volume.name);
+    expect(names()).toContain(network.name);
+  });
 });

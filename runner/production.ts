@@ -207,7 +207,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   /** Told before the slow part (recovery and the image build) starts. */
   onSlowStart?: () => void;
   /** Measures task storage's path identity with the built image; Docker's own by default. */
-  probeTaskStorage?: (imageId: string) => Promise<PathIdentity> }): Promise<RunnerAssembly> {
+  probeTaskStorage?: (imageId: string, runnerOwner: string) => Promise<PathIdentity> }): Promise<RunnerAssembly> {
   const { service, config } = o, review = service.config;
   if (review.demo) throw new Error('Demos never run the runner.');
   if (!review.github) throw new Error(RUNNER_NEEDS_GITHUB);
@@ -275,8 +275,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   // #162: plan path keys follow pathIdentity, so it must match the filesystem the agent edits, where the runner inspects
   // and commits task changes. That is task storage in the Docker daemon's kernel, not the host folder the staging clone
   // is made in, so it is probed there, with the built image, before anything is admitted. Host checkouts (the staging
-  // clone, the rebase worktree) are #179.
-  assertPathIdentity(review.pathIdentity, await (o.probeTaskStorage ?? probeTaskStoragePathIdentity)(imageId),
+  // clone, the rebase worktree) are #179. The probe is labelled with this runner's token, so whatever an interrupted
+  // probe leaves, the next startup's recovery removes (#181).
+  assertPathIdentity(review.pathIdentity, await (o.probeTaskStorage ?? probeTaskStoragePathIdentity)(imageId, runnerOwner),
     'the task storage the agent edits');
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
     limits: { ...EXECUTE_STORAGE, ...config.limits }, committer: config.committer });
