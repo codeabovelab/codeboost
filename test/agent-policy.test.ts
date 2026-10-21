@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { assertAgentCommand, assertAgentTool, assertCommandSchema, codexBaseArguments, createClaudeCommand,
-  createCodexCommand, createPhasePolicy, createRunnerCommand, dispatchApprovedCommand, MAX_COMMAND_SCHEMA_BYTES } from '../agents/policy.ts';
+  createCodexCommand, createPhasePolicy, createRunnerCommand, dispatchApprovedCommand, MAX_COMMAND_SCHEMA_BYTES,
+  MAX_PLANNING_INPUT_BYTES, PLANNING_MAX_TURNS } from '../agents/policy.ts';
 import planSchema from '../schema/versions/1/plan.schema.json' with { type: 'json' };
 import editSchema from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -96,6 +97,25 @@ describe('agent phase policy', () => {
       for (const argument of argv) expect(Buffer.byteLength(argument)).toBeLessThan(128 * 1024);
       expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MAX_COMMAND_SCHEMA_BYTES);
     }
+  });
+
+  it('accepts a planning request at exactly its model budget and refuses one byte more', () => {
+    const planning = () => createPhasePolicy(request('planning'));
+    // A multibyte character proves the budget counts UTF-8 bytes, not UTF-16 code units.
+    const fill = (bytes: number) => '\u00e9' + 'p'.repeat(bytes - Buffer.byteLength(SCHEMA) - 2);
+    const exact = fill(MAX_PLANNING_INPUT_BYTES);
+    expect(Buffer.byteLength(exact) + Buffer.byteLength(SCHEMA)).toBe(64 * 1024);
+    expect(createClaudeCommand(planning(), exact, SCHEMA).argv).toEqual(['claude', '--print', '--output-format', 'json',
+      '--json-schema', SCHEMA, '--max-turns', '50', '--restricted', '--strict-mcp-config', '--mcp-config',
+      '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome', '--permission-prompts', 'none', '--permission-mode',
+      'plan', '--tools', 'Read,Glob,Grep', '--allowedTools', 'Read,Glob,Grep', '--disallowedTools',
+      'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input', '--', exact]);
+    expect(PLANNING_MAX_TURNS).toBe(50);
+    expect(() => createClaudeCommand(planning(), fill(MAX_PLANNING_INPUT_BYTES + 1), SCHEMA))
+      .toThrow(`Planning request is ${64 * 1024 + 1} bytes of prompt and schema, over the 65536-byte model budget.`);
+    // Only planning has the budget: the other Claude phases carry no turn limit.
+    for (const phase of ['questions', 'review', 'execute', 'fix'] as const)
+      expect(createClaudeCommand(createPhasePolicy(request(phase)), 'Work.').argv).not.toContain('--max-turns');
   });
 
   it('refuses a planning schema that is not a bounded JSON object', () => {

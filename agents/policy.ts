@@ -77,6 +77,18 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
 }
 
 /**
+ * Planning's model budget (#163), checked when the command is built, before any container exists. The first request's
+ * input is counted in UTF-8 bytes of the prompt and schema: Claude's tokenizer is not available offline, and a count
+ * of bytes bounds the tokens if every token covers at least one byte (assumed, not verified against Claude's
+ * tokenizer). 64 KiB is the 32 KiB prompt plus the 32 KiB of schema text that the notes in prompts/plan-author.md
+ * allow. The run is bounded by turns: each turn sends at most one context window, so `--max-turns` bounds the tokens
+ * a run can use. Claude stops at the limit with an `error_max_turns` result, which the adapter reports as a provider
+ * failure. See docs/implementation/agent-isolation.md, "Planning model budget".
+ */
+export const MAX_PLANNING_INPUT_BYTES = 64 * 1024;
+export const PLANNING_MAX_TURNS = 50;
+
+/**
  * Planning answers must match the request's schema, so the planning command carries it. Claude's `--json-schema` takes
  * the schema text, not a path; the profile checks that text against the mounted file. Questions answer in plain text
  * (their schema is `{"type":"string"}`), and the other phases return no JSON answer, so they carry no schema.
@@ -86,11 +98,12 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
   if ((policy.phase === 'planning') !== (schema !== undefined))
     throw new Error('Only the Claude planning command carries an answer schema, and it must.');
-  const schemaArguments = schema === undefined ? [] : ['--json-schema', assertPlanningSchema(schema)];
+  const planningArguments = schema === undefined ? []
+    : ['--json-schema', assertPlanningInput(prompt, assertPlanningSchema(schema)), '--max-turns', String(PLANNING_MAX_TURNS)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, ['claude', '--print', '--output-format', 'json', ...schemaArguments, '--restricted',
+  return command(policy, ['claude', '--print', '--output-format', 'json', ...planningArguments, '--restricted',
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome',
     '--permission-prompts', 'none', '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed,
     '--allowedTools', allowed, '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir',
@@ -115,6 +128,15 @@ export function createRunnerCommand(policy: PhasePolicy, commands: string): Agen
   for (const argv of parsed as string[][]) if (!permitsCommand(invocation, argv))
     throw new Error('Runner command was not approved exactly for this invocation.');
   return command(policy, ['node', '/usr/local/bin/codeboost-command-check', '/run/codeboost-input/schema.json'], commands);
+}
+
+/** Refuse a planning request whose prompt and schema together exceed the model budget. Returns the schema unchanged. */
+export function assertPlanningInput(prompt: string, schema: string): string {
+  const bytes = Buffer.byteLength(prompt, 'utf8') + Buffer.byteLength(schema, 'utf8');
+  if (bytes > MAX_PLANNING_INPUT_BYTES)
+    throw new Error(`Planning request is ${bytes} bytes of prompt and schema, over the ${MAX_PLANNING_INPUT_BYTES}-byte `
+      + 'model budget. Narrow the issue and comments, the selected paths or the lessons, then retry.');
+  return schema;
 }
 
 /**
