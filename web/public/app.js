@@ -176,16 +176,20 @@ async function refresh() {
     if (!data) renderPlans();
   }
 }
-/** Where focus goes when the focused merge control hides: Merge PR while it is shown and enabled, otherwise Refresh. */
+/**
+ * Where focus goes when the focused merge control hides: Merge PR while it is shown and not `disabled` (an
+ * `aria-disabled` Merge PR still takes focus), otherwise Refresh.
+ */
 function mergeFocusFallback() {
   return !$("merge").hidden && !$("merge").disabled ? $("merge") : $("reload");
 }
 function renderMerge() {
-  // Read before rendering: hiding the focused control blurs it at once. A render that hides the focused merge control (or
-  // its blockers button) moves focus to what is still shown and enabled, once the controls' final state is set (AGENTS.md).
+  // Read before rendering: hiding the focused control itself blurs it at once (hiding its parent does so at the next
+  // frame). A render that hides the focused merge control, its blockers button or Cancel moves focus to the fallback once
+  // every control's final state is set (AGENTS.md).
   const focused = document.activeElement;
   renderMergeControls();
-  renderMergeSteps();
+  renderMergeSteps(focused);
   if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) mergeFocusFallback().focus();
 }
 function renderMergeControls() {
@@ -225,7 +229,6 @@ function renderMergeControls() {
     // Keep the control focusable while its job runs; repeat activation is ignored because the merge is not ready.
     $("merge").setAttribute("aria-disabled", "true");
     $("merge").textContent = mergeJobStepLabel(job);
-    $("merge-details").hidden = false;
     $("merge-details").textContent = "Merge status";
     scheduleMergePoll();
     return;
@@ -381,15 +384,15 @@ function mergeStepElapsed(step, now = Date.now()) {
  * The step list under the review strip, with Cancel, while a job runs and after the page saw it end (until Refresh).
  * A job saved before step lists existed has none: the control and banner say its step, as before.
  */
-function renderMergeSteps() {
+/** `focused` is the element that had focus before the update began (the caller reads it before any control hides). */
+function renderMergeSteps(focused = document.activeElement) {
   const job = data?.merge?.available ? data.merge.job : null;
   const ended = data?.merge?.blockers?.some(blocker => blocker.code === "job-refresh") || (!!job && data.merge.endedJobShown === job.id);
   const shown = !!job?.steps && (job.state === "running" || ended);
   $("merge-steps-bar").hidden = !shown;
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
-  // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the merge control
-  // instead, or to Refresh when that control is hidden too.
-  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) mergeFocusFallback().focus();
+  // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the fallback instead.
+  if ((!shown || job.state !== "running") && focused === $("merge-cancel")) mergeFocusFallback().focus();
   if (!shown) return;
   // Rebuilt only when a step changes; the timer below rewrites the elapsed times alone, so a screen reader keeps its place.
   const key = JSON.stringify(job.steps);
