@@ -199,7 +199,7 @@ export class PlanningCheck {
     if (check.passed) return;
     // The reason comes last and as it is: some end with a command a person may copy.
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
-      + 'it checks again on the next request after a minute, or at once when another agent is chosen in Settings. '
+      + 'it checks again on the next request after a minute. '
       + `The check said: ${messageOf(check.failure.error)}`);
     throw new GuardRefusal(STILL_CHECKING);
   }

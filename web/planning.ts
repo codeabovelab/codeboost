@@ -39,8 +39,8 @@ export function productionPlanning(config: ReviewConfig, options: {
       { recheckMs: options.recheckMs, waitMs: options.admitWaitMs });
     check.start();
     return {
-      // Checked once more as the request starts, in the turn after its recorded action: Settings may have changed in
-      // between, and the provider reads the vendor again.
+      // Checked once more when the coordinator invokes the provider, after the recorded action: Settings may have changed
+      // in between, and the provider reads the vendor again. A refusal here settles the request as failed.
       provider: { invoke(request, signal) { check.assertPassed(); return provider.invoke(request, signal); } },
       async describe(signal) {
         await check.admit(signal);

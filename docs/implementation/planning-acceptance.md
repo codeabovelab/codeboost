@@ -96,20 +96,20 @@ reads the issue or records anything, and the request checks again just before it
 starts, so a vendor chosen during the issue read never runs unchecked. That last
 check runs inside the Store's transaction, so it starts no check itself: it
 refuses, and the check it needs starts on the next turn. The provider checks once
-more as it invokes the agent, in the turn after the recorded action. A failed
-check refuses the request with a `GuardRefusal` that starts "Planning is
-unavailable:" and ends with the reason exactly as given (some end with a command
-to copy), and so does a check still running after the wait; the server records the
-refusal and starts no agent. Requests within a minute of a failure are refused
-with it; the next request after that checks again. With no vendor chosen nothing
-is checked, and the request is refused later, as before. Shutdown cancels a
-running check and waits up to 20 s for it before closing the worker. If startup
-fails after planning's setup, the process exits, and the next start's planning
-recovery removes what the check left. Tests: `test/planning-production.test.ts`
-("the planning check (#164)", with a check that passes, one that fails and one
-that does not finish), `test/planning-worker.test.ts` (the check in planning's
-worker, including a wrong answer) and `test/agent-planning.test.ts` (against the
-vendor, real Docker).
+more when the coordinator invokes it, after the recorded action; a refusal there
+settles the request as failed. A failed check refuses the request with a
+`GuardRefusal` that starts "Planning is unavailable:" and ends with the reason
+exactly as given (some end with a command to copy), and so does a check still
+running after the wait; the server records the refusal and starts no agent.
+Requests within a minute of a failure are refused with it; the next request after
+that checks again. With no vendor chosen nothing is checked, and the request is
+refused later, as before. Shutdown cancels a running check and waits up to 20 s
+for it before closing the worker. If startup fails after planning's setup, the
+process exits, and the next start's planning recovery removes what the check left.
+Tests: `test/planning-production.test.ts` ("the planning check (#164)", with a
+check that passes, one that fails and one that does not finish),
+`test/planning-worker.test.ts` (the check in planning's worker, including a wrong
+answer) and `test/agent-planning.test.ts` (against the vendor, real Docker).
 
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now

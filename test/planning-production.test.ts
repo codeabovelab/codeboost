@@ -484,18 +484,18 @@ describe('the planning check (#164)', () => {
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    // Claude's check passes at 600 ms, after the vendor changed; Codex's never ends.
+    // Claude's check passes at 500 ms, after the vendor changed; Codex's never ends.
     const check = new PlanningCheck(probed => new Promise<void>(resolve => {
-      if (probed === 'claude') setTimeout(resolve, 600);
-    }), () => vendor, { waitMs: 1_000 });
+      if (probed === 'claude') setTimeout(resolve, 500);
+    }), () => vendor, { waitMs: 600 });
     const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
     await new Promise(resolve => setTimeout(resolve, 100));
     vendor = 'codex';
-    // One deadline ends the wait at 1 s; a fresh 1 s for Codex would end it at 1.6 s.
+    // One deadline ends the wait at 600 ms; a fresh 600 ms for Codex would end it at 1.1 s.
     const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toContain('still checking');
-    expect(performance.now() - started).toBeLessThan(1_450);
+    expect(performance.now() - started).toBeLessThan(950);
     await check.close(10);
   });
 
@@ -524,7 +524,7 @@ describe('the planning check (#164)', () => {
       vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
       return text(number);
     });
-    // (The provider, too, checks again as the request starts; see the next test.)
+    // (The provider, too, checks again when it is invoked: "refuses to invoke an agent whose check has not passed".)
     const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());
