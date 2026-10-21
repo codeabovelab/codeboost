@@ -176,17 +176,24 @@ async function refresh() {
     if (!data) renderPlans();
   }
 }
+/** Where focus goes when the focused merge control hides: Merge PR while it is shown and enabled, otherwise Refresh. */
+function mergeFocusFallback() {
+  return !$("merge").hidden && !$("merge").disabled ? $("merge") : $("reload");
+}
 function renderMerge() {
-  const merge = data?.merge;
-  // Read before hiding: hiding the focused control blurs it at once. A reload that hides the focused merge control (or its
-  // blockers button) moves focus to what is still shown (AGENTS.md).
+  // Read before rendering: hiding the focused control blurs it at once. A render that hides the focused merge control (or
+  // its blockers button) moves focus to what is still shown and enabled, once the controls' final state is set (AGENTS.md).
   const focused = document.activeElement;
+  renderMergeControls();
+  renderMergeSteps();
+  if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) mergeFocusFallback().focus();
+}
+function renderMergeControls() {
+  const merge = data?.merge;
   $("merge").hidden = !merge?.available;
   // Decided once: a running job shows Merge status even with no blockers, and hiding then showing the focused button
   // would blur it (and move focus) on every poll.
   $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue && merge.job?.state !== "running");
-  if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) ($("merge").hidden ? $("reload") : $("merge")).focus();
-  renderMergeSteps();
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
@@ -382,7 +389,7 @@ function renderMergeSteps() {
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
   // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the merge control
   // instead, or to Refresh when that control is hidden too.
-  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) ($("merge").hidden ? $("reload") : $("merge")).focus();
+  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) mergeFocusFallback().focus();
   if (!shown) return;
   // Rebuilt only when a step changes; the timer below rewrites the elapsed times alone, so a screen reader keeps its place.
   const key = JSON.stringify(job.steps);

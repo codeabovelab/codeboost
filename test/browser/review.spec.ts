@@ -1033,14 +1033,18 @@ test('keeps focus on Merge status while the poll follows a running job with no b
  await page.waitForTimeout(200);
  await expect(page.locator('#merge-details')).toBeFocused();
 });
-test('moves focus off the blockers button to Merge PR when a reload clears the last blocker (D16)',async({page})=>{
+for (const runner of [true,false] as const) test(`moves focus off the blockers button to Merge PR when a reload clears the last blocker, ${runner?'with':'without'} a runner (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  let reloaded=false;
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
-  body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null,blockers:reloaded?[]:[...body.merge.blockers,...jobResolvedBlockers]});await route.fulfill({response,json:body});});
+  // With a runner Merge PR is offered (aria-disabled only while a job runs); without one it is disabled until the last
+  // blocker clears, so the fallback must wait for its final enabled state.
+  body.merge=runner?runnerMerge(body.merge,{ready:true,action:'merge',job:null,blockers:reloaded?[]:[...body.merge.blockers,...jobResolvedBlockers]})
+   :{...body.merge,ready:reloaded,action:reloaded?'merge':null,blockers:reloaded?[]:[...body.merge.blockers,...jobResolvedBlockers]};
+  await route.fulfill({response,json:body});});
  await page.goto(app.url);
  await expect(page.locator('#merge-details')).toBeVisible({timeout:10_000});
  await page.locator('#merge-details').focus();
@@ -1050,6 +1054,7 @@ test('moves focus off the blockers button to Merge PR when a reload clears the l
  await answered;
  await expect(page.locator('#merge-details')).toBeHidden();
  await expect(page.locator('#merge')).toBeVisible();
+ await expect(page.locator('#merge')).toBeEnabled();
  await expect(page.locator('#merge')).toBeFocused();
 });
 for (const control of ['merge','merge-details'] as const) for (const reload of ['unavailable','failed'] as const) test(`moves focus off ${control==='merge'?'Merge PR':'the blockers button'} to Refresh when a reload ${reload==='failed'?'fails':'makes merging unavailable'} (D16)`,async({page})=>{
