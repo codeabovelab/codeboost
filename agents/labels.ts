@@ -87,3 +87,23 @@ export const ownerLabels = (owner: ResourceOwner): Readonly<Record<string, strin
 export const hasOwnerLabels = (labels: Readonly<Record<string, string>> | null | undefined, owner: ResourceOwner) =>
   labels?.[RUNNER_LABEL] === owner.runnerOwner && labels?.[ATTEMPT_LABEL] === owner.attemptId
   && labels?.[ALLOCATION_LABEL] === owner.allocationId;
+
+/**
+ * The kind label of a runner-scoped probe (#181): an object that belongs to the runner as a whole, not to an attempt or
+ * an allocation, so it carries only the runner label and this one. Startup recovery, under the runner lock, removes
+ * this runner's leftover probes: only one process holds a runner token at a time, so a probe found then is an earlier
+ * process's. A Docker client that process left may still be creating one: if the create lands between recovery's
+ * container and volume listings, recovery keeps its volume, which the new container holds; if it lands after them,
+ * recovery does not see it. Either way the next start removes both.
+ */
+export const PROBE_LABEL = 'io.codeboost.probe';
+/** The probes D runs: `path-identity` measures task storage's path identity at runner startup (#162). */
+export type RunnerProbe = 'path-identity';
+export const RUNNER_PROBES: readonly RunnerProbe[] = Object.freeze(['path-identity']);
+
+/** The labels on a runner-scoped probe's container and volume. Validates the runner token before it is written. */
+export function runnerProbeLabels(runnerOwner: string, probe: RunnerProbe): Readonly<Record<string, string>> {
+  if (!isRunnerOwner(runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
+  if (!RUNNER_PROBES.includes(probe)) throw new Error('Unknown runner probe.');
+  return Object.freeze({ [RUNNER_LABEL]: runnerOwner, [PROBE_LABEL]: probe });
+}

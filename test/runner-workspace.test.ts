@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { PROBE_VOLUME_MOUNT, probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
+import { pathIdentityProbeArgs, probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
+import { recoverLeftovers } from '../agents/recovery.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SafetyFindings, executionDeps, type ExecutionSources } from '../runner/execution.ts';
@@ -35,10 +36,9 @@ afterAll(() => {
     for (const store of stores) store.close();
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   } finally {
-    // Then remove the task storage this run still owns, even when a test failed or the cleanup above threw. The path
-    // identity probe carries no owner labels, so it is not found here. It may not run before a hook timeout.
-    // The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for the
-    // cleanup before it.
+    // Then remove the task storage and path identity probes this run still owns, even when a test failed or the cleanup
+    // above threw. It may not run before a hook timeout. The hook's 7 minutes leave a minute and a half over this
+    // sweep's worst case (eleven calls of 30 s), for the cleanup before it.
     removeRunnerObjects(RUNNER_OWNER);
   }
 }, 7 * 60_000);
@@ -158,10 +158,10 @@ describe('real task workspace (#87)', () => {
 });
 
 describe('task storage path identity (#162)', () => {
-  // The probe names its container itself and gives it an anonymous volume, with no labels. This test finds both from
-  // the name the probe gave: a shim on PATH records it, and the daemon's events give that container's ID and the
-  // volumes mounted in it. Another probe on the daemon (another runner's startup, or this file run from another
-  // checkout) or a container a dead runner left behind does not count.
+  // The probe names its container itself and gives it an anonymous volume. This test finds both from the name the probe
+  // gave, not by the runner label they carry (#181): a shim on PATH records it, and the daemon's events give that
+  // container's ID and the volumes mounted in it. Another probe on the daemon (another runner's startup, or this file
+  // run from another checkout) or a container a dead runner left behind does not count.
   async function watchedProbe() {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')); roots.push(shim);
     const names = join(shim, 'names'), realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -185,7 +185,7 @@ describe('task storage path identity (#162)', () => {
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
     try {
-      const identity = await probeTaskStoragePathIdentity(imageId);
+      const identity = await probeTaskStoragePathIdentity(imageId, RUNNER_OWNER);
       const recorded = readFileSync(names, 'utf8').split('\n').filter(Boolean);
       expect(recorded).toEqual([expect.stringMatching(/^codeboost-path-identity-[0-9a-f-]{36}$/)]);
       const container = () => events.find(event => event.Type === 'container' && event.Action === 'create'
@@ -216,22 +216,51 @@ describe('task storage path identity (#162)', () => {
     expect(() => docker('container', 'inspect', probe.container!)).toThrow(/No such container/);
     expect(() => docker('volume', 'inspect', probe.volumes[0]!)).toThrow(/no such volume/i);
   }, 120_000);
+  // A probe container created but never started, as a killed client leaves it: the probe's own arguments, with `create`
+  // in place of `run` (`--rm` stays). Returns its name and the anonymous volume its mount made.
+  const leftoverProbe = (runnerOwner: string) => {
+    const name = `codeboost-path-identity-${randomUUID()}`, args = pathIdentityProbeArgs(imageId, runnerOwner, name);
+    expect(args.slice(0, 2)).toEqual(['run', '--rm']);
+    docker('create', ...args.slice(1));
+    return { name, volume: docker('container', 'inspect', '--format', '{{range .Mounts}}{{.Name}}{{end}}', name) };
+  };
   it('removes a never-started probe container and its volume with the cleanup\'s own rm', () => {
     // The failure path's claim: a container created but never started (a killed client) loses its anonymous volume to
-    // `rm --force --volumes`. Made with the probe's exact mount; removed with the exact command the cleanup runs.
-    const name = `codeboost-path-identity-${randomUUID()}`;
-    docker('create', '--name', name, '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'true', imageId);
-    let volume = '';
+    // `rm --force --volumes`. Made with the probe's exact arguments; removed with the exact command the cleanup runs.
+    let probe: { name: string; volume: string } | undefined;
     try {
-      // This container's own volume, by name: the anonymous volume the mount made.
-      volume = docker('container', 'inspect', '--format', '{{range .Mounts}}{{.Name}}{{end}}', name);
-      expect(volume).toMatch(/^[0-9a-f]{64}$/);
-      expect(docker('volume', 'inspect', '--format', '{{json .Options}}', volume)).toContain('size=1048576,nr_inodes=64,');
-    } finally { docker('rm', '--force', '--volumes', name); }
-    expect(() => docker('volume', 'inspect', volume)).toThrow();
+      probe = leftoverProbe(RUNNER_OWNER);
+      expect(probe.volume).toMatch(/^[0-9a-f]{64}$/);
+      expect(docker('volume', 'inspect', '--format', '{{json .Options}}', probe.volume)).toContain('size=1048576,nr_inodes=64,');
+    } finally { if (probe) docker('rm', '--force', '--volumes', probe.name); }
+    expect(() => docker('volume', 'inspect', probe.volume)).toThrow();
+  }, 120_000);
+  it('removes a probe a killed runner left, with its volume, in the next startup\'s recovery, and no other runner\'s (#181)', async () => {
+    // Tokens of their own: recovery removes every agent container of its runner, and this file's may have some.
+    const mine = randomBytes(16).toString('hex'), theirs = randomBytes(16).toString('hex');
+    try {
+      const left = leftoverProbe(mine), other = leftoverProbe(theirs);
+      // Both parts carry the runner's token and the probe kind.
+      for (const labels of [docker('container', 'inspect', '--format', '{{json .Config.Labels}}', left.name),
+        docker('volume', 'inspect', '--format', '{{json .Labels}}', left.volume)])
+        expect(JSON.parse(labels)).toMatchObject({ 'io.codeboost.runner': mine, 'io.codeboost.probe': 'path-identity' });
+      // A container of this runner, named like a probe, without the probe kind label: reported, never removed.
+      const unmarked = `codeboost-path-identity-${randomUUID()}`;
+      docker('create', '--name', unmarked, '--label', `io.codeboost.runner=${mine}`, '--entrypoint', 'true', imageId);
+      const report = await recoverLeftovers(mine, 120_000, { unowned: false });
+      expect(report.removed.map(resource => resource.name).sort()).toEqual([left.name, left.volume].sort());
+      expect(() => docker('container', 'inspect', left.name)).toThrow(/No such container/);
+      expect(() => docker('volume', 'inspect', left.volume)).toThrow(/no such volume/i);
+      expect(report.unowned).toEqual([expect.objectContaining({ name: unmarked, reason: 'unknown-kind' })]);
+      for (const ref of [other.name, unmarked]) expect(docker('container', 'inspect', '--format', '{{.State.Status}}', ref)).toBe('created');
+      expect(docker('volume', 'inspect', '--format', '{{.Name}}', other.volume)).toBe(other.volume);
+    } finally {
+      removeRunnerObjects(mine);
+      removeRunnerObjects(theirs);
+    }
   }, 120_000);
   it('runs only the image the trusted builder produced', async () => {
-    await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
-    await expect(probeTaskStoragePathIdentity('alpine')).rejects.toThrow('requires the immutable built image ID');
+    await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`, RUNNER_OWNER)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
+    await expect(probeTaskStoragePathIdentity('alpine', RUNNER_OWNER)).rejects.toThrow('requires the immutable built image ID');
   });
 });
