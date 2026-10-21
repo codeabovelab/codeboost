@@ -21,12 +21,12 @@ export const PLANNING_PROBE_PROMPT = 'This is codeboost\'s check that planning w
   + 'Answer with the JSON object {"ok": true} and nothing else.';
 export const PLANNING_PROBE_SCHEMA = JSON.stringify({ type: 'object', properties: { ok: { const: true } },
   required: ['ok'], additionalProperties: false });
-/** Whether a planning answer is exactly the check's: the object `{"ok": true}`, as JSON. */
+/**
+ * Whether a planning answer is exactly the check's: the object `{"ok": true}`, as JSON, with that one member written
+ * once (JSON.parse would let a repeated key's last value win).
+ */
 export function isPlanningProbeAnswer(text: string): boolean {
-  let answer: unknown;
-  try { answer = JSON.parse(text); } catch { return false; }
-  return typeof answer === 'object' && answer !== null && !Array.isArray(answer) && Object.keys(answer).length === 1
-    && (answer as { ok?: unknown }).ok === true;
+  return /^\s*\{\s*"ok"\s*:\s*true\s*\}\s*$/.test(text);
 }
 
 /**

@@ -350,7 +350,7 @@ describe('the planning check (#164)', () => {
     expect(issueAccess).not.toHaveBeenCalled();
   });
 
-  it('checks again once the wait after a failure is over, and admits once a check passes', async () => {
+  it('checks again once the recheck window after a failure is over, and admits once a check passes', async () => {
     let fail = true;
     const { deps, probe, issueAccess } = checked(async () => { if (fail) throw new Error('Docker is not running.'); }, 'claude', 0);
     await expect(deps.describe(signal())).rejects.toThrow('Docker is not running.');
@@ -550,7 +550,8 @@ describe('the planning check (#164)', () => {
   });
 
   it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
-    const reason = 'Claude could not write the plan. Claude said: no Cleanup also did not settle: docker volume rm failed';
+    // planning-provider.ts' cleanupFailed: the run's own failure, then the cleanup's.
+    const reason = 'Planning agent timed out. Cleanup also did not settle: docker volume rm failed';
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
@@ -662,7 +663,7 @@ describe('the planning check (#164)', () => {
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 
-  it('refuses a request as still starting when the check outlasts its wait, and admits it once the check passed', async () => {
+  it('refuses a request as still checking when the check outlasts its wait, and admits it once the check passed', async () => {
     let pass!: () => void;
     const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
