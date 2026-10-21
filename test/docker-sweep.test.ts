@@ -132,6 +132,7 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
 it('takes the daemon set at load, not the default, when one was set, for every call', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const seen = join(root, 'seen'), net = 'n'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64), labelled = 'c'.repeat(64);
+  const volumeHolder = 'e'.repeat(64);
   // Records the address and the whole command of each call. Answers as Docker 27.4 does, in the parts the code reads,
   // for one labelled container, one swept network and one swept volume, each held by one container, and for a container
   // named x; every other call gets no output and exit 0, and the removals' stdout is not read. The network line holds
@@ -141,6 +142,7 @@ it('takes the daemon set at load, not the default, when one was set, for every c
     `if [ "$1 $2" = "container ls" ]; then printf '%s\\n' ${labelled}; exit 0; fi`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' swept-volume; exit 0; fi`,
+    `if [ "$1" = ps ] && [ "$last" = volume=swept-volume ]; then printf '%s\\n' ${volumeHolder}; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${holder}; exit 0; fi`,
     `if [ "$1 $2" = "container inspect" ] && [ "$last" = x ]; then printf '%s\\n' '"${named}" "/x"'; exit 0; fi`,
     `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '"${holder}" {"swept":{}}'; exit 0; fi`,
@@ -169,7 +171,7 @@ it('takes the daemon set at load, not the default, when one was set, for every c
     `container inspect --format {{json .Id}} {{json .NetworkSettings.Networks}} ${holder}`, `rm --force ${holder}`,
     `network rm ${net}`,
     `volume ls --quiet --filter label=${TEST_RUN_LABEL}=x`, 'ps --all --quiet --no-trunc --filter volume=swept-volume',
-    'volume rm --force swept-volume',
+    `rm --force ${volumeHolder}`, 'volume rm --force swept-volume',
   ]) expect(commands).toContain(command);
   expect(new Set(lines.map(line => `${line[0]}|${line[1]}`))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
 });
