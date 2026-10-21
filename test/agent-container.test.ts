@@ -241,7 +241,7 @@ describe('real Docker agent isolation', () => {
     ['a json-file daemon log', (args: readonly string[]) => args.map(arg => arg === '--log-driver=none' ? '--log-driver=json-file' : arg)],
     ['a bounded local daemon log', (args: readonly string[]) => args.flatMap(arg => arg === '--log-driver=none'
       ? ['--log-driver=local', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1'] : [arg])],
-  ] as const)('refuses an agent container with %s before it starts', async (_label, change) => {
+  ] as const)('refuses an agent container with %s at validation', async (_label, change) => {
     const valid = await profile(fixture(), 'planning', 'must-not-run');
     expect(valid.args).toContain('--log-driver=none');
     docker(...change(valid.args)); containers.add(valid.name);
