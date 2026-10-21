@@ -2583,13 +2583,16 @@ describe('real Docker agent isolation', () => {
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
       passed = true;
     } finally {
-      spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore', ...CLIENT_LIMIT });
+      const keeperRemoved = spawnSync('docker', ['rm', '--force', filesystems.keeper], { encoding: 'utf8', ...CLIENT_LIMIT });
       // A failure above stays the one reported: what the removal leaves, the allocation sweep below removes, the keeper
-      // with another runner's label included (#189). After a pass, the storage must release once the foreign keeper is
-      // gone, so its failure fails the test. The sweep may take up to 5.5 minutes, which the test's budget allows for.
+      // with another runner's label included (#189). After a pass, the foreign keeper's removal and then the storage's
+      // release must succeed, as on main, so either failure fails the test, the keeper's first. The sweep may take up to
+      // 5.5 minutes, which the test's budget allows for.
       let released: unknown;
       try { removeTaskFilesystems(filesystems); } catch (error) { released = error; console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
+      if (passed && keeperRemoved.status !== 0) throw new Error(`docker rm --force ${filesystems.keeper} failed: `
+        + (keeperRemoved.error?.message ?? (keeperRemoved.signal ? `killed by ${keeperRemoved.signal}` : keeperRemoved.stderr?.trim())));
       if (passed && released) throw released;
     }
   }, 7 * 60_000);
