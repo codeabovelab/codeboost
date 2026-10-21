@@ -44,8 +44,8 @@
   offline, lane D counts the prompt and schema in UTF-8 bytes (64 KiB together)
   and bounds the run with Claude's --max-turns (#163; see agent-isolation.md,
   "Planning model budget"; no probe tests them yet, #164). The launch probe
-  must test these caps on the supported container OS/CLI; lower them if needed, never raise them
-  automatically. Tests include one huge field, many small fields exceeding the
+  must test these caps on the supported container OS/CLI; lower them if
+  needed, never raise them automatically. Tests include one huge field, many small fields exceeding the
   aggregate, post-escaping expansion, and exact boundary accepted/rejected inputs.
   In every serialized data string, escape <, >, and & as JSON Unicode escapes. Never insert
   raw source text or recursively render placeholders inside serialized values.
