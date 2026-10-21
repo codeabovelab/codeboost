@@ -159,9 +159,10 @@ export class PlanningCheck {
   }
   // The check that covers `vendor`, started now if none does.
   #check(vendor: Provider) {
+    // First: after close nothing is admitted, not even under a check that passed.
+    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     const covering = this.#covering(vendor);
     if (covering) return covering;
-    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     // A check for another vendor no longer admits anything: stop it, so replaced checks do not pile up in the worker.
     if (this.#current && !this.#current.passed && !this.#current.failure) {
       this.#current.abort.abort(new Error('The planning agent chosen in Settings changed.'));
@@ -246,9 +247,9 @@ export class PlanningCheck {
   assertPassed(): void {
     const vendor = this.#vendor();
     if (!vendor) return;
+    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     const covering = this.#covering(vendor);
     if (covering) return this.#verdict(covering);
-    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     // Checks the vendor chosen when this runs, which Settings may have changed since the refusal.
     setImmediate(() => {
       // Never throws: an exception here would end the process. A Store that cannot be read starts nothing.

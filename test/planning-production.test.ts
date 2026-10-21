@@ -541,7 +541,7 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
-  it('waits 30 s for a check, fails one after the planning budget and a minute, and closes within 20 s', async () => {
+  it('waits 30 s for a check, fails one after the planning budget and a minute, and waits 20 s at close', async () => {
     // productionPlanning's own defaults, as the docs give them: nothing here overrides them. The clock is faked too, so each wait is exact.
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     try {
@@ -562,8 +562,7 @@ describe('the planning check (#164)', () => {
       expect(outcome).toBeUndefined();
       await vi.advanceTimersByTimeAsync(1);
       expect(String(outcome)).toContain('did not finish within 11 minutes');
-      // A check still running at close is waited for 20 s.
-      void Promise.resolve(deps.describe(signal())).catch(() => undefined);
+      // Close waits 20 s for the timed-out check's probe, which never stops.
       let closed = false;
       void deps.close!().then(() => { closed = true; });
       await vi.advanceTimersByTimeAsync(20_000 - 1);
@@ -699,6 +698,16 @@ describe('the planning check (#164)', () => {
     expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     await new Promise(resolve => setImmediate(resolve));
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('admits nothing after close, even under a check that passed', async () => {
+    const made = checked(async () => undefined);
+    await made.deps.describe(signal());
+    await made.deps.close!();
+    const stopping = `${PLANNING_UNAVAILABLE} planning is stopping.`;
+    await expect(Promise.resolve(made.deps.describe(signal()))).rejects.toThrow(stopping);
+    await expect(made.deps.provider.invoke({} as Parameters<typeof made.deps.provider.invoke>[0], signal())).rejects.toThrow(stopping);
+    expect(made.agent.invoke).not.toHaveBeenCalled();
   });
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
