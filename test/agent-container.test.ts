@@ -820,7 +820,7 @@ describe('real Docker agent isolation', () => {
       // And an inspect naming a missing container exits non-zero yet prints the others, the answer the shim below gives.
       const partial = spawnSync('docker', ['container', 'inspect', '--format', '{{.Id}}', holders[0]!, `codeboost-gone-${randomUUID()}`],
         { encoding: 'utf8', ...CLIENT_LIMIT });
-      expect(partial.status).not.toBe(0);
+      expect(partial.status).toBe(1);
       expect(partial.stdout).toContain(holders[0]);
       expect(partial.stderr).toMatch(/^Error response from daemon: No such container: codeboost-gone-/m);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
@@ -842,8 +842,9 @@ describe('real Docker agent isolation', () => {
         sweepCalls = [...sweepWarn.mock.calls];
       } finally { sweepWarn.mockRestore(); }
       expect(existsSync(marker), 'the sweep read its holders through the shim').toBe(true);
-      expect(sweepCalls.filter(call => String(call[0]).endsWith('failed:'))).toEqual([]);
-      expect(sweepCalls.length).toBeGreaterThan(0);
+      // Only the sweep's own lines: what it removes. Any failure or unreadable answer is a different line.
+      expect(sweepCalls.map(call => String(call[0])).filter(line => !/^test removes /.test(line))).toEqual([]);
+      expect(sweepCalls.some(call => String(call[0]).startsWith('test removes the containers that hold them: '))).toBe(true);
       // afterAll removes tracked names with removeByName, as here: an object of exactly that name goes, and a name that
       // is gone says nothing.
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -976,10 +977,10 @@ describe('real Docker agent isolation', () => {
     ].join('\n');
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    const listing = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
-      { encoding: 'utf8', ...CLIENT_LIMIT });
-    // A listing that failed fails here with its cause, as main's helper did.
-    expect(listing.status, `docker network ls --filter label=io.codeboost.allocation=${allocationId} failed: `
+    const listArgs = ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`];
+    const listing = spawnSync('docker', listArgs, { encoding: 'utf8', ...CLIENT_LIMIT });
+    // A listing that failed fails here with the command and its cause, as main's helper did.
+    expect(listing.status, `docker ${listArgs.join(' ')} failed: `
       + (listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr))).toBe(0);
     const left = listing.stdout.trim();
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
