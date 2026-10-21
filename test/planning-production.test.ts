@@ -333,7 +333,8 @@ describe('the planning check (#164)', () => {
   const signal = () => new AbortController().signal;
   const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
   // A real sign-in failure, as planningOutput words it for a failed run. Tests that only show a reason passed through
-  // whole use any text ('Docker is not running.', 'No worker could start.').
+  // whole use any text ('Docker is not running.', 'No worker could start.'). Codex's refusal is CODEX_PLANNING_REFUSED,
+  // which planningCredential throws as it is.
   const runContext = { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 };
   const failedRun = (stdout: string) => thrown(() => planningOutput({ attemptId: 'probe', context: runContext, exitCode: 1,
     signal: null, stderr: '', stdout }, { attemptId: 'probe', context: runContext } as InvocationInput));
@@ -700,15 +701,17 @@ describe('the planning check (#164)', () => {
     expect(probe).toHaveBeenCalledTimes(1);
   });
 
-  it('admits nothing after close, even under a check that passed', async () => {
-    const made = checked(async () => undefined);
-    await made.deps.describe(signal());
-    await made.deps.close!();
-    const stopping = `${PLANNING_UNAVAILABLE} planning is stopping.`;
-    await expect(Promise.resolve(made.deps.describe(signal()))).rejects.toThrow(stopping);
-    await expect(made.deps.provider.invoke({} as Parameters<typeof made.deps.provider.invoke>[0], signal())).rejects.toThrow(stopping);
-    expect(made.agent.invoke).not.toHaveBeenCalled();
-  });
+  it.each([['under a check that passed', 'claude'], ['with no agent chosen', null]] as const)(
+    'admits nothing after close, %s', async (_label, vendor) => {
+      const made = checked(async () => undefined, vendor);
+      await made.deps.describe(signal());
+      await made.deps.close!();
+      const stopping = `${PLANNING_UNAVAILABLE} planning is stopping.`;
+      await expect(Promise.resolve(made.deps.describe(signal()))).rejects.toThrow(stopping);
+      await expect(made.deps.provider.invoke({} as Parameters<typeof made.deps.provider.invoke>[0], signal())).rejects.toThrow(stopping);
+      expect(made.agent.invoke).not.toHaveBeenCalled();
+      expect(made.issueAccess).toHaveBeenCalledTimes(1);
+    });
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';

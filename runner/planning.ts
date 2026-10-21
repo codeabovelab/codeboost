@@ -212,6 +212,8 @@ export class PlanningCheck {
     for (;;) {
       // A request that stopped waiting starts, replaces or cancels no check.
       signal.throwIfAborted();
+      // After close nothing is admitted, with or without a vendor.
+      if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
       const vendor = this.#vendor();
       if (!vendor) return;
       const check = this.#check(vendor);
@@ -245,9 +247,9 @@ export class PlanningCheck {
    * no check there (that runs inside the Store's transaction): one it needs is started on the next turn.
    */
   assertPassed(): void {
+    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     const vendor = this.#vendor();
     if (!vendor) return;
-    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     const covering = this.#covering(vendor);
     if (covering) return this.#verdict(covering);
     // Checks the vendor chosen when this runs, which Settings may have changed since the refusal.
