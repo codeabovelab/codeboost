@@ -40,12 +40,14 @@
   Reject NUL input and any oversized request before spawning; do not silently
   truncate any source. Report which input exceeded the budget and ask the person
   to narrow the issue/comments, selected path set, or lesson set before retrying.
-  Also enforce the selected pinned model profile's token budget (including
-  schema/system overhead and reserved answer tokens) before launch; missing
-  budget/tokenizer support fails closed. The launch probe must test these caps
-  on the supported container OS/CLI; lower them if needed, never raise them
-  automatically. Tests include one huge field, many small fields exceeding the
-  aggregate, post-escaping expansion, and exact boundary accepted/rejected inputs.
+  Also enforce the model budget before launch. With no tokenizer available
+  offline, lane D counts the prompt and schema in UTF-8 bytes (64 KiB together)
+  and bounds the run with Claude's --max-turns (#163; see agent-isolation.md,
+  "Planning model budget"; no probe tests them yet, #164). The launch probe
+  must test these caps on the supported container OS/CLI; lower them if
+  needed, never raise them automatically. Tests include one huge field, many
+  small fields exceeding the aggregate, post-escaping expansion, and exact
+  boundary accepted/rejected inputs.
   In every serialized data string, escape <, >, and & as JSON Unicode escapes. Never insert
   raw source text or recursively render placeholders inside serialized values.
   These wrappers do not prevent semantic prompt injection: container permissions,
