@@ -111,8 +111,9 @@ Use only these entry points to run an agent:
        comments, the paths, the lessons, the feedback or the previous plan). Bytes stand in for tokens because Claude's tokenizer is not available offline. A count of bytes is an upper bound on the tokens
        if every token covers at least one byte; this is assumed, not verified against Claude's tokenizer.
        `prepareDraft` and `prepareSuggestions` already limit the prompt and the schema text to 32 KiB each, so this
-       check refuses nothing they produce (`planning-author` checks a draft at the prompt limit with today's schema):
-       it is a backstop for a caller that skips them. It does not count Claude
+       check refuses nothing they produce. It is a backstop for a caller that skips them. A test checks a draft at the
+       prompt limit with today's schema; no test fails if the 32 KiB schema bound in `core/planning-author.ts` is
+       removed. It does not count Claude
        Code's own system prompt and tool definitions, or the tokens of the answer.
      - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
        window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for

@@ -77,6 +77,7 @@ it('rejects aggregate small fields and post-escaping expansion', () => {
 });
 it('fits the largest prompt and schema text it prepares into the planning model budget (#163)', () => {
   // prepare() bounds the prompt and the schema text by MAX_PROMPT_BYTES each, so the backstop refuses none of them.
+  // This checks a draft at the prompt limit with today's schema file, not the schema bound itself.
   expect(MAX_PLANNING_INPUT_BYTES).toBe(2 * MAX_PROMPT_BYTES);
   const value = input(), first = prepareDraft(value).request;
   value.issue.body = 'x'.repeat(MAX_PROMPT_BYTES - Buffer.byteLength(first.prompt));
