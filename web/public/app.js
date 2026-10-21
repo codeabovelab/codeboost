@@ -294,18 +294,21 @@ async function pollMergeQueue(generation) {
     const update = await api("/api/merge");
     current = settle();
     if (!current) return;
+    const job = update.job;
+    const shownJob = data.merge.job;
+    // A poll read before a cancel's answer was adopted must not restore an older record of the same job, or a record
+    // of an older job than the one shown (a newer job the cancel's answer carried).
+    const stale = shownJob?.state === "running" && !!job
+      && (job.id === shownJob.id ? job.revision < shownJob.revision : !laterMergeJob(job, shownJob));
     // A poll that read the job before it ended still reports it running: Cancel stays unavailable until a poll does not.
-    if (!(update.job?.id === mergeCancelAwaitingPoll && update.job.state === "running")) mergeCancelAwaitingPoll = null;
-    if (data.merge.job?.state === "running") {
+    // A stale answer says nothing about the job shown, so it keeps the wait.
+    if (!stale && !(job?.id === mergeCancelAwaitingPoll && job.state === "running")) mergeCancelAwaitingPoll = null;
+    if (shownJob?.state === "running") {
       // A full review response read before this observation must not restore an older record of this job.
       mergeObservationGeneration++;
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
       // a background reload would erase the person's selection and input; Refresh shows the outcome.
-      const job = update.job;
-      // A poll read before a cancel's answer was adopted must not restore an older record of the same job, or a record
-      // of an older job than the one shown (a newer job the cancel's answer carried).
-      const shownJob = data.merge.job;
-      if (job && (job.id === shownJob.id ? job.revision < shownJob.revision : !laterMergeJob(job, shownJob))) {
+      if (stale) {
         backOffMergePoll();
         renderMerge();
         return;
