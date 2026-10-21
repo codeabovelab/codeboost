@@ -308,7 +308,7 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
   const bin = join(root, 'bin'), seen = join(root, 'seen'); mkdirSync(bin);
   symlinkSync(spawnSync('sh', ['-c', 'command -v sh'], { encoding: 'utf8' }).stdout.trim(), join(bin, 'sh'));
   // Answers as Docker 27.4 does for `inspect` of an object that exists, of a missing container, network and volume,
-  // and for an unknown context; one call is killed by a signal. Each call records its daemon address. Only the exit
+  // and for an unknown context (its meta.json path shortened); one call is killed by a signal. Each call records its daemon address. Only the exit
   // status and stderr are read.
   writeFileSync(join(bin, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
     'case "$1 $3" in',
@@ -317,7 +317,7 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
     "  'network gone') echo; echo 'Error response from daemon: network gone not found' >&2; exit 1;;",
     "  'volume gone') echo; echo 'Error response from daemon: get gone: no such volume' >&2; exit 1;;",
     "  'container killed') kill -9 $$;;",
-    "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \\\"x\\\": context not found' >&2; exit 1;;",
+    "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
     'esac; exit 0'].join('\n'), { mode: 0o755 });
   vi.stubEnv('PATH', bin);
   vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-loaded.sock');

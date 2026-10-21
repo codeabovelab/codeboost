@@ -773,7 +773,7 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
     await withoutRunnerLabel([['create', '--name']], () =>
       expect(createValidatedContainer(live)).rejects.toThrow('lockdown'));
-    expect(spawnSync('docker', ['container', 'inspect', live.name]).status).not.toBe(0);
+    expect(objectExists('container', live.name)).toBe(false);
   }, 60_000);
 
   // #189: the sweep removes what holds a swept network or volume, even a container created and never started, and
@@ -860,12 +860,11 @@ describe('real Docker agent isolation', () => {
       removeByName('network', lookalike.slice(0, 12), 'test');
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
       removeByName('container', bystanders[0]!.slice(0, 12), 'test');
-      const exists = objectExists;
-      for (const holder of holders) expect(exists('container', holder)).toBe(false);
-      expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);
-      expect(exists('container', labelled)).toBe(false);
-      for (const bystander of [...bystanders, holderLookalike, labelledLookalike]) expect(exists('container', bystander)).toBe(true);
-      expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
+      for (const holder of holders) expect(objectExists('container', holder)).toBe(false);
+      expect([objectExists('network', network), objectExists('network', prefixNamed), objectExists('volume', volume)]).toEqual([false, false, false]);
+      expect(objectExists('container', labelled)).toBe(false);
+      for (const bystander of [...bystanders, holderLookalike, labelledLookalike]) expect(objectExists('container', bystander)).toBe(true);
+      expect([objectExists('network', bystanderNetwork), objectExists('volume', bystanderVolume), objectExists('network', lookalike)])
         .toEqual([true, true, true]);
     } finally {
       // By exact name: some are named like the start of another object's ID. Containers first, as they hold the rest.
@@ -2586,7 +2585,7 @@ describe('real Docker agent isolation', () => {
         '--network=none', '--entrypoint', 'sleep', imageId, 'infinity');
       expect(() => removeTaskFilesystems(filesystems)).toThrow('did not settle');
       expect(docker('container', 'inspect', '--format', '{{.State.Running}}', filesystems.keeper)).toBe('true');
-      expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
+      expect(objectExists('volume', filesystems.workVolume)).toBe(false);
       passed = true;
     } finally {
       const keeperRemoved = spawnSync('docker', ['rm', '--force', filesystems.keeper], { encoding: 'utf8', ...CLIENT_LIMIT });

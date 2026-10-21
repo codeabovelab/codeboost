@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { CLIENT_LIMIT, removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, objectExists, removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,7 +30,10 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
 const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
-/** Label-less containers, by name, removed in afterAll should their create land after their test's finally (#189). */
+/**
+ * Containers without this run's runner label, by name, removed in afterAll should their create land after their test's
+ * finally (#189).
+ */
 const unlabelled = new Set<string>();
 let imageId = '';
 const git = fixtureGit;
@@ -405,7 +408,7 @@ describe('container invocation supervisor', () => {
       expect(result.unreleased).toBeUndefined();
       expect(isInvocationActive(attempt('foreign-name'))).toBe(false);
       expect(isContainerProfileAuthentic(current)).toBe(false);
-      expect(spawnSync('docker', ['network', 'inspect', current.network.name], { stdio: 'ignore' }).status).not.toBe(0);
+      expect(objectExists('network', current.network.name)).toBe(false);
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
       passed = true;
