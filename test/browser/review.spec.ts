@@ -853,10 +853,9 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
  const steps=page.getByRole('list',{name:'Merge steps'});
  await expect(steps.getByRole('listitem')).toHaveCount(7);
- await expect(steps.getByRole('listitem').first()).toHaveAccessibleName('Fetch: Done, 1 s',{timeout:10_000});
- await expect(steps.getByRole('listitem').nth(1)).toHaveAccessibleName(/^Rebase: Running, \d+ (s|min \d\d s)$/);
- await expect(steps.getByRole('listitem').nth(2)).toHaveAccessibleName('Push: Waiting');
- await expect(steps.getByRole('listitem').nth(1)).toHaveText(/● Rebase Running/);
+ await expect(steps.getByRole('listitem').first()).toHaveText('✓ Fetch Done, 1 s',{timeout:10_000});
+ await expect(steps.getByRole('listitem').nth(1)).toHaveText(/^● Rebase Running, \d+ (s|min \d\d s)$/);
+ await expect(steps.getByRole('listitem').nth(2)).toHaveText('○ Push Waiting');
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
@@ -874,7 +873,7 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  // The job ends: the list stays with the stopped step until Refresh, and Cancel goes away.
  await expect(page.locator('#merge')).toHaveText('Merge cancelled',{timeout:15_000});
  await expect(page.locator('#banner')).toContainText('Merge cancelled. You cancelled the merge; the task and its pull request stay open.');
- await expect(steps.getByRole('listitem').nth(1)).toHaveAccessibleName('Rebase: Stopped, 1 s');
+ await expect(steps.getByRole('listitem').nth(1)).toHaveText('! Rebase Stopped, 1 s');
  await expect(page.locator('#merge-cancel')).toBeHidden();
  expect(cancels).toHaveLength(1);
 });
@@ -908,8 +907,36 @@ test('shows the outcome at once when a cancel is answered with a job that alread
  expect(polls).toBe(before+1);
  await expect(page.locator('#merge')).toHaveText('Merged',{timeout:5_000});
  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
- await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').last()).toHaveAccessibleName('Merge: Done, 1 s');
+ await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').last()).toHaveText('✓ Merge Done, 1 s');
  await expect(page.locator('#merge-cancel')).toBeHidden();
+});
+test('shows a cancelled merge within seconds even after the merge-status poll has backed off (D16)',async({page})=>{
+ test.setTimeout(120_000);
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const id='0f6b0000-0000-4000-8000-0000000000d4';
+ const waiting=mergeJobRecord({id,state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
+ const cancelling=mergeJobRecord({...waiting,revision:4,cancelRequested:true});
+ const cancelled=mergeJobRecord({...waiting,state:'cancelled',step:null,revision:5,cancelRequested:true,reason:'You cancelled the merge; the task and its pull request stay open.',steps:mergeSteps(['done','skipped','skipped','skipped','stopped'])});
+ let cancelAsked=false;const polls:number[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();
+  if(body.action==='cancel-merge'){cancelAsked=true;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({job:cancelling})});return;}
+  if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:waiting}),job:waiting})});});
+ // The job waits unchanged, so the poll backs off (2 s, 4 s, 8 s, ...); once the cancel was asked the job has ended.
+ await page.route('**/api/merge',async route=>{polls.push(Date.now());await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:cancelAsked?cancelled:waiting})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ // Three unchanged answers: the next poll waits 16 s.
+ await expect.poll(()=>polls.length,{timeout:30_000}).toBeGreaterThanOrEqual(3);
+ const clicked=Date.now();
+ await page.locator('#merge-cancel').click();
+ await expect(page.locator('#merge')).toHaveText('Merge cancelled',{timeout:6_000});
+ expect(Date.now()-clicked).toBeLessThan(4_000);
 });
 test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
@@ -930,7 +957,7 @@ test('disables Cancel once the merge job asked GitHub to merge (D16)',async({pag
  const cancel=page.locator('#merge-cancel');
  await expect(cancel).toHaveAttribute('aria-disabled','true',{timeout:10_000});
  await expect(cancel).toHaveAttribute('title','GitHub has been asked to merge; wait for its outcome.');
- await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').nth(1)).toHaveAccessibleName('Rebase: Skipped');
+ await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').nth(1)).toHaveText('– Rebase Skipped');
  await cancel.click({force:true});
  expect(cancels).toBe(0);
 });

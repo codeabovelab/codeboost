@@ -240,7 +240,9 @@ function scheduleMergePoll() {
   const queue = data?.merge?.queue;
   const job = data?.merge?.job;
   // A new step of the list polls quickly again, as a new job step does.
-  const state = job?.state === "running" ? `job:${job.step}:${job.steps?.find(step => step.state === "running")?.name ?? ""}` : queue?.state;
+  // A new step of the list, or a cancel, polls quickly again, as a new job step does: a cancel usually ends the job at once.
+  const state = job?.state === "running"
+    ? `job:${job.step}:${job.steps?.find(step => step.state === "running")?.name ?? ""}:${job.cancelRequested ? "cancel" : ""}` : queue?.state;
   if (job?.state === "running" || (queue?.kind === "queue" && ["submitting", "queued"].includes(state))) {
     if (state !== mergePollState) {
       mergePollState = state;
@@ -368,11 +370,14 @@ function renderMergeSteps() {
     $("merge-steps").dataset.steps = key;
     $("merge-steps").innerHTML = job.steps.map(step => {
       const [icon, word] = mergeStepStates[step.state] ?? ["?", step.state];
-      return `<li class="merge-step merge-step-${esc(step.state)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word" aria-hidden="true">${word}</span> <span class="mono muted elapsed" aria-hidden="true"></span></li>`;
+      // Screen readers skip the mark and read the name, the word and the time (DESIGN.md).
+      return `<li class="merge-step merge-step-${esc(step.state)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word">${word}</span><span class="mono muted elapsed"></span></li>`;
     }).join("");
   }
   updateMergeStepTimes(job);
   const cancel = $("merge-cancel");
+  // Hiding a focused Cancel would drop keyboard focus to the page: it moves to the merge control instead.
+  if (job.state !== "running" && document.activeElement === cancel) $("merge").focus();
   cancel.hidden = job.state !== "running";
   // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
   const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
@@ -385,15 +390,12 @@ function renderMergeSteps() {
     if (current?.steps && current.state === "running") updateMergeStepTimes(current);
   }, 1000);
 }
-/** Each step's elapsed time, and the label that names its state and time for a screen reader. */
+/** Each step's elapsed time, as text after its word. */
 function updateMergeStepTimes(job) {
   const items = $("merge-steps").children;
   job.steps.forEach((step, index) => {
-    const item = items[index];
-    if (!item) return;
-    const elapsed = mergeStepElapsed(step), word = (mergeStepStates[step.state] ?? ["?", step.state])[1];
-    item.querySelector(".elapsed").textContent = elapsed;
-    item.setAttribute("aria-label", `${mergeStepNames[step.name] ?? step.name}: ${word}${elapsed ? `, ${elapsed}` : ""}`);
+    const elapsed = mergeStepElapsed(step), time = items[index]?.querySelector(".elapsed");
+    if (time) time.textContent = elapsed ? `, ${elapsed}` : "";
   });
 }
 $("merge-cancel").onclick = async () => {

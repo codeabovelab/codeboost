@@ -61,7 +61,7 @@ A rebase moves the pull request's base. The guarded merge would then scan only t
 
 ## Step list and Cancel
 
-While a job runs, a step list under the review strip shows the design's seven steps (D16), in order: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows an icon, a word and its elapsed time: ○ Waiting, ● Running, ✓ Done, – Skipped, ✕ Failed, ! Stopped or ! Unknown.
+While a job runs, a step list under the review strip shows the design's seven steps (D16), in order: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows an icon, a word and its elapsed time (from the step's saved times to the browser's clock, so a clock difference between browser and server can skew a running step's time): ○ Waiting, ● Running, ✓ Done, – Skipped, ✕ Failed, ! Stopped or ! Unknown.
 
 | Step | Running while | Skipped when |
 |---|---|---|
@@ -76,9 +76,9 @@ While a job runs, a step list under the review strip shows the design's seven st
 The job saves each change to the list in its `merge_jobs` record, so the list survives a reload and a second tab sees it. Starting a step finishes any step still running. Steps are display only: the job never waits for a step write, and one that fails is logged ("Could not record merge step …") without stopping the job. When the job ends, the step that was running takes the outcome's word: **Done** after `merged` or `queued`, **Unknown** after `submitted`, **Stopped** after `cancelled`, and **Failed** otherwise. Steps the job never reached stay **Waiting**. The list says where the job stopped, not why: the banner gives the reason. So:
 
 - The step that was running is **Failed** even when its own work succeeded and a check during it stopped the job. For example, **Fetch** fails when the fetch shows the pull request head moved, **Push** fails when the pull request moves after the push, and **Already-fixed check** fails for any refusal in the guarded merge's validation, such as a pull request that changed.
-- When no step was running, the list stays as it was. This happens when preparation stops for review after the rebase (a stale approval), and when its final inspection or authorization, after **Re-run checks**, refuses.
+- When no step was running, the list stays as it was. For example: preparation stops for review after the rebase (a stale approval); its final inspection or authorization, after **Re-run checks**, refuses; it refuses before **Fetch** starts (an earlier push was settled, or cleanup is unresolved); the review changed between the click and the job's first review load; or the merge was cancelled during that load. Then every step may still read **Waiting**.
 
-The list stays on screen after the job ends, until **Refresh**. **Cancel merge** shows only while the job runs, not "always" as the design says: an ended job has nothing to cancel. A job saved before the list existed has no `steps`; the page then shows its step as before, without the list or Cancel.
+The list stays on screen after the job ends, until **Refresh**. **Cancel merge** shows only while the job runs, not "always" as the design says: an ended job has nothing to cancel. When the job ends, keyboard focus on Cancel moves to the merge control. A job saved before the list existed has no `steps`; the page then shows its step as before, without the list or Cancel.
 
 **Cancel merge** stops the job without cancelling the task. It is shown while the job runs. The page sends `{action: "cancel-merge", jobId}` to `POST /api/action`:
 
@@ -86,7 +86,7 @@ The list stays on screen after the job ends, until **Refresh**. **Cancel merge**
 - The job ends `cancelled`, with "You cancelled the merge; the task and its pull request stay open." The task keeps its status (in review, or approved, merge blocked), its pull request stays open, and **Merge PR** may be clicked again. A task cancelled before the job's work stops ends the job as a cancelled task instead.
 - Once the job's merge attempt exists, GitHub has been asked: stopping then could only make the outcome unknown, so the server refuses ("GitHub has been asked to merge; wait for its outcome.") and the page disables the button once the Merge step has started.
 - If the cancel is answered with a job that already ended (it merged before the page saw it, or another tab cancelled it), the page polls the merge status at once and shows the outcome, as it does when a poll sees a job end.
-- A cancel of a job that ended, a refused click, an unknown job, or a job still running on disk that this server does not run (its ending write failed) is refused (HTTP 409, with the task's latest job). During shutdown it answers 503. A repeat of the same cancel answers the job, so the request needs no key of its own.
+- A cancel of a job that ended, a refused click, an unknown job, or a job still running on disk that this server does not run (its ending write failed) is refused (HTTP 409, with the task's latest job). During shutdown it answers 503. A repeat of the same cancel answers the job while it runs (200), and once it has ended is refused as above with the ended job, which the page shows; so the request needs no key of its own.
 - A restart after the cancel was saved, but before GitHub was asked, settles the job `cancelled`, not `failed`.
 
 ## Cancel, shutdown and restart

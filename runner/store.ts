@@ -2332,7 +2332,10 @@ export class Store {
     const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
     if (!attempt || attempt.actionId !== running.mergeActionId) {
       // GitHub was never asked: a merge the person had cancelled is cancelled, as it would have ended without the restart.
-      if (running.cancelRequested) this.finishMergeJob(identity, running.id, { state: 'cancelled', reason: MERGE_CANCELLED });
+      // A task cancelled too wins, as it does while the job runs: its pull requests close, so the merge-only words would be wrong.
+      const task = this.getTask(identity);
+      if (running.cancelRequested) this.finishMergeJob(identity, running.id, { state: 'cancelled',
+        reason: task.status === 'cancelled' || task.cancelRequested !== null ? 'Task cancelled.' : MERGE_CANCELLED });
       else this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
       return;
     }

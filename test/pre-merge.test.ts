@@ -2046,3 +2046,11 @@ it('aborts an owned rebase and cleans it up when the merge is cancelled, leaving
   expect(fixture.pushes).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('pushes nothing when the merge is cancelled while the push reads the remote, settles the push and keeps the task in review', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringPushRead(_service, coordinator) { coordinator.stopForMergeCancel(); } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: MERGE_CANCELLED });
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(fixture.service.store.getTask(fixture.service.config.identity)).toMatchObject({ status: 'in review', cancelRequested: null, pushInProgress: null });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});

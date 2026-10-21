@@ -1720,3 +1720,12 @@ it('ends a cancelled merge cancelled, not left running, when shutdown follows be
   await f.coordinator.close();
   expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
 });
+
+it('settles a merge the person cancelled as a cancelled task at restart when the task was cancelled too', () => {
+  const store = publishedTask();
+  const { job } = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' });
+  store.requestMergeJobCancel(identity, job.id);
+  store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+  store.settleInterruptedMergeJobs(identity);
+  expect(store.getMergeJob(identity, job.id)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
+});
