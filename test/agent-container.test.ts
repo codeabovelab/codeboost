@@ -796,7 +796,7 @@ describe('real Docker agent isolation', () => {
       for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
         spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
     }
-  }, 120_000);
+  }, 8 * 60_000);
 
   // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after
   // making a keeper without its runner label, before the removal that "rejects a keeper without its runner label"
@@ -2302,12 +2302,11 @@ describe('real Docker agent isolation', () => {
         owner)).toThrow('cleanup did not settle'));
       await expect(recoverLeftovers(runnerOwner)).rejects.toThrow('still holds task storage');
     } finally {
-      for (const name of docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`)
-        .split('\n').filter(Boolean)) spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' });
-      for (const name of docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`)
-        .split('\n').filter(Boolean)) spawnSync('docker', ['volume', 'rm', '--force', name], { stdio: 'ignore' });
+      // Another runner's objects, so no sweep of this run finds them: removed by allocation, by full ID, never throwing
+      // (#189). The sweep may take up to 5.5 minutes, which the test's budget allows for.
+      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
-  }, 60_000);
+  }, 7 * 60_000);
 
   it('recovers only its own runner after a restart, keeping its storage for removal by handle', async () => {
     const data = fixture(), runners = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')] as const;
@@ -2509,7 +2508,7 @@ describe('real Docker agent isolation', () => {
       try { if (foreign) removeTaskFilesystems(foreign); }
       finally { removeLabelledObjects('io.codeboost.allocation', allocationId, 'test'); }
     }
-  }, 60_000);
+  }, 7 * 60_000);
 
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
     const data = fixture();

@@ -12,8 +12,8 @@ export const TEST_RUN_LABEL = 'io.codeboost.test-run';
  * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it, after
  * its other cleanup.
  */
-export function removeRunnerObjects(runnerOwner: string): void {
-  removeLabelledObjects(RUNNER_LABEL, runnerOwner, 'afterAll');
+export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): void {
+  removeLabelledObjects(RUNNER_LABEL, runnerOwner, when);
 }
 
 /**
@@ -44,7 +44,9 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
-      .flatMap(line => kind === 'network' ? parsed<{ ID: string; Name: string }>(line) : [{ ID: line, Name: line }]);
+      .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>(line)
+        .filter((object): object is { ID: string; Name: string } => typeof object?.ID === 'string' && typeof object.Name === 'string')
+        : [{ ID: line, Name: line }]);
     const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
@@ -57,7 +59,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
       const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
         '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
         const at = line.indexOf(' '), id = parsed<string>(line.slice(0, at)), on = parsed<Record<string, unknown>>(line.slice(at + 1));
-        return id.length && on.length ? [{ id: id[0]!, on: Object.keys(on[0] ?? {}) }] : [];
+        return typeof id[0] === 'string' && on.length ? [{ id: id[0], on: Object.keys(on[0] ?? {}) }] : [];
       }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);

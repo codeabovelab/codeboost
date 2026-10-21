@@ -255,10 +255,11 @@ describe('task storage path identity (#162)', () => {
       for (const ref of [other.name, unmarked]) expect(docker('container', 'inspect', '--format', '{{.State.Status}}', ref)).toBe('created');
       expect(docker('volume', 'inspect', '--format', '{{.Name}}', other.volume)).toBe(other.volume);
     } finally {
-      removeRunnerObjects(mine);
-      removeRunnerObjects(theirs);
+      // Each sweep may take up to 5.5 minutes, which the test's budget allows for.
+      removeRunnerObjects(mine, 'test');
+      removeRunnerObjects(theirs, 'test');
     }
-  }, 120_000);
+  }, 13 * 60_000);
   it('runs only the image the trusted builder produced', async () => {
     await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`, RUNNER_OWNER)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
     await expect(probeTaskStoragePathIdentity('alpine', RUNNER_OWNER)).rejects.toThrow('requires the immutable built image ID');
