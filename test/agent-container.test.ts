@@ -633,7 +633,7 @@ describe('real Docker agent isolation', () => {
       '--entrypoint', 'true', imageId);
     const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
     await disposeValidatedContainer(live);
-    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(objectExists('container', originalId)).toBe(false);
     expect(docker('container', 'inspect', '--format', '{{.Id}}', replacement)).toBe(replacementId);
     expect(isContainerProfileAuthentic(live)).toBe(false);
   }, 60_000);
@@ -673,7 +673,7 @@ describe('real Docker agent isolation', () => {
     expect(await startValidatedContainer(live)).toBe('stdout-marker');
     // The replacement was never started, and cleanup removed only ours.
     expect(docker('container', 'inspect', '--format', '{{.State.StartedAt}}', replacement)).toBe('0001-01-01T00:00:00Z');
-    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(objectExists('container', originalId)).toBe(false);
   }, 60_000);
 
   it('labels every Docker object with its runner, attempt and allocation', async () => {
@@ -2410,8 +2410,8 @@ describe('real Docker agent isolation', () => {
     // Cleanup runs in reverse: containers go before the networks and volumes they use.
     const undo: (() => unknown)[] = [];
     const quietly = (...args: string[]) => () => spawnSync('docker', args, { stdio: 'ignore' });
-    const exists = (kind: 'container' | 'volume' | 'network', ref: string) =>
-      spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
+    // Only Docker's missing answer counts as gone (#189).
+    const exists = objectExists;
     const label = (labels: Record<string, string>) => Object.entries(labels).flatMap(([key, value]) =>
       ['--label', `${key}=${value}`]);
     // What a crashed process leaves for the first runner, made with the labels and names D writes, so nothing in this
@@ -2835,8 +2835,7 @@ describe('real Docker agent isolation', () => {
       docker('run', '--detach', '--name', rogue, `--network=${valid.network.name}`, '--entrypoint', 'node', imageId,
         '-e', 'setInterval(()=>{},1000)');
       await expect(createValidatedContainer(valid)).rejects.toThrow('cleanup did not settle');
-      const absent = spawnSync('docker', ['container', 'inspect', valid.name], { encoding: 'utf8' });
-      expect(absent.status).not.toBe(0);
+      expect(objectExists('container', valid.name)).toBe(false);
     } finally {
       spawnSync('docker', ['rm', '--force', rogue], { stdio: 'ignore' });
       await disposeContainerProfile(valid);

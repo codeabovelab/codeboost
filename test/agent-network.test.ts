@@ -109,7 +109,7 @@ describe('vendor-only egress', () => {
     execFileSync('sleep', ['3']);
     // A network landing later still carries this run's runner label (the shim passes production's arguments on), so
     // afterAll's runner sweep removes it.
-    const orphaned = spawnSync('docker', ['network', 'inspect', name], { stdio: 'ignore' }).status === 0;
+    const orphaned = objectExists('network', name);
     if (orphaned) docker('network', 'rm', name);
     expect(name).toMatch(/^codeboost-egress-/);
     expect(orphaned).toBe(false);

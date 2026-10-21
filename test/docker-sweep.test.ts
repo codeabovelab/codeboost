@@ -119,8 +119,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
     ['test: removing container nospace: docker printed what is not JSON:', '"nospace"\n'],
     ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
-    ['test: removing container --help: refused a name that is not one Docker gives'],
-    ['test: removing volume -v: refused a name that is not one Docker gives'],
+    ['test: removing container --help: refused a name that could read as an option'],
+    ['test: removing volume -v: refused a name that could read as an option'],
   ]);
 });
 
@@ -308,8 +308,9 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
   const bin = join(root, 'bin'), seen = join(root, 'seen'); mkdirSync(bin);
   symlinkSync(spawnSync('sh', ['-c', 'command -v sh'], { encoding: 'utf8' }).stdout.trim(), join(bin, 'sh'));
   // Answers as Docker 27.4 does for `inspect` of an object that exists, of a missing container, network and volume,
-  // and for an unknown context (its meta.json path shortened); one call is killed by a signal. Each call records its daemon address. Only the exit
-  // status and stderr are read.
+  // and for an unknown context (its meta.json path shortened); one call is killed by a signal. Each call records its
+  // daemon address. Only the exit status and stderr are read: the stdout is invented (27.4 prints the objects' JSON, or
+  // `[]` for a missing one).
   writeFileSync(join(bin, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
     'case "$1 $3" in',
     "  'container there') echo '[]';;",

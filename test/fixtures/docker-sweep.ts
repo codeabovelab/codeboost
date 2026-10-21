@@ -69,7 +69,7 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
   // The name is passed on too: refused if it could read as an option (a volume's must have the shape Docker allows).
   if (kind === 'volume' ? !VOLUME_NAME.test(name) : name.startsWith('-') || !name) {
-    console.warn(`${when}: removing ${kind} ${name}: refused a name that is not one Docker gives`); return;
+    console.warn(`${when}: removing ${kind} ${name}: refused a name that could read as an option`); return;
   }
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
   const inspect = [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name];
