@@ -117,16 +117,18 @@ worker abandoned later, cleanup that did not settle (the check's own run include
 when its answer still came back), or a token revoked later, shows as a failed
 request. A refusal recorded when a request stopped waiting, or when the Store
 could not be read during the wait, is replayed if the browser resends the same
-action; keeping a Store error out of the record needs `web/server.ts`. A check
-deferred from the Store's transaction can start during shutdown, before planning
-closes; close then waits for it within its bound. If startup fails after
-planning's setup, the CLI exits, and the next start's planning recovery removes
-what the check left. Tests: `test/planning-production.test.ts` ("the planning
-check (#164)", with a check that passes, one that fails and one that does not
-finish), `test/planning-worker.test.ts` (the check in planning's worker, including
-a wrong answer) and `test/agent-planning.test.ts` (against the vendor, real
-Docker: an invalid sign-in fails, and a live probe in the Live probes workflow
-passes with a real one).
+action; keeping a Store error out of the record needs `web/server.ts`. Showing the
+check's state in the review view before a request, and the other limits that need
+`web/server.ts`, are #198. A check deferred from the Store's transaction can start
+during shutdown, before planning closes; close then waits for it within its bound.
+If startup fails after planning's setup, the CLI exits, and the next start's
+planning recovery removes what the check left. Tests:
+`test/planning-production.test.ts` ("the planning check (#164)", with a check that
+passes, one that fails and one that does not finish),
+`test/planning-worker.test.ts` (the check in planning's worker, including a wrong
+answer) and `test/agent-planning.test.ts` (against the vendor, real Docker: an
+invalid sign-in fails, and a live probe in the Live probes workflow passes with a
+real one).
 
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now

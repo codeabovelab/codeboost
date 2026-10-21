@@ -36,7 +36,7 @@ export function productionPlanning(config: ReviewConfig, options: {
     const provider = options.agent?.(service) ?? new PlanningAgent(service);
     // Started now, before the server listens. If startup fails after this, the CLI exits (web/cli.ts), and the next start's
     // planning recovery removes what the check left (its objects carry planning's owner). Another caller of startServer
-    // is left with the check running: startServer does not close planning when a later startup step fails (follow-up).
+    // is left with the check running: startServer does not close planning when a later startup step fails (#198).
     const check = new PlanningCheck((vendor, signal) => provider.probe(vendor, signal), () => service.store.questionProvider(),
       { recheckMs: options.recheckMs, waitMs: options.admitWaitMs });
     check.start();
