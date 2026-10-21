@@ -841,9 +841,10 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
   if(body.action!=='merge'){await route.continue();return;}
   const review=await clickReview(route),running=mergeJobRecord({id,state:'running',step:'preparing',steps:mergeSteps([])});
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:running,blockers:[...review.merge.blockers,...jobResolvedBlockers]}),job:running})});});
- // The poll shows the rebase running until the cancel was asked; then the job is cancelling, then cancelled.
+ // The poll shows the rebase running until the cancel was asked. The first poll after it answers the older record (read
+ // before the cancel was saved), which must not undo the adopted answer; then the job is cancelling, then cancelled.
  let afterCancel=0;
- await page.route('**/api/merge',async route=>{const job=!cancelAsked?rebasing:afterCancel++<1?cancelling:cancelled;
+ await page.route('**/api/merge',async route=>{const job=!cancelAsked?rebasing:[rebasing,cancelling][afterCancel++]??cancelled;
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
   body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers]});await route.fulfill({response,json:body});});
@@ -859,17 +860,56 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
+ const stalePoll=page.waitForResponse(response=>response.url().endsWith('/api/merge')&&cancelAsked);
  await cancel.click();
  expect(cancels).toEqual([{action:'cancel-merge',jobId:id}]);
- await expect(page.getByRole('button',{name:'Cancelling…',exact:true}).first()).toHaveAttribute('aria-disabled','true');
+ await expect(page.getByRole('button',{name:'Cancel requested',exact:true})).toHaveAttribute('aria-disabled','true');
  await expect(page.locator('#merge')).toHaveText('Cancelling…');
  await expect(page.locator('#banner')).toHaveText('Cancelling the merge. The task and its pull request stay open.');
+ // The older record the next poll answers changes nothing on screen.
+ expect((await (await stalePoll).json()).job.revision).toBe(3);
+ await page.waitForTimeout(200);
+ await expect(page.locator('#merge')).toHaveText('Cancelling…');
+ await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
  // The job ends: the list stays with the stopped step until Refresh, and Cancel goes away.
  await expect(page.locator('#merge')).toHaveText('Merge cancelled',{timeout:15_000});
  await expect(page.locator('#banner')).toContainText('Merge cancelled. You cancelled the merge; the task and its pull request stay open.');
  await expect(steps.getByRole('listitem').nth(1)).toHaveAccessibleName('Rebase: Stopped, 1 s');
  await expect(page.locator('#merge-cancel')).toBeHidden();
  expect(cancels).toHaveLength(1);
+});
+test('shows the outcome at once when a cancel is answered with a job that already ended (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const id='0f6b0000-0000-4000-8000-0000000000d3';
+ const waiting=mergeJobRecord({id,state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
+ const merged=mergeJobRecord({id,state:'merged',step:null,revision:6,url:'https://github.com/owner/repo/pull/7',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','done'])});
+ // The job merged before the poll saw it; the cancel is refused with the ended job, and the poll then reports it too.
+ let ended=false,polls=0;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();
+  if(body.action==='cancel-merge'){ended=true;await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'This merge has already ended.',job:merged})});return;}
+  if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:waiting}),job:waiting})});});
+ await page.route('**/api/merge',async route=>{polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:ended?merged:waiting})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#merge-cancel')).toBeVisible({timeout:10_000});
+ const before=polls;
+ const polled=page.waitForResponse(response=>response.url().endsWith('/api/merge')&&ended);
+ const clicked=Date.now();
+ await page.locator('#merge-cancel').click();
+ // The page asks the poll at once rather than waiting out its delay (2 s at least), and shows the outcome with the list.
+ await polled;
+ expect(Date.now()-clicked).toBeLessThan(1_500);
+ expect(polls).toBe(before+1);
+ await expect(page.locator('#merge')).toHaveText('Merged',{timeout:5_000});
+ await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
+ await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').last()).toHaveAccessibleName('Merge: Done, 1 s');
+ await expect(page.locator('#merge-cancel')).toBeHidden();
 });
 test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);

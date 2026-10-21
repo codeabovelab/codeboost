@@ -1779,7 +1779,7 @@ describe('the one-click merge job (F6b of #22)', () => {
   /** Preparation as F5/F6a end it: readiness recorded exactly on its own action. */
   const preparation = (service: ReviewService) => ({
     get active() { return false; }, get last() { return null; }, assertStartable() {}, settlePendingPush: async () => null,
-    cancelTask: () => 'closed' as const, close: async () => undefined,
+    cancelTask: () => 'closed' as const, close: async () => undefined, stopForMergeCancel() {},
     start: async (expected: { actionId: string }) => {
       const identity = service.config.identity, snapshot = service.store.getSnapshot(identity);
       const readiness = { stateVersion: service.store.getTask(identity).stateVersion, reviewVersion: service.store.reviewVersion(identity),

@@ -1668,3 +1668,55 @@ it('leaves a job saved before step lists existed without one, through its steps 
   expect(store.finishMergeJob(identity, job.id, { state: 'failed', reason: 'x' })).toBe(true);
   expect(store.getMergeJob(identity, job.id)).not.toHaveProperty('steps');
 });
+
+it('cancels a merge during the guarded merge\'s validation, before GitHub is asked, leaving the task in review', async () => {
+  let cancelAt = Number.POSITIVE_INFINITY, coordinatorRef: MergeJobCoordinator | null = null, storeRef: Store | null = null;
+  const seen: unknown[] = [];
+  const f = setup({ change: n => {
+    if (n === cancelAt) {
+      const running = storeRef!.runningMergeJob(identity)!;
+      // The job saved its merge action ID and runs the already-fixed check, but no merge attempt exists yet.
+      seen.push({ step: running.step, mergeActionId: running.mergeActionId, attempt: storeRef!.getMergeAttempt(identity)?.actionId ?? null,
+        steps: stepStates(running) });
+      coordinatorRef!.cancelMerge(running.id);
+    }
+    return {};
+  } });
+  coordinatorRef = f.coordinator; storeRef = f.store;
+  // Inspection 1 is the wait; inspections 2+ are the guarded merge's validation passes.
+  cancelAt = 2;
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(seen).toEqual([{ step: 'merging', mergeActionId: expect.any(String), attempt: null, steps: expect.objectContaining({ 'already-fixed': 'running', merge: 'pending' }) }]);
+  expect(done).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(stepStates(done)).toMatchObject({ 'already-fixed': 'stopped', merge: 'pending' });
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity)).toMatchObject({ status: 'in review', cancelRequested: null });
+});
+
+it('cancels a merge during the job\'s own first review load, preparing nothing', async () => {
+  const f = setup(), id = randomUUID();
+  // The admission's load passes; the job's own first load (its first step) is held.
+  (f.review.load as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => (f.review as never as { view: () => unknown }).view());
+  const held = holdNextLoad(f.review as never);
+  await f.coordinator.start('review-token', id);
+  const signal = await held.loading;
+  f.coordinator.cancelMerge(id);
+  // The cancel stopped the held load through the job's signal.
+  expect(signal?.aborted).toBe(true);
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(f.prep.calls).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('ends a cancelled merge cancelled, not left running, when shutdown follows before its work stops', async () => {
+  const f = setup(), held = holdPreparation(f);
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await held.started;
+  f.coordinator.cancelMerge(job.id);
+  // Shutdown's first step, then the preparation settles (as it does after the drain).
+  f.coordinator.stop();
+  held.finish('failed', MERGE_CANCELLED);
+  await f.coordinator.close();
+  expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+});

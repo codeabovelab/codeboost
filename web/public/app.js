@@ -362,33 +362,55 @@ function renderMergeSteps() {
   $("merge-steps-bar").hidden = !shown;
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
   if (!shown) return;
-  $("merge-steps").innerHTML = job.steps.map(step => {
-    const [icon, word] = mergeStepStates[step.state] ?? ["?", step.state];
-    const elapsed = mergeStepElapsed(step);
-    return `<li class="merge-step merge-step-${esc(step.state)}" aria-label="${esc(`${mergeStepNames[step.name] ?? step.name}: ${word}${elapsed ? `, ${elapsed}` : ""}`)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word" aria-hidden="true">${word}</span>${elapsed ? ` <span class="mono muted" aria-hidden="true">${elapsed}</span>` : ""}</li>`;
-  }).join("");
+  // Rebuilt only when a step changes; the timer below rewrites the elapsed times alone, so a screen reader keeps its place.
+  const key = JSON.stringify(job.steps);
+  if ($("merge-steps").dataset.steps !== key) {
+    $("merge-steps").dataset.steps = key;
+    $("merge-steps").innerHTML = job.steps.map(step => {
+      const [icon, word] = mergeStepStates[step.state] ?? ["?", step.state];
+      return `<li class="merge-step merge-step-${esc(step.state)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word" aria-hidden="true">${word}</span> <span class="mono muted elapsed" aria-hidden="true"></span></li>`;
+    }).join("");
+  }
+  updateMergeStepTimes(job);
   const cancel = $("merge-cancel");
   cancel.hidden = job.state !== "running";
   // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
   const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
   const blocked = asked || job.cancelRequested || mergeCancelPending;
   if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
-  cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancelling…" : "Cancel merge";
+  cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancel requested" : "Cancel merge";
   cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
-  if (job.state === "running" && !mergeStepTimer) mergeStepTimer = setInterval(renderMergeSteps, 1000);
+  if (job.state === "running" && !mergeStepTimer) mergeStepTimer = setInterval(() => {
+    const current = data?.merge?.job;
+    if (current?.steps && current.state === "running") updateMergeStepTimes(current);
+  }, 1000);
+}
+/** Each step's elapsed time, and the label that names its state and time for a screen reader. */
+function updateMergeStepTimes(job) {
+  const items = $("merge-steps").children;
+  job.steps.forEach((step, index) => {
+    const item = items[index];
+    if (!item) return;
+    const elapsed = mergeStepElapsed(step), word = (mergeStepStates[step.state] ?? ["?", step.state])[1];
+    item.querySelector(".elapsed").textContent = elapsed;
+    item.setAttribute("aria-label", `${mergeStepNames[step.name] ?? step.name}: ${word}${elapsed ? `, ${elapsed}` : ""}`);
+  });
 }
 $("merge-cancel").onclick = async () => {
   const job = data?.merge?.job;
   if (!job || job.state !== "running" || $("merge-cancel").getAttribute("aria-disabled") === "true") return;
   mergeCancelPending = true;
   renderMergeSteps();
+  let endedAnswer = false;
   const adopt = answered => {
-    // Only a later record of the job shown: the poll owns every other change, as it does for the job's own progress.
+    // Only a later running record of the job shown. A job that ended (here or in another tab) is the poll's to show:
+    // it presents the outcome, follows a queued attempt and keeps the step list, so it is asked at once.
     const shownJob = data?.merge?.job;
     if (!answered || shownJob?.id !== answered.id || !(answered.revision > shownJob.revision)) return;
+    if (answered.state !== "running") { endedAnswer = true; return; }
     mergeObservationGeneration++;
     data = { ...data, merge: { ...data.merge, job: answered } };
-    if (answered.state === "running") $("banner").textContent = mergeJobText(answered);
+    $("banner").textContent = mergeJobText(answered);
   };
   try { adopt((await api("/api/action", { action: "cancel-merge", jobId: job.id })).job); }
   catch (error) {
@@ -397,6 +419,10 @@ $("merge-cancel").onclick = async () => {
   } finally {
     mergeCancelPending = false;
     renderMerge();
+    if (endedAnswer && !mergePollInFlight) {
+      if (mergePollTimer) clearTimeout(mergePollTimer);
+      void pollMergeQueue(mergeGeneration);
+    }
   }
 };
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
