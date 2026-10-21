@@ -284,8 +284,10 @@ async function pollMergeQueue(generation) {
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
       // a background reload would erase the person's selection and input; Refresh shows the outcome.
       const job = update.job;
-      // A poll read before a cancel's answer was adopted must not restore the older record of the same job.
-      if (job?.id === data.merge.job.id && job.revision < data.merge.job.revision) {
+      // A poll read before a cancel's answer was adopted must not restore an older record of the same job, or a record
+      // of an older job than the one shown (a newer job the cancel's answer carried).
+      const shownJob = data.merge.job;
+      if (job && (job.id === shownJob.id ? job.revision < shownJob.revision : !laterMergeJob(job, shownJob))) {
         backOffMergePoll();
         renderMerge();
         return;
@@ -361,7 +363,7 @@ function mergeStepElapsed(step, now = Date.now()) {
  */
 function renderMergeSteps() {
   const job = data?.merge?.available ? data.merge.job : null;
-  const ended = data?.merge?.blockers?.some(blocker => blocker.code === "job-refresh");
+  const ended = data?.merge?.blockers?.some(blocker => blocker.code === "job-refresh") || (!!job && data.merge.endedJobShown === job.id);
   const shown = !!job?.steps && (job.state === "running" || ended);
   $("merge-steps-bar").hidden = !shown;
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
@@ -413,21 +415,34 @@ $("merge-cancel").onclick = async () => {
   renderMergeSteps();
   let pollNow = false;
   const adopt = answered => {
-    // Only a later running record of the job shown is adopted. Any other answer (the job ended, here or in another tab,
-    // or a newer job runs) is the poll's to show: it presents the outcome, follows a queued attempt and keeps the step
-    // list, so it is asked at once.
     const shownJob = data?.merge?.job;
-    if (!answered) return;
-    if (shownJob?.id !== answered.id || answered.state !== "running") { pollNow = true; return; }
-    if (!(answered.revision > shownJob.revision)) return;
-    mergeObservationGeneration++;
-    data = { ...data, merge: { ...data.merge, job: answered } };
-    $("banner").textContent = mergeJobText(answered);
+    if (!answered || !shownJob) return;
+    if (answered.id === shownJob.id) {
+      // Already observed (an older or the same record, including the ended record the poll already showed): nothing to do.
+      if (!(answered.revision > shownJob.revision)) return;
+      // The job ended: the poll presents the outcome, follows a queued attempt and keeps the step list, so it is asked
+      // at once. A later running record is adopted.
+      if (answered.state !== "running") { pollNow = true; return; }
+      mergeObservationGeneration++;
+      data = { ...data, merge: { ...data.merge, job: answered } };
+      $("banner").textContent = mergeJobText(answered);
+      return;
+    }
+    // A newer job another tab started: followed as the poll follows a job, whatever this page last saw of the older one.
+    if (!laterMergeJob(answered, shownJob)) return;
+    if (answered.state === "running") {
+      mergeObservationGeneration++;
+      data = withMergeJobObservation(data, answered);
+      $("banner").textContent = mergeJobText(answered);
+    } else if (shownJob.state === "running") pollNow = true;
   };
   try { adopt((await api("/api/action", { action: "cancel-merge", jobId: job.id })).job); }
   catch (error) {
     adopt(error.job);
-    $("banner").textContent = `Could not cancel the merge. ${error.message}`;
+    // Only while the job this cancel was for is still shown running: an outcome the poll showed meanwhile, or a newer
+    // job, says more than the refusal.
+    if (data?.merge?.job?.id === job.id && data.merge.job.state === "running")
+      $("banner").textContent = `Could not cancel the merge. ${error.message}`;
   } finally {
     mergeCancelPending = false;
     renderMerge();
@@ -458,7 +473,10 @@ const mergeJobReachedMerge = new Set(["merged", "queued", "submitted"]);
 function withEndedMergeJob(view, job, message) {
   const settled = new Set(mergeJobReachedMerge.has(job?.state) ? view.merge.settledBeforeJobMerge ?? [] : []);
   const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code) && !settled.has(blocker.code));
-  return { ...view, merge: { ...view.merge, ready: false, action: null, job, blockers: [{ code: "job-refresh", message }, ...blockers] } };
+  // `endedJobShown` keeps the step list of the job seen ending on screen until Refresh, also once the poll that follows
+  // its queued attempt has replaced the `job-refresh` blocker with the attempt's own status.
+  return { ...view, merge: { ...view.merge, ready: false, action: null, job, endedJobShown: job?.id ?? null,
+    blockers: [{ code: "job-refresh", message }, ...blockers] } };
 }
 /** The merge control's label for a job the page saw end: its outcome, as the control reads a queue merge's. */
 function endedMergeJobLabel(job) {
