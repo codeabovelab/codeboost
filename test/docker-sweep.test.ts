@@ -8,7 +8,8 @@ import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/
 // The test sweep's and `removeByName`'s handling of answers they cannot use (#189), each test with its own fake
 // `docker`, described beside it. The sweep reads only stdout, the exit status, whether a signal killed the call and
 // whether it could start, and stderr only to report a failure; `removeByName` also reads an inspect's stderr to tell a
-// missing object from a failure. What Docker 27.4 really prints is covered against the daemon in agent-container.
+// missing object from a failure. Against the daemon, agent-container's holder test covers the sweep and removeByName's
+// removal, its silence on a missing name, and its refusal of an object found by an ID prefix.
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });

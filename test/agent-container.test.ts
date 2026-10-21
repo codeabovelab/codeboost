@@ -802,6 +802,10 @@ describe('real Docker agent isolation', () => {
       const holderLookalike = make('container', holders[0]!.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
       const labelled = make('container', named('swept'), 'create', '--label', label, '--label', fileLabel, '--entrypoint', 'true', imageId);
       const labelledLookalike = make('container', labelled.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
+      // Unlabelled and free, for removeByName below: one of each kind, by its exact name.
+      const byName = [['container', named('by-name')], ['network', named('by-name')], ['volume', named('by-name')]] as const;
+      for (const [kind, name] of byName)
+        make(kind, name, 'create', ...(kind === 'container' ? ['--entrypoint', 'true', imageId] : []));
       // The traps are live on this daemon, so the checks below test something: the network filter matches the start of
       // a network's ID, and a name is resolved before an ID prefix, for networks and containers alike.
       expect(docker('ps', '--all', '--quiet', '--no-trunc', '--filter', `network=${bystanderNetwork.slice(0, 12)}`).split('\n'))
@@ -822,9 +826,17 @@ describe('real Docker agent isolation', () => {
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
       removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
-      // afterAll removes these tracked names with removeByName. One now gone is the start of a live object's ID, which
-      // Docker resolves it to; removeByName must leave that object alone. The network has no endpoints, so Docker would
-      // remove it if asked.
+      // afterAll removes tracked names with removeByName, as here: an object of exactly that name goes, and a name that
+      // is gone says nothing.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        for (const [kind, name] of byName) removeByName(kind, name);
+        expect(byName.filter(([kind, name]) => spawnSync('docker', [kind, 'inspect', name], { stdio: 'ignore' }).status === 0)).toEqual([]);
+        for (const [kind, name] of byName) removeByName(kind, name);
+        expect(warn).not.toHaveBeenCalled();
+      } finally { warn.mockRestore(); }
+      // A missing name that Docker resolves to a live object's ID, as a tracked name gone since would be: removeByName
+      // must leave that object alone. The network has no endpoints, so Docker would remove it if asked.
       expect(docker('network', 'inspect', '--format', '{{.Id}}', lookalike.slice(0, 12))).toBe(lookalike);
       removeByName('network', lookalike.slice(0, 12));
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
@@ -837,13 +849,12 @@ describe('real Docker agent isolation', () => {
       expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
         .toEqual([true, true, true]);
     } finally {
-      for (const { ref } of made.filter(object => object.kind === 'container'))
-        spawnSync('docker', ['rm', '--force', ref], { stdio: 'ignore' });
-      for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
-        spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
+      // By exact name: some are named like the start of another object's ID. Containers first, as they hold the rest.
+      for (const { kind, ref } of [...made.filter(object => object.kind === 'container'), ...made.filter(object => object.kind !== 'container')])
+        removeByName(kind, ref);
     }
-  // The budget covers the sweep's worst case (5.5 minutes), two removals by name (up to a minute each) and ordinary
-  // Docker calls, not every call at its own 60 s limit.
+  // The budget covers the sweep's worst case (5.5 minutes) and ordinary Docker calls, removals by name included, not
+  // every call at its own limit.
   }, 8 * 60_000);
 
   // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after
