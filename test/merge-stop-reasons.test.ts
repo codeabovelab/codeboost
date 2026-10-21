@@ -483,3 +483,44 @@ it('merge-state inspection answers a caller abort, not the already-fixed check\'
   // Not the check's gh text: a blocker result that arrives after the abort is discarded, so the click may be resent.
   expect(await inspection).toBe(reason);
 });
+
+it('merge-state inspection reports the first stage\'s gh exit when a stopped pinned-check read then settles with its own gh exit', async () => {
+  // A published target, so the branch's PR list runs beside the rule reads. The rules pin `test` to app 10, so the rule
+  // stage ends with the pinned-check read (#176). That read's gh has already exited with an error, but its output pipes
+  // stay open (a process it started holds them). Then the list's gh exit stops the other stages. runWithInput reports
+  // an exit it saw before the abort, so the pinned-check read settles with its own error once its pipes close (#48).
+  // Every answer has gh 2.102.0's shape, as runWithInput reports it (`ghExit`: stderr, then stdout after a newline).
+  const ghExit = (stderr: string, stdout: string) => new CommandFailed(`gh failed (exit 1): ${stderr}${stdout ? `\n${stdout}` : ''}`, stderr, stdout);
+  const first = ghExit('gh: Bad credentials (HTTP 401)', '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}');
+  // GitHub's usual text for its own failure while running a query; not reproduced here (GitHub gives it only when it
+  // fails), and the gateway reads only that this is gh's own exit, not its text.
+  const wentWrong = 'Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug. Please include `0000:0000:0000000:0000000:00000000` when reporting this issue.';
+  const later = ghExit(`gh: ${wentWrong}`, JSON.stringify({ data: null, errors: [{ message: wentWrong }] }));
+  const notProtected = ghExit('gh: Branch not protected (HTTP 404)',
+    '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}');
+  const pinnedExited = deferred();
+  let pinnedStopReason: unknown;
+  const run: Run = async (args, options) => {
+    const joined = args.join(' ');
+    // The pull request read leaves out `url`, which the gateway reads only for display; the ruleset leaves out each
+    // rule's source fields and `do_not_enforce_on_create`, which it does not read.
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'task',
+      headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], body: '', isCrossRepository: false });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true,
+      required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: false, protection: { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } });
+    if (joined.endsWith('/protection')) throw notProtected;
+    if (args[1] === 'graphql' && joined.includes('checkSuites(')) return new Promise<string>((_, reject) => {
+      pinnedExited.resolve(); // gh exited; runWithInput now waits for its pipes and ignores a later abort.
+      options?.signal?.addEventListener('abort', () => { pinnedStopReason = options.signal!.reason; setTimeout(() => reject(later), 20); }, { once: true });
+    });
+    if (joined.includes('/pulls?')) { await pinnedExited.promise; throw first; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => ({ outcome: 'clear', baseHead: sha('9') }) };
+  const error = await new GhMergeGateway(config, run, checks).inspect({ fresh: true, target: { pullRequest: 7, headBranch: 'task' } })
+    .then(() => null, (reason: unknown) => reason);
+  // The interleaving: the pinned-check read's gh had exited, then the list's exit stopped that read, which settled after.
+  expect(pinnedStopReason).toBe(first);
+  expect(error).toBe(first);
+});
