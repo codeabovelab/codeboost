@@ -190,7 +190,7 @@ export class PlanningCheck {
       // check the vendor it will run with, within the same wait.
       if (this.#vendor() !== vendor || check.replaced || check !== this.#current) continue;
       if (!check.passed && !check.failure) continue;
-      // This request's own check: a recheck started since must not replace the outcome it waited for.
+      // This check's own verdict: calling #check again could start a recheck once the window has passed.
       return this.#verdict(check);
     }
   }
