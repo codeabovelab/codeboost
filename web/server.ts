@@ -718,6 +718,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           const view=await service.load({signal:requestAbort.signal});if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
           questions.start(input.id,view);applied=true;json(200,await load(requestAbort.signal));return;
         }
+        if(input.action==='cancel-merge') {
+          // The merge header's Cancel stops the running job only; the task and its pull request stay open. Cancelling
+          // the same job again answers it, so the request needs no key of its own.
+          if(!mergeJobs)throw new GuardRefusal('Merging does not run as a job for this review.');
+          if(!isUuidV4(input.jobId)) { json(400,{error:'A merge cancel needs the job\'s UUID v4 jobId.'}); return; }
+          try { json(200,{job:mergeJobs.cancelMerge(input.jobId)}); }
+          catch (error) { if(error instanceof GuardRefusal) { json(409,{error:error.message,job:mergeJobs.latest()}); return; } throw error; }
+          return;
+        }
         if(input.action==='merge') {
           // Every merge click carries its idempotency key; a request without one would bypass replay.
           if(!isUuidV4(input.actionId)) { json(400,{error:'A merge request needs a UUID v4 actionId.'}); return; }

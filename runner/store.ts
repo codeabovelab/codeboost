@@ -90,6 +90,8 @@ export interface PreMergeReadiness {
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
 /** The next step after a failing required check or GitHub's refusal blocks a merge job (docs/implementation/merge-handoff.md). */
 export const FIX_THEN_RETRY = 'Fix it, then Retry merge.';
+/** Why a job ends when the person cancelled the merge, not the task: the task and its pull request stay open. */
+export const MERGE_CANCELLED = 'You cancelled the merge; the task and its pull request stay open.';
 /** The longest review token a merge job or its saved refusal is saved under. */
 export const MAX_MERGE_JOB_TOKEN_LENGTH = 512;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
@@ -138,6 +140,23 @@ export type PushOutcome = 'pushed' | 'not-pushed' | 'moved';
 /** A one-click merge job (F6b of #22; docs/implementation/merge-handoff.md). */
 export type MergeJobState = 'running' | 'merged' | 'queued' | 'submitted' | 'blocked' | 'review-required' | 'failed' | 'cancelled';
 export type MergeJobStep = 'preparing' | 'checks' | 'merging';
+/** The design's merge step list (D16), in order: what the job's header shows while it runs. */
+export const MERGE_STEP_NAMES = Object.freeze(['fetch', 'rebase', 'push', 'commands', 'checks', 'already-fixed', 'merge'] as const);
+export type MergeStepName = (typeof MERGE_STEP_NAMES)[number];
+/**
+ * `stopped`: the job was cancelled while this step ran. `unknown`: GitHub was asked to merge and its answer is not known.
+ * A job that ends leaves no step running.
+ */
+export type MergeStepState = 'pending' | 'running' | 'done' | 'skipped' | 'failed' | 'stopped' | 'unknown';
+export interface MergeStep { name: MergeStepName; state: MergeStepState; startedAt: string | null; endedAt: string | null }
+export const pendingMergeSteps = (): MergeStep[] => MERGE_STEP_NAMES.map(name => ({ name, state: 'pending', startedAt: null, endedAt: null }));
+/** The step that was running when a job ended takes the outcome's word; the steps it never reached stay pending. */
+function endedSteps(steps: MergeStep[], outcome: Exclude<MergeJobState, 'running'>): MergeStep[] {
+  const state: MergeStepState = outcome === 'merged' || outcome === 'queued' ? 'done' : outcome === 'submitted' ? 'unknown'
+    : outcome === 'cancelled' ? 'stopped' : 'failed';
+  const now = new Date().toISOString();
+  return steps.map(step => step.state === 'running' ? { ...step, state, endedAt: now } : step);
+}
 export interface MergeJob {
   /** The click's action ID. */
   id: string;
@@ -165,6 +184,10 @@ export interface MergeJob {
   revision: number;
   startedAt: string;
   updatedAt: string;
+  /** The step list, in `MERGE_STEP_NAMES` order. Absent on records saved before it existed and on refused clicks. */
+  steps?: MergeStep[];
+  /** The person cancelled the merge (not the task) while it ran; the job ends `cancelled` once its work stops. */
+  cancelRequested?: boolean;
 }
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
@@ -2157,7 +2180,7 @@ export class Store {
       if (this.runningMergeJob(identity)) throw new GuardRefusal('A merge is already running for this task.');
       const now = input.now ?? new Date().toISOString();
       const job: MergeJob = { id: input.actionId, mergeActionId: null, token: input.token, state: 'running', step: 'preparing', reason: null, checks: [],
-        url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now };
+        url: null, sequence: this.#nextMergeJobSequence(key), revision: 1, startedAt: now, updatedAt: now, steps: pendingMergeSteps() };
       this.#run('INSERT INTO merge_jobs VALUES (?,?,?)', job.id, key, encode(job));
       return { job, resent: false };
     });
@@ -2194,6 +2217,25 @@ export class Store {
   updateMergeJob(identity: PlanIdentity, id: string, patch: { step?: MergeJobStep; reason?: string | null; checks?: { context: string; state: string }[];
     mergeActionId?: string }): MergeJob | null {
     return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, ...patch } : null);
+  }
+  /**
+   * Start, finish or skip one step of a running job. Starting a step finishes any other step still running (the job has
+   * moved on). A job without a step list (saved before it existed) or no longer running is left unchanged.
+   */
+  markMergeStep(identity: PlanIdentity, id: string, name: MergeStepName, state: 'running' | 'done' | 'skipped'): MergeJob | null {
+    return this.#changeMergeJob(identity, id, job => {
+      if (job.state !== 'running' || !job.steps) return null;
+      const now = new Date().toISOString();
+      return { ...job, steps: job.steps.map(step => {
+        if (step.name === name) return state === 'running' ? { ...step, state, startedAt: now, endedAt: null }
+          : { ...step, state, startedAt: state === 'skipped' ? null : step.startedAt ?? now, endedAt: now };
+        return state === 'running' && step.state === 'running' ? { ...step, state: 'done', endedAt: now } : step;
+      }) };
+    });
+  }
+  /** Record that the person cancelled the running job's merge. Returns null when the job is no longer running. */
+  requestMergeJobCancel(identity: PlanIdentity, id: string): MergeJob | null {
+    return this.#changeMergeJob(identity, id, job => job.state === 'running' ? { ...job, cancelRequested: true } : null);
   }
   /**
    * End a running job `blocked` and, in the same transaction, move a task still in review to approved, merge blocked,
@@ -2248,7 +2290,8 @@ export class Store {
   /** End a running job. Returns false when it had already ended. */
   finishMergeJob(identity: PlanIdentity, id: string, outcome: { state: Exclude<MergeJobState, 'running'>; reason?: string | null; url?: string | null }): boolean {
     return this.#changeMergeJob(identity, id, job => job.state === 'running'
-      ? { ...job, state: outcome.state, step: null, reason: outcome.reason ?? null, url: outcome.url ?? job.url } : null) !== null;
+      ? { ...job, state: outcome.state, step: null, reason: outcome.reason ?? null, url: outcome.url ?? job.url,
+        ...(job.steps ? { steps: endedSteps(job.steps, outcome.state) } : {}) } : null) !== null;
   }
   #changeMergeJob(identity: PlanIdentity, id: string, change: (job: MergeJob) => MergeJob | null): MergeJob | null {
     const key = identityKey(identity);
@@ -2288,7 +2331,9 @@ export class Store {
     if (!running) return;
     const attempt = running.mergeActionId ? this.getMergeAttempt(identity) : null;
     if (!attempt || attempt.actionId !== running.mergeActionId) {
-      this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
+      // GitHub was never asked: a merge the person had cancelled is cancelled, as it would have ended without the restart.
+      if (running.cancelRequested) this.finishMergeJob(identity, running.id, { state: 'cancelled', reason: MERGE_CANCELLED });
+      else this.finishMergeJob(identity, running.id, { state: 'failed', reason: 'The server restarted before the merge finished.' });
       return;
     }
     if (attempt.state === 'merged' || attempt.state === 'queued') {

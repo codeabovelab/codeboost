@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it, vi } from 'vitest';
-import { MAX_MERGE_JOB_TOKEN_LENGTH, Store } from '../runner/store.ts';
+import { MAX_MERGE_JOB_TOKEN_LENGTH, MERGE_CANCELLED, MERGE_STEP_NAMES, Store, type MergeStep } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { MergeCoordinator, type PublishedTarget } from '../runner/merge.ts';
 import { JOB_RESOLVES, MergeJobCoordinator, REVIEW_CHANGED_AFTER_CLICK, SETTLED_BEFORE_JOB_MERGE, withMergeJob, type MergeJobView } from '../runner/merge-job.ts';
-import type { PreMergeCoordinator, PreMergeResult } from '../runner/pre-merge.ts';
+import type { PreMergeCoordinator, PreMergeProgress, PreMergeResult } from '../runner/pre-merge.ts';
 import type { ReviewService } from '../runner/review.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type RemoteMergeState, type RequiredCheck } from '../github/merge.ts';
 import { openingMarker } from '../github/pull-requests.ts';
@@ -24,8 +28,8 @@ const stores: Store[] = [], jobs: MergeJobCoordinator[] = [];
 afterEach(async () => { for (const job of jobs.splice(0)) await job.close(); for (const store of stores.splice(0)) store.close(); });
 
 /** A task in review whose runner published PR 7 with head oid(2) over oid(1). */
-function publishedTask(): Store {
-  const store = new Store(':memory:'); stores.push(store);
+function publishedTask(path = ':memory:'): Store {
+  const store = new Store(path); stores.push(store);
   store.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
   store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(2), [{ sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }]);
   store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
@@ -54,8 +58,12 @@ function preparation(store: Store, result: (call: number) => PreMergeResult['sta
   const calls: string[] = [];
   const fake = {
     assertStartable: () => undefined,
-    start: vi.fn(async (expected: { actionId: string }) => {
+    stopForMergeCancel: vi.fn(),
+    start: vi.fn(async (expected: { actionId: string }, progress?: PreMergeProgress) => {
       calls.push(expected.actionId);
+      // As production reports a preparation with nothing to rebase, push or run (runner/pre-merge.ts).
+      progress?.('fetch', 'running'); progress?.('fetch', 'done');
+      progress?.('rebase', 'skipped'); progress?.('push', 'skipped'); progress?.('commands', 'skipped');
       const outcome = result(calls.length), snapshot = store.getSnapshot(identity);
       if (outcome instanceof Error) throw outcome;
       const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
@@ -1443,4 +1451,220 @@ it('keeps the guarded merge\'s Retry merge for a task still in review', () => {
   const status = { ready: true, action: 'retry', blockers: [{ code: 'preparation', message: 'preparation' }], remote: { mergeable: 'MERGEABLE' }, queue: null } as Parameters<typeof withMergeJob>[0];
   expect(withMergeJob(status, null, 'in review')).toMatchObject({ ready: true, action: 'retry' });
   expect(withMergeJob({ ...status, action: 'merge' }, null, 'in review')).toMatchObject({ ready: true, action: 'merge' });
+});
+
+// The design's merge step list and the header's Cancel (D16, DT7; docs/implementation/merge-handoff.md, "Step list").
+const stepStates = (job: { steps?: MergeStep[] } | null) => Object.fromEntries((job?.steps ?? []).map(step => [step.name, step.state]));
+/** Holds the job's preparation once it has started fetching, until `finish` settles it with `state` and `reason`. */
+function holdPreparation(f: ReturnType<typeof setup>) {
+  let begun!: () => void, finish!: (state: PreMergeResult['state'], reason: string | null) => void;
+  const started = new Promise<void>(resolve => { begun = resolve; });
+  const gate = new Promise<{ state: PreMergeResult['state']; reason: string | null }>(resolve => { finish = (state, reason) => resolve({ state, reason }); });
+  (f.prep.fake.start as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async (expected: { actionId: string }, progress?: PreMergeProgress) => {
+    f.prep.calls.push(expected.actionId);
+    progress?.('fetch', 'running'); begun();
+    const { state, reason } = await gate, snapshot = f.store.getSnapshot(identity);
+    const readiness = state === 'ready' ? { stateVersion: f.store.getTask(identity).stateVersion, reviewVersion: f.store.reviewVersion(identity),
+      snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) } : null;
+    return f.store.settlePreMergeAction(identity, expected.actionId, { state, base: snapshot.base, head: snapshot.head, checked: [], reason }, readiness);
+  });
+  return { started, finish };
+}
+
+it('starts every job with the seven design steps pending, in order', async () => {
+  const f = setup(), held = holdPreparation(f);
+  const job = await f.coordinator.start('review-token', randomUUID());
+  expect(job.steps?.map(step => step.name)).toEqual(['fetch', 'rebase', 'push', 'commands', 'checks', 'already-fixed', 'merge']);
+  expect(job.steps?.map(step => step.name)).toEqual([...MERGE_STEP_NAMES]);
+  expect(job.steps?.every(step => step.state === 'pending' && step.startedAt === null && step.endedAt === null)).toBe(true);
+  await held.started;
+  expect(stepStates(f.coordinator.latest())).toMatchObject({ fetch: 'running', rebase: 'pending' });
+  held.finish('ready', null);
+  expect((await settled(f.coordinator)).state).toBe('merged');
+});
+
+it('records each step a merge passes through, with its start and end times, and the steps preparation skipped', async () => {
+  let release!: () => void, passes = false;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const f = setup({ checks: () => [passes ? passing() : pending()], merge: async () => { await held; return { url: 'https://github.com/owner/repo/pull/7' }; } });
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(stepStates(f.store.getMergeJob(identity, job.id))).toMatchObject({ checks: 'running' }));
+  expect(stepStates(f.store.getMergeJob(identity, job.id))).toEqual({ fetch: 'done', rebase: 'skipped', push: 'skipped', commands: 'skipped',
+    checks: 'running', 'already-fixed': 'pending', merge: 'pending' });
+  passes = true;
+  // GitHub has been asked (the merge command is held): the already-fixed check passed in the guarded merge's validation.
+  await vi.waitFor(() => expect(f.gh.merged).toEqual([oid(2)]));
+  expect(stepStates(f.store.getMergeJob(identity, job.id))).toMatchObject({ checks: 'done', 'already-fixed': 'done', merge: 'running' });
+  release();
+  const done = await settled(f.coordinator);
+  expect(done.state).toBe('merged');
+  expect(stepStates(done)).toEqual({ fetch: 'done', rebase: 'skipped', push: 'skipped', commands: 'skipped', checks: 'done', 'already-fixed': 'done', merge: 'done' });
+  for (const step of done.steps!) {
+    if (step.state === 'skipped') { expect(step.startedAt).toBeNull(); expect(step.endedAt).not.toBeNull(); continue; }
+    expect(Date.parse(step.endedAt!)).toBeGreaterThanOrEqual(Date.parse(step.startedAt!));
+  }
+});
+
+it('marks the step that was running failed when the job ends there, and leaves later steps pending', async () => {
+  const failing = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }] });
+  await failing.coordinator.start('review-token', randomUUID());
+  const blocked = await settled(failing.coordinator);
+  expect(blocked.state).toBe('blocked');
+  expect(stepStates(blocked)).toMatchObject({ commands: 'skipped', checks: 'failed', 'already-fixed': 'pending', merge: 'pending' });
+
+  const refused = setup({ merge: async () => { throw new MergeSubmissionError('Base branch was modified.', 'refused'); } });
+  await refused.coordinator.start('review-token', randomUUID());
+  const done = await settled(refused.coordinator);
+  expect(done.state).toBe('blocked');
+  expect(stepStates(done)).toMatchObject({ checks: 'done', 'already-fixed': 'done', merge: 'failed' });
+
+  const review = setup({ prepare: () => 'review-required' });
+  await review.coordinator.start('review-token', randomUUID());
+  const reviewed = await settled(review.coordinator);
+  expect(reviewed.state).toBe('review-required');
+  // The fake preparation finished every step it reports; nothing was running when it stopped for review.
+  expect(stepStates(reviewed)).toMatchObject({ fetch: 'done', checks: 'pending', merge: 'pending' });
+});
+
+it('marks the merge step unknown when GitHub\'s merge outcome is unknown', async () => {
+  const f = setup({ merge: async () => { throw new MergeSubmissionError('connection reset', 'unknown'); } });
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(done.state).toBe('submitted');
+  expect(stepStates(done)).toMatchObject({ 'already-fixed': 'done', merge: 'unknown' });
+});
+
+it('keeps merging when a step cannot be recorded: the list is display only', async () => {
+  const f = setup();
+  const mark = vi.spyOn(f.store, 'markMergeStep').mockImplementation(() => { throw new Error('disk I/O error'); });
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  try {
+    await f.coordinator.start('review-token', randomUUID());
+    expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
+    expect(mark).toHaveBeenCalled();
+    expect(errors.mock.calls.some(([message]) => /Could not record merge step .*disk I\/O error/.test(String(message)))).toBe(true);
+    expect(f.gh.merged).toEqual([oid(2)]);
+  } finally { errors.mockRestore(); }
+});
+
+it('cancels a merge during preparation without cancelling the task, and a new click merges', async () => {
+  const f = setup(), held = holdPreparation(f);
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await held.started;
+  const answer = f.coordinator.cancelMerge(job.id);
+  expect(answer).toMatchObject({ id: job.id, state: 'running', cancelRequested: true });
+  expect(answer).not.toHaveProperty('token');
+  // The preparation is told to stop, as a task cancel stops it, and settles once its work has.
+  expect(f.prep.fake.stopForMergeCancel).toHaveBeenCalledTimes(1);
+  // A repeat of the same cancel answers the job.
+  expect(f.coordinator.cancelMerge(job.id)).toMatchObject({ id: job.id, cancelRequested: true });
+  held.finish('failed', MERGE_CANCELLED);
+  const done = await settled(f.coordinator);
+  expect(done).toMatchObject({ id: job.id, state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(stepStates(done)).toMatchObject({ fetch: 'stopped', rebase: 'pending', merge: 'pending' });
+  expect(f.gh.merged).toEqual([]);
+  const task = f.store.getTask(identity);
+  expect(task.status).toBe('in review');
+  expect(task.cancelRequested).toBeNull();
+  expect(f.store.taskPullRequests(identity).find(pr => pr.number === 7)).toBeDefined();
+  // Merge PR may be clicked again.
+  await f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
+});
+
+it('cancels a merge while it waits for required checks, leaving an approved, merge blocked task blocked', async () => {
+  const f = setup({ checks: () => [pending()] });
+  // A retry: the task is approved, merge blocked before the job starts.
+  f.store.transitionTask(identity, f.store.getTask(identity).stateVersion, 'approved but merge blocked');
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ step: 'checks', checks: [{ state: 'pending' }] }));
+  f.coordinator.cancelMerge(job.id);
+  const done = await settled(f.coordinator);
+  expect(done).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(stepStates(done)).toMatchObject({ fetch: 'done', checks: 'stopped', 'already-fixed': 'pending' });
+  expect(f.gh.merged).toEqual([]);
+  expect(f.store.getTask(identity).status).toBe('approved but merge blocked');
+});
+
+it('refuses to cancel a merge once GitHub has been asked, and the merge ends as GitHub answers', async () => {
+  const hold = holdGatewayMerge();
+  const f = setup({ merge: hold.merge });
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await hold.started;
+  expect(() => f.coordinator.cancelMerge(job.id)).toThrow(new GuardRefusal('GitHub has been asked to merge; wait for its outcome.'));
+  expect(f.store.getMergeJob(identity, job.id)?.cancelRequested).toBeUndefined();
+  hold.release();
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
+});
+
+it('refuses to cancel a merge that ended, an unknown or refused one, one this server is not running, or any during shutdown', async () => {
+  const f = setup();
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await settled(f.coordinator);
+  expect(() => f.coordinator.cancelMerge(job.id)).toThrow(new GuardRefusal('This merge has already ended.'));
+  expect(() => f.coordinator.cancelMerge(randomUUID())).toThrow(new GuardRefusal('There is no such merge to cancel.'));
+  const refusedId = randomUUID();
+  await expect(f.coordinator.start('stale-token', refusedId)).rejects.toBeInstanceOf(GuardRefusal);
+  expect(() => f.coordinator.cancelMerge(refusedId)).toThrow(new GuardRefusal('There is no such merge to cancel.'));
+  // Running on disk (its ending write failed before a restart), but not run by this coordinator.
+  const g = setup();
+  const orphan = g.store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' }).job;
+  expect(() => g.coordinator.cancelMerge(orphan.id)).toThrow(/running until the server restarts/);
+  g.coordinator.stop();
+  expect(() => g.coordinator.cancelMerge(orphan.id)).toThrow(ShuttingDownError);
+});
+
+it('ends a job the person cancelled as a cancelled task when the task is cancelled before its work stops', async () => {
+  const f = setup(), held = holdPreparation(f);
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await held.started;
+  f.coordinator.cancelMerge(job.id);
+  f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID());
+  f.coordinator.cancel();
+  held.finish('failed', 'Task cancelled.');
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
+});
+
+it('settles a cancelled merge that a restart interrupted before GitHub was asked as cancelled, and ends its running step', () => {
+  const store = publishedTask();
+  const { job } = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' });
+  store.markMergeStep(identity, job.id, 'fetch', 'running');
+  store.requestMergeJobCancel(identity, job.id);
+  store.settleInterruptedMergeJobs(identity);
+  const settledJob = store.getMergeJob(identity, job.id)!;
+  expect(settledJob).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(stepStates(settledJob)).toMatchObject({ fetch: 'stopped', rebase: 'pending' });
+  expect(store.getTask(identity).status).toBe('in review');
+
+  // Without a cancel, the restart fails the job, as before, and its running step with it.
+  const other = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' }).job;
+  store.markMergeStep(identity, other.id, 'rebase', 'running');
+  store.settleInterruptedMergeJobs(identity);
+  expect(store.getMergeJob(identity, other.id)).toMatchObject({ state: 'failed', reason: 'The server restarted before the merge finished.' });
+  expect(stepStates(store.getMergeJob(identity, other.id))).toMatchObject({ rebase: 'failed' });
+});
+
+it('moves the step list on: starting a step finishes the one still running, and a job that ended or has no list is left unchanged', () => {
+  const store = publishedTask();
+  const { job } = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' });
+  store.markMergeStep(identity, job.id, 'checks', 'running');
+  const moved = store.markMergeStep(identity, job.id, 'already-fixed', 'running')!;
+  expect(stepStates(moved)).toMatchObject({ checks: 'done', 'already-fixed': 'running' });
+  expect(moved.steps!.find(step => step.name === 'checks')!.endedAt).not.toBeNull();
+  store.finishMergeJob(identity, job.id, { state: 'failed', reason: 'x' });
+  expect(store.markMergeStep(identity, job.id, 'merge', 'running')).toBeNull();
+  expect(store.requestMergeJobCancel(identity, job.id)).toBeNull();
+});
+
+it('leaves a job saved before step lists existed without one, through its steps and its end', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'codeboost-merge-steps-')), 'store.db');
+  const store = publishedTask(path);
+  const { job } = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' });
+  // As a record written before this change: no `steps` field in its data.
+  const raw = new DatabaseSync(path);
+  raw.prepare(`UPDATE merge_jobs SET data=json_remove(data,'$.steps') WHERE id=?`).run(job.id); raw.close();
+  expect(store.getMergeJob(identity, job.id)).not.toHaveProperty('steps');
+  expect(store.markMergeStep(identity, job.id, 'fetch', 'running')).toBeNull();
+  expect(store.finishMergeJob(identity, job.id, { state: 'failed', reason: 'x' })).toBe(true);
+  expect(store.getMergeJob(identity, job.id)).not.toHaveProperty('steps');
 });

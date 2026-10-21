@@ -354,8 +354,11 @@ export class MergeCoordinator {
   /**
    * `actionId` is the click's idempotency key. A resend with the same key (after a lost response) returns the saved
    * attempt's current outcome and never submits again.
+   * `onAsking`, for the merge job's step list, is told once every validation pass (the already-fixed check included) has
+   * passed and the attempt is saved, in the same turn as GitHub is asked. Display only: an error it throws is ignored.
+   * A click that joins or replays another does not call it.
    */
-  async merge(token: unknown, actionId?: unknown, caller?: AbortSignal): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
+  async merge(token: unknown, actionId?: unknown, caller?: AbortSignal, onAsking?: () => void): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
     // A resend of the click still in progress joins it, so it gets the final result rather than a saved interim state.
     if (this.#active && typeof actionId === 'string' && this.#activeClick?.actionId === actionId) {
@@ -379,7 +382,7 @@ export class MergeCoordinator {
     const stop = () => abort.abort(caller!.reason);
     if (caller?.aborted) stop(); else caller?.addEventListener('abort', stop, { once: true });
     this.#abort = abort;
-    const attempt = this.#merge(token, abort.signal, actionId as string | undefined).finally(() => {
+    const attempt = this.#merge(token, abort.signal, actionId as string | undefined, onAsking).finally(() => {
       clearTimeout(timer);
       caller?.removeEventListener('abort', stop);
       if (this.#active === attempt) { this.#active = null; this.#activeClick = null; }
@@ -469,7 +472,7 @@ export class MergeCoordinator {
     return replayed;
   }
 
-  async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
+  async #merge(token: string, signal: AbortSignal, actionId?: string, onAsking?: () => void): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     let queueAttempt: MergeAttempt | null = null;
     const action = actionId ? { actionId, kind: 'merge', request: { token } } : null;
     try {
@@ -565,6 +568,7 @@ export class MergeCoordinator {
         if (!begun) throw new Error('This merge click was already submitted. Refresh to see its outcome.');
         queueAttempt = begun;
       }
+      try { onAsking?.(); } catch { /* Display only. */ }
       const result = await this.gateway.merge(commandStatus.remote.head, { signal, pullRequest: commandStatus.remote.pullRequest });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not

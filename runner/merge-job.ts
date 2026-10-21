@@ -3,7 +3,8 @@ import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, se
 import { MergeBlocked, MergeOutcomeUnknown, PUSH_UNSETTLED, type MergeCoordinator, type MergeStatus } from './merge.ts';
 import type { PreMergeCoordinator } from './pre-merge.ts';
 import type { ReviewService } from './review.ts';
-import { FIX_THEN_RETRY, MAX_MERGE_JOB_TOKEN_LENGTH, type MergeAttempt, type MergeJob, type MergeJobState } from './store.ts';
+import { FIX_THEN_RETRY, MAX_MERGE_JOB_TOKEN_LENGTH, MERGE_CANCELLED, type MergeAttempt, type MergeJob, type MergeJobState,
+  type MergeStepName } from './store.ts';
 
 /** How long a job waits for GitHub's required checks on the pushed head (docs/implementation/merge-handoff.md). */
 export const REQUIRED_CHECK_WAIT_MS = 30 * 60_000;
@@ -37,6 +38,8 @@ export class MergeJobCoordinator {
   readonly settle: <T>(fn: () => T) => T;
   #active: Promise<void> | null = null;
   #abort: AbortController | null = null;
+  /** The running job's ID, while `#active` is set. */
+  #activeId: string | null = null;
   #closing = false;
 
   constructor(service: ReviewService, preMerge: PreMergeCoordinator, merges: MergeCoordinator, capability?: ShutdownCapability,
@@ -116,13 +119,44 @@ export class MergeJobCoordinator {
       try {
         // A cancel is checked before shutdown: a task cancelled before shutdown began ends the job `cancelled` even when
         // the stopped work rejects only after shutdown began (the store's write gate closes after the job is awaited).
-        if ((abort.signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled()) return this.#end(job, abort.signal);
+        const code = (abort.signal.reason as { code?: string } | undefined)?.code;
+        if (code === 'CANCELLED' || code === 'MERGE_CANCELLED' || this.#cancelled()) return this.#end(job, abort.signal);
         if (abort.signal.aborted && this.#closing) return;
         this.#finish(job.id, 'failed', error instanceof Error ? error.message : String(error));
       } catch (unended) { this.#unended(job.id, unended); }
-    }).finally(() => { if (this.#active === run) { this.#active = null; this.#abort = null; } });
-    this.#active = run;
+    }).finally(() => { if (this.#active === run) { this.#active = null; this.#abort = null; this.#activeId = null; } });
+    this.#active = run; this.#activeId = job.id;
     return mergeJobView(job);
+  }
+
+  /**
+   * The merge header's Cancel: stop this job, and its preparation, without cancelling the task. The task keeps its
+   * status and its pull request, and Merge PR may be clicked again. Refused once the job's merge attempt exists (GitHub
+   * has been asked, so stopping could only make its outcome unknown), and for a job that ended or that this server is
+   * not running (one still running on disk after its ending write failed). A repeat of the same cancel answers the job.
+   */
+  cancelMerge(jobId: string): MergeJobView {
+    const { store, config } = this.service, identity = config.identity;
+    if (this.#closing) throw new ShuttingDownError();
+    const job = store.getMergeJob(identity, jobId);
+    if (!job || job.refused) throw new GuardRefusal('There is no such merge to cancel.');
+    if (job.state !== 'running') throw new GuardRefusal('This merge has already ended.');
+    if (this.#activeId !== jobId) throw new GuardRefusal('This merge shows as running until the server restarts; it cannot be cancelled.');
+    const attempt = job.mergeActionId ? store.getMergeAttempt(identity) : null;
+    if (attempt && attempt.actionId === job.mergeActionId) throw new GuardRefusal('GitHub has been asked to merge; wait for its outcome.');
+    // Saved before anything stops, so a restart before the job ends settles it cancelled rather than failed.
+    const saved = store.requestMergeJobCancel(identity, jobId);
+    if (!saved) throw new GuardRefusal('This merge has already ended.');
+    // While a job runs no other preparation can start, so a running preparation is this job's.
+    this.#abort?.abort(Object.assign(new Error(MERGE_CANCELLED), { code: 'MERGE_CANCELLED' }));
+    this.preMerge.stopForMergeCancel();
+    return mergeJobView(saved);
+  }
+
+  /** Record a step of the list for display. A failed write leaves the list behind; it never stops the job. */
+  #step(id: string, name: MergeStepName, state: 'running' | 'done' | 'skipped'): void {
+    try { this.settle(() => this.service.store.markMergeStep(this.service.config.identity, id, name, state)); }
+    catch (error) { console.error(`Could not record merge step ${name} of job ${id}: ${JSON.stringify((error as Error)?.message ?? String(error))}`); }
   }
 
   /** Why this click may not start a job now, or null. A preparation stopping for shutdown throws instead (not definite). */
@@ -189,12 +223,14 @@ export class MergeJobCoordinator {
       request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: reviewVersion, mergeJob: job.id } },
     () => ({ outcome: 'preparing' }));
     const prepared = await this.preMerge.start({ stateVersion: task.stateVersion, reviewVersion,
-      snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, actionId: prepareId });
+      snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, actionId: prepareId },
+    (name, state) => this.#step(job.id, name, state));
     if (signal.aborted || this.#cancelled()) return this.#end(job, signal);
     if (prepared.state !== 'ready')
       return this.#finish(job.id, prepared.state === 'review-required' ? 'review-required' : 'failed', prepared.reason);
     // 2. Wait for GitHub's required checks on the pushed head.
     this.settle(() => store.updateMergeJob(identity, job.id, { step: 'checks' }));
+    this.#step(job.id, 'checks', 'running');
     const verdict = await this.#awaitChecks(job, signal);
     if (verdict.kind === 'cancelled') return this.#end(job, signal);
     // A failing or slow check blocks only while the readiness it was read for still holds (in the block's transaction).
@@ -204,13 +240,15 @@ export class MergeJobCoordinator {
     // The merge's action ID is saved first: after a restart, the attempt carrying it gives the job's outcome.
     const mergeId = randomUUID();
     this.settle(() => store.updateMergeJob(identity, job.id, { step: 'merging', checks: [], mergeActionId: mergeId }));
+    // The guarded merge's validation passes rerun the already-fixed check; the merge step starts when GitHub is asked.
+    this.#step(job.id, 'already-fixed', 'running');
     view = await this.service.load({ signal });
     // The current token, not the click's: a rebase during preparation makes a new snapshot, and so a new token. The
     // readiness the guarded merge requires binds the review version preparation read, so a review change since is refused.
     try {
       // The job's signal stops the guarded merge as shutdown or a deadline stops a click: before GitHub is asked, nothing
       // is applied; after, the outcome is unknown.
-      const merged = await this.merges.merge(view.token, mergeId, signal);
+      const merged = await this.merges.merge(view.token, mergeId, signal, () => this.#step(job.id, 'merge', 'running'));
       // A fulfilled merge does not prove its outcome: when saving it fails, the attempt stays submitting and reconciles
       // from GitHub. This job's own attempt decides, as when the merge rejects. A queue poll that ended the attempt
       // (removed or failed) while GitHub was asked makes the guarded merge reject instead; one ending it after the save is
@@ -255,10 +293,14 @@ export class MergeJobCoordinator {
     const task = this.service.store.getTask(this.service.config.identity);
     return task.status === 'cancelled' || task.cancelRequested !== null;
   }
-  /** A cancelled task ends the job, however the job learned of it; shutdown leaves it running on disk for startup. */
+  /**
+   * A cancelled task ends the job, however the job learned of it; so does a cancel of the merge alone, which leaves the
+   * task as it is. A task cancel wins over an earlier merge cancel. Shutdown leaves the job running on disk for startup.
+   */
   #end(job: MergeJob, signal: AbortSignal): void {
-    if ((signal.reason as { code?: string } | undefined)?.code === 'CANCELLED' || this.#cancelled())
-      this.#finish(job.id, 'cancelled', 'Task cancelled.');
+    const code = (signal.reason as { code?: string } | undefined)?.code;
+    if (code === 'CANCELLED' || this.#cancelled()) this.#finish(job.id, 'cancelled', 'Task cancelled.');
+    else if (code === 'MERGE_CANCELLED') this.#finish(job.id, 'cancelled', MERGE_CANCELLED);
   }
 
   /**

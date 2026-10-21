@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
-import { Store, type PublishRecord } from '../runner/store.ts';
+import { MERGE_CANCELLED, Store, type PublishRecord } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { PreparedAttempt, RunnerCoordinator, RunnerDeps } from '../runner/coordinator.ts';
@@ -1892,6 +1892,38 @@ describe('the one-click merge job (F6b of #22)', () => {
     await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ state: 'merged' }), { timeout: 10_000 });
     expect(gh.merged).toEqual([served.store.getSnapshot(served.identity).head]);
     expect(served.store.getTask(served.identity).status).toBe('merged');
+   }, 60_000);
+
+  it('cancels a running merge job from the merge header without cancelling the task, and refuses a cancel once the job ended', async () => {
+    const w = world(); moveUserHead(w);
+    let storeRef: Store | null = null;
+    const gh = gateway(() => storeRef!, () => [{ context: 'ci', appId: null, state: 'pending' }]);
+    const served = await serve(w, { runnerReview: true, before: mergeableReview, issueGateway, preMerge: preparation, mergeGateway: gh, runnerPublished: true,
+      mergeJobTiming: { checkWaitMs: 600_000, firstDelayMs: 20, maxDelayMs: 50 } });
+    storeRef = served.store; createIdentity = () => served.identity;
+    await publishSettled(served.app, served.identity);
+    const cancel = async (jobId: unknown) => {
+      const response = await fetch(`${new URL(served.app.url).origin}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': served.app.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'cancel-merge', jobId }) });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    expect(await cancel('not-a-uuid')).toMatchObject({ status: 400, body: { error: 'A merge cancel needs the job\'s UUID v4 jobId.' } });
+    const started = await merge(served.app, (await review(served.app)).token);
+    expect(started.status).toBe(200);
+    const id = started.body.job.id;
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ step: 'checks', steps: expect.arrayContaining([{ name: 'checks', state: 'running',
+      startedAt: expect.any(String), endedAt: null }]) }), { timeout: 10_000 });
+    const pullRequests = served.store.taskPullRequests(served.identity);
+    const answered = await cancel(id);
+    expect(answered).toMatchObject({ status: 200, body: { job: { id, cancelRequested: true } } });
+    expect(answered.body.job).not.toHaveProperty('token');
+    await vi.waitFor(async () => expect((await mergeState(served.app)).job).toMatchObject({ id, state: 'cancelled', reason: MERGE_CANCELLED }), { timeout: 10_000 });
+    expect(gh.merged).toEqual([]);
+    expect(served.store.getTask(served.identity)).toMatchObject({ status: 'in review', cancelRequested: null });
+    expect(served.store.taskPullRequests(served.identity)).toEqual(pullRequests);
+    expect(await cancel(id)).toMatchObject({ status: 409, body: { error: 'This merge has already ended.', job: { id, state: 'cancelled' } } });
+    // Merge PR is offered again.
+    expect((await review(served.app)).merge).toMatchObject({ ready: true, action: 'merge' });
    }, 60_000);
 
   it('refuses start and resume while a merge job waits, even after a new plan revision is imported and approved; the import only ends the job failed', async () => {

@@ -118,6 +118,7 @@ function showFailure(message, planStatusOwner) {
   $("approve").hidden = true;
   $("merge").hidden = true;
   $("merge-details").hidden = true;
+  $("merge-steps-bar").hidden = true;
   $("message").disabled = true;
   $("save-note").disabled = true;
   $("previous").disabled = true;
@@ -176,6 +177,7 @@ function renderMerge() {
   const merge = data?.merge;
   $("merge").hidden = !merge?.available;
   $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
+  renderMergeSteps();
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
   if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
@@ -237,7 +239,8 @@ function scheduleMergePoll() {
   mergePollTimer = null;
   const queue = data?.merge?.queue;
   const job = data?.merge?.job;
-  const state = job?.state === "running" ? `job:${job.step}` : queue?.state;
+  // A new step of the list polls quickly again, as a new job step does.
+  const state = job?.state === "running" ? `job:${job.step}:${job.steps?.find(step => step.state === "running")?.name ?? ""}` : queue?.state;
   if (job?.state === "running" || (queue?.kind === "queue" && ["submitting", "queued"].includes(state))) {
     if (state !== mergePollState) {
       mergePollState = state;
@@ -277,8 +280,16 @@ async function pollMergeQueue(generation) {
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
       // a background reload would erase the person's selection and input; Refresh shows the outcome.
       const job = update.job;
+      // A poll read before a cancel's answer was adopted must not restore the older record of the same job.
+      if (job?.id === data.merge.job.id && job.revision < data.merge.job.revision) {
+        backOffMergePoll();
+        renderMerge();
+        return;
+      }
       if (job?.state === "running") {
-        const changed = job.step !== data.merge.job.step || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
+        // Any saved change (a step, the waiting checks, a cancel) is a later revision of the record.
+        const changed = job.revision !== data.merge.job.revision || job.step !== data.merge.job.step
+          || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
         data = { ...data, merge: { ...data.merge, job } };
         $("banner").textContent = mergeJobText(job);
         if (!changed) backOffMergePoll();
@@ -306,6 +317,7 @@ async function pollMergeQueue(generation) {
   }
 }
 function mergeJobText(job) {
+  if (job.state === "running" && job.cancelRequested) return "Cancelling the merge. The task and its pull request stay open.";
   if (job.state === "running") return job.step === "checks"
     ? `Waiting for required checks${job.checks.length ? `: ${job.checks.map(check => `${check.context} is ${check.state}`).join(", ")}` : ""}.`
     : job.step === "merging" ? "Merging the reviewed head." : "Preparing the merge: refresh, rebase, push and command checks.";
@@ -316,13 +328,77 @@ function mergeJobText(job) {
     blocked: `Approved, merge blocked. ${job.reason ?? "Retry merge when ready."}`,
     "review-required": `Review needed before merging. ${job.reason ?? ""}`.trim(),
     // A failed job's reason says why (and anything to do first); the next step is always to merge again, said once here.
-    failed: `Merge stopped.${job.reason ? ` ${job.reason}` : ""} Merge again when ready.`, cancelled: "Merge cancelled.",
+    failed: `Merge stopped.${job.reason ? ` ${job.reason}` : ""} Merge again when ready.`,
+    // A cancel of the merge alone says the task stays open; a cancelled task needs no more words.
+    cancelled: job.reason && job.reason !== "Task cancelled." ? `Merge cancelled. ${job.reason}` : "Merge cancelled.",
   }[job.state] ?? job.state;
 }
 /** The running job's step, as the Merge control and its status dialog name it. */
 function mergeJobStepLabel(job) {
+  if (job.cancelRequested) return "Cancelling…";
   return { preparing: "Preparing…", checks: "Waiting for checks…", merging: "Merging…" }[job.step] ?? "Merging…";
 }
+// The design's merge step list (D16). Each state is an icon, a word and a color (DESIGN.md).
+const mergeStepNames = { fetch: "Fetch", rebase: "Rebase", push: "Push", commands: "Re-run checks", checks: "GitHub checks",
+  "already-fixed": "Already-fixed check", merge: "Merge" };
+const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running"], done: ["✓", "Done"], skipped: ["–", "Skipped"],
+  failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
+let mergeCancelPending = false;
+let mergeStepTimer = null;
+function mergeStepElapsed(step, now = Date.now()) {
+  if (!step.startedAt) return "";
+  const ms = Math.max(0, (step.endedAt ? Date.parse(step.endedAt) : now) - Date.parse(step.startedAt));
+  const seconds = Math.floor(ms / 1000);
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${String(seconds % 60).padStart(2, "0")} s`;
+}
+/**
+ * The step list under the review strip, with Cancel, while a job runs and after the page saw it end (until Refresh).
+ * A job saved before step lists existed has none: the control and banner say its step, as before.
+ */
+function renderMergeSteps() {
+  const job = data?.merge?.available ? data.merge.job : null;
+  const ended = data?.merge?.blockers?.some(blocker => blocker.code === "job-refresh");
+  const shown = !!job?.steps && (job.state === "running" || ended);
+  $("merge-steps-bar").hidden = !shown;
+  if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
+  if (!shown) return;
+  $("merge-steps").innerHTML = job.steps.map(step => {
+    const [icon, word] = mergeStepStates[step.state] ?? ["?", step.state];
+    const elapsed = mergeStepElapsed(step);
+    return `<li class="merge-step merge-step-${esc(step.state)}" aria-label="${esc(`${mergeStepNames[step.name] ?? step.name}: ${word}${elapsed ? `, ${elapsed}` : ""}`)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word" aria-hidden="true">${word}</span>${elapsed ? ` <span class="mono muted" aria-hidden="true">${elapsed}</span>` : ""}</li>`;
+  }).join("");
+  const cancel = $("merge-cancel");
+  cancel.hidden = job.state !== "running";
+  // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
+  const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
+  const blocked = asked || job.cancelRequested || mergeCancelPending;
+  if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
+  cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancelling…" : "Cancel merge";
+  cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
+  if (job.state === "running" && !mergeStepTimer) mergeStepTimer = setInterval(renderMergeSteps, 1000);
+}
+$("merge-cancel").onclick = async () => {
+  const job = data?.merge?.job;
+  if (!job || job.state !== "running" || $("merge-cancel").getAttribute("aria-disabled") === "true") return;
+  mergeCancelPending = true;
+  renderMergeSteps();
+  const adopt = answered => {
+    // Only a later record of the job shown: the poll owns every other change, as it does for the job's own progress.
+    const shownJob = data?.merge?.job;
+    if (!answered || shownJob?.id !== answered.id || !(answered.revision > shownJob.revision)) return;
+    mergeObservationGeneration++;
+    data = { ...data, merge: { ...data.merge, job: answered } };
+    if (answered.state === "running") $("banner").textContent = mergeJobText(answered);
+  };
+  try { adopt((await api("/api/action", { action: "cancel-merge", jobId: job.id })).job); }
+  catch (error) {
+    adopt(error.job);
+    $("banner").textContent = `Could not cancel the merge. ${error.message}`;
+  } finally {
+    mergeCancelPending = false;
+    renderMerge();
+  }
+};
 const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge", "job-refresh"]);
 /** Outcomes of a job that asked GitHub to merge, which it does only once no blocker remains. */
 const mergeJobReachedMerge = new Set(["merged", "queued", "submitted"]);

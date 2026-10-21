@@ -216,6 +216,47 @@ pre {
 #issue {
   margin-left: 16px;
 }
+.merge-steps {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.merge-steps ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+#merge-cancel {
+  margin-left: auto;
+}
+.merge-step .mark,
+.merge-step .word {
+  color: var(--neutral);
+}
+.merge-step-running .mark,
+.merge-step-running .word {
+  color: var(--text);
+}
+.merge-step-done .mark,
+.merge-step-done .word {
+  color: var(--success);
+}
+.merge-step-failed .mark,
+.merge-step-failed .word {
+  color: var(--error);
+}
+.merge-step-stopped .mark,
+.merge-step-stopped .word,
+.merge-step-unknown .mark,
+.merge-step-unknown .word {
+  color: var(--warning);
+}
 #progress {
   margin-left: auto;
 }
