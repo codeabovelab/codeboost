@@ -117,7 +117,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
     ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
-    ['test: removing container nospace: docker printed what is not JSON:', '"nospace"\n'],
+    ['test: removing container nospace: docker printed no ID and name:', '"nospace"\n'],
     ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
     ['test: removing container --help: refused a name that could read as an option'],
     ['test: removing volume -v: refused a name that is not a volume name Docker allows'],
@@ -278,12 +278,13 @@ it('reports a holder line that is not an ID and networks, and removes no holder 
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${'a'.repeat(64)}; exit 0; fi`,
-    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null' '"--all" {"swept":{}}'; exit 0; fi`, 'exit 0'].join('\n'),
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null' '"--all" {"swept":{}}' '"${'a'.repeat(64)}"'; exit 0; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '123 null']);
   expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '"--all" {"swept":{}}']);
+  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', `"${'a'.repeat(64)}"`]);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
 });
 
@@ -340,10 +341,19 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
 
 it('gives every docker call its time limit, killed with SIGKILL: 30 s for the removals, 60 s for objectExists', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  // Answers as Docker 27.4 does for an `ls` with no match and an inspect of a missing container; only the options each
-  // call is given are checked.
-  writeFileSync(join(root, 'docker'), ['#!/bin/sh',
-    'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+  const net = 'f'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64), labelled = 'c'.repeat(64), volumeHolder = 'e'.repeat(64);
+  // The loaded-daemon test's answers, so every call the two make runs (13), plus an inspect of a missing container for
+  // objectExists; only the options each call is given are checked.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', 'for arg; do last="$arg"; done',
+    `if [ "$1 $2 $3" = "container inspect x" ]; then echo; echo 'Error response from daemon: No such container: x' >&2; exit 1; fi`,
+    `if [ "$1 $2" = "container ls" ]; then printf '%s\\n' ${labelled}; exit 0; fi`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' swept-volume; exit 0; fi`,
+    `if [ "$1" = ps ] && [ "$last" = volume=swept-volume ]; then printf '%s\\n' ${volumeHolder}; exit 0; fi`,
+    `if [ "$1" = ps ]; then printf '%s\\n' ${holder}; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ] && [ "$last" = x ]; then printf '%s\\n' '"${named}" "/x"'; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '"${holder}" {"swept":{}}'; exit 0; fi`,
+    'exit 0'].join('\n'),
   { mode: 0o755 });
   const options: { timeout?: number; killSignal?: unknown }[] = [];
   vi.doMock('node:child_process', async original => {
@@ -357,12 +367,29 @@ it('gives every docker call its time limit, killed with SIGKILL: 30 s for the re
   vi.resetModules();
   try {
     const fresh = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     fresh.removeByName('container', 'x', 'test', join(root, 'docker'));
     fresh.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
     const removals = options.length;
     expect(fresh.objectExists('container', 'x')).toBe(false);
-    expect(removals).toBeGreaterThan(3);
+    // removeByName's inspect and removal, and the sweep's eleven calls.
+    expect(removals).toBe(13);
     expect(options.slice(0, removals).every(given => given.timeout === 30_000 && given.killSignal === 'SIGKILL')).toBe(true);
     expect(options.slice(removals)).toMatchObject([{ timeout: 60_000, killSignal: 'SIGKILL' }]);
   } finally { vi.doUnmock('node:child_process'); vi.resetModules(); }
+});
+
+it('reports and skips a holder search line that is not a container ID, so none becomes an option', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls');
+  // One swept volume, whose holder search prints a line Docker 27.4 is not known to print; every other call gets no
+  // output and exit 0, as for `ls` with no match.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' swept-volume; exit 0; fi`,
+    `if [ "$1" = ps ]; then printf '%s\\n' '--all'; exit 0; fi`, 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(warn.mock.calls).toContainEqual(['test: finding holders: docker printed a line that is not a container ID:', '--all']);
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
 });

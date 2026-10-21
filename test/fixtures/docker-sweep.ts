@@ -84,7 +84,9 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
   let id: unknown, actual: unknown;
   try {
     const at = found.stdout.indexOf(' ');
-    if (kind !== 'volume' && at < 0) throw new Error('no space');
+    if (kind !== 'volume' && at < 0) {
+      console.warn(`${when}: removing ${kind} ${name}: docker printed no ID and name:`, found.stdout); return;
+    }
     [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
   } catch { console.warn(`${when}: removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
   // A container's or network's ID is checked too, as it is passed on as an argument.
