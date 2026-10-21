@@ -49,7 +49,7 @@ const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
 /**
  * Put, beside its test-run ID, on every object the `withoutRunnerLabel` wrapper makes and on the holder test's swept
- * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `volumes`).
+ * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`, `volumes`).
  */
 const TEST_FILE_RUN = randomUUID();
 /** Networks a test makes without this run's runner label, removed by name in afterAll as `volumes` are. */
@@ -175,7 +175,7 @@ afterAll(async () => {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test makes
     // under another owner or without the runner label are not found here, unless they hold one of this run's volumes or
     // networks: those this file labels with its own run ID are found by the file-label sweep, the try above removes
-    // those tracked by name (`containers`, `volumes`), and the other tests remove their own. It may not run before a
+    // those tracked by name (`containers`, `networks`, `volumes`), and the other tests remove their own. It may not run before a
     // hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup before them.
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
@@ -789,7 +789,7 @@ describe('real Docker agent isolation', () => {
         make('container', named('bystander'), 'create', '--mount', `type=volume,source=${bystanderVolume},target=/x`, '--entrypoint', 'true', imageId)];
       const network = make('network', named('swept'), 'create', '--label', label, '--label', fileLabel);
       // Named like the start of the bystander network's ID: Docker's network filter also matches that prefix.
-      make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label, '--label', fileLabel);
+      const prefixNamed = make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label, '--label', fileLabel);
       const volume = make('volume', named('swept'), 'create', '--label', label, '--label', fileLabel);
       // And a bystander named like the start of the swept network's ID: removing by a short ID would remove it.
       const lookalike = make('network', network.slice(0, 12), 'create');
@@ -822,7 +822,7 @@ describe('real Docker agent isolation', () => {
       removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
-      expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
+      expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);
       expect(exists('container', labelled)).toBe(false);
       for (const bystander of [...bystanders, holderLookalike, labelledLookalike]) expect(exists('container', bystander)).toBe(true);
       expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
@@ -925,12 +925,14 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), allocationId = randomUUID();
     // The network carries another runner's label, so no sweep of this run finds it: removed by its allocation (#189).
     sweepWhenFinished('io.codeboost.allocation', allocationId);
-    // The create lands with another runner's label, and its client is killed before it reports the ID.
+    // The create lands with another runner's label, and its client is killed before it reports the ID. Only this
+    // allocation's: should the test time out with the shim still on PATH, other tests' creates pass through.
     const foreign = [
+      `if (!args.includes('io.codeboost.allocation=${allocationId}')) result = run(args); else {`,
       `const at = args.findIndex(arg => arg.startsWith('io.codeboost.runner='));`,
       `args[at] = 'io.codeboost.runner=${'f'.repeat(32)}';`,
       'result = run(args);',
-      "process.kill(process.pid, 'SIGKILL');",
+      "process.kill(process.pid, 'SIGKILL'); }",
     ].join('\n');
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));

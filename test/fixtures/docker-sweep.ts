@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { RUNNER_LABEL } from '../../agents/labels.ts';
 
 /**
@@ -23,16 +23,25 @@ export const TEST_FILE_LABEL = 'io.codeboost.test-file';
 
 /**
  * Removes the container, network or volume named exactly `name`, by its full ID (a volume by its name, which is its
- * ID). Docker would read a missing name as an ID prefix, so an object found under another name is left alone. Never
- * throws; each call has a 30 s limit.
+ * ID). Docker would read a missing name as an ID prefix, so an object found under another name is left alone. It
+ * reports a failed call, other than an inspect that finds no such object, and never throws; each call has a 30 s limit.
  */
 export function removeByName(kind: 'container' | 'network' | 'volume', name: string, docker = REAL_DOCKER): void {
   const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const };
-  const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{.Name}}' : '{{.Id}} {{.Name}}', name], options);
-  if (found.status !== 0 || found.error) return;
-  const [id, actual] = kind === 'volume' ? [name, found.stdout.trim()] : found.stdout.trim().split(' ');
-  if (actual?.replace(/^\//, '') !== name || !id) return;
-  spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
+  const failed = (result: SpawnSyncReturns<string>, what: string) => console.warn(`removing ${kind} ${name}: docker ${what} failed:`,
+    result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
+  // As JSON: a network's name may hold spaces.
+  const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name], options);
+  // Docker 27.4's answers for a missing object: "No such container", "network … not found", "no such volume".
+  if (found.error || found.status !== 0) { if (found.status === null || !/no such|not found/i.test(found.stderr)) failed(found, 'inspect'); return; }
+  let id: unknown, actual: unknown;
+  try {
+    const at = found.stdout.indexOf(' ');
+    [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
+  } catch { console.warn(`removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
+  if (typeof id !== 'string' || typeof actual !== 'string' || actual.replace(/^\//, '') !== name) return;
+  const removed = spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
+  if (removed.error || removed.status !== 0) failed(removed, `${kind} rm`);
 }
 
 /**

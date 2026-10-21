@@ -42,8 +42,9 @@ const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string 
 afterAll(async () => {
   try {
     for (const { kind, name, file } of unlabelled) {
-      const ref = name ?? (file && existsSync(file) ? readFileSync(file, 'utf8') : '');
-      if (ref) removeByName(kind, ref);
+      // A record holds one name per line: should a test time out with its shim still on PATH, later creates add theirs.
+      for (const ref of name ? [name] : file && existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [])
+        removeByName(kind, ref);
     }
     if (network) await removeVendorNetwork(network);
   }
@@ -105,7 +106,7 @@ describe('vendor-only egress', () => {
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
-        + `printf %s "$last" > '${recorded}'; '${realDocker}' network create "$last" >/dev/null; `
+        + `printf '%s\\n' "$last" >> '${recorded}'; '${realDocker}' network create "$last" >/dev/null; `
         + `echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-network-${randomUUID()}`,
@@ -118,13 +119,12 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
-      foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      foreign = made[0] ?? '';
       // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      if (foreign) unlabelled.push({ kind: 'network', name: foreign });
-      if (foreign) {
-        survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-        spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
-      }
+      for (const name of made) unlabelled.push({ kind: 'network', name });
+      if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+      for (const name of made) removeByName('network', name);
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
@@ -164,7 +164,7 @@ describe('vendor-only egress', () => {
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
-        + `printf %s "$3" > '${recorded}'; '${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; fi`,
+        + `printf '%s\\n' "$3" >> '${recorded}'; '${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-proxy-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
@@ -176,13 +176,12 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
-      foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      foreign = made[0] ?? '';
       // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      if (foreign) unlabelled.push({ kind: 'container', name: foreign });
-      if (foreign) {
-        survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-        spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
-      }
+      for (const name of made) unlabelled.push({ kind: 'container', name });
+      if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+      for (const name of made) removeByName('container', name);
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
@@ -219,7 +218,7 @@ describe('vendor-only egress', () => {
       `  label=$('${realDocker}' inspect -f '{{index .Config.Labels "io.codeboost.egress"}}' "$2")`,
       `  '${realDocker}' rm --force "$2" >/dev/null`,
       // Recorded before the stand-in exists, so the test can remove it even if the run is cut short.
-      `  printf %s "$name" > '${recorded}'`,
+      `  printf '%s\\n' "$name" >> '${recorded}'`,
       `  '${realDocker}' run --detach --name "$name" --label "io.codeboost.egress=$label" --entrypoint sleep ${imageId} 300 >/dev/null`,
       '  exit 1', 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const failing = captureInvocation({ ...invocation, attemptId: `failed-setup-${randomUUID()}`,
@@ -232,13 +231,12 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
-      impostor = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      impostor = made[0] ?? '';
       // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      if (impostor) unlabelled.push({ kind: 'container', name: impostor });
-      if (impostor) {
-        survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
-        spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
-      }
+      for (const name of made) unlabelled.push({ kind: 'container', name });
+      if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
+      for (const name of made) removeByName('container', name);
       rmSync(shim, { recursive: true, force: true });
     }
     expect(impostor).toMatch(/^codeboost-proxy-/);
