@@ -514,18 +514,18 @@ describe('the planning check (#164)', () => {
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    // Claude's check passes at 1 s, after the vendor changed; Codex's never ends.
+    // Claude's check passes at 2 s, after the vendor changed; Codex's never ends.
     const check = new PlanningCheck(probed => new Promise<void>(resolve => {
-      if (probed === 'claude') setTimeout(resolve, 1_000);
-    }), () => vendor, { waitMs: 1_200 });
+      if (probed === 'claude') setTimeout(resolve, 2_000);
+    }), () => vendor, { waitMs: 2_200 });
     const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
     await new Promise(resolve => setTimeout(resolve, 100));
     vendor = 'codex';
-    // One deadline ends the wait at 1.2 s; a fresh 1.2 s for Codex would end it at 2.2 s.
+    // One deadline ends the wait at 2.2 s; a fresh 2.2 s for Codex would end it at 4.2 s.
     const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toContain('still checking');
-    expect(performance.now() - started).toBeLessThan(1_900);
+    expect(performance.now() - started).toBeLessThan(3_500);
     await check.close(10);
   });
 
@@ -542,7 +542,7 @@ describe('the planning check (#164)', () => {
     const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry shortly.`);
+    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent\\. .* Retry shortly\\.$`));
     expect(issueAccess).not.toHaveBeenCalled();
     pass();
     await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });

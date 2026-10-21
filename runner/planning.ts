@@ -91,7 +91,8 @@ export const PLANNING_CHECK_CLOSE_MS = 20_000;
 type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number };
   abort: AbortController; replaced?: boolean };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
-const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry shortly.`;
+const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. The first check after `
+  + 'codeboost starts can take several minutes while the agent image is built. Retry shortly.';
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : `${Math.max(1, Math.round(ms / 1_000))} s`;
 /**
  * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at
@@ -109,8 +110,9 @@ export class PlanningCheck {
   readonly #abort = new AbortController();
   readonly #running = new Set<Promise<void>>();
   #current?: Check;
-  // Settles when `#current` is replaced, so a request waiting on an older check moves to the new one at once.
-  #replaced = Promise.withResolvers<void>();
+  // Tells a request waiting on an older check that `#current` was replaced, so it moves to the new one at once. A
+  // listener, removed when the wait ends, so no settled request stays attached.
+  readonly #events = new EventTarget();
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
     options: { recheckMs?: number; waitMs?: number } = {}) {
     this.#probe = probe; this.#vendor = vendor;
@@ -151,8 +153,7 @@ export class PlanningCheck {
     this.#running.add(done);
     void done.finally(() => this.#running.delete(done));
     this.#current = check;
-    this.#replaced.resolve();
-    this.#replaced = Promise.withResolvers<void>();
+    this.#events.dispatchEvent(new Event('replaced'));
     return check;
   }
   /**
@@ -166,15 +167,20 @@ export class PlanningCheck {
       const vendor = this.#vendor();
       if (!vendor) return;
       const check = this.#check(vendor);
-      let release!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
-      const stopped = new Promise<'timeout'>((resolve, reject) => {
+      // A settled check gives its verdict at once.
+      if (check.passed || check.failure) return this.#verdict(check);
+      let release!: () => void, moved!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
+      const stopped = new Promise<'timeout' | 'replaced'>((resolve, reject) => {
         release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true });
+        moved = () => resolve('replaced'); this.#events.addEventListener('replaced', moved, { once: true });
         timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - performance.now()));
       });
       if (signal.aborted) release();
-      let outcome: void | 'timeout';
-      try { outcome = await Promise.race([check.done, this.#replaced.promise, stopped]); }
-      finally { signal.removeEventListener('abort', release); clearTimeout(timer); }
+      let outcome: void | 'timeout' | 'replaced';
+      try { outcome = await Promise.race([check.done, stopped]); }
+      finally {
+        signal.removeEventListener('abort', release); this.#events.removeEventListener('replaced', moved); clearTimeout(timer);
+      }
       if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
       // Settings changed while this request waited, or its check was replaced (the vendor changed and changed back):
       // check the vendor it will run with, within the same wait.
@@ -194,7 +200,7 @@ export class PlanningCheck {
     if (!vendor) return;
     const covering = this.#covering(vendor);
     if (covering) return this.#verdict(covering);
-    // The vendor chosen then, which Settings may have changed again since.
+    // Checks the vendor chosen when this runs, which Settings may have changed since the refusal.
     setImmediate(() => {
       // Never throws: an exception here would end the process. A Store that cannot be read starts nothing.
       try { const now = this.#vendor(); if (now) this.#check(now); } catch { /* stopping, or no Store: nothing to start */ }

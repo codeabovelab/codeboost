@@ -58,4 +58,15 @@ describe('planning in the agent container', () => {
       expect(docker(kind, 'ls', ...(kind === 'container' ? ['-a'] : []), '--quiet', '--filter', `label=io.codeboost.runner=${owner}`).stdout.trim(), kind).toBe('');
     expect(existsSync(`${realpathSync(service.config.database)}.planning-leftovers.json`)).toBe(false);
   }, 11 * 60_000);
+
+  // #164: the check's own prompt and schema, answered by the real Claude service. Runs in the Live probes workflow.
+  it.runIf(process.env.CODEBOOST_RUN_AUTH_PROBES === '1')('passes the planning check with a real sign-in (live Claude)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-planning-')); roots.push(root);
+    const service = new ReviewService(createDemo(join(root, 'demo'))); services.push(service);
+    owners.push(service.store.planningOwnerToken(statSync(realpathSync(service.config.database), { bigint: true })));
+    const agent = new PlanningAgent(service, { env: { CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN } });
+    try { await expect(agent.probe('claude', new AbortController().signal)).resolves.toBeUndefined(); }
+    finally { await agent.close(); }
+    expect(existsSync(`${realpathSync(service.config.database)}.planning-leftovers.json`)).toBe(false);
+  }, 11 * 60_000);
 });

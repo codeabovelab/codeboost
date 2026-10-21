@@ -104,12 +104,15 @@ running after the wait; the server records the refusal and starts no agent.
 Requests within a minute of a failure are refused with it; the next request after
 that checks again. With no vendor chosen nothing is checked, and the request is
 refused later, as before. Shutdown cancels a running check and waits up to 20 s
-for it before closing the worker. If startup fails after planning's setup, the
-process exits, and the next start's planning recovery removes what the check left.
-Tests: `test/planning-production.test.ts` ("the planning check (#164)", with a
-check that passes, one that fails and one that does not finish),
+for it before closing the worker; that wait comes after the server's own 20 s
+grace for planning requests, so the two add up. If startup fails after planning's
+setup, the process exits, and the next start's planning recovery removes what the
+check left. Tests: `test/planning-production.test.ts` ("the planning check
+(#164)", with a check that passes, one that fails and one that does not finish),
 `test/planning-worker.test.ts` (the check in planning's worker, including a wrong
-answer) and `test/agent-planning.test.ts` (against the vendor, real Docker).
+answer) and `test/agent-planning.test.ts` (against the vendor, real Docker: an
+invalid sign-in fails, and a live probe in the Live probes workflow passes with a
+real one).
 
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now
