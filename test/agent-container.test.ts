@@ -704,7 +704,9 @@ describe('real Docker agent isolation', () => {
   // holds one of this run's volumes or networks, and such a volume or network never, so the wrapper labels it with a
   // test-run ID and this file's run ID instead (#189). Whatever has that ID is removed when the test finishes (Vitest
   // runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails` pair below tests the failure), and again
-  // in afterAll, for a create that lands after a timed-out test's removal (its body runs on).
+  // in afterAll, for a create that lands after a timed-out test's removal (its body runs on). A timed-out test leaves the
+  // wrapper on PATH while its body runs on, so a later test's matching create is unlabelled too and that test fails;
+  // what it makes carries this file's run ID, so afterAll removes it.
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
@@ -913,10 +915,11 @@ describe('real Docker agent isolation', () => {
     try { return await run(); } finally { process.env.PATH = path; }
   };
   // After our create, another process creates a volume carrying the same allocation ID: both passed the check first.
-  const racer = (name: string) => [
+  // Only for this allocation's create: should the test time out with the shim still on PATH, other creates pass through.
+  const racer = (name: string, allocationId: string) => [
     'result = run(args);',
-    "const allocation = args.find(arg => arg.startsWith('io.codeboost.allocation='));",
-    `run(['volume', 'create', '--label', 'io.codeboost.runner=${'f'.repeat(32)}', '--label', allocation, '${name}']);`,
+    `if (args.includes('io.codeboost.allocation=${allocationId}'))`,
+    `  run(['volume', 'create', '--label', 'io.codeboost.runner=${'f'.repeat(32)}', '--label', 'io.codeboost.allocation=${allocationId}', '${name}']);`,
   ].join('\n');
 
   it('backs out of task storage when a concurrent process claims the same allocation ID', async () => {
@@ -924,7 +927,7 @@ describe('real Docker agent isolation', () => {
     // Tracked for afterAll should the test time out: the rival carries another runner's label (#189).
     volumes.add(rival);
     try {
-      await withDockerShim(['volume', 'create'], racer(rival), () => expect(() => prepareTaskFilesystems(data.clone,
+      await withDockerShim(['volume', 'create'], racer(rival, owner.allocationId), () => expect(() => prepareTaskFilesystems(data.clone,
         { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 },
         imageId, owner)).toThrow('still labels a Docker object'));
       expect(byAllocation(owner.allocationId)).toEqual([rival]);
@@ -936,7 +939,7 @@ describe('real Docker agent isolation', () => {
     // Tracked for afterAll should the test time out: the rival carries another runner's label (#189).
     volumes.add(rival);
     try {
-      await withDockerShim(['network', 'create'], racer(rival), () => expect(createVendorNetwork(
+      await withDockerShim(['network', 'create'], racer(rival, allocationId), () => expect(createVendorNetwork(
         invocation(data.clone, 'planning'), imageId, allocationId)).rejects.toThrow('still labels a Docker object'));
       expect(byAllocation(allocationId)).toEqual([rival]);
     } finally { spawnSync('docker', ['volume', 'rm', '--force', rival], { stdio: 'ignore' }); }
