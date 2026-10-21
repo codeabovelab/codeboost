@@ -26,3 +26,15 @@ it('skips output that is not a network, reports what is not JSON, and never thro
   // Nothing it could not read is removed or looked up as a holder.
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);
 });
+
+it('reads nothing from a docker call that was killed, whose output may be cut short', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls');
+  // A well-formed network line, then the client is killed before it exits by itself (as at the 30 s limit).
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${'a'.repeat(64)}","Name":"swept"}'; kill -9 $$; fi`, 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|network rm) /.test(line))).toEqual([]);
+});

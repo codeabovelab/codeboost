@@ -15,7 +15,7 @@ import { attemptRef, openRunnerRepository } from '../runner/runner-repository.ts
 import { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import { createTaskWorkspace } from '../runner/workspace.ts';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit as git } from './fixtures/git.ts';
 
 // F2b against the real lane D (#87): each item runs in fresh task storage cloned from the runner-owned repository, an
@@ -165,7 +165,7 @@ describe('task storage path identity (#162)', () => {
   // run from another checkout) or a container a dead runner left behind does not count.
   async function watchedProbe() {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')); roots.push(shim);
-    const names = join(shim, 'names'), realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const names = join(shim, 'names'), realDocker = requireRealDocker();
     // Not a fake: it records the argument after each separate `--name` (the form the probe uses; if that changed, no name
     // is recorded and the test fails) and runs the real docker with the same arguments, so every exit status, stdout
     // and stderr the probe reads is Docker's own.

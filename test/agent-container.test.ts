@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { REAL_DOCKER, removeLabelledObjects, removeRunnerObjects, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { REAL_DOCKER, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -60,7 +60,8 @@ const volumes = new Set<string>();
 /**
  * For an async test that makes objects under another runner's owner, or its own random one, which no afterAll sweep
  * finds: removes what carries `label=value` when the test finishes, passed, failed or timed out (a timed-out body runs
- * on, and its finally may never run), with the sweep's own 6-minute budget (#189).
+ * on, and its finally may never run), with the sweep's own 6-minute budget (#189). Not covered: an object a timed-out
+ * body makes after this sweep has run.
  */
 const sweepWhenFinished = (label: string, value: string) =>
   onTestFinished(() => removeLabelledObjects(label, value, 'onTestFinished'), 6 * 60_000);
@@ -170,8 +171,9 @@ afterAll(async () => {
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
-    // volumes or networks: those this file labels with its own run ID are found by it, and the other tests remove their
-    // own. It may not run before a hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup
+    // volumes or networks: those this file labels with its own run ID are found by it, the try above removes those
+    // tracked by name (`containers`, `volumes`), and the other tests remove their own. It may not run before a hook
+    // timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup
     // before them.
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
@@ -574,7 +576,7 @@ describe('real Docker agent isolation', () => {
   it('releases a killed create once its settle window passes with no container', async () => {
     const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
-    const realDocker = REAL_DOCKER;
+    const realDocker = requireRealDocker();
     // The create client hangs until its deadline kills it, so the daemon outcome stays unknown.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = create ]; then exec sleep 30; fi',
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -593,7 +595,7 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const created = join(shim, 'created'), failed = join(shim, 'failed');
-    const realDocker = REAL_DOCKER;
+    const realDocker = requireRealDocker();
     // The create client hangs until killed, and the first inspect after it fails for an unrelated reason, so the
     // create path gives up early, inside the settle window.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -707,7 +709,7 @@ describe('real Docker agent isolation', () => {
     onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 6 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = REAL_DOCKER;
+    const realDocker = requireRealDocker();
     writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
       "const { spawnSync } = require('node:child_process');",
       'const args = process.argv.slice(2);',
@@ -811,7 +813,7 @@ describe('real Docker agent isolation', () => {
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
       mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-      const realDocker = REAL_DOCKER;
+      const realDocker = requireRealDocker();
       writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -872,7 +874,7 @@ describe('real Docker agent isolation', () => {
   const withDockerShim = async <T>(prefix: string[], script: string, run: () => Promise<T> | T): Promise<T> => {
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-shim-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = REAL_DOCKER;
+    const realDocker = requireRealDocker();
     writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
       "const { spawnSync } = require('node:child_process');",
       'const args = process.argv.slice(2);',
@@ -896,6 +898,8 @@ describe('real Docker agent isolation', () => {
 
   it('backs out of task storage when a concurrent process claims the same allocation ID', async () => {
     const data = fixture(), owner = testOwner('storage-race'), rival = `codeboost-race-${randomUUID()}`;
+    // Tracked for afterAll should the test time out: the rival carries another runner's label (#189).
+    volumes.add(rival);
     try {
       await withDockerShim(['volume', 'create'], racer(rival), () => expect(() => prepareTaskFilesystems(data.clone,
         { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 },
@@ -928,10 +932,9 @@ describe('real Docker agent isolation', () => {
     ].join('\n');
     const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--no-trunc', '--filter',
       `label=io.codeboost.allocation=${allocationId}`], { encoding: 'utf8' }).stdout?.trim() ?? '';
-    let left = '';
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    left = listed();
+    const left = listed();
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
     expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
@@ -2584,7 +2587,7 @@ describe('real Docker agent isolation', () => {
       '--filter', `label=io.codeboost.runner=${TEST_RUNNER_OWNER}`).split('\n').filter(Boolean));
     const before = keepers();
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
-    const realDocker = REAL_DOCKER;
+    const realDocker = requireRealDocker();
     // The keeper's create client hangs until killed, and the real create lands in the daemon afterwards.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ]; then ( sleep 10; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,

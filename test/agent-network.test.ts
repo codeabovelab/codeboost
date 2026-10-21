@@ -9,7 +9,7 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { REAL_DOCKER, removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { REAL_DOCKER, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
@@ -50,10 +50,10 @@ afterAll(async () => {
   }
   finally {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
-    // makes without the runner label are found here only while they hold one of this run's networks or volumes; those
-    // tests remove their own. It may not run before a hook timeout.
-    // The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for the
-    // cleanup before it.
+    // makes without the runner label are found here only while they hold one of this run's networks or volumes; the
+    // tests remove their own, and the try above removes those registered in `unlabelled`. It may not run before a hook
+    // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
+    // the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 7 * 60_000);
@@ -61,7 +61,7 @@ afterAll(async () => {
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // Every network operation hangs, so both setup and cleanup can only end by deadline.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = network ]; then exec sleep 30; fi',
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -74,7 +74,7 @@ describe('vendor-only egress', () => {
 
   it('removes a network that lands in the daemon after its create client was killed', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), requested = join(shim, 'network-name');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The create client hangs until killed, and the real create lands after that, inside the cleanup reserve.
     // The shim records this test's network name, since other suites may create egress networks concurrently.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -100,7 +100,7 @@ describe('vendor-only egress', () => {
   it('leaves a same-named network alone when the daemon refuses the create', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
     unlabelled.push({ kind: 'network', file: recorded });
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
@@ -133,7 +133,7 @@ describe('vendor-only egress', () => {
 
   it('removes a proxy that was created even though its start failed', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'proxy');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The proxy container is created, then its start fails: a container this allocation owns by ID.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = start ] && [ "$2" != --attach ]; then printf %s "$2" > '${recorded}'; `
@@ -157,7 +157,7 @@ describe('vendor-only egress', () => {
   it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
     unlabelled.push({ kind: 'container', file: recorded });
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
@@ -207,7 +207,7 @@ describe('vendor-only egress', () => {
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
     unlabelled.push({ kind: 'container', file: recorded });
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
       `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" | sed 's#^/##')`,

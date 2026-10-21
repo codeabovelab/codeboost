@@ -1,11 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { REAL_DOCKER, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput } from '../agents/adapters/codex.ts';
 import { ACKNOWLEDGEMENT_SCRIPT, isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
@@ -332,7 +332,7 @@ describe('container invocation supervisor', () => {
   const hangingDocker = (match: string) => {
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-slow-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', `case "$*" in ${match}) exec sleep 60;; esac`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     return `${shim}:${process.env.PATH}`;
@@ -387,6 +387,8 @@ describe('container invocation supervisor', () => {
 
   it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
+    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); });
     try {
       // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
@@ -440,6 +442,8 @@ describe('container invocation supervisor', () => {
   it('releases only the profile when rejecting before creation, even if its name is held elsewhere', async () => {
     const current = await profile(fixture(), 'noop');
     // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
+    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); });
     try {
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
         '--entrypoint', 'true', imageId], { stdio: 'ignore' });
