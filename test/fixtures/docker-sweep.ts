@@ -48,8 +48,8 @@ const missingAnswer = (kind: 'container' | 'network' | 'volume', ref: string) =>
  * gone, and any other failure (a killed call, a daemon that cannot be reached) throws, naming the command.
  */
 export function objectExists(kind: 'container' | 'network' | 'volume', ref: string): boolean {
-  // The ref is passed on: one that could read as an option is refused, naming it.
-  if (!ref || ref.startsWith('-')) throw new Error(`Refused to inspect ${kind} ${JSON.stringify(ref)}: it could read as an option.`);
+  // The ref is passed on: one that is empty or could read as an option is refused, naming it.
+  if (!ref || ref.startsWith('-')) throw new Error(`Refused to inspect ${kind} ${JSON.stringify(ref)}: it is empty or could read as an option.`);
   const args = [kind, 'inspect', ref];
   const found = spawnSync(REAL_DOCKER, args, { encoding: 'utf8', ...CLIENT_LIMIT, env: dockerEnv() });
   if (found.status === 0) return true;
@@ -71,7 +71,7 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
   // The name is passed on too: refused if it could read as an option (a volume's must have the shape Docker allows).
   if (kind === 'volume' ? !VOLUME_NAME.test(name) : name.startsWith('-') || !name) {
-    console.warn(`${when}: removing ${kind} ${name}: refused a name that ${kind === 'volume' ? 'is not a volume name Docker allows' : 'could read as an option'}`);
+    console.warn(`${when}: removing ${kind} ${name}: refused a name that ${kind === 'volume' ? 'is not a volume name Docker allows' : 'is empty or could read as an option'}`);
     return;
   }
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
@@ -89,9 +89,12 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     }
     [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
   } catch { console.warn(`${when}: removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
-  // A container's or network's ID is checked too, as it is passed on as an argument.
-  if (typeof id !== 'string' || typeof actual !== 'string' || (kind !== 'volume' && !OBJECT_ID.test(id))) {
+  if (typeof id !== 'string' || typeof actual !== 'string') {
     console.warn(`${when}: removing ${kind} ${name}: docker printed no ID and name:`, found.stdout); return;
+  }
+  // A container's or network's ID is checked too, as it is passed on as an argument.
+  if (kind !== 'volume' && !OBJECT_ID.test(id)) {
+    console.warn(`${when}: removing ${kind} ${name}: docker printed an ID that is not a full ID:`, found.stdout); return;
   }
   if ((kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
   const remove = kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id];

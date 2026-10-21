@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -97,7 +98,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
     ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost'],
     ['network', 'raced'], ['container', 'junk'], ['container', 'odd'], ['container', 'nospace'], ['container', 'optid'],
-    ['container', '--help'], ['volume', '-v']] as const;
+    ['container', '--help'], ['volume', '-v'], ['container', '']] as const;
   expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
   // Each missing name reached its inspect, so the quiet answer was Docker's missing one.
   for (const kind of ['container', 'network'] as const)
@@ -118,9 +119,10 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
     ['test: removing container nospace: docker printed no ID and name:', '"nospace"\n'],
-    ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
-    ['test: removing container --help: refused a name that could read as an option'],
+    ['test: removing container optid: docker printed an ID that is not a full ID:', '"--help" "/optid"\n'],
+    ['test: removing container --help: refused a name that is empty or could read as an option'],
     ['test: removing volume -v: refused a name that is not a volume name Docker allows'],
+    ['test: removing container : refused a name that is empty or could read as an option'],
   ]);
 });
 
@@ -273,18 +275,21 @@ it('reports a holder line that is not an ID and networks, and removes no holder 
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls'), net = 'd'.repeat(64);
   // One swept network with one candidate holder, whose inspect line parses but is not an ID and networks, which Docker
-  // 27.4 is not known to print. Every other call gets no output and exit 0, as for `ls` with no match. The network line
-  // holds only the fields the sweep reads.
+  // 27.4 is not known to print, one of them not JSON. Every other call gets no output and exit 0, as for `ls` with no
+  // match, and the removals' stdout is not read. The network line holds only the fields the sweep reads.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${'a'.repeat(64)}; exit 0; fi`,
-    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null' '"--all" {"swept":{}}' '"${'a'.repeat(64)}"'; exit 0; fi`, 'exit 0'].join('\n'),
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null' '"--all" {"swept":{}}' '"${'a'.repeat(64)}"' 'unquoted {}'; exit 0; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
-  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '123 null']);
-  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '"--all" {"swept":{}}']);
-  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', `"${'a'.repeat(64)}"`]);
+  // Each line reported once: the one that is not JSON only as that.
+  expect(warn.mock.calls.filter(call => String(call[0]).startsWith('test: reading holders:'))).toEqual([
+    ['test: reading holders: docker printed a line that is not an ID and networks:', '123 null'],
+    ['test: reading holders: docker printed a line that is not an ID and networks:', '"--all" {"swept":{}}'],
+    ['test: reading holders: docker printed a line that is not an ID and networks:', `"${'a'.repeat(64)}"`],
+    ['test: reading holders: docker printed a line that is not JSON:', 'unquoted']]);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
 });
 
@@ -322,6 +327,7 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
     "  'volume gone') echo; echo 'Error response from daemon: get gone: no such volume' >&2; exit 1;;",
     "  'container killed') kill -9 $$;;",
     "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
+    "  'container odd') echo 'Error response from daemon: No such container: odd' >&2; exit 2;;",
     'esac; exit 0'].join('\n'), { mode: 0o755 });
   vi.stubEnv('PATH', bin);
   vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-loaded.sock');
@@ -334,6 +340,8 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
   for (const kind of ['container', 'network', 'volume'] as const) expect(fresh.objectExists(kind, 'gone')).toBe(false);
   expect(() => fresh.objectExists('container', 'killed')).toThrow('docker container inspect killed failed: killed by SIGKILL');
   expect(() => fresh.objectExists('container', 'lost')).toThrow('docker container inspect lost failed: Failed to initialize');
+  // The missing answer with another exit status is not Docker's missing answer (invented: 27.4 exits 1).
+  expect(() => fresh.objectExists('container', 'odd')).toThrow('docker container inspect odd failed: Error response from daemon: No such container: odd');
   expect(() => fresh.objectExists('container', '--help')).toThrow('Refused to inspect container "--help"');
   expect(() => fresh.objectExists('network', '')).toThrow('Refused to inspect network ""');
   expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
@@ -383,7 +391,7 @@ it('reports and skips a holder search line that is not a container ID, so none b
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
   // One swept volume, whose holder search prints a line Docker 27.4 is not known to print; every other call gets no
-  // output and exit 0, as for `ls` with no match.
+  // output and exit 0, as for `ls` with no match, and the removals' stdout is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' swept-volume; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' '--all'; exit 0; fi`, 'exit 0'].join('\n'),
@@ -392,4 +400,15 @@ it('reports and skips a holder search line that is not a container ID, so none b
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls).toContainEqual(['test: finding holders: docker printed a line that is not a container ID:', '--all']);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
+});
+
+it('reports a docker that cannot start, and never throws', () => {
+  const missing = join(tmpdir(), `codeboost-no-docker-${randomUUID()}`, 'docker');
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  expect(() => removeByName('container', 'x', 'test', missing)).not.toThrow();
+  expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', missing)).not.toThrow();
+  const reports = warn.mock.calls.map(call => `${String(call[0])} ${String(call[1])}`);
+  expect(reports[0]).toMatch(/^test: removing container x: docker container inspect .* x failed: .*ENOENT/);
+  expect(reports.slice(1).length).toBe(3);
+  for (const report of reports.slice(1)) expect(report).toMatch(/^test: listing (containers|networks|volumes): docker .* failed: .*ENOENT/);
 });
