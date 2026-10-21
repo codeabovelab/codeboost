@@ -1,18 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { linkSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { ISSUE_READ_ACTIVE_MS, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
-import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
+import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS, PLANNING_FEATURE, PLANNING_LEFTOVERS, planningCredential,
+  planningOutput } from '../runner/planning-provider.ts';
+import type { InvocationInput } from '../agents/contract.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { PLANNING_UNAVAILABLE, PlanningCheck, type PlanningAgent } from '../runner/planning.ts';
+import { LeftoverLedger, PLANNING_NAMING } from '../runner/question-leftovers.ts';
+import { abandonedWorkerText } from '../runner/question-agent.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -34,7 +38,9 @@ const text = (number: number): IssueText => ({ number, title: 'Retries ignore th
 const issues = (issueText: (number: number, options?: { trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => Promise<IssueText>, collaborator = true) => ({
   issueAccess: async (number: number) => ({ number, authorLogin: 'outside', collaborator }), issueText,
 });
-const closable = (close = vi.fn(async () => undefined)) => ({ close, invoke: vi.fn() }) as unknown as PlanningAgent;
+const closable = (close = vi.fn(async () => undefined),
+  probe: (vendor: string, signal: AbortSignal) => Promise<void> = vi.fn(async () => undefined)) =>
+  ({ close, invoke: vi.fn(), probe }) as unknown as PlanningAgent;
 const verified = { verifyLock: () => undefined };
 
 it('is off in a demo and without a github block, so neither plans', () => {
@@ -309,4 +315,530 @@ it('ends a planning request that does not settle after shutdown aborts it by clo
     await closing;
     expect(order).toEqual(['planning closed', 'server closed']);
   } finally { vi.useRealTimers(); }
+});
+
+// #164: the planning check, through productionPlanning's setup with a stand-in agent whose `probe` is the check.
+describe('the planning check (#164)', () => {
+  /** The production setup on a review whose Settings chose `vendor`, with a stand-in agent and issue reads. */
+  function checked(probe: (vendor: string, signal: AbortSignal) => Promise<void>, vendor: 'claude' | null = 'claude',
+    recheckMs?: number, admitWaitMs?: number, issueText = vi.fn(async (number: number) => text(number))) {
+    const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+    if (vendor) service.store.setQuestionProvider(vendor);
+    const issueAccess = vi.fn(async (number: number) => ({ number, authorLogin: 'outside', collaborator: true }));
+    const close = vi.fn(async () => undefined), agent = closable(close, vi.fn(probe));
+    const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => agent, recheckMs,
+      admitWaitMs })!(service);
+    return { deps, service, agent, issueAccess, close, probe: vi.mocked(agent.probe) };
+  }
+  const signal = () => new AbortController().signal;
+  const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
+  // A real sign-in failure, as planningOutput words it for a failed run. Tests that only show a reason passed through
+  // whole use any text ('Docker is not running.', 'No worker could start.'). Codex's refusal is CODEX_PLANNING_REFUSED,
+  // which planningCredential throws as it is.
+  const runContext = { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 };
+  const failedRun = (stdout: string) => thrown(() => planningOutput({ attemptId: 'probe', context: runContext, exitCode: 1,
+    signal: null, stderr: '', stdout }, { attemptId: 'probe', context: runContext } as InvocationInput));
+  const signInFailure = failedRun('Invalid API key · Please run /login');
+
+  it('starts at setup with the vendor chosen in Settings, and that one check serves every later request', async () => {
+    const { deps, probe, issueAccess } = checked(async () => undefined);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls[0]![0]).toBe('claude');
+    await deps.describe(signal());
+    await deps.describe(signal());
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a request with the check\'s reason, before it reads the issue, and does not check again within the recheck window', async () => {
+    const { deps, probe, issueAccess } = checked(async () => { throw new Error(signInFailure); });
+    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message.startsWith(`${PLANNING_UNAVAILABLE} `)).toBe(true);
+    expect((refusal as Error).message.endsWith(`The check said: ${signInFailure}`)).toBe(true);
+    // Inside the recheck window, the same failure refuses at once.
+    await expect(deps.describe(signal())).rejects.toThrow(signInFailure);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(issueAccess).not.toHaveBeenCalled();
+  });
+
+  it('checks again once the recheck window after a failure is over, and admits once a check passes', async () => {
+    let fail = true;
+    const { deps, probe, issueAccess } = checked(async () => { if (fail) throw new Error('Docker is not running.'); }, 'claude', 0);
+    await expect(deps.describe(signal())).rejects.toThrow('Docker is not running.');
+    fail = false;
+    await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+    expect(probe).toHaveBeenCalledTimes(2);
+    // A passed check is kept: the wait applies only to a failure.
+    fail = true;
+    await deps.describe(signal());
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
+  });
+
+  it('makes every request wait for the one running check, and a request that stops waiting leaves it running', async () => {
+    let pass!: () => void;
+    const { deps, probe } = checked((_vendor, probeSignal) => new Promise<void>((resolve, reject) => {
+      pass = resolve; probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true });
+    }));
+    const leaving = new AbortController(), left = deps.describe(leaving.signal), waiting = deps.describe(signal());
+    leaving.abort(new Error('The browser went away.'));
+    // A refusal about the wait, never one the server would record as a failed GitHub read.
+    const stopped = await Promise.resolve(left).catch((error: unknown) => error);
+    expect(stopped).toBeInstanceOf(GuardRefusal);
+    expect((stopped as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost stopped waiting for the planning check: The browser went away.`);
+    pass();
+    await expect(waiting).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls[0]![1].aborted).toBe(false);
+  });
+
+  it('checks nothing while no agent is chosen, then checks the vendor chosen before its first request', async () => {
+    // As PlanningAgent.probe answers: Claude's check passes here, and Codex's always fails (planningCredential).
+    const { deps, service, probe, issueAccess } = checked(async vendor => {
+      if (vendor === 'codex') throw new Error(CODEX_PLANNING_REFUSED);
+    }, null);
+    expect(probe).not.toHaveBeenCalled();
+    // No vendor: the request goes on, and fails later with NO_PLANNING_AGENT, as before.
+    await deps.describe(signal());
+    expect(probe).not.toHaveBeenCalled();
+    service.store.setQuestionProvider('claude');
+    await deps.describe(signal());
+    // Settings refuse Codex now, but a database from before #75 may still hold it.
+    vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+    await expect(deps.describe(signal())).rejects.toThrow(CODEX_PLANNING_REFUSED);
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
+  });
+
+  it('checks the vendor chosen while a request waited, before it admits the request', async () => {
+    let pass!: () => void;
+    const { deps, service, probe } = checked(vendor => vendor === 'claude' ? new Promise<void>(resolve => { pass = resolve; })
+      : Promise.reject(new Error(CODEX_PLANNING_REFUSED)));
+    const waiting = Promise.resolve(deps.describe(signal()));
+    vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+    pass();
+    await expect(waiting).rejects.toThrow(CODEX_PLANNING_REFUSED);
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+  });
+
+  it('refuses to invoke an agent whose check has not passed for the vendor chosen at the call', async () => {
+    const made = checked(async () => undefined);
+    await made.deps.describe(signal());
+    const request = {} as Parameters<typeof made.deps.provider.invoke>[0], forwarded = signal();
+    // Once the check passed, the call goes to the agent as it is.
+    await made.deps.provider.invoke(request, forwarded);
+    expect(made.agent.invoke).toHaveBeenCalledWith(request, forwarded);
+    vi.mocked(made.agent.invoke).mockClear();
+    vi.spyOn(made.service.store, 'questionProvider').mockReturnValue('codex');
+    // A rejection, as `AuthorProvider.invoke` promises: E3 then settles the request as failed with this reason
+    // (test/planning-suggestions.test.ts covers a provider whose invoke fails).
+    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('and codeboost checks it next');
+    expect(made.agent.invoke).not.toHaveBeenCalled();
+  });
+
+  it('cancels a running check on close, and closes the agent only once it stopped', async () => {
+    const order: string[] = [];
+    // The check settles a while after it is cancelled, as a worker job does.
+    const { deps, probe, close } = checked((_vendor, probeSignal) => new Promise<void>((_, reject) =>
+      probeSignal.addEventListener('abort', () => setTimeout(() => { order.push('check stopped'); reject(probeSignal.reason); }, 50),
+        { once: true })));
+    close.mockImplementation(async () => { order.push('agent closed'); });
+    await deps.close!();
+    expect(probe.mock.calls[0]![1].aborted).toBe(true);
+    expect(order).toEqual(['check stopped', 'agent closed']);
+  });
+
+  it('fails the check, and refuses with its reason, when the probe throws instead of rejecting', async () => {
+    const check = new PlanningCheck(() => { throw new Error('No worker could start.'); }, () => 'claude');
+    expect(() => check.start()).not.toThrow();
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toContain('No worker could start.');
+  });
+
+  it('cancels a running check that a check for another vendor replaced', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    const signals: AbortSignal[] = [];
+    // Claude's check runs until cancelled; Codex's fails at once, as PlanningAgent.probe's does.
+    const check = new PlanningCheck((probed, probeSignal) => {
+      signals.push(probeSignal);
+      return probed === 'codex' ? Promise.reject(new Error(CODEX_PLANNING_REFUSED)) : new Promise<void>(() => undefined);
+    }, () => vendor, { waitMs: 10 });
+    check.start();
+    vendor = 'codex';
+    await expect(check.admit(signal())).rejects.toThrow('choose another agent in Settings');
+    expect(signals.map(probeSignal => probeSignal.aborted)).toEqual([true, false]);
+    await check.close(10);
+  });
+
+  it('keeps a multi-line reason whole, at the end of the refusal', async () => {
+    // LeftoverLedger.assertClear's text for host copies it could not delete.
+    const reason = `${PLANNING_NAMING.label} is off: host copies of ${PLANNING_NAMING.code} or credentials from an earlier session could not be deleted. Delete them, then retry:\nrm -rf '/tmp/codeboost-plan-x'`;
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message.endsWith(`The check said: ${reason}`)).toBe(true);
+  });
+
+  it('keeps waiting, rather than failing, when its check was replaced and the vendor changed back', async () => {
+    let vendor: 'claude' | 'codex' = 'claude', count = 0;
+    const check = new PlanningCheck((_probed, probeSignal) => {
+      count += 1;
+      // The third check (Claude again) passes; the first two wait until cancelled.
+      if (count === 3) return Promise.resolve();
+      return new Promise<void>((_, reject) => probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true }));
+    }, () => vendor);
+    const waiting = check.admit(signal());
+    vendor = 'codex';
+    const other = check.admit(signal()).catch(() => undefined);
+    vendor = 'claude';
+    await expect(Promise.all([waiting, check.admit(signal())])).resolves.toEqual([undefined, undefined]);
+    await other;
+    expect(count).toBe(3);
+  });
+
+  it('moves a waiting request to a newer check at once, without waiting for the replaced one to stop', async () => {
+    let vendor: 'claude' | 'codex' = 'claude', count = 0;
+    // The first check ignores its cancellation, as a worker job stuck in a synchronous build does; the third passes.
+    const check = new PlanningCheck(() => { count += 1; return count === 3 ? Promise.resolve() : new Promise<void>(() => undefined); },
+      () => vendor, { waitMs: 5_000 });
+    const started = performance.now(), waiting = check.admit(signal());
+    vendor = 'codex';
+    void check.admit(signal()).catch(() => undefined);
+    vendor = 'claude';
+    void check.admit(signal()).catch(() => undefined);
+    await expect(waiting).resolves.toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(2_000);
+    await check.close(10);
+  });
+
+  it('never throws from the deferred check when the Store cannot be read', async () => {
+    let fail = false;
+    const probe = vi.fn(async () => undefined);
+    const check = new PlanningCheck(probe, () => { if (fail) throw new Error('database is closed'); return 'claude'; });
+    const uncaught = vi.fn();
+    process.on('uncaughtException', uncaught);
+    try {
+      expect(() => check.assertPassed()).toThrow('and codeboost checks it next');
+      fail = true;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalled();
+    } finally { process.off('uncaughtException', uncaught); }
+  });
+
+  it('lets many requests wait on one check without a listener warning', async () => {
+    let pass!: () => void;
+    const check = new PlanningCheck(() => new Promise<void>(resolve => { pass = resolve; }), () => 'claude');
+    const warnings: string[] = [], warned = (warning: Error) => warnings.push(warning.name);
+    process.on('warning', warned);
+    try {
+      const waiting = Array.from({ length: 20 }, () => check.admit(signal()));
+      await new Promise(resolve => setTimeout(resolve, 10));
+      pass();
+      await Promise.all(waiting);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(warnings).not.toContain('MaxListenersExceededWarning');
+    } finally { process.off('warning', warned); }
+  });
+
+  it('waits 30 s for a check, fails one after the planning budget and a minute, and waits 20 s at close', async () => {
+    // productionPlanning's own defaults, as the docs give them: nothing here overrides them. The clock is faked too, so each wait is exact.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      // The probe never settles and ignores its abort, as a job stuck in the worker would.
+      const { deps } = checked(() => new Promise<void>(() => undefined));
+      let outcome: unknown;
+      void Promise.resolve(deps.describe(signal())).catch((error: unknown) => { outcome = error; });
+      await vi.advanceTimersByTimeAsync(30_000 - 1);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(String(outcome)).toContain('still checking');
+      // The check itself fails once the planning budget and a minute have passed since it started.
+      // A request waiting from 15 s before then gets that failure, not the end of its own wait.
+      await vi.advanceTimersByTimeAsync(11 * 60_000 - 30_000 - 15_000);
+      outcome = undefined;
+      void Promise.resolve(deps.describe(signal())).catch((error: unknown) => { outcome = error; });
+      await vi.advanceTimersByTimeAsync(15_000 - 1);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(String(outcome)).toContain('did not finish within 11 minutes');
+      // Close waits 20 s for the timed-out check's probe, which never stops.
+      let closed = false;
+      void deps.close!().then(() => { closed = true; });
+      await vi.advanceTimersByTimeAsync(20_000 - 1);
+      expect(closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(closed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('lets a request go on when Settings clear the agent while it waits, even once the wait has passed', async () => {
+    let vendor: 'claude' | null = 'claude';
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>(resolve =>
+      probeSignal.addEventListener('abort', () => resolve(), { once: true })), () => vendor, { waitMs: 50 });
+    const waiting = check.admit(signal());
+    vendor = null;
+    // No check replaces Claude's, so only the wait's end sees the change.
+    await expect(waiting).resolves.toBeUndefined();
+    await check.close(2_000);
+  });
+
+  it('fails and cancels a check that does not settle in time, and checks again after the recheck window', async () => {
+    let count = 0, late!: () => void;
+    const signals: AbortSignal[] = [];
+    const check = new PlanningCheck((_vendor, probeSignal) => {
+      count += 1; signals.push(probeSignal);
+      return count === 1 ? new Promise<void>(resolve => { late = resolve; }) : Promise.resolve();
+    }, () => 'claude', { timeoutMs: 50, recheckMs: 2_000, waitMs: 1_000 });
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('The planning check did not finish within a moment.');
+    expect(signals[0]!.aborted).toBe(true);
+    expect((signals[0]!.reason as Error).message).toContain('did not finish');
+    // A probe that answers after its timeout does not pass the check: within the wait it still refuses.
+    late();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await expect(check.admit(signal())).rejects.toThrow('did not finish');
+    expect(count).toBe(1);
+    await new Promise(resolve => setTimeout(resolve, 2_100));
+    await expect(check.admit(signal())).resolves.toBeUndefined();
+    expect(count).toBe(2);
+  });
+
+  it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
+    // planning-provider.ts' cleanupFailed: the run's own failure, then the cleanup's.
+    const reason = PLANNING_FEATURE.cleanupFailed([new Error('docker volume rm failed')], { error: new Error('Planning agent timed out.') }).message;
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
+  });
+
+  it('keeps the recheck promise when only the vendor\'s output mentions a restart', async () => {
+    // planningOutput's text for a failed run whose output says so.
+    const reason = failedRun('planning is off until codeboost restarts');
+    expect(reason).toContain(' Claude said: planning is off until codeboost restarts');
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
+  });
+
+  it('reports a Store it cannot read, once a wait has begun, as an unavailable check, not a stopped wait', async () => {
+    const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+    service.store.setQuestionProvider('claude');
+    let pass!: () => void;
+    const deps = productionPlanning(config, { ...verified, issues: issues(async number => text(number)),
+      agent: () => closable(undefined, (_vendor, probeSignal) => new Promise<void>((resolve, reject) => {
+        pass = resolve; probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true });
+      })) })!(service);
+    const waiting = Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    // The read after the wait fails: the database went bad while the check ran.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    vi.spyOn(service.store, 'questionProvider').mockImplementation(() => { throw new Error('database disk image is malformed'); });
+    pass();
+    const refusal = await waiting;
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost could not check the planning agent: database disk image is malformed`);
+    vi.mocked(service.store.questionProvider).mockRestore();
+    await deps.close!();
+  });
+
+  it('refuses with "planning is stopping" after close, never with a recheck promise', async () => {
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>((_, reject) =>
+      probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true })), () => 'claude');
+    check.start();
+    await check.close();
+    expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+  });
+
+  it('tells Codex to choose another agent, not to wait for a recheck', async () => {
+    const check = new PlanningCheck(async () => { throw new Error(CODEX_PLANNING_REFUSED); }, () => 'codex');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choose another agent in Settings, and the next planning request checks it. The check said: ${CODEX_PLANNING_REFUSED}`);
+  });
+
+  it('waits on close for a timed-out check\'s probe to stop, within its bound', async () => {
+    const order: string[] = [];
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>((_, reject) => {
+      // The probe stops a while after the timeout cancels it, as a worker job busy in setup does.
+      probeSignal.addEventListener('abort', () =>
+        setTimeout(() => { order.push('probe stopped'); reject(probeSignal.reason); }, 100), { once: true });
+    }), () => 'claude', { timeoutMs: 20 });
+    await expect(check.admit(signal())).rejects.toThrow('did not finish');
+    await check.close(2_000);
+    order.push('closed');
+    expect(order).toEqual(['probe stopped', 'closed']);
+  });
+
+  // Each reason as the code that gives it words it, so a reworded message that no longer matches fails here.
+  const hardLinked = () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-linked-')); closers.push(() => rmSync(root, { recursive: true, force: true }));
+    writeFileSync(join(root, 'review.db'), ''); linkSync(join(root, 'review.db'), join(root, 'other.db'));
+    const ledger = LeftoverLedger.forDatabase(join(root, 'review.db'), PLANNING_NAMING);
+    return thrown(() => { ledger.acquire(); ledger.release(); });
+  };
+  it.each([
+    ['the sign-in is missing', () => thrown(() => planningCredential('claude', {}))],
+    ['the worker was given up on', () => abandonedWorkerText(PLANNING_NAMING, 'stopped (exit code 1)')],
+    ['cleanup could not be confirmed', () => PLANNING_LEFTOVERS.untracked()],
+    ['the database file has other hard links', hardLinked],
+  ])('promises no recheck when %s, which only a restart can change', async (_label, reasonOf) => {
+    const reason = reasonOf();
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that; fix the cause first if the reason names one. The check said: ${reason}`);
+  });
+
+  it('starts no check after close, not even one deferred before it', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    const probe = vi.fn(async (_probed: string) => undefined), check = new PlanningCheck(probe, () => vendor);
+    check.start();
+    await new Promise(resolve => setImmediate(resolve));
+    // A changed vendor defers its check to the next turn; close comes first.
+    vendor = 'codex';
+    expect(() => check.assertPassed()).toThrow('and codeboost checks it next');
+    await check.close();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(() => check.start()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+  });
+
+  it('wakes a request waiting at close at once, though its check\'s probe never stops', async () => {
+    const check = new PlanningCheck(() => new Promise<void>(() => undefined), () => 'claude');
+    const started = performance.now();
+    const waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setImmediate(resolve));
+    void check.close(10);
+    const refusal = await waiting;
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+
+  it('tells a request waiting at close that planning is stopping, even if the check then passes', async () => {
+    let pass!: () => void;
+    // The probe answers after close cancelled it, as an answer already on its way would.
+    const check = new PlanningCheck(() => new Promise<void>(resolve => { pass = resolve; }), () => 'claude');
+    const waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setImmediate(resolve));
+    const closed = check.close(2_000);
+    pass();
+    await closed;
+    const refusal = await waiting;
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+  });
+
+  it.each([['under a check that passed', 'claude'], ['with no agent chosen', null]] as const)(
+    'admits nothing after close, %s', async (_label, vendor) => {
+      const made = checked(async () => undefined, vendor);
+      await made.deps.describe(signal());
+      await made.deps.close!();
+      const stopping = `${PLANNING_UNAVAILABLE} planning is stopping.`;
+      await expect(Promise.resolve(made.deps.describe(signal()))).rejects.toThrow(stopping);
+      await expect(made.deps.provider.invoke({} as Parameters<typeof made.deps.provider.invoke>[0], signal())).rejects.toThrow(stopping);
+      expect(made.agent.invoke).not.toHaveBeenCalled();
+      expect(made.issueAccess).toHaveBeenCalledTimes(1);
+    });
+
+  it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    // Claude's check passes at 3 s, after the vendor changed; Codex's never ends.
+    const check = new PlanningCheck(probed => new Promise<void>(resolve => {
+      if (probed === 'claude') setTimeout(resolve, 3_000);
+    }), () => vendor, { waitMs: 3_200 });
+    const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    vendor = 'codex';
+    // One deadline ends the wait at 3.2 s; a fresh 3.2 s for Codex would end it at 6.2 s.
+    const refusal = await waiting;
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toContain('still checking');
+    expect(performance.now() - started).toBeLessThan(5_000);
+    await check.close(10);
+  });
+
+  it('waits a bounded time on close for a check that never stops', async () => {
+    const check = new PlanningCheck(() => new Promise<void>(() => undefined), () => 'claude');
+    check.start();
+    const started = performance.now();
+    await check.close(100);
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  it('refuses a request as still checking when the check outlasts its wait, and admits it once the check passed', async () => {
+    let pass!: () => void;
+    const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
+    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent\\. .* Retry in a minute\\.$`));
+    expect(issueAccess).not.toHaveBeenCalled();
+    pass();
+    await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+  });
+
+  it('refuses at the start a vendor chosen while the issue was read, and checks it', async () => {
+    let service!: ReviewService;
+    // Settings take Claude while the issue is read, after a request with none chosen was admitted unchecked.
+    const issueText = vi.fn(async (number: number) => {
+      service.store.setQuestionProvider('claude');
+      return text(number);
+    });
+    // (The provider, too, checks again when it is invoked: "refuses to invoke an agent whose check has not passed …".)
+    const made = checked(async () => undefined, null, undefined, undefined, issueText);
+    service = made.service;
+    const described = await made.deps.describe(signal());
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost checks it next.`);
+    // validate runs inside the Store's transaction, so the new vendor's check starts only on the next turn.
+    expect(made.probe).not.toHaveBeenCalled();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+    // Once that check passed, the same request is admitted.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(() => described.validate()).not.toThrow();
+  });
+
+  it('refuses at the start while the check for a vendor chosen during the issue read still runs', async () => {
+    let service!: ReviewService, pass!: () => void;
+    const issueText = vi.fn(async (number: number) => {
+      service.store.setQuestionProvider('claude');
+      return text(number);
+    });
+    const made = checked(() => new Promise<void>(resolve => { pass = resolve; }), null, undefined, undefined, issueText);
+    service = made.service;
+    const described = await made.deps.describe(signal());
+    expect(() => described.validate()).toThrow('and codeboost checks it next');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent.`);
+    pass();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(() => described.validate()).not.toThrow();
+  });
+
+  it('refuses a start through the server with 409, recording no request and starting no agent', async () => {
+    const config = production(), probe = vi.fn(async () => { throw new Error(signInFailure); });
+    const service = new ReviewService(config); service.store.setQuestionProvider('claude'); service.close();
+    const agent = closable(undefined, probe), issueAccess = vi.fn();
+    const setup = productionPlanning(config, { ...verified, issues: { issueAccess, issueText: vi.fn() }, agent: () => agent })!;
+    const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup);
+    closers.push(() => app.close());
+    const api = async (method: string, path: string, body?: unknown) => {
+      const response = await fetch(`${new URL(app.url).origin}${path}`, { method, headers: { 'x-codeboost-token': app.token,
+        ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    const view = (await api('GET', '/api/review')).body;
+    const started = await api('POST', '/api/plan/suggestions', { expectedRevision: view.plan.revision,
+      snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID() });
+    expect(started.status).toBe(409);
+    expect(started.body.error.startsWith(`${PLANNING_UNAVAILABLE} `)).toBe(true);
+    expect(started.body.error).toContain(signInFailure);
+    const db = new DatabaseSync(config.database);
+    try { expect((db.prepare('SELECT COUNT(*) AS n FROM requests').get() as { n: number }).n).toBe(0); } finally { db.close(); }
+    expect(agent.invoke).not.toHaveBeenCalled();
+    expect(issueAccess).not.toHaveBeenCalled();
+  });
 });
