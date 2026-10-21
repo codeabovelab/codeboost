@@ -140,7 +140,7 @@ export class PlanningCheck {
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
     options: { recheckMs?: number; waitMs?: number; timeoutMs?: number } = {}) {
     // One listener per waiting request, each removed when its wait ends: many at once are no leak. (Node 26 warns of
-    // none on an AbortSignal, which holds one per running check.)
+    // none on an AbortSignal, which holds one per running check and one per waiting request.)
     setMaxListeners(0, this.#events);
     this.#probe = probe; this.#vendor = vendor;
     this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
