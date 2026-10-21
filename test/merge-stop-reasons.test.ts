@@ -483,3 +483,33 @@ it('merge-state inspection answers a caller abort, not the already-fixed check\'
   // Not the check's gh text: a blocker result that arrives after the abort is discarded, so the click may be resent.
   expect(await inspection).toBe(reason);
 });
+
+it('merge-state inspection reports the first stage\'s gh exit when a stopped pinned-check read then settles with its own gh exit', async () => {
+  // A published target, so the branch's PR list runs beside the rule reads. The rules pin `test` to app 10, so the rule
+  // stage ends with the pinned-check read (#176). The list's gh exit comes first and stops that read; gh then exits on
+  // its own with another error while it is stopping, which runWithInput reports instead of the abort (#48).
+  const first = new CommandFailed('gh failed (exit 1): gh: Bad credentials (HTTP 401)', 'gh: Bad credentials (HTTP 401)', '{"message":"Bad credentials","status":"401"}');
+  const later = new CommandFailed('gh failed (exit 1): gh: Something went wrong while executing your query.', 'gh: Something went wrong while executing your query.', '');
+  const pinnedStarted = deferred();
+  let pinnedStopReason: unknown;
+  const run: Run = async (args, options) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'task',
+      headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], body: '', isCrossRepository: false });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true,
+      required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new CommandFailed('gh failed (exit 1): gh: Branch not protected (HTTP 404)', 'gh: Branch not protected (HTTP 404)', '{"message":"Branch not protected","status":"404"}');
+    if (args[1] === 'graphql' && joined.includes('checkSuites(')) return new Promise<string>((_, reject) => {
+      pinnedStarted.resolve();
+      options?.signal?.addEventListener('abort', () => { pinnedStopReason = options.signal!.reason; setTimeout(() => reject(later), 20); }, { once: true });
+    });
+    if (joined.includes('/pulls?')) { await pinnedStarted.promise; throw first; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => ({ outcome: 'clear', baseHead: sha('9') }) };
+  const error = await new GhMergeGateway(config, run, checks).inspect({ fresh: true, target: { pullRequest: 7, headBranch: 'task' } })
+    .then(() => null, (reason: unknown) => reason);
+  expect(pinnedStopReason).toBe(first); // The interleaving: the list's exit stopped the pinned-check read.
+  expect(error).toBe(first);
+});

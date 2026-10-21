@@ -1,0 +1,36 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "sveltejs/svelte",
+  "pullRequest": 19050,
+  "recordedAt": "2026-10-21T02:15:18.764Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "repos/sveltejs/svelte/commits/111cc6411c9c647f691a159862da2b74212791e3/check-suites",
+        "--jq",
+        "[.check_suites[] | {id, app: {id: .app.id, slug: .app.slug}}]"
+      ],
+      "exitCode": 0,
+      "stdout": "[{\"app\":{\"id\":15368,\"slug\":\"github-actions\"},\"id\":106830892590},{\"app\":{\"id\":2935623,\"slug\":\"svite-ecosystem-ci\"},\"id\":106830896506},{\"app\":{\"id\":4226557,\"slug\":\"vercel-security-reviewer\"},\"id\":106830908878},{\"app\":{\"id\":8329,\"slug\":\"vercel\"},\"id\":106830910586}]\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "graphql",
+        "-f",
+        "query=query($owner:String!,$repo:String!,$oid:GitObjectID!){repository(owner:$owner,name:$repo){object(oid:$oid){... on Commit{checkSuites(first:100){nodes{databaseId app{databaseId slug}}}}}}}",
+        "-f",
+        "owner=sveltejs",
+        "-f",
+        "repo=svelte",
+        "-f",
+        "oid=111cc6411c9c647f691a159862da2b74212791e3"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"data\":{\"repository\":{\"object\":{\"checkSuites\":{\"nodes\":[{\"databaseId\":106830892590,\"app\":{\"databaseId\":15368,\"slug\":\"github-actions\"}},{\"databaseId\":106830896506,\"app\":null},{\"databaseId\":106830908878,\"app\":{\"databaseId\":4226557,\"slug\":\"vercel-security-reviewer\"}},{\"databaseId\":106830910586,\"app\":{\"databaseId\":8329,\"slug\":\"vercel\"}}]}}}}}",
+      "stderr": ""
+    }
+  ]
+}

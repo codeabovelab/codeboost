@@ -55,7 +55,7 @@ it('reads the ruleset\'s required checks as pending, then as passing at the same
 // The same reads by a token without admin rights, recorded 2026-10-20 with gh 2.102.0 from public repositories this
 // token may only read. Each classic protection read answers 404 "Not Found", so classic checks come from the branch read.
 // nonadmin-ruleset and nonadmin-mixed were recorded again at the same heads on 2026-10-21 (UTC), when the inspection
-// began to read the head's check runs with their apps for checks pinned to an app (#176); their other answers did not change.
+// began to read the runs of checks pinned to an app from GitHub (#176); their other answers did not change.
 // - nonadmin-ruleset: vitejs/vite PR 23837 into main, which only a ruleset covers (`protection.enabled` false);
 // - nonadmin-classic: cli/cli PR 14716 into trunk, with classic required checks and no ruleset checks;
 // - nonadmin-mixed: sveltejs/svelte PR 19050 into main, where a ruleset and classic protection both require one check.
@@ -83,9 +83,9 @@ it('records the 404 a token without admin rights gets, and the branch read\'s cl
 it('reads a ruleset-only branch\'s required checks with a token without admin rights', async () => {
   const run = replayGh(nonAdmin.ruleset), state = await gatewayFor(nonAdmin.ruleset, run).inspect({ fresh: true });
   expect(run.unrecorded).toEqual([]);
-  // The ruleset binds each check to GitHub Actions (app 15368). gh's rollup names no app (#176), so they are matched from
-  // the head's check runs, where GitHub Actions reported a passing run of each (one of two runs of `Build & Test Passed
-  // or Skipped` was skipped, which passes).
+  // The ruleset binds each check to GitHub Actions (app 15368). gh's rollup names no app (#176), so they are read from
+  // GitHub by app and name, in one call; GitHub Actions reported a passing run of each (`Build & Test Passed or Skipped`
+  // ran in two suites, skipped in the older and passed in the newer).
   expect(run.calls.filter(args => args[1] === 'graphql')).toHaveLength(1);
   expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, mergeQueue: false, requiredChecks: [
     { context: 'Semantic Pull Request', appId: 15368, state: 'success' },
@@ -107,14 +107,69 @@ it('reads a classic-protected branch\'s required checks with a token without adm
 it('reads a check both a ruleset and classic protection require once, with a token without admin rights', async () => {
   const run = replayGh(nonAdmin.mixed), state = await gatewayFor(nonAdmin.mixed, run).inspect({ fresh: true });
   expect(run.unrecorded).toEqual([]);
-  // The head has a skipped `vite-ecosystem-ci` run, but GitHub names no app for its check suite to this reader, so the
-  // run cannot be shown to come from app 2935623, and the pinned check reads as missing: it fails closed.
-  const suites = (JSON.parse(nonAdmin.mixed.calls.find(call => call.args[1] === 'graphql')!.stdout) as
-    { data: { repository: { object: { checkSuites: { nodes: { app: { databaseId: number } | null; checkRuns: { nodes: { name: string; conclusion: string }[] } }[] } } } } })
-    .data.repository.object.checkSuites.nodes;
-  expect(suites.filter(suite => suite.checkRuns.nodes.some(check => check.name === 'vite-ecosystem-ci')))
-    .toEqual([{ app: null, checkRuns: { totalCount: 1, nodes: [expect.objectContaining({ name: 'vite-ecosystem-ci', conclusion: 'SKIPPED' })] } }]);
-  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [{ context: 'vite-ecosystem-ci', appId: 2935623, state: 'missing' }] });
+  // App 2935623 is private: GitHub's GraphQL API gives this reader `app: null` for its check suite, though REST names
+  // the app (private-app-suites.json, recorded 2026-10-21). Filtering suites by app ID on GitHub's side still returns
+  // that suite, with its skipped `vite-ecosystem-ci` run, so the check reads as passing (#176 review).
+  const privateApp = loadRecording('private-app-suites');
+  const rest = JSON.parse(privateApp.calls.find(call => call.args[1]!.endsWith('/check-suites'))!.stdout) as { id: number; app: { id: number; slug: string } }[];
+  const graphql = JSON.parse(privateApp.calls.find(call => call.args[1] === 'graphql')!.stdout) as
+    { data: { repository: { object: { checkSuites: { nodes: { databaseId: number; app: { databaseId: number } | null }[] } } } } };
+  const suite = rest.find(entry => entry.app.id === 2935623)!;
+  expect(suite.app.slug).toBe('svite-ecosystem-ci');
+  expect(graphql.data.repository.object.checkSuites.nodes.find(node => node.databaseId === suite.id)).toEqual({ databaseId: suite.id, app: null });
+  const answer = JSON.parse(nonAdmin.mixed.calls.find(call => call.args[1] === 'graphql')!.stdout) as
+    { data: { repository: { object: { c0: { totalCount: number; nodes: { checkRuns: { nodes: { name: string; conclusion: string }[] } }[] } } } } };
+  expect(answer.data.repository.object.c0).toMatchObject({ totalCount: 1, nodes: [{ checkRuns: { nodes: [{ name: 'vite-ecosystem-ci', conclusion: 'SKIPPED' }] } }] });
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [{ context: 'vite-ecosystem-ci', appId: 2935623, state: 'success' }] });
+});
+
+// Pinned-check reads on public commits whose rules pin no check, recorded 2026-10-21 with gh 2.102.0 by a script that
+// ran the gateway with the fake pull request and ruleset of `inspectPinned` below and sent only the pinned-check read to
+// the real gh. Each file also holds a REST read that shows what makes the commit a case worth recording.
+// - pinned-rerun: codeabovelab/codeboost commit e3697dd (PR 151's head). REST's list of every run (`filter=all`) shows
+//   suite 102552054061 ran `test` twice: failed at 21:54, passed when re-run at 22:02.
+// - pinned-large-suite: microsoft/vscode commit b3aa5cb (PR 343099's head). REST counts 101 runs in GitHub Actions
+//   suite 107124344927, more than one page of runs holds.
+const pinnedRecordings = { rerun: loadRecording('pinned-rerun'), largeSuite: loadRecording('pinned-large-suite') };
+/** Inspects `recording`'s head with `context` pinned to `appId`; only the pinned-check read is answered from the recording. */
+async function inspectPinned(recording: RecordedGh, head: string, context: string, appId: number) {
+  const replay = replayGh(recording);
+  const run: RunGh = async (args, options) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: recording.pullRequest, isDraft: false, baseRefName: 'main', baseRefOid: '0'.repeat(40), headRefName: 'x', headRefOid: head, state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context, integration_id: appId }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    return replay(args, options);
+  };
+  const state = await new GhMergeGateway({ repository: recording.repository, pullRequest: recording.pullRequest, issue: 1 }, run, clearCheck(recording.repository)).inspect({ fresh: true });
+  expect(replay.unrecorded).toEqual([]);
+  expect(replay.calls.filter(args => args[1] === 'graphql')).toHaveLength(1);
+  return state;
+}
+type PinnedAnswer = { data: { repository: { object: { c0: { nodes: { checkRuns: { totalCount: number; nodes: { name: string; conclusion: string }[] } }[] } } } } };
+const pinnedAnswer = (recording: RecordedGh) => JSON.parse(recording.calls.find(call => call.args[1] === 'graphql')!.stdout) as PinnedAnswer;
+
+it('reads only the latest run of a pinned check inside a suite that re-ran it', async () => {
+  const { rerun } = pinnedRecordings;
+  expect(rerun.gh).toBe('gh version 2.102.0 (2026-09-30)');
+  const every = JSON.parse(rerun.calls.find(call => call.args[1]!.includes('filter=all'))!.stdout) as { name: string; conclusion: string; check_suite: { id: number } }[];
+  expect(every.filter(check => check.name === 'test' && check.check_suite.id === 102552054061).map(check => check.conclusion).sort()).toEqual(['failure', 'success']);
+  // The read asks for each suite's latest run of a name, and GitHub leaves the older failure out.
+  expect(pinnedAnswer(rerun).data.repository.object.c0.nodes.flatMap(suite => suite.checkRuns.nodes.map(check => check.conclusion))).toEqual(['SUCCESS', 'SUCCESS']);
+  expect((await inspectPinned(rerun, 'e3697dd532643de0f831b678856b2d677338231d', 'test', 15368)).requiredChecks).toEqual([{ context: 'test', appId: 15368, state: 'success' }]);
+});
+
+it('reads a pinned check from an app whose suite has more than 100 runs', async () => {
+  const { largeSuite } = pinnedRecordings;
+  expect(largeSuite.gh).toBe('gh version 2.102.0 (2026-09-30)');
+  const count = JSON.parse(largeSuite.calls.find(call => call.args[1]!.includes('/check-suites/'))!.stdout) as { total_count: number; app: { id: number }; check_suite: { id: number; head_sha: string } };
+  expect(count).toEqual({ total_count: 101, app: { id: 15368 }, check_suite: { id: 107124344927, head_sha: 'b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f' } });
+  // GitHub filters the runs by name, so that suite answers with only the one run asked for.
+  const suites = pinnedAnswer(largeSuite).data.repository.object.c0.nodes;
+  expect(suites.map(suite => suite.checkRuns.totalCount).sort()).toEqual([0, 0, 0, 0, 1]);
+  expect((await inspectPinned(largeSuite, 'b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f', 'Detect Changes', 15368)).requiredChecks)
+    .toEqual([{ context: 'Detect Changes', appId: 15368, state: 'success' }]);
 });
 
 // The job, against the real Store and guarded merge, with GitHub answered from the recordings. Its preparation is a

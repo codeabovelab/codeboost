@@ -1,0 +1,40 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "codeabovelab/codeboost",
+  "pullRequest": 151,
+  "recordedAt": "2026-10-21T02:11:40.539Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "graphql",
+        "-f",
+        "query=query($owner:String!,$repo:String!,$oid:GitObjectID!,$app0:Int!,$name0:String!,$after0:String){repository(owner:$owner,name:$repo){object(oid:$oid){__typename ... on Commit{oid c0:checkSuites(first:100,after:$after0,filterBy:{appId:$app0}){totalCount pageInfo{hasNextPage endCursor} nodes{checkRuns(first:100,filterBy:{checkName:$name0,checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}}}}}",
+        "-f",
+        "owner=codeabovelab",
+        "-f",
+        "repo=codeboost",
+        "-f",
+        "oid=e3697dd532643de0f831b678856b2d677338231d",
+        "-F",
+        "app0=15368",
+        "-f",
+        "name0=test"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"data\":{\"repository\":{\"object\":{\"__typename\":\"Commit\",\"oid\":\"e3697dd532643de0f831b678856b2d677338231d\",\"c0\":{\"totalCount\":3,\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":\"Y3Vyc29yOnYyOpHPAAAAF-CVb90=\"},\"nodes\":[{\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"test\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"startedAt\":\"2026-10-08T22:02:19Z\",\"completedAt\":\"2026-10-08T22:09:24Z\"}]}},{\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"test\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"startedAt\":\"2026-10-08T21:54:42Z\",\"completedAt\":\"2026-10-08T22:01:14Z\"}]}},{\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}}]}}}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/codeabovelab/codeboost/commits/e3697dd532643de0f831b678856b2d677338231d/check-runs?filter=all&per_page=100",
+        "--jq",
+        "[.check_runs[] | {name, status, conclusion, started_at, completed_at, check_suite: {id: .check_suite.id}, app: {id: .app.id}}]"
+      ],
+      "exitCode": 0,
+      "stdout": "[{\"app\":{\"id\":15368},\"check_suite\":{\"id\":102552054061},\"completed_at\":\"2026-10-08T22:09:24Z\",\"conclusion\":\"success\",\"name\":\"test\",\"started_at\":\"2026-10-08T22:02:19Z\",\"status\":\"completed\"},{\"app\":{\"id\":15368},\"check_suite\":{\"id\":102552137693},\"completed_at\":\"2026-10-08T21:57:30Z\",\"conclusion\":\"success\",\"name\":\"copilot-pull-request-reviewer\",\"started_at\":\"2026-10-08T21:55:00Z\",\"status\":\"completed\"},{\"app\":{\"id\":15368},\"check_suite\":{\"id\":102552064689},\"completed_at\":\"2026-10-08T22:01:14Z\",\"conclusion\":\"success\",\"name\":\"test\",\"started_at\":\"2026-10-08T21:54:42Z\",\"status\":\"completed\"},{\"app\":{\"id\":15368},\"check_suite\":{\"id\":102552054061},\"completed_at\":\"2026-10-08T22:01:47Z\",\"conclusion\":\"failure\",\"name\":\"test\",\"started_at\":\"2026-10-08T21:54:40Z\",\"status\":\"completed\"}]\n",
+      "stderr": ""
+    }
+  ]
+}

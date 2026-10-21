@@ -218,6 +218,12 @@ function classicFromBranch(required: unknown): { enforced: boolean; strict: fals
 /** Every value GitHub's GraphQL API documents for a check run's `status` and `conclusion` (CheckStatusState, CheckConclusionState). */
 const CHECK_RUN_STATUSES = ['REQUESTED','QUEUED','IN_PROGRESS','COMPLETED','WAITING','PENDING'];
 const CHECK_RUN_CONCLUSIONS = ['ACTION_REQUIRED','CANCELLED','FAILURE','NEUTRAL','SKIPPED','STALE','STARTUP_FAILURE','SUCCESS','TIMED_OUT'];
+/**
+ * Pinned checks read per `gh api graphql` call, and pages of 100 suites read per check. Each check asks for at most
+ * 100 suites of 100 runs, so 25 stay well inside GitHub's limit of 500,000 nodes per query.
+ */
+const PINNED_CHECKS_PER_READ = 25, PINNED_SUITE_PAGES = 10;
+const pinnedKey = (context: string, appId: number) => `${context}\0${appId}`;
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
 
@@ -327,6 +333,10 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       published ? this.#branchOpen(target.headBranch!, reads).catch(stopOthers) : undefined,
     ]);
     const fixed = await alreadyFixed;
+    // The first stage to fail stopped the others, and its error is `failed`'s reason. A stopped stage can still settle
+    // with an error of its own (a gh exit that came while gh was stopping), so the first failure is reported, not the
+    // first stage in this list that failed. Every rejection above aborts `failed`, so the loop after it is a backstop.
+    if (failed.signal.aborted) throw failed.signal.reason;
     for (const read of [ruleRead, listRead]) if (read.status === 'rejected') throw read.reason;
     if (fixed instanceof Error) throw fixed;
     const rules = (ruleRead as PromiseFulfilledResult<BranchRules>).value;
@@ -362,60 +372,82 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   }
 
   /**
-   * Every check run on commit `head`, with the ID of the app that reported it, in the shape of gh's statusCheckRollup
-   * entries plus `appId` (null for a suite GitHub names no app for). gh's statusCheckRollup does not ask for a run's app
-   * (#176), so a required check that a rule pins to an app is matched from this read. Only the fields the gateway reads
-   * are asked for, which keeps the answer small: a run's output text, which the REST API returns, is not. Each suite's
-   * latest run of each name is read, as GitHub counts for required checks. The read fails closed: on a gh failure (its error is kept), on errors or a
-   * malformed field in GitHub's answer, on a suite with more than 100 runs, on more than 1,000 suites, and when the
-   * suites change between pages.
+   * For each required check pinned to an app, the runs of that check's name on commit `head` from that app's check suites,
+   * in the shape of gh's statusCheckRollup entries, keyed by `pinnedKey`. gh's statusCheckRollup does not ask for a
+   * run's app (#176), so a pinned check is matched from this read, `gh api graphql`. GitHub filters on its side, by
+   * suite app (`checkSuites(filterBy: {appId})`) and by run name (`checkRuns(filterBy: {checkName})`, which matches
+   * the name exactly), so the answer holds only the runs that can meet a pinned check. The app filter also returns a
+   * suite whose `app` GitHub hides from this reader (a private app), which an app read from the answer would not name.
+   * Only each suite's latest run of a name is asked for (`checkType: LATEST`): a run re-run inside its suite is left out.
+   * Each check is one alias in the query, with up to PINNED_CHECKS_PER_READ checks per call; a check whose app has more
+   * than 100 suites on the head is paged, up to PINNED_SUITE_PAGES pages.
+   *
+   * The read fails closed. A gh failure keeps gh's error. GitHub's own errors in an answer, a malformed field, an answer
+   * for another commit, a suite with more runs of the name than one page holds, more suites than the page limit, and
+   * suites that change between pages each fail it with codeboost's reason.
    */
-  async #checkRuns(head: string, signal?: AbortSignal): Promise<Array<Record<string, unknown> & { appId: number | null }>> {
+  async #pinnedRuns(head: string, pinned: ReadonlyArray<{ context: string; appId: number }>, signal?: AbortSignal): Promise<Map<string, Array<Record<string, unknown>>>> {
     const [owner, name] = this.config.repository.split('/') as [string, string];
-    const query = 'query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){__typename ... on Commit{oid checkSuites(first:100,after:$after){totalCount pageInfo{hasNextPage endCursor} nodes{app{databaseId} checkRuns(first:100,filterBy:{checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}}}}}';
-    const runs: Array<Record<string, unknown> & { appId: number | null }> = [];
-    let cursor: string | null = null, suites = 0, total: number | null = null;
-    for (let page = 1; ; page++) {
-      const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-f',`oid=${head}`];
-      if (cursor !== null) args.push('-f', `after=${cursor}`);
-      const response = await this.#json(args, signal) as { data?: { repository?: { object?: Record<string, unknown> | null } | null }; errors?: unknown } | null;
-      signal?.throwIfAborted();
-      if (!response || typeof response !== 'object' || (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)))
-        throw new Error('GitHub returned check runs with errors.');
-      const commit = response.data?.repository?.object;
-      if (!commit || commit.__typename !== 'Commit' || commit.oid !== head) throw new Error('GitHub returned no check runs for the pull request head.');
-      const connection = commit.checkSuites as { totalCount?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null; nodes?: unknown } | null | undefined;
-      if (!connection || typeof connection !== 'object' || !Number.isSafeInteger(connection.totalCount) || (connection.totalCount as number) < 0 || !Array.isArray(connection.nodes)
-          || !connection.pageInfo || typeof connection.pageInfo.hasNextPage !== 'boolean' || (connection.pageInfo.endCursor !== null && typeof connection.pageInfo.endCursor !== 'string'))
-        throw new Error('GitHub returned incomplete check runs.');
-      if (total !== null && connection.totalCount !== total) throw new Error('The check suites on the pull request head changed while they were read.');
-      total = connection.totalCount as number;
-      for (const suite of connection.nodes) {
-        const value = suite as { app?: { databaseId?: unknown } | null; checkRuns?: { totalCount?: unknown; nodes?: unknown } | null } | null;
-        if (!value || typeof value !== 'object' || !Object.hasOwn(value, 'app') || (value.app !== null && (typeof value.app !== 'object' || !validNumber(value.app.databaseId))))
-          throw new Error('GitHub returned incomplete check runs.');
-        const appId = value.app === null ? null : value.app!.databaseId as number;
-        const checkRuns = value.checkRuns;
-        if (!checkRuns || typeof checkRuns !== 'object' || !Number.isSafeInteger(checkRuns.totalCount) || !Array.isArray(checkRuns.nodes)) throw new Error('GitHub returned incomplete check runs.');
-        // One page of runs per suite is read: a suite with more runs than its page holds could hide the required one.
-        if (checkRuns.nodes.length !== checkRuns.totalCount) throw new Error('A check suite on the pull request head has more check runs than codeboost can read.');
-        for (const run of checkRuns.nodes) {
-          const check = run as Record<string, unknown> | null;
-          if (!check || typeof check !== 'object' || typeof check.name !== 'string' || !CHECK_RUN_STATUSES.includes(check.status as string)
-              || (check.conclusion !== null && !CHECK_RUN_CONCLUSIONS.includes(check.conclusion as string))
-              || (check.startedAt !== null && typeof check.startedAt !== 'string') || (check.completedAt !== null && typeof check.completedAt !== 'string'))
-            throw new Error('GitHub returned a malformed check run.');
-          runs.push({ name: check.name, status: check.status, conclusion: check.conclusion, startedAt: check.startedAt, completedAt: check.completedAt, appId });
+    const found = new Map<string, Array<Record<string, unknown>>>();
+    for (let start = 0; start < pinned.length; start += PINNED_CHECKS_PER_READ) {
+      // Every check of this call, with its cursor (null for its first page), its suites seen and GitHub's suite count.
+      const checks = pinned.slice(start, start + PINNED_CHECKS_PER_READ).map(check => ({ ...check, cursor: null as string | null, suites: 0, total: null as number | null, done: false }));
+      for (const check of checks) found.set(pinnedKey(check.context, check.appId), []);
+      for (let page = 1; checks.some(check => !check.done); page++) {
+        const open = checks.map((check, index) => ({ check, index })).filter(({ check }) => !check.done);
+        const declared = open.map(({ index }) => `,$app${index}:Int!,$name${index}:String!,$after${index}:String`).join('');
+        const selected = open.map(({ index }) => ` c${index}:checkSuites(first:100,after:$after${index},filterBy:{appId:$app${index}}){totalCount pageInfo{hasNextPage endCursor} nodes{checkRuns(first:100,filterBy:{checkName:$name${index},checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}`).join('');
+        const query = `query($owner:String!,$repo:String!,$oid:GitObjectID!${declared}){repository(owner:$owner,name:$repo){object(oid:$oid){__typename ... on Commit{oid${selected}}}}}`;
+        // `-F` makes an app ID a number; a name always goes with `-f`, which gh passes as a literal string.
+        const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`repo=${name}`,'-f',`oid=${head}`];
+        for (const { check, index } of open) {
+          args.push('-F', `app${index}=${check.appId}`, '-f', `name${index}=${check.context}`);
+          if (check.cursor !== null) args.push('-f', `after${index}=${check.cursor}`);
+        }
+        const response = await this.#json(args, signal) as { data?: { repository?: { object?: Record<string, unknown> | null } | null }; errors?: unknown } | null;
+        signal?.throwIfAborted();
+        // gh exits 1 on an answer with errors, so this is defensive: such an answer never reaches here as gh's output.
+        if (!response || typeof response !== 'object' || (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)))
+          throw new Error('GitHub returned check runs with errors.');
+        const commit = response.data?.repository?.object;
+        if (!commit || commit.__typename !== 'Commit' || commit.oid !== head) throw new Error('GitHub returned no check runs for the pull request head.');
+        for (const { check, index } of open) {
+          const connection = commit[`c${index}`] as { totalCount?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null; nodes?: unknown } | null | undefined;
+          if (!connection || typeof connection !== 'object' || !Number.isSafeInteger(connection.totalCount) || (connection.totalCount as number) < 0 || !Array.isArray(connection.nodes)
+              || !connection.pageInfo || typeof connection.pageInfo.hasNextPage !== 'boolean' || (connection.pageInfo.endCursor !== null && typeof connection.pageInfo.endCursor !== 'string'))
+            throw new Error('GitHub returned incomplete check runs.');
+          if (check.total !== null && connection.totalCount !== check.total) throw new Error('The check suites on the pull request head changed while they were read.');
+          check.total = connection.totalCount as number;
+          const runs = found.get(pinnedKey(check.context, check.appId))!;
+          for (const suite of connection.nodes) {
+            const checkRuns = (suite as { checkRuns?: { totalCount?: unknown; nodes?: unknown } | null } | null)?.checkRuns;
+            if (!checkRuns || typeof checkRuns !== 'object' || !Number.isSafeInteger(checkRuns.totalCount) || !Array.isArray(checkRuns.nodes)) throw new Error('GitHub returned incomplete check runs.');
+            // One page of runs per suite is read: more latest runs of one name in one suite than it holds could hide one.
+            if (checkRuns.nodes.length !== checkRuns.totalCount) throw new Error(`A check suite on the pull request head has more runs named ${JSON.stringify(check.context)} than codeboost can read.`);
+            for (const run of checkRuns.nodes) {
+              const value = run as Record<string, unknown> | null;
+              if (!value || typeof value !== 'object' || typeof value.name !== 'string' || !CHECK_RUN_STATUSES.includes(value.status as string)
+                  || (value.conclusion !== null && !CHECK_RUN_CONCLUSIONS.includes(value.conclusion as string))
+                  || (value.startedAt !== null && typeof value.startedAt !== 'string') || (value.completedAt !== null && typeof value.completedAt !== 'string'))
+                throw new Error('GitHub returned a malformed check run.');
+              // GitHub's name filter is exact (checked against GitHub); a run of another name could only be dropped here.
+              if (value.name === check.context)
+                runs.push({ name: value.name, status: value.status, conclusion: value.conclusion, startedAt: value.startedAt, completedAt: value.completedAt });
+            }
+          }
+          check.suites += connection.nodes.length;
+          if (!connection.pageInfo.hasNextPage) {
+            if (check.suites !== check.total) throw new Error('The check suites on the pull request head changed while they were read.');
+            check.done = true;
+            continue;
+          }
+          if (page === PINNED_SUITE_PAGES || typeof connection.pageInfo.endCursor !== 'string' || !connection.pageInfo.endCursor)
+            throw new Error(`The pull request head has more check suites from app ${check.appId} than codeboost can read.`);
+          check.cursor = connection.pageInfo.endCursor;
         }
       }
-      suites += connection.nodes.length;
-      if (!connection.pageInfo.hasNextPage) break;
-      if (page === 10 || typeof connection.pageInfo.endCursor !== 'string' || !connection.pageInfo.endCursor)
-        throw new Error('The pull request head has more check suites than codeboost can read.');
-      cursor = connection.pageInfo.endCursor;
     }
-    if (suites !== total) throw new Error('The check suites on the pull request head changed while they were read.');
-    return runs;
+    return found;
   }
 
   /** The effective branch rules and the state of each required check on the PR, whose head is `head`. */
@@ -506,13 +538,16 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
     }
     // A check any app may report is matched from gh's rollup, check runs and commit statuses alike. One pinned to an app
-    // is matched only from the check runs that app reported on the head (#176): the rollup names no app, and a commit
-    // status has none, so a status never meets a pinned check. A failed read fails the inspection with its error.
-    const pinned = [...requirements.values()].some(required => required.appId !== null) ? await this.#checkRuns(head, signal) : [];
+    // is matched only from the check runs that app reported on the head (#176): the rollup names no app. No commit status
+    // meets a pinned check, though GitHub may count one an app set: that fails closed (the check waits or reads missing).
+    // With the rules unknown the merge is blocked anyway, so the read is skipped and cannot replace that blocker. A failed
+    // read fails the inspection with its reason.
+    const pinnedChecks = [...requirements.values()].filter((required): required is { context: string; appId: number } => required.appId !== null);
+    const pinned = rulesKnown && pinnedChecks.length ? await this.#pinnedRuns(head, pinnedChecks, signal) : new Map<string, Array<Record<string, unknown>>>();
     const requiredChecks = [...requirements.values()].map(required => {
       const matches = required.appId === null
         ? observed.filter(check => (typeof check.name === 'string' ? check.name : check.context) === required.context)
-        : pinned.filter(run => run.name === required.context && run.appId === required.appId);
+        : pinned.get(pinnedKey(required.context, required.appId)) ?? [];
       if (!matches.length) return { ...required, state: 'missing' as const };
       // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
       // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not

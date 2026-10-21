@@ -1,0 +1,40 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "microsoft/vscode",
+  "pullRequest": 343099,
+  "recordedAt": "2026-10-21T02:14:52.164Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "graphql",
+        "-f",
+        "query=query($owner:String!,$repo:String!,$oid:GitObjectID!,$app0:Int!,$name0:String!,$after0:String){repository(owner:$owner,name:$repo){object(oid:$oid){__typename ... on Commit{oid c0:checkSuites(first:100,after:$after0,filterBy:{appId:$app0}){totalCount pageInfo{hasNextPage endCursor} nodes{checkRuns(first:100,filterBy:{checkName:$name0,checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}}}}}",
+        "-f",
+        "owner=microsoft",
+        "-f",
+        "repo=vscode",
+        "-f",
+        "oid=b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f",
+        "-F",
+        "app0=15368",
+        "-f",
+        "name0=Detect Changes"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"data\":{\"repository\":{\"object\":{\"__typename\":\"Commit\",\"oid\":\"b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f\",\"c0\":{\"totalCount\":5,\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":\"Y3Vyc29yOnYyOpHPAAAAGPEbyF8=\"},\"nodes\":[{\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}},{\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}},{\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}},{\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}},{\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"Detect Changes\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"startedAt\":\"2026-10-21T01:54:29Z\",\"completedAt\":\"2026-10-21T01:54:35Z\"}]}}]}}}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/microsoft/vscode/check-suites/107124344927/check-runs?per_page=1",
+        "--jq",
+        "{total_count, check_suite: {id: .check_runs[0].check_suite.id, head_sha: .check_runs[0].head_sha}, app: {id: .check_runs[0].app.id}}"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"app\":{\"id\":15368},\"check_suite\":{\"head_sha\":\"b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f\",\"id\":107124344927},\"total_count\":101}\n",
+      "stderr": ""
+    }
+  ]
+}

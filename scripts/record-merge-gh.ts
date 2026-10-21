@@ -4,7 +4,7 @@
 //
 // The production GhMergeGateway runs one fresh inspection of the pull request through the real `gh`, signed in as you.
 // Every `gh` call it makes (the pull request, the ruleset, the branch and its classic protection, and, when a required
-// check is pinned to an app, the head's check runs with their apps) is saved with its exit
+// check is pinned to an app, the runs of each pinned check) is saved with its exit
 // status, stdout and stderr, as runWithInput reports them (trimmed on a failure), to test/fixtures/gh/<name>.json. The
 // already-fixed check is replaced by a stub, so its reads are not recorded. A branch read keeps only `name`,
 // `protected` and `protection` (the gateway reads only the last two), dropping the commit and its authors' emails. Use a public
