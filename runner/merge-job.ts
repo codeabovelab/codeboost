@@ -354,9 +354,9 @@ export class MergeJobCoordinator {
         return { kind: 'blocked', reason: `Required checks passed only after the ${Math.round(this.checkWaitMs / 60_000)}-minute limit.`, next: 'Retry merge.' };
       }
       if (verdict.kind !== 'wait') return verdict;
-      // The first inspection's checks are saved, then only a change, so an unchanged inspection makes no new revision and
-      // the page's poll backs off.
-      if (JSON.stringify(verdict.checks) !== JSON.stringify(waiting) || !waited)
+      // Saved only when they change (the job starts, and the merging step leaves it, with none), so an unchanged inspection
+      // makes no new revision and the page's poll backs off.
+      if (JSON.stringify(verdict.checks) !== JSON.stringify(waiting))
         this.settle(() => store.updateMergeJob(identity, job.id, { checks: verdict.checks }));
       waiting = verdict.checks; waited = true;
       const remaining = until - performance.now();

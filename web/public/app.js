@@ -178,8 +178,12 @@ async function refresh() {
 }
 function renderMerge() {
   const merge = data?.merge;
+  // Read before hiding: hiding the focused control blurs it at once. A reload that hides the focused merge control (or its
+  // blockers button) moves focus to what is still shown (AGENTS.md).
+  const focused = document.activeElement;
   $("merge").hidden = !merge?.available;
   $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
+  if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) ($("merge").hidden ? $("reload") : $("merge")).focus();
   renderMergeSteps();
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
