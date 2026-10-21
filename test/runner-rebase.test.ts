@@ -12,6 +12,9 @@ import { splitBoundedIndexRecords, verifyCheckout } from '../runner/verify-check
 import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
 import { listGitPaths } from '../runner/list-git-paths.ts';
 import { outsideConflictDigest } from '../runner/hash-outside-conflict.ts';
+import { UpstreamFailure } from '../runner/lifecycle.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
+import { ghIssueNotFound } from './fixtures/gh-answers.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
 const roots: string[] = [];
@@ -664,6 +667,108 @@ describe('trusted pre-merge rebase', () => {
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
       ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/child resources remain/);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(true);
+  });
+
+  describe('a conflict resolver whose issue-trust read failed, and a stop (#174)', () => {
+    /**
+     * The resolver's issue-trust read as production builds it: the issue gateway's bounded read keeps whichever came
+     * first, its own timeout, gh's answer or the caller's abort, and the server's readIssueAccess reports the abort as
+     * itself, or wraps any other failure as an UpstreamFailure caused by it. Here `answer` is ready before the read is
+     * called, so it came first unless the caller's signal was already aborted.
+     */
+    const trustRead = (signal: AbortSignal, answer: Error): Promise<never> => signal.aborted ? Promise.reject(signal.reason)
+      : Promise.reject(new UpstreamFailure(`Issue trust could not be verified: ${answer.message}`, { cause: answer }));
+    // The last row is a failure that is neither a timeout nor gh's answer: the same order reports the stop, as before.
+    // Each row: the read's failure, what is reported, the failure itself, and whether the failure is reported.
+    const answers = [
+      ['its own timeout', 'the timeout', () => new RemoteTimeout('Issue retrieval timed out.'), true],
+      ["gh's answer", "gh's answer", ghIssueNotFound, true],
+      ['a failure of another kind', 'the stop', () => new Error('The trust read failed.'), false],
+    ] as const;
+    const run = (s: Awaited<ReturnType<typeof setup>>, runner: GitRebaser, attemptId: string, signal?: AbortSignal) =>
+      runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal,
+        ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] }).then(() => null, (error: unknown) => error as Error);
+
+    it.each(answers)('when %s came before a cancel, reports %s', async (_case, _reported, answer, kept) => {
+      const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
+      const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
+      let pending: unknown;
+      const runner = createRebaser(s, { resolveForeignConflict: async input => {
+        const read = trustRead(input.signal!, cause);
+        // The cancel comes while gh is still stopping, so it is pending when the resolver's error is handled.
+        stop.abort(new Error('Task cancelled.'));
+        pending = input.signal!.aborted ? input.signal!.reason : null;
+        await read;
+      } });
+      const error = await run(s, runner, attemptId, stop.signal);
+      expect((pending as Error | null)?.message).toBe('Task cancelled.');
+      expect(error?.message).toBe(kept ? expected : 'Task cancelled.');
+      if (kept) expect(error?.cause).toBe(cause);
+      // The failed attempt was cleaned up as usual.
+      expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+    });
+
+    it.each(answers)('when %s came before the rebase work deadline, reports %s', async (_case, _reported, answer, kept) => {
+      const s = await setup('foreign'), attemptId = randomUUID(), realNow = performance.now.bind(performance);
+      const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
+      let skew = 0, overdueMs = 0, aborted: boolean | null = null;
+      vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+      const runner = createRebaser(s, { resolveForeignConflict: async input => {
+        const read = trustRead(input.signal!, cause);
+        // The work deadline (whose wall-clock form is input.deadline) passes 1 s before the error is handled, and before
+        // its timer can run. Cleanup keeps its own 30 s reserve after the work deadline.
+        skew = input.deadline - Date.now() + 1_000;
+        overdueMs = Date.now() + (performance.now() - realNow()) - input.deadline;
+        aborted = input.signal!.aborted;
+        await read;
+      } });
+      const error = await run(s, runner, attemptId);
+      expect(overdueMs).toBeGreaterThan(0);
+      expect(aborted).toBe(false);
+      expect(error?.message).toBe(kept ? expected : 'The rebase deadline expired during conflict resolution.');
+      if (kept) expect(error?.cause).toBe(cause);
+      expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+    });
+
+    // The cancel comes before the read can answer, so which answer it would have given does not matter: one is enough.
+    it('reports a cancel that came before the trust read could answer', async () => {
+      const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
+      let abortedBeforeRead: boolean | null = null;
+      const runner = createRebaser(s, { resolveForeignConflict: async input => {
+        stop.abort(new Error('Task cancelled.'));
+        abortedBeforeRead = input.signal!.aborted;
+        await trustRead(input.signal!, new RemoteTimeout('Issue retrieval timed out.'));
+      } });
+      const error = await run(s, runner, attemptId, stop.signal);
+      expect(abortedBeforeRead).toBe(true);
+      expect(error?.message).toBe('Task cancelled.');
+    });
+
+    // The second row's cause is neither a timeout nor gh's answer, so only the precedence of retained ownership keeps it
+    // from being reported as the pending cancel.
+    it.each([
+      ['a trust-read timeout', () => new RemoteTimeout('Issue retrieval timed out.'),
+        /retained resources for startup recovery: Issue trust could not be verified: Issue retrieval timed out/],
+      ['a failure of another kind', () => new Error('The trust read failed.'),
+        /retained resources for startup recovery: Issue trust could not be verified: The trust read failed/],
+    ] as const)('keeps retained resource ownership ahead of %s and a later cancel', async (_case, failure, message) => {
+      const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
+      let pending = false;
+      const runner = createRebaser(s, { resolveForeignConflict: async input => {
+        const read = trustRead(input.signal!, failure());
+        stop.abort(new Error('Task cancelled.'));
+        pending = input.signal!.aborted;
+        // The resolver's cleanup did not settle, so it retains its resources, as createConflictResolver reports it.
+        await read.catch((error: Error) => {
+          throw new RebaseResourcesUnsettled(`Conflict resolution retained resources for startup recovery: ${error.message}`, { cause: error });
+        });
+      } });
+      const error = await run(s, runner, attemptId, stop.signal);
+      expect(pending).toBe(true);
+      expect(error).toBeInstanceOf(RebaseResourcesUnsettled);
+      expect(error?.message).toMatch(message);
+      expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(true);
+    });
   });
 
   it('routes an owned conflict through the sandbox while preserving its owned provenance', async () => {

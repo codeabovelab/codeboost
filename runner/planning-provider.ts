@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { TaskStorageLimits } from '../agents/container/storage.ts';
+import { PLANNING_MAX_TURNS } from '../agents/policy.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { allocations, exceedsStorage, RetainedStorage, runReadOnlyAgent, sameContext, type ContainerDependencies, type LeftoverPolicy, type Provider,
   type ReadOnlyFeature, type ReadOnlyRun, type RepositorySize } from './question-container.ts';
@@ -94,7 +95,13 @@ export function planningOutput(result: InvocationResult, invocation: InvocationI
     throw new Error(`Claude stopped unexpectedly${result.signal ? ` (${result.signal})` : ''}.`);
   if (result.exitCode !== 0) {
     const detail = result.stdout.replace(/\s+/g, ' ').trim().slice(0, 300);
-    throw new Error(`Claude could not write the plan. Check its sign-in and usage limits.${detail ? ` Claude said: ${detail}` : ''}`);
+    // Claude Code's own text when `--max-turns` stops the run (#163). The decoder keeps no subtype, so this matches the
+    // text: a stop without it gets the general advice, and other output that contains it (Claude's own `result` text
+    // can) gets the turn-limit advice. Only the advice can be wrong; the text is still quoted.
+    const advice = detail.includes('Reached maximum number of turns')
+      ? `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.`
+      : 'Check its sign-in and usage limits.';
+    throw new Error(`Claude could not write the plan. ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
   }
   return result.stdout;
 }
