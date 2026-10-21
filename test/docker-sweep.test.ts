@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
-import { removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 
 // The test sweep's handling of output it cannot read (#189). The fake `docker` answers as no real daemon does for
 // `network ls`: a line that is not JSON, a JSON null and one network without a name. To every other call it answers
@@ -44,4 +44,28 @@ it('reads nothing from a docker call that was killed, whose output may be cut sh
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|network rm) /.test(line))).toEqual([]);
   expect(warn.mock.calls).toContainEqual(['test: docker network ls failed:', 'killed by SIGKILL']);
+});
+
+it('removes by name only an object of exactly that name, and reports failures other than no such object', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls'), id = 'b'.repeat(64);
+  // Answers as Docker 27.4 does, read for `--format '{{json .Id}} {{json .Name}}'`: a missing name, another object found
+  // by an ID prefix, one whose removal is refused, and an inspect killed by a signal.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    'for arg; do name="$arg"; done',
+    'if [ "$2" = inspect ]; then case "$name" in',
+    "  gone) echo 'Error response from daemon: No such container: gone' >&2; exit 1;;",
+    `  prefix) printf '%s\\n' '"${id}" "/someone-else"';;`,
+    `  busy) printf '%s\\n' '"${id}" "/busy"';;`,
+    '  killed) kill -9 $$;;', 'esac; exit 0; fi',
+    "if [ \"$1\" = rm ]; then echo 'Error response from daemon: conflict' >&2; exit 1; fi", 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  for (const name of ['gone', 'prefix', 'busy', 'killed']) removeByName('container', name, join(root, 'docker'));
+  // Only the exact name is removed, and by its full ID.
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([`rm --force ${id}`]);
+  expect(warn.mock.calls).toEqual([
+    ['removing container busy: docker container rm failed:', 'Error response from daemon: conflict'],
+    ['removing container killed: docker inspect failed:', 'killed by SIGKILL'],
+  ]);
 });

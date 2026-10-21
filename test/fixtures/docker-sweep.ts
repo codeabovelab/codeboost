@@ -30,7 +30,7 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
   const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const };
   const failed = (result: SpawnSyncReturns<string>, what: string) => console.warn(`removing ${kind} ${name}: docker ${what} failed:`,
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
-  // As JSON: a network's name may hold spaces.
+  // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
   const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name], options);
   // Docker 27.4's answers for a missing object: "No such container", "network … not found", "no such volume".
   if (found.error || found.status !== 0) { if (found.status === null || !/no such|not found/i.test(found.stderr)) failed(found, 'inspect'); return; }
@@ -39,7 +39,7 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     const at = found.stdout.indexOf(' ');
     [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
   } catch { console.warn(`removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
-  if (typeof id !== 'string' || typeof actual !== 'string' || actual.replace(/^\//, '') !== name) return;
+  if (typeof id !== 'string' || typeof actual !== 'string' || (kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
   const removed = spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
   if (removed.error || removed.status !== 0) failed(removed, `${kind} rm`);
 }
@@ -79,7 +79,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
   for (const kind of ['container', 'network', 'volume'] as const) {
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
     // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
-    // As JSON: a network's name may hold spaces.
+    // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
     const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])

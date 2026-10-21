@@ -61,7 +61,8 @@ const networks = new Set<string>();
 const volumes = new Set<string>();
 /**
  * For an async test that makes objects under another runner's owner, or its own random one, which no afterAll sweep
- * finds: removes what carries `label=value` when the test finishes, passed, failed or timed out (a timed-out body runs
+ * finds, and for `withoutRunnerLabel`'s test-run ID, so they go before the next test rather than at afterAll: removes
+ * what carries `label=value` when the test finishes, passed, failed or timed out (a timed-out body runs
  * on, and its finally may never run), with the sweep's own budget: up to eleven synchronous Docker calls of 30 s each,
  * which a timer cannot cut short, so 6 minutes rather than a hook's default 10 s (#189). Not covered: an object that
  * lands after this sweep has run, from a timed-out body or a killed process's Docker client.
@@ -820,6 +821,12 @@ describe('real Docker agent isolation', () => {
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
       removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
+      // afterAll removes these tracked names with removeByName. One now gone is the start of a live object's ID, which
+      // Docker resolves it to; removeByName must leave that object alone.
+      expect(docker('network', 'inspect', '--format', '{{.Id}}', bystanderNetwork.slice(0, 12))).toBe(bystanderNetwork);
+      removeByName('network', bystanderNetwork.slice(0, 12));
+      expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
+      removeByName('container', bystanders[0]!.slice(0, 12));
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);

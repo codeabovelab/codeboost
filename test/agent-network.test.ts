@@ -35,9 +35,11 @@ beforeAll(async () => {
 }, 10 * 60_000);
 /**
  * Objects a test makes without this run's runner label, by name or by the file its shim records the name in, so
- * afterAll removes them should the test time out before its own removal runs (#189).
+ * afterAll removes them should the test time out before its own removal runs (#189). The record files live in
+ * `RECORDS`, not in the shims, so a name a late client adds after the test's own removal is still read here.
  */
 const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
+const RECORDS = mkdtempSync(join(tmpdir(), 'codeboost-records-'));
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => {
   try {
@@ -55,6 +57,7 @@ afterAll(async () => {
     // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
     // the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
+    rmSync(RECORDS, { recursive: true, force: true });
   }
 }, 7 * 60_000);
 
@@ -100,7 +103,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('leaves a same-named network alone when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
     unlabelled.push({ kind: 'network', file: recorded });
     const realDocker = requireRealDocker();
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
@@ -121,8 +124,7 @@ describe('vendor-only egress', () => {
       // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
-      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      for (const name of made) unlabelled.push({ kind: 'network', name });
+      // afterAll reads the record again: the object may land after this removal (#189).
       if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
       for (const name of made) removeByName('network', name);
       rmSync(shim, { recursive: true, force: true });
@@ -158,7 +160,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
@@ -178,8 +180,7 @@ describe('vendor-only egress', () => {
       // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
-      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      for (const name of made) unlabelled.push({ kind: 'container', name });
+      // afterAll reads the record again: the object may land after this removal (#189).
       if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
       for (const name of made) removeByName('container', name);
       rmSync(shim, { recursive: true, force: true });
@@ -209,7 +210,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
@@ -233,8 +234,7 @@ describe('vendor-only egress', () => {
       // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       impostor = made[0] ?? '';
-      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
-      for (const name of made) unlabelled.push({ kind: 'container', name });
+      // afterAll reads the record again: the object may land after this removal (#189).
       if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
       for (const name of made) removeByName('container', name);
       rmSync(shim, { recursive: true, force: true });
