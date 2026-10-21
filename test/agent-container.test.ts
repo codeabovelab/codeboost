@@ -980,7 +980,7 @@ describe('real Docker agent isolation', () => {
     const listing = spawnSync('docker', listArgs, { encoding: 'utf8', ...CLIENT_LIMIT });
     // A listing that failed fails here with the command and its cause, as main's helper did.
     expect(listing.status, `docker ${listArgs.join(' ')} failed: `
-      + (listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr))).toBe(0);
+      + (listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr.trim()))).toBe(0);
     const left = listing.stdout.trim();
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
