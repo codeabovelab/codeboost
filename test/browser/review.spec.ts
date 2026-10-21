@@ -1213,9 +1213,9 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
   if(body.action!=='merge'){await route.continue();return;}
   started=true;const review=await clickReview(route);
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:merging}),job:merging})});});
- let failNext=false;
+ let failNext=false,later=false;
  await page.route('**/api/merge',route=>{if(failNext){failNext=false;return route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'GitHub returned HTTP 502.'})});}
-  return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:merging})});});
+  return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:later?{...merging,revision:merging.revision+1}:merging})});});
  // As a runner server answers a full review: the running job rides along once the click started it.
  let started=false;
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
@@ -1236,10 +1236,14 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
  await expect(page.locator('#banner')).toHaveText(/^Could not refresh merge status\./,{timeout:15_000});
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.',{timeout:40_000});
  // Refresh rewrites the banner too; the next poll, answering the same record, shows the refusal again.
+ // (Then the job's record changes, below, and the job's own text comes back.)
  const reloaded=page.waitForResponse(response=>response.url().endsWith('/api/review'));
  await page.locator('#reload').click();await reloaded;
  await expect(page.locator('#banner')).not.toHaveText(/^Could not cancel the merge\./);
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.',{timeout:40_000});
+ // A later record of the job ends the held refusal: the banner says the job's step again.
+ later=true;
+ await expect(page.locator('#banner')).toHaveText('Merging the reviewed head.',{timeout:40_000});
 });
 test('keeps an adopted cancel when a poll on its way answers the older record of the same job (D16)',async({page})=>{
  test.setTimeout(120_000);

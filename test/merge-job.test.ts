@@ -516,6 +516,8 @@ it('keeps a job running and reports it when even reading the task fails after th
     f.store.getTask = getTask;
     expect(logged).toHaveBeenCalledWith(`Could not end merge job ${started.id}; it shows as running until the server restarts: "database is locked"`);
     expect(f.store.getMergeJob(identity, started.id)).toMatchObject({ state: 'running' });
+    // Nothing runs it any more, so a merge-only cancel is refused rather than accepted and never ended.
+    expect(() => f.coordinator.cancelMerge(started.id)).toThrow(/running until the server restarts/);
   } finally { f.store.getTask = getTask; logged.mockRestore(); }
 });
 
@@ -1853,4 +1855,18 @@ it('keeps the Merge step waiting when the merge attempt cannot be saved, since G
   expect(done.state).toBe('failed');
   expect(stepStates(done)).toMatchObject({ 'already-fixed': 'failed', merge: 'pending' });
   expect(f.gh.merged).toEqual([]);
+});
+
+it('settles a merge the person cancelled as a cancelled task at restart when the task cancel is still stopping', async () => {
+  const store = publishedTask();
+  const { job } = store.beginMergeJob(identity, { actionId: randomUUID(), token: 'review-token' });
+  store.requestMergeJobCancel(identity, job.id);
+  // A rebase was under way when the server stopped, so the task cancel could only be requested, not closed.
+  const snapshot = store.getSnapshot(identity);
+  store.beginRebase(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, store.getTask(identity).stateVersion,
+    { oldBase: snapshot.base, oldHead: snapshot.head, oldHistory: [snapshot.head], onto: oid(3) });
+  expect(store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  expect(store.getTask(identity)).toMatchObject({ status: 'in review', cancelRequested: expect.any(String) });
+  store.settleInterruptedMergeJobs(identity);
+  expect(store.getMergeJob(identity, job.id)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
 });
