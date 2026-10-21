@@ -13,7 +13,7 @@ import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/c
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
   containerProfileResources, isContainerProfileAuthentic } from '../agents/container/profile.ts';
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
-  startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
+  startValidatedContainer, hasExactOptions, keepsNoDaemonLog, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, exportTaskPaths, importTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
@@ -227,6 +227,31 @@ describe('real Docker agent isolation', () => {
     const args = (await profile(fixture(), 'planning', 'noop')).args;
     expect(args).toContain('--ipc=private');
     expect(args).toContain('--cgroupns=private');
+  }, 60_000);
+
+  // #165: the supervisor bounds the output it reads through `docker start --attach`; the daemon must keep no copy.
+  it('creates the agent container with no Docker daemon log', async () => {
+    const live = await profile(fixture(), 'planning', 'noop');
+    await createValidatedContainer(live); containers.add(live.name);
+    const inspected = JSON.parse(docker('container', 'inspect', live.name))[0] as
+      { HostConfig: { LogConfig: { Type: string; Config: Record<string, string> | null } } };
+    // Driver `none`, with no option but the `cache-*` ones a daemon copies from its own log options, if it has any.
+    expect(inspected.HostConfig.LogConfig.Type).toBe('none');
+    expect(Object.keys(inspected.HostConfig.LogConfig.Config ?? {}).filter(key => !key.startsWith('cache-'))).toEqual([]);
+    expect(keepsNoDaemonLog(inspected.HostConfig.LogConfig)).toBe(true);
+    await disposeValidatedContainer(live); containers.delete(live.name);
+  }, 60_000);
+
+  it.each([
+    ['a json-file daemon log', (args: readonly string[]) => args.map(arg => arg === '--log-driver=none' ? '--log-driver=json-file' : arg)],
+    ['a bounded local daemon log', (args: readonly string[]) => args.flatMap(arg => arg === '--log-driver=none'
+      ? ['--log-driver=local', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1'] : [arg])],
+  ] as const)('refuses an agent container with %s at validation', async (_label, change) => {
+    const valid = await profile(fixture(), 'planning', 'must-not-run');
+    expect(valid.args).toContain('--log-driver=none');
+    docker(...change(valid.args)); containers.add(valid.name);
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
   it.each(['planning', 'review', 'execute'] as const)(
