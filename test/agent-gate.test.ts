@@ -1,9 +1,14 @@
 import { spawnSync } from 'node:child_process';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type Phase } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
+import { RUNNER_LABEL } from '../agents/labels.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
-const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+// Each run has its own runner owner, and its probe containers carry it, so the sweep after this file removes this
+// run's leftovers and never another run's.
+const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
 
 // The gate is only meaningful if its probes fail when isolation breaks. Each case runs the exact production probe
 // script in a container deliberately built without one protection, bypassing the profile and its validator, and
@@ -25,18 +30,29 @@ const probeScript = (phase: Phase, probe: IsolationProbe) => {
 // A committed repository whose metadata lives on its own filesystem, as in a real task container.
 const seedRepository = 'git init -q /work && git -C /work -c user.name=gate -c user.email=gate@example.com '
   + 'commit -q --allow-empty -m seed';
-const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => spawnSync('docker', ['run',
-  '--rm', '--network=none', '--user', '10001:10001', '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
-  ...(mounts.some(mount => mount.startsWith('/home/codeboost:')) ? []
-    : ['--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700']),
-  '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
-{ encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+// A client killed by SIGTERM passes the signal to the container's shell, which ignores it, and waits; SIGKILL ends the
+// client at the timeout instead, and leaves the container to the sweep, which finds it by its runner label. A killed
+// client has no exit status, which the cases' `not.toBe(0)` checks would accept, so it throws: a hung probe fails.
+const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => {
+  const result = spawnSync('docker', ['run', '--rm', '--label', `${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`,
+    '--network=none', '--user', '10001:10001', '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
+    ...(mounts.some(mount => mount.startsWith('/home/codeboost:')) ? []
+      : ['--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700']),
+    '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
+  { encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (result.error || result.status === null)
+    throw new Error(`docker run did not exit: ${result.error?.message ?? `signal ${result.signal}`}`,
+      { cause: result.error });
+  return result;
+};
 const tmpfs = (target: string, options: string) => ['--tmpfs', `${target}:rw,uid=10001,gid=10001,${options}`];
 const bounded = tmpfs('/work', 'size=16m,nr_inodes=512');
 const writableMetadata = tmpfs('/work/.git', 'size=16m,nr_inodes=512');
 const boundedScratch = tmpfs('/tmp', 'size=32m,nr_inodes=4096');
 
 beforeAll(() => { imageId = buildAgentImage(); }, 10 * 60_000);
+// The file has no other cleanup: a probe container whose client timed out may still be running.
+afterAll(() => removeRunnerObjects(TEST_RUNNER_OWNER), 4 * 60_000);
 
 describe('isolation gate detects breaches', () => {
   it.each([

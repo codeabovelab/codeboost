@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +9,10 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+// Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
+// proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
+const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
 
 let imageId = '', network: VendorNetwork, invocation: InvocationInput;
 const docker = (...args: string[]) => execFileSync('docker', args, {
@@ -31,7 +34,15 @@ beforeAll(async () => {
   network = await createVendorNetwork(invocation, imageId, randomUUID());
 }, 10 * 60_000);
 // If setup failed there is no network, and a teardown error would hide the setup failure.
-afterAll(async () => { if (network) await removeVendorNetwork(network); }, 60_000);
+afterAll(async () => {
+  try { if (network) await removeVendorNetwork(network); }
+  finally {
+    // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
+    // makes without the runner label are not found here; those tests remove their own. It may not run before a hook
+    // timeout.
+    removeRunnerObjects(TEST_RUNNER_OWNER);
+  }
+}, 4 * 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {
