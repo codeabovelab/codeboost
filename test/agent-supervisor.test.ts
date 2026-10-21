@@ -388,7 +388,7 @@ describe('container invocation supervisor', () => {
   it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
     // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
-    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); });
+    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); }, 60_000);
     try {
       // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
@@ -443,7 +443,7 @@ describe('container invocation supervisor', () => {
     const current = await profile(fixture(), 'noop');
     // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
     // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
-    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); });
+    onTestFinished(() => { spawnSync(REAL_DOCKER, ['rm', '--force', current.name], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' }); }, 60_000);
     try {
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
         '--entrypoint', 'true', imageId], { stdio: 'ignore' });

@@ -169,12 +169,11 @@ afterAll(async () => {
     });
     if (failures.length) throw new AggregateError(failures, 'Test cleanup failed.');
   } finally {
-    // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
-    // makes under another owner or without the runner label are not found here, unless they hold one of this run's
-    // volumes or networks: those this file labels with its own run ID are found by it, the try above removes those
-    // tracked by name (`containers`, `volumes`), and the other tests remove their own. It may not run before a hook
-    // timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup
-    // before them.
+    // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test makes
+    // under another owner or without the runner label are not found here, unless they hold one of this run's volumes or
+    // networks: those this file labels with its own run ID are found by the file-label sweep, the try above removes
+    // those tracked by name (`containers`, `volumes`), and the other tests remove their own. It may not run before a
+    // hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup before them.
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }

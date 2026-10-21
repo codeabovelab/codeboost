@@ -44,7 +44,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
   const run = (args: string[]) => {
     const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
-      result.error?.message ?? result.stderr.trim());
+      result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
     // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call
     // that exited by itself is read whatever its status. A killed call's output may be cut short, so it is not.
     return result.error || result.status === null ? [] : result.stdout.split('\n').filter(Boolean);

@@ -30,7 +30,7 @@ it('skips output that is not a network, reports what is not JSON, and never thro
 it('reads nothing from a docker call that was killed, whose output may be cut short', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
-  // A well-formed network line, then the client is killed before it exits by itself (as at the 30 s limit).
+  // A well-formed network line, then the client is killed by a signal before it exits by itself.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${'a'.repeat(64)}","Name":"swept"}'; kill -9 $$; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
