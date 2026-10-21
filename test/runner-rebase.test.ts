@@ -679,16 +679,17 @@ describe('trusted pre-merge rebase', () => {
     const trustRead = (signal: AbortSignal, answer: Error): Promise<never> => signal.aborted ? Promise.reject(signal.reason)
       : Promise.reject(new UpstreamFailure(`Issue trust could not be verified: ${answer.message}`, { cause: answer }));
     // The last row is a failure that is neither a timeout nor gh's answer: the same order reports the stop, as before.
+    // Each row: the read's failure, what is reported, the failure itself, and whether the failure is reported.
     const answers = [
-      ['its own timeout', () => new RemoteTimeout('Issue retrieval timed out.'), true],
-      ["gh's answer", ghIssueNotFound, true],
-      ['a failure of another kind', () => new Error('The trust read failed.'), false],
+      ['its own timeout', 'the timeout', () => new RemoteTimeout('Issue retrieval timed out.'), true],
+      ["gh's answer", "gh's answer", ghIssueNotFound, true],
+      ['a failure of another kind', 'the stop', () => new Error('The trust read failed.'), false],
     ] as const;
     const run = (s: Awaited<ReturnType<typeof setup>>, runner: GitRebaser, attemptId: string, signal?: AbortSignal) =>
       runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal,
         ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] }).then(() => null, (error: unknown) => error as Error);
 
-    it.each(answers)('reports %s that came before a cancel, not the cancel', async (_case, answer, kept) => {
+    it.each(answers)('when %s came before a cancel, reports %s', async (_case, _reported, answer, kept) => {
       const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
       const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
       let pending: unknown;
@@ -707,7 +708,7 @@ describe('trusted pre-merge rebase', () => {
       expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
     });
 
-    it.each(answers)('reports %s that came before the rebase work deadline, not the deadline', async (_case, answer, kept) => {
+    it.each(answers)('when %s came before the rebase work deadline, reports %s', async (_case, _reported, answer, kept) => {
       const s = await setup('foreign'), attemptId = randomUUID(), realNow = performance.now.bind(performance);
       const cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
       let skew = 0, overdueMs = 0, aborted: boolean | null = null;
