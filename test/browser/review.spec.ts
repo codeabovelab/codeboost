@@ -1279,6 +1279,39 @@ test('keeps an adopted cancel when a poll on its way answers the older record of
   merge:document.getElementById('merge')!.textContent,banner:document.getElementById('banner')!.textContent})))
   .toEqual({cancel:'Cancel requested',unavailable:'true',merge:'Cancelling…',banner:'Cancelling the merge. The task and its pull request stay open.'});
 });
+// Each step state's mark, word and color, as DESIGN.md's status table gives them.
+const stepLooks={done:['✓','Done','--success'],running:['●','Running','--text'],pending:['○','Waiting','--neutral'],skipped:['–','Skipped','--neutral'],
+ failed:['✕','Failed','--error'],stopped:['!','Stopped','--warning'],unknown:['!','Unknown','--warning']} as const;
+for (const outcome of [
+ {name:'running',state:'running',step:'checks',steps:['done','skipped','skipped','skipped','running']},
+ {name:'failed',state:'failed',step:null,steps:['done','skipped','failed']},
+ {name:'cancelled',state:'cancelled',step:null,steps:['done','stopped']},
+ {name:'submitted',state:'submitted',step:null,steps:['done','skipped','skipped','skipped','done','done','unknown']},
+] as const) test(`shows each step's mark, word and color for a ${outcome.name} job (D16)`,async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const id='0f6b0000-0000-4000-8000-0000000000df';
+ const running=mergeJobRecord({id,state:'running',step:'preparing',revision:2,steps:mergeSteps(['running'])});
+ const shown=mergeJobRecord({id,state:outcome.state,step:outcome.step,revision:7,steps:mergeSteps([...outcome.steps]),reason:outcome.state==='running'?null:'Stopped here.'});
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:running}),job:running})});});
+ await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:shown})}));
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ const items=page.getByRole('list',{name:'Merge steps'}).getByRole('listitem');
+ const states=mergeSteps([...outcome.steps]).map(step=>step.state as keyof typeof stepLooks);
+ await expect(items.nth(outcome.steps.length-1)).toHaveText(new RegExp(`^${stepLooks[states[outcome.steps.length-1]!][0]} `),{timeout:15_000});
+ const looks=await page.evaluate(()=>[...document.querySelectorAll('#merge-steps li')].map(item=>({
+  mark:item.querySelector('.mark')!.textContent,word:item.querySelector('.word')!.textContent,color:getComputedStyle(item.querySelector('.mark')!).color,
+  wordColor:getComputedStyle(item.querySelector('.word')!).color})));
+ const tokens=await page.evaluate(names=>Object.fromEntries(names.map(name=>{const probe=document.createElement('span');probe.style.color=`var(${name})`;document.body.append(probe);
+  const color=getComputedStyle(probe).color;probe.remove();return [name,color];})),['--success','--text','--neutral','--error','--warning']);
+ expect(looks).toEqual(states.map(state=>{const [mark,word,token]=stepLooks[state];return {mark,word,color:tokens[token],wordColor:tokens[token]};}));
+});
 test('marks Cancel unavailable once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
