@@ -99,17 +99,17 @@ const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the 
   + 'several minutes the first time, while the agent image is built. Retry in a minute.';
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
   : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
-// Reasons a recheck cannot help, so codeboost must be restarted once the cause is fixed: an abandoned worker
+// Reasons a recheck cannot help, so only a restart can, once any cause is fixed: an abandoned worker
 // (question-agent.ts), unconfirmed cleanup (planning-provider.ts' "off until codeboost restarts"), a database file with
-// other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while it runs. Each is codeboost's own message, given
-// before any vendor output. A run whose cleanup did not settle is not among them: its storage is retried before the
+// other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while it runs.
+// Each is codeboost's own message, given before any vendor output. A run whose cleanup did not settle is not among them: its storage is retried before the
 // next run, and if planning did go off, the recheck reports that with these words.
 const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
 const ownText = (message: string) => message.split(' Claude said:')[0]!;
 /**
  * How long one check may take before it fails: a real request's budget, as the probe has, and a minute for the worker
- * to settle. Waiting requests are then refused with the failure, and the next one after the recheck window checks
- * again. A recheck joins the worker's one startup recovery, so a recovery that never ends fails each recheck the same
+ * to settle. No request waits that long (see PLANNING_ADMIT_WAIT_MS): requests after it are refused with the failure
+ * until the recheck window passes, and the next one after that checks again. A recheck joins the worker's one startup recovery, so a recovery that never ends fails each recheck the same
  * way until codeboost restarts.
  */
 export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
@@ -227,8 +227,7 @@ export class PlanningCheck {
       // Settings changed while this request waited, or its check was replaced (the vendor changed and changed back):
       // check the vendor it will run with, within the same wait. A replaced check is never `#current` again.
       if (this.#vendor() !== vendor || check !== this.#current) continue;
-      if (!check.passed && !check.failure) continue;
-      // This check's own verdict: calling #check again could start a recheck once the window has passed.
+      // Settled, so passed or failed. This check's own verdict: calling #check again could start a recheck once the window has passed.
       return this.#verdict(check);
     }
   }
@@ -258,8 +257,8 @@ export class PlanningCheck {
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and codeboost must `
-        + `be restarted after it is fixed. The check said: ${messageOf(check.failure.error)}`);
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `
+        + `of codeboost can change that; fix the cause first if the reason names one. The check said: ${messageOf(check.failure.error)}`);
     // Codex is refused whatever happens (#93): only choosing another agent helps, and the next request checks that
     // one. A restart-only reason above keeps its own wording.
     if (check.failure && check.vendor === 'codex')
