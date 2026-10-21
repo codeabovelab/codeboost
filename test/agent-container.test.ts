@@ -13,7 +13,7 @@ import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/c
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
   containerProfileResources, isContainerProfileAuthentic } from '../agents/container/profile.ts';
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
-  startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
+  startValidatedContainer, hasExactOptions, keepsNoDaemonLog, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, exportTaskPaths, importTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
@@ -234,6 +234,18 @@ describe('real Docker agent isolation', () => {
     expect(inspected.State.Status).toBe('created');
     await disposeValidatedContainer(live); containers.delete(live.name);
   }, 60_000);
+
+  // The validator's own rule, for configurations the CLI cannot make: it refuses `--log-opt` with `none`, but the API
+  // stores any option, and a daemon copies its `cache-*` log options into every container (moby v27.4.0).
+  it('keeps no daemon log only with driver none and no option but the daemon\'s cache ones', () => {
+    expect(keepsNoDaemonLog({ Type: 'none', Config: {} })).toBe(true);
+    expect(keepsNoDaemonLog({ Type: 'none', Config: null })).toBe(true);
+    expect(keepsNoDaemonLog({ Type: 'none', Config: { 'cache-disabled': 'true', 'cache-max-size': '1m' } })).toBe(true);
+    for (const config of [undefined, null, {}, { Type: 'json-file', Config: {} }, { Type: 'NONE', Config: {} },
+      { Type: 'none', Config: { mode: 'non-blocking' } },
+      { Type: 'none', Config: { 'max-size': '1m' } }, { Type: 'none', Config: { 'cache-disabled': 'true', mode: 'non-blocking' } },
+    ] as Parameters<typeof keepsNoDaemonLog>[0][]) expect(keepsNoDaemonLog(config)).toBe(false);
+  });
 
   it.each([
     ['a json-file daemon log', (args: readonly string[]) => args.map(arg => arg === '--log-driver=none' ? '--log-driver=json-file' : arg)],
