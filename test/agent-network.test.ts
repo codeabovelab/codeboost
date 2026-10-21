@@ -64,9 +64,10 @@ afterAll(async () => {
     // carry this file's run ID; the tests remove their own, and the try above removes those registered in
     // `unlabelled`. It may not run before a hook timeout. The hook's 13 minutes leave two over the worst case of these
     // two sweeps (eleven calls of 30 s each), for the cleanup before them.
+    // The records were read above; removed first, so a hook timeout during the sweeps does not leave them.
+    if (records) rmSync(records, { recursive: true, force: true });
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
-    if (records) rmSync(records, { recursive: true, force: true });
   }
 }, 13 * 60_000);
 
@@ -332,6 +333,8 @@ describe('vendor-only egress', () => {
     const otherInvocation = captureInvocation({ ...invocation, attemptId: 'concurrent-network-probe',
       deadline: Date.now() + 60_000 });
     const other = await createVendorNetwork(otherInvocation, imageId, randomUUID()), peer = `codeboost-peer-${randomUUID()}`;
+    // Tracked for afterAll: its create may land after the finally, and once the network is gone it is no holder (#189).
+    unlabelled.push({ kind: 'container', name: peer });
     try {
       docker('run', '--detach', '--name', peer, `--network=${network.name}`, '--network-alias', 'codeboost-peer',
         '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
@@ -366,6 +369,8 @@ describe('vendor-only egress', () => {
       { Config: { Labels: Record<string, string> }; NetworkSettings: { Networks: Record<string, { IPAddress: string }> } };
     const allocation = inspected.Config.Labels['io.codeboost.egress'];
     const proxyIp = inspected.NetworkSettings.Networks[replacement.name]!.IPAddress;
+    // Tracked for afterAll: the stand-in has no runner label, and its create may land after the finally (#189).
+    unlabelled.push({ kind: 'container', name: replacement.proxyContainer });
     try {
       docker('rm', '--force', replacement.proxyContainer);
       // Same name, label, image, lockdown and IP as the original, so only the extra option and the object ID differ.

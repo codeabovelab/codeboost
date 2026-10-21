@@ -16,6 +16,7 @@ const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // The fake answers as no real daemon does for `network ls`: a line that is not JSON, a JSON null and one network
@@ -146,7 +147,9 @@ it.each([
   const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
   // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
   // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
-  // removals' stdout (the removed IDs or names in 27.4) is not read.
+  // removals' stdout (the removed IDs or names in 27.4) is not read. The network line holds only the fields the sweep
+  // reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope), and the inspect an empty endpoint for
+  // the network, where 27.4 gives its full settings: the sweep reads only the network names.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${a} ${b}; exit 0; fi`,

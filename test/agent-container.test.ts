@@ -821,6 +821,7 @@ describe('real Docker agent isolation', () => {
         { encoding: 'utf8' });
       expect(partial.status).not.toBe(0);
       expect(partial.stdout).toContain(holders[0]);
+      expect(partial.stderr).toMatch(/^Error response from daemon: No such container: codeboost-gone-/m);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
@@ -829,7 +830,10 @@ describe('real Docker agent isolation', () => {
       writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
         `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
-      removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
+      // And it says nothing of that gone holder: Docker's own answer is not a failure.
+      const sweepWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try { removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker')); } finally { sweepWarn.mockRestore(); }
+      expect(sweepWarn.mock.calls.filter(call => String(call[0]).endsWith('failed:'))).toEqual([]);
       // afterAll removes tracked names with removeByName, as here: an object of exactly that name goes, and a name that
       // is gone says nothing.
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -2549,6 +2553,8 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
     docker('rm', '--force', filesystems.keeper);
+    // Tracked for afterAll too: its create may land after the finally (#189).
+    containers.add(filesystems.keeper);
     try {
       // Inside the try: this keeper carries another runner's label, so only the finally below removes it (#189).
       docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
