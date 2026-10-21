@@ -261,7 +261,8 @@ export class PlanningCheck {
     if (check.passed) return;
     // After close no check starts, so no recheck can be promised.
     if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
-    // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
+    // The reason comes last and as it is: some end with a command a person may copy. (The Store records a refusal cut
+    // to 4,000 characters, so a resend of the same action may replay it shortened.) One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
       throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `

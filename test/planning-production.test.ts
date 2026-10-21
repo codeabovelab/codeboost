@@ -541,6 +541,38 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
+  it('waits 30 s for a check, fails one after the planning budget and a minute, and closes within 20 s', async () => {
+    // productionPlanning's own defaults, as the docs give them: nothing here overrides them. The clock is faked too, so each wait is exact.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      // The probe never settles and ignores its abort, as a job stuck in the worker would.
+      const { deps } = checked(() => new Promise<void>(() => undefined));
+      let outcome: unknown;
+      void Promise.resolve(deps.describe(signal())).catch((error: unknown) => { outcome = error; });
+      await vi.advanceTimersByTimeAsync(30_000 - 1);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(String(outcome)).toContain('still checking');
+      // The check itself fails once the planning budget and a minute have passed since it started.
+      // A request waiting from 15 s before then gets that failure, not the end of its own wait.
+      await vi.advanceTimersByTimeAsync(11 * 60_000 - 30_000 - 15_000);
+      outcome = undefined;
+      void Promise.resolve(deps.describe(signal())).catch((error: unknown) => { outcome = error; });
+      await vi.advanceTimersByTimeAsync(15_000 - 1);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(String(outcome)).toContain('did not finish within 11 minutes');
+      // A check still running at close is waited for 20 s.
+      void Promise.resolve(deps.describe(signal())).catch(() => undefined);
+      let closed = false;
+      void deps.close!().then(() => { closed = true; });
+      await vi.advanceTimersByTimeAsync(20_000 - 1);
+      expect(closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(closed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('lets a request go on when Settings clear the agent while it waits, even once the wait has passed', async () => {
     let vendor: 'claude' | null = 'claude';
     const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>(resolve =>
