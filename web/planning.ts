@@ -42,7 +42,7 @@ export function productionPlanning(config: ReviewConfig, options: {
     return {
       // Checked once more when the coordinator invokes the provider, after the recorded action: Settings may have changed
       // in between, and the provider reads the vendor again. A refusal here settles the request as failed.
-      provider: { invoke(request, signal) { check.assertPassed(); return provider.invoke(request, signal); } },
+      provider: { async invoke(request, signal) { check.assertPassed(); return provider.invoke(request, signal); } },
       async describe(signal) {
         await check.admit(signal);
         return withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {

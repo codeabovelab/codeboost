@@ -409,7 +409,9 @@ describe('the planning check (#164)', () => {
     await made.deps.describe(signal());
     vi.spyOn(made.service.store, 'questionProvider').mockReturnValue('codex');
     const request = {} as Parameters<typeof made.deps.provider.invoke>[0];
-    expect(() => made.deps.provider.invoke(request, signal())).toThrow('still checking');
+    // A rejection, as `AuthorProvider.invoke` promises: E3 then settles the request as failed with this reason
+    // (test/planning-suggestions.test.ts covers a provider whose invoke fails).
+    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('still checking');
     expect(made.agent.invoke).not.toHaveBeenCalled();
   });
 
@@ -522,25 +524,25 @@ describe('the planning check (#164)', () => {
     await check.close();
     vendor = 'codex';
     await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
-    expect(() => check.assertPassed()).toThrow('still checking');
+    expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     await new Promise(resolve => setImmediate(resolve));
     expect(probe).toHaveBeenCalledTimes(1);
   });
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    // Claude's check passes at 2 s, after the vendor changed; Codex's never ends.
+    // Claude's check passes at 3 s, after the vendor changed; Codex's never ends.
     const check = new PlanningCheck(probed => new Promise<void>(resolve => {
-      if (probed === 'claude') setTimeout(resolve, 2_000);
-    }), () => vendor, { waitMs: 2_200 });
+      if (probed === 'claude') setTimeout(resolve, 3_000);
+    }), () => vendor, { waitMs: 3_200 });
     const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
     await new Promise(resolve => setTimeout(resolve, 100));
     vendor = 'codex';
-    // One deadline ends the wait at 2.2 s; a fresh 2.2 s for Codex would end it at 4.2 s.
+    // One deadline ends the wait at 3.2 s; a fresh 3.2 s for Codex would end it at 6.2 s.
     const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toContain('still checking');
-    expect(performance.now() - started).toBeLessThan(3_500);
+    expect(performance.now() - started).toBeLessThan(5_000);
     await check.close(10);
   });
 
