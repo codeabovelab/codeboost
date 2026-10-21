@@ -262,3 +262,4 @@ There are no shadows and no glows. Depth comes from the surface brightness steps
 | 2026-10-21 | Two progress marks for the merge step list: ○ "Waiting" in `neutral-status` and ● "Running" in `text` | Steps that have not started or are under way are not outcomes, so they take no outcome color. Approved by the user (PR #194) |
 | 2026-10-21 | The not-applicable mark also reads "Skipped" for a merge step that was not needed | Same meaning as N/A, worded for a step. Part of the step list the user approved (PR #194) |
 | 2026-10-21 | The warning mark also reads "Stopped" (a cancelled merge step) and "Unknown" (GitHub's merge outcome not known) | Both mean "look at this, it did not finish normally". Approved by the user (PR #194) |
+| 2026-10-21 | While a merge job runs, a step bar sits between the review strip and the panes | It shows the merge step list and Cancel merge without replacing the review strip's merge control. Approved by the user (PR #194) |

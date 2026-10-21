@@ -856,6 +856,10 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(steps.getByRole('listitem').first()).toHaveText('✓ Fetch Done, 1 s',{timeout:10_000});
  await expect(steps.getByRole('listitem').nth(1)).toHaveText(/^● Rebase Running, \d+ (s|min \d\d s)$/);
  await expect(steps.getByRole('listitem').nth(2)).toHaveText('○ Push Waiting');
+ // The 1 s timer rewrites only the times: the list items themselves stay, so a screen reader keeps its place.
+ const first=await steps.getByRole('listitem').first().elementHandle();
+ await page.waitForTimeout(1_300);
+ expect(await first!.evaluate(node=>node.isConnected)).toBe(true);
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
@@ -1001,9 +1005,17 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
  else await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
  const released=Date.now();release();
  // The next poll comes 2 s after the held one, not after its backed-off delay of 16 s or more.
- if(answer==='ended') await expect(page.locator('#merge')).toHaveText('Merged',{timeout:6_000});
- else await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/,{timeout:6_000});
- expect(Date.now()-released).toBeLessThan(5_000);
+ if(answer==='ended'){
+  await expect(page.locator('#merge')).toHaveText('Merged',{timeout:6_000});
+  expect(Date.now()-released).toBeLessThan(5_000);
+ } else {
+  // The held poll, read before the newer job, now answers the older job's running record: it must be discarded.
+  const pollsAtRelease=polls.length;
+  await expect.poll(()=>polls.length,{timeout:6_000}).toBeGreaterThan(pollsAtRelease);
+  await page.waitForTimeout(200);
+  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
+  await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
+ }
 });
 for (const reload of ['unavailable','failed','ended'] as const) test(`moves focus off Cancel when a reload ${{failed:'fails',unavailable:'hides the merge control',ended:'shows the job ended'}[reload]} (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
@@ -1077,7 +1089,8 @@ for (const refusal of ['ended','older','newer'] as const) test(`keeps what the p
  release();await refused;
  await page.waitForTimeout(300);
  if(refusal==='newer'){
-  // The newer job is followed: its step list and step show.
+  // The newer job is followed: its step list and step show, also after the next poll (which answers it).
+  await page.waitForTimeout(2_500);
   await expect(page.locator('#merge')).toHaveText('Preparing…');
   await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
   await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
@@ -1245,6 +1258,14 @@ test('does not back off the merge-job poll when only the waiting checks change w
  expect(delays).toEqual([2000,4000,4000]);
 });
 
+test('polls soon again when only the running step of the list changes within a job step (D16)',async({page})=>{
+ // As production saves them: preparation reports Fetch, then Rebase, while the job's own step stays `preparing`.
+ const fetching=mergeJobRecord({state:'running',step:'preparing',revision:2,steps:mergeSteps(['running'])});
+ const rebasing=mergeJobRecord({state:'running',step:'preparing',revision:3,steps:mergeSteps(['done','running'])});
+ const delays=await mergeJobPollDelays(page,[fetching,fetching,rebasing,rebasing,mergeJobRecord({state:'merged',step:null,revision:6})]);
+ // 2 s, doubled to 4 s after the unchanged poll, back to 2 s once the running list step changed, then doubled again.
+ expect(delays).toEqual([2000,4000,2000,4000]);
+});
 test('starts a new action for Retry merge once the job its retained key started has ended (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
