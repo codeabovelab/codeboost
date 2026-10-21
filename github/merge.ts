@@ -380,9 +380,10 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    * suite whose `app` GitHub hides from this reader (a private app), which an app read from the answer would not name.
    * Only each suite's latest run of a name is asked for (`checkType: LATEST`): a run re-run inside its suite is left out.
    * Each check is one alias in the query, with up to PINNED_CHECKS_PER_READ checks per call; a check whose app has more
-   * than 100 suites on the head is paged, up to PINNED_SUITE_PAGES pages. That cap only bounds the work: at about a second
-   * per call, the inspection's deadline usually stops the read first (after a few pages in a fresh six-second inspection,
-   * about nine in a 12-second display one), and the inspection then fails with its timeout.
+   * than 100 suites on the head is paged, up to PINNED_SUITE_PAGES pages. That cap only bounds the work: a call takes about
+   * a second for a few suites and two to three seconds for a full page of 100 (measured with gh 2.102.0), so the
+   * inspection's deadline stops the read first (after about one full page in a fresh six-second inspection, three or four
+   * in a 12-second display one), and the inspection then fails with its timeout.
    *
    * The read fails closed. A gh failure keeps gh's error. GitHub's own errors in an answer, a malformed field, an answer
    * for another commit, a suite with more runs of the name than one page holds, more suites than the page limit, and

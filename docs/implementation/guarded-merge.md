@@ -56,7 +56,7 @@ What this covers, each checked against GitHub:
 - A suite with many other runs. Only the pinned name is asked for, so a suite with more than 100 runs (microsoft/vscode) does not matter.
 - A re-run inside one suite. `LATEST` leaves out the older run (codeabovelab/codeboost PR 151: `test` failed, then passed when re-run). Runs of the name in several suites are ordered as the rollup's are.
 
-One call holds up to 25 pinned checks, so most inspections make one call of about one second. A check whose app has more than 100 suites on the head is read in pages of 100, up to 10 pages. For a fresh inspection, the deadline ends the read first: each call takes about a second, so its six seconds fit only a few pages after the other reads. The display inspection has 12 seconds, which fit about nine. Either way, a head with more suites than fit fails closed with “GitHub merge-state inspection timed out.”
+One call holds up to 25 pinned checks, so most inspections make one call. A call takes about one second when the head has a few suites from the app, and two to three seconds for a full page of 100 (measured with gh 2.102.0 on vite, cli/cli and next.js). A check whose app has more than 100 suites on the head is read in pages of 100, up to 10 pages, but the deadline ends the read first. A fresh inspection's six seconds fit about one full page after the other reads; the display inspection's 12 seconds fit three or four. Either way, a head with more suites than fit fails closed with “GitHub merge-state inspection timed out.”
 
 Checks that any app may report are still read from the rollup alone.
 
