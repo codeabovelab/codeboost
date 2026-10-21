@@ -36,7 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
-| A planning request over its model budget is refused before the start, and a planning run stops after 50 turns (see [planning model budget](#planning-model-budget)) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
+| A planning request over its model budget is refused before the start, and a planning run stops at its 50-turn limit (see [planning model budget](#planning-model-budget)) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
 | A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
@@ -114,16 +114,18 @@ Use only these entry points to run an agent:
        Code's own system prompt and tool definitions, or the tokens of the answer.
      - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
        window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
-       itself, such as compaction, may not count as turns, and the bound is loose (50 context windows). Claude Code
-       2.1.281 accepts the flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns`
-       result and exit status 1. This was checked with `--max-turns 1` in a run of the 2.1.281 macOS arm64 build outside
-       the container; the Linux build in the image was read from its bundled source only. The adapter reports that result as a provider failure
-       whose text is the result's `errors` strings. The planning error then names the turn limit, asks the person to
-       narrow the request, and quotes "Reached maximum number of turns (50)". A token or dollar limit was not chosen:
-       `--max-budget-usd` counts the dollar cost of API calls, which is not what an OAuth subscription token pays, and
-       the CLI has no flag that limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute
-       budget; a planning run reads files and answers, so most turns are reads. Lower it if runs are seen to loop; raise
-       it only with a recorded run that needs more.
+       itself, such as compaction, may not count as turns, and the bound is loose (about 50 context windows; the CLI
+       reported `num_turns: 2` when it stopped at a limit of 1, so it may make one call more than the limit). Claude
+       Code 2.1.281 accepts the flag in `--print` mode (its help hides it) and stops at the limit with an
+       `error_max_turns` result and exit status 1. This was checked with `--max-turns 1` in a run of the 2.1.281 macOS
+       arm64 build outside the container; the Linux build in the image was read from its bundled source only. The
+       adapter reports that result as a provider failure whose text is the result's `errors` strings ("Reached maximum
+       number of turns (1)" in that run). The planning error then names the 50-turn limit, asks the person to narrow the
+       request, and quotes that text. A token or dollar limit was not chosen: `--max-budget-usd` counts the dollar cost
+       of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag that limits the tokens
+       of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning run reads files and
+       answers, so most turns are reads. Lower it if runs are seen to loop; raise it only with a recorded run that needs
+       more.
      The other phases do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).

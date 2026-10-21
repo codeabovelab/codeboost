@@ -42,8 +42,8 @@
   to narrow the issue/comments, selected path set, or lesson set before retrying.
   Also enforce the model budget before launch. With no tokenizer available
   offline, lane D counts the prompt and schema in UTF-8 bytes (64 KiB together)
-  and bounds the run with Claude's --max-turns (#163; see
-  docs/implementation/agent-isolation.md, "Planning model budget"). The launch probe must test these caps
+  and bounds the run with Claude's --max-turns (#163; see agent-isolation.md,
+  "Planning model budget"). The launch probe must test these caps
   on the supported container OS/CLI; lower them if needed, never raise them
   automatically. Tests include one huge field, many small fields exceeding the
   aggregate, post-escaping expansion, and exact boundary accepted/rejected inputs.
