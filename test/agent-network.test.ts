@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -190,13 +190,19 @@ describe('vendor-only egress', () => {
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let impostor = '';
+    let impostor = '', survived = false;
     try {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow();
-      impostor = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
+      impostor = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      if (impostor) {
+        survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
+        spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
+      }
+      rmSync(shim, { recursive: true, force: true });
+    }
     expect(impostor).toMatch(/^codeboost-proxy-/);
     expect(survived).toBe(true);
   }, 60_000);
@@ -209,8 +215,8 @@ describe('vendor-only egress', () => {
     expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
     expect(net).toMatchObject({ kind: 'network', name: created.name });
     // A foreign endpoint keeps the network busy, so the proxy is removed but `network rm` fails.
-    docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
     try {
+      docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
       await expect(removeVendorNetwork(created, 10_000)).rejects.toThrow('did not settle');
       expect(vendorNetworkResources(created)).toEqual([net]);
     } finally { spawnSync('docker', ['rm', '--force', blocker], { stdio: 'ignore' }); }

@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { removeLabelledObjects, removeRunnerObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -7,7 +7,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
@@ -144,8 +144,9 @@ afterAll(async () => {
     }
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
-    // makes under another owner or without the runner label are not found here; those tests remove their own. It may
-    // not run before a hook timeout.
+    // makes under another owner or without the runner label are not found here, unless they hold one of this run's
+    // volumes; those tests remove their own (`withoutRunnerLabel` when the test finishes). It may not run before a hook
+    // timeout.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 120_000);
@@ -625,8 +626,13 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
-  // creates is genuinely mislabelled and only the owner-label checks can catch it.
+  // creates is genuinely mislabelled and only the owner-label checks can catch it. Neither afterAll's runner sweep nor
+  // production cleanup finds such an object, so the wrapper labels it with a test-run ID instead, and the test removes
+  // everything with that ID when it finishes, passed, failed or timed out (#189).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
+    if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
+    const testRun = randomUUID();
+    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'));
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -636,6 +642,7 @@ describe('real Docker agent isolation', () => {
       `const strip = ${JSON.stringify(prefixes)}.some(prefix => prefix.every((word, i) => args[i] === word));`,
       'const out = [];',
       "for (let i = 0; i < args.length; i++) { if (strip && args[i] === '--label' && String(args[i + 1]).startsWith('io.codeboost.runner=')) { i++; continue; } out.push(args[i]); }",
+      `if (strip) out.splice(out.indexOf('create') + 1, 0, '--label', ${JSON.stringify(`${TEST_RUN_LABEL}=${testRun}`)});`,
       `const result = spawnSync(${JSON.stringify(realDocker)}, out, { stdio: 'inherit' });`,
       'process.exit(result.status ?? 1);'].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
@@ -681,6 +688,27 @@ describe('real Docker agent isolation', () => {
     await withoutRunnerLabel([['create', '--name']], () =>
       expect(createValidatedContainer(live)).rejects.toThrow('lockdown'));
     expect(spawnSync('docker', ['container', 'inspect', live.name]).status).not.toBe(0);
+  }, 60_000);
+
+  // #189: these two run in order. The first stops after making a keeper without its runner label, before the removal
+  // its sibling test above ends with; the second checks that the keeper went when the first finished.
+  let stoppedEarly: ReturnType<typeof fixture> | undefined;
+  it.fails('stops after making a keeper without its runner label (expected to fail)', async () => {
+    stoppedEarly = await withoutRunnerLabel([['create', '--name']], () => fixture());
+    const keeper = JSON.parse(docker('container', 'inspect', stoppedEarly.filesystems.keeper))[0] as
+      { Config: { Labels: Record<string, string> } };
+    expect(keeper.Config.Labels).not.toHaveProperty('io.codeboost.runner');
+    expect(keeper.Config.Labels).toHaveProperty(TEST_RUN_LABEL);
+    throw new Error('This test stops before it removes the keeper.');
+  }, 60_000);
+
+  it('removed the keeper that a test without its runner label left when it stopped', () => {
+    const left = stoppedEarly!.filesystems, allocationId = taskFilesystemOwner(left).allocationId;
+    expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore' }).status).not.toBe(0);
+    // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
+    taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
+    removeTaskFilesystems(left);
+    expect(byAllocation(allocationId)).toEqual([]);
   }, 60_000);
 
   it('refuses an allocation ID that still labels Docker objects, as after a restart, before creating any storage', () => {
