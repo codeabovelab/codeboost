@@ -58,11 +58,11 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const calls = join(root, 'calls'), id = 'b'.repeat(64), other = 'c'.repeat(64), raced = 'd'.repeat(64);
   // Answers as Docker 27.4 does for `inspect --format '{{json .Id}} {{json .Name}}'` (a volume: '{{json .Name}}') and
   // `rm`, in the parts removeByName reads: stdout of an inspect that succeeded, stderr and the exit status. A missing
-  // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and a
-  // failure before the daemon (an unknown context; its meta.json path shortened). Also a network gone between its
-  // inspect and its removal, which 27.4 answers "network <ID> not found", and an inspect answer that is not JSON, which
-  // 27.4 is not known to give. The stdout of a failed call (a bare newline for a missing object in 27.4, nothing for
-  // the others) is not read.
+  // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and
+  // a failure before the daemon (an unknown context; its meta.json path shortened). Also a network gone between its
+  // inspect and its removal, which 27.4 answers "network <ID> not found", and inspect answers that are not JSON or not
+  // an ID and a name, which 27.4 is not known to give. The stdout of a failed call (a bare newline for a missing object
+  // in 27.4, nothing for the others) is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     'for arg; do name="$arg"; done',
     'if [ "$2" = inspect ]; then case "$1 $name" in',
@@ -76,6 +76,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
     `  'volume busy') printf '%s\\n' '"busy"';;`,
     `  'network raced') printf '%s\\n' '"${raced}" "raced"';;`,
     "  'container junk') echo 'not json';;",
+    "  'container odd') echo '1 2';;",
     "  'container killed') kill -9 $$;;",
     "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
     'esac; exit 0; fi',
@@ -88,7 +89,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
     ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost'],
-    ['network', 'raced'], ['container', 'junk']] as const;
+    ['network', 'raced'], ['container', 'junk'], ['container', 'odd']] as const;
   expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
@@ -103,6 +104,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container lost: docker container inspect failed:',
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
     ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
+    ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
   ]);
 });
 
@@ -156,8 +158,9 @@ it.each([
   // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
   // removals' stdout (the removed IDs or names in 27.4) is not read. The second case's answer is invented: it stands in
   // for an unexpected inspect failure that still printed some holders, which 27.4 is not known to give. The network
-  // line holds only the fields the sweep reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope), and the inspect an empty endpoint for
-  // the network, where 27.4 gives its full settings: the sweep reads only the network names.
+  // line holds only the fields the sweep reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope),
+  // and the inspect an empty endpoint for the network, where 27.4 gives its full settings: the sweep reads only the
+  // network names.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${a} ${b}; exit 0; fi`,

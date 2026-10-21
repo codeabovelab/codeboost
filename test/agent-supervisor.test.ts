@@ -389,6 +389,7 @@ describe('container invocation supervisor', () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
     // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189).
     onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
+    let passed = false;
     try {
       // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
       execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
@@ -402,9 +403,12 @@ describe('container invocation supervisor', () => {
       expect(spawnSync('docker', ['network', 'inspect', current.network.name], { stdio: 'ignore' }).status).not.toBe(0);
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
+      passed = true;
     } finally {
-      // Never throws, whatever exit status this Docker version gives for a missing name.
-      spawnSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
+      // A failure above stays the one reported, whatever exit status this Docker version gives for a missing name. After
+      // a pass the container exists, and its removal must succeed, as on main.
+      const removed = spawnSync('docker', ['rm', '--force', current.name], { encoding: 'utf8' });
+      if (passed && removed.status !== 0) throw new Error(`Removing ${current.name} failed: ${removed.stderr.trim()}`);
     }
   }, 3 * 60_000);
 

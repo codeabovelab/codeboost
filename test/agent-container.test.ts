@@ -2375,6 +2375,10 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
     const owner = { runnerOwner, attemptId: 'unsettled-allocation', allocationId: randomUUID() };
     // Another runner's objects, so no sweep of this run finds them: removed by allocation when the test finishes (#189).
+    // After a pass, nothing of the allocation may be left once that sweep has run, as on main; this check, registered
+    // first, runs after the sweep (Vitest runs onTestFinished hooks in reverse order).
+    let passed = false;
+    onTestFinished(() => { if (passed) expect(byAllocation(owner.allocationId)).toEqual([]); }, 2 * 60_000);
     sweepWhenFinished('io.codeboost.allocation', owner.allocationId);
     // The seeder is refused, and every volume removal fails, so the allocation's cleanup does not settle.
     const failing = [
@@ -2385,6 +2389,7 @@ describe('real Docker agent isolation', () => {
     await withDockerShim([], failing, () => expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId,
       owner)).toThrow('cleanup did not settle'));
     await expect(recoverLeftovers(runnerOwner)).rejects.toThrow('still holds task storage');
+    passed = true;
   }, 60_000);
 
   it('recovers only its own runner after a restart, keeping its storage for removal by handle', async () => {

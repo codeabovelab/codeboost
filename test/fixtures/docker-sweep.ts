@@ -35,8 +35,9 @@ export const TEST_FILE_LABEL = 'io.codeboost.test-file';
 /**
  * Removes the container, network or volume named exactly `name`, by its full ID (a volume by its name, which is its
  * ID). Docker would read a missing name as an ID prefix, so an object found under another name is left alone. It
- * reports a failed call, other than an inspect that finds no such object, prefixed with `when`, and never throws; each
- * call has a 30 s limit.
+ * reports, prefixed with `when`, a failed call and an answer it cannot read, but not an object that is gone: an inspect
+ * that finds no such object, or a network gone between its inspect and its removal. It never throws; each call has a
+ * 30 s limit.
  */
 export function removeByName(kind: 'container' | 'network' | 'volume', name: string, when: string, docker = REAL_DOCKER): void {
   const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const, env: dockerEnv() };
@@ -53,7 +54,10 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     const at = found.stdout.indexOf(' ');
     [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
   } catch { console.warn(`${when}: removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
-  if (typeof id !== 'string' || typeof actual !== 'string' || (kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
+  if (typeof id !== 'string' || typeof actual !== 'string') {
+    console.warn(`${when}: removing ${kind} ${name}: docker printed no ID and name:`, found.stdout); return;
+  }
+  if ((kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
   const removed = spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
   // A network gone since the inspect is gone: Docker 27.4 answers "network <ID> not found" (rm --force of a missing
   // container or volume exits 0).
