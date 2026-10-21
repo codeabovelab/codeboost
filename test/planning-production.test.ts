@@ -10,7 +10,9 @@ import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS, PLANNING_LEFTOVERS, planningCredential } from '../runner/planning-provider.ts';
+import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS, PLANNING_FEATURE, PLANNING_LEFTOVERS, planningCredential,
+  planningOutput } from '../runner/planning-provider.ts';
+import type { InvocationInput } from '../agents/contract.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
@@ -330,6 +332,7 @@ describe('the planning check (#164)', () => {
     return { deps, service, agent, issueAccess, close, probe: vi.mocked(agent.probe) };
   }
   const signal = () => new AbortController().signal;
+  const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
 
   it('starts at setup with the vendor chosen in Settings, and that one check serves every later request', async () => {
     const { deps, probe, issueAccess } = checked(async () => undefined);
@@ -346,7 +349,7 @@ describe('the planning check (#164)', () => {
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*The check said: Claude could not sign in\\.$`));
-    // Inside the wait, the same failure refuses at once.
+    // Inside the recheck window, the same failure refuses at once.
     await expect(deps.describe(signal())).rejects.toThrow('Claude could not sign in.');
     expect(probe).toHaveBeenCalledTimes(1);
     expect(issueAccess).not.toHaveBeenCalled();
@@ -459,7 +462,8 @@ describe('the planning check (#164)', () => {
   });
 
   it('keeps a multi-line reason whole, at the end of the refusal', async () => {
-    const reason = 'Planning stays off until they are deleted. Delete them, then retry:\nrm -rf \'/tmp/codeboost-planning-x\'';
+    // LeftoverLedger.assertClear's text for host copies it could not delete.
+    const reason = `${PLANNING_NAMING.label} is off: host copies of ${PLANNING_NAMING.code} or credentials from an earlier session could not be deleted. Delete them, then retry:\nrm -rf '/tmp/codeboost-plan-x'`;
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message.endsWith(`The check said: ${reason}`)).toBe(true);
@@ -561,14 +565,18 @@ describe('the planning check (#164)', () => {
 
   it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
     // planning-provider.ts' cleanupFailed: the run's own failure, then the cleanup's.
-    const reason = 'Planning agent timed out. Cleanup also did not settle: docker volume rm failed';
+    const reason = PLANNING_FEATURE.cleanupFailed([new Error('docker volume rm failed')], { error: new Error('Planning agent timed out.') }).message;
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
   });
 
   it('keeps the recheck promise when only the vendor\'s output mentions a restart', async () => {
-    const reason = 'Claude could not write the plan. Check its sign-in and usage limits. Claude said: planning is off until codeboost restarts';
+    // planningOutput's text for a failed run whose output says so.
+    const context = { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 };
+    const reason = thrown(() => planningOutput({ attemptId: 'probe', context, exitCode: 1, signal: null, stderr: '',
+      stdout: 'planning is off until codeboost restarts' }, { attemptId: 'probe', context } as InvocationInput));
+    expect(reason).toContain(' Claude said: planning is off until codeboost restarts');
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
@@ -604,9 +612,9 @@ describe('the planning check (#164)', () => {
   });
 
   it('tells Codex to choose another agent, not to wait for a recheck', async () => {
-    const check = new PlanningCheck(async () => { throw new Error('Codex cannot write plans yet.'); }, () => 'codex');
+    const check = new PlanningCheck(async () => { throw new Error(CODEX_PLANNING_REFUSED); }, () => 'codex');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choose another agent in Settings, and the next planning request checks it. The check said: Codex cannot write plans yet.`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choose another agent in Settings, and the next planning request checks it. The check said: ${CODEX_PLANNING_REFUSED}`);
   });
 
   it('waits on close for a timed-out check\'s probe to stop, within its bound', async () => {
@@ -623,7 +631,6 @@ describe('the planning check (#164)', () => {
   });
 
   // Each reason as the code that gives it words it, so a reworded message that no longer matches fails here.
-  const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
   const hardLinked = () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-linked-')); closers.push(() => rmSync(root, { recursive: true, force: true }));
     writeFileSync(join(root, 'review.db'), ''); linkSync(join(root, 'review.db'), join(root, 'other.db'));

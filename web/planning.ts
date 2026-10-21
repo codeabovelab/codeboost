@@ -10,9 +10,9 @@ export { ISSUE_READ_TIMEOUT_MS } from '../github/issues.ts';
  * Production planning (#117): on for a review with a github block, never in a demo. It needs no runner block, since
  * planning only reads code, as Ask does. The issue text is read from GitHub for each request (current collaborators'
  * comments, or every comment under explicit author-bound trust), bounded like an execute prompt; approved lessons stay
- * empty until lessons exist (L1 to L4). When a vendor is chosen in Settings, the planning check (#164) starts with the
- * server and must pass before a request reads the issue or records anything; a failed check refuses the request with
- * its reason.
+ * empty until lessons exist (L1 to L4). The planning check (#164) starts with the server for the vendor chosen in
+ * Settings (or, with none chosen then, with the first request after one is), and must pass before a request reads the
+ * issue or records anything; a failed check refuses the request with its reason.
  */
 export function productionPlanning(config: ReviewConfig, options: {
   /** The single-runner lock's check that the database path still names the locked file (runner/recovery.ts). */
