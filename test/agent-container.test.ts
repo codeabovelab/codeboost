@@ -224,6 +224,31 @@ describe('real Docker agent isolation', () => {
     expect(args).toContain('--cgroupns=private');
   }, 60_000);
 
+  // #165: the supervisor bounds the output it reads through `docker start --attach`; the daemon must keep no copy.
+  it('creates the agent container with no Docker daemon log', async () => {
+    const live = await profile(fixture(), 'planning', 'noop');
+    await createValidatedContainer(live); containers.add(live.name);
+    const inspected = JSON.parse(docker('container', 'inspect', live.name))[0] as
+      { HostConfig: { LogConfig: unknown }; State: { Status: string } };
+    expect(inspected.HostConfig.LogConfig).toEqual({ Type: 'none', Config: {} });
+    expect(inspected.State.Status).toBe('created');
+    await disposeValidatedContainer(live); containers.delete(live.name);
+  }, 60_000);
+
+  it.each([
+    ['a json-file daemon log', (args: readonly string[]) => args.map(arg => arg === '--log-driver=none' ? '--log-driver=json-file' : arg)],
+    ['a bounded local daemon log', (args: readonly string[]) => args.flatMap(arg => arg === '--log-driver=none'
+      ? ['--log-driver=local', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1'] : [arg])],
+  ] as const)('refuses an agent container with %s before it starts', async (_label, change) => {
+    const valid = await profile(fixture(), 'planning', 'must-not-run');
+    expect(valid.args).toContain('--log-driver=none');
+    docker(...change(valid.args)); containers.add(valid.name);
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
+    const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
+    expect(state.State.Status).toBe('created');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
   it.each(['planning', 'review', 'execute'] as const)(
     'keeps Git metadata unchanged under link, alias, truncation and replacement attempts during %s', async phase => {
       expect(await runContainer(await profile(fixture(), phase, 'metadata-alias'))).toBe('metadata-unchanged');

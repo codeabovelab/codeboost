@@ -190,6 +190,7 @@ type Inspect = {
     CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
+    LogConfig?: { Type?: string; Config?: Record<string, string> | null } | null;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean;
       TmpfsOptions?: { SizeBytes?: number; Mode?: number; Options?: unknown };
@@ -244,7 +245,8 @@ export async function validateContainer(container: string, profile: ContainerPro
     || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
     || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== ''
     || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
-    || host.Runtime !== 'runc')
+    || host.Runtime !== 'runc'
+    || host.LogConfig?.Type !== 'none' || Object.keys(host.LogConfig.Config ?? {}).length !== 0)
     throw new Error('Container daemon configuration is missing required lockdown.');
   if (JSON.stringify(host.Dns) !== JSON.stringify(['127.0.0.1']))
     throw new Error('Container DNS configuration changed.');
