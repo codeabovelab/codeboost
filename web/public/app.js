@@ -121,6 +121,7 @@ function showFailure(message, planStatusOwner) {
   $("merge").hidden = true;
   $("merge-details").hidden = true;
   $("merge-steps-bar").hidden = true;
+  if (mergeStepTimer) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
   $("message").disabled = true;
   $("save-note").disabled = true;
   $("previous").disabled = true;

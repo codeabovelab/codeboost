@@ -1003,6 +1003,35 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
  else await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/,{timeout:6_000});
  expect(Date.now()-released).toBeLessThan(5_000);
 });
+for (const reload of ['unavailable','failed'] as const) test(`moves focus off Cancel to Refresh when a reload ${reload==='failed'?'fails':'hides the merge control'} (D16)`,async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const waiting=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000d8',state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
+ let reloaded=false;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:waiting}),job:waiting})});});
+ await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:waiting})}));
+ // The reload answers a review whose merging is not available (the merge control hides), or fails (every merge control hides).
+ await page.route('**/api/review',async route=>{
+  if(reloaded&&reload==='failed'){await route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({error:'Could not read this branch\'s history.'})});return;}
+  const response=await route.fetch(),body=await response.json();body.merge=reloaded?{...body.merge,available:false}:runnerMerge(body.merge,{ready:true,action:'merge',job:null});
+  await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#merge-cancel')).toBeVisible({timeout:10_000});
+ await page.locator('#merge-cancel').focus();
+ reloaded=true;
+ const answered=page.waitForResponse(response=>response.url().endsWith('/api/review'));
+ // A synthetic click on the Review link reloads the review without moving focus off Cancel.
+ await page.locator('#review-link').dispatchEvent('click');
+ await answered;
+ await expect(page.locator('#merge-steps-bar')).toBeHidden();
+ await expect(page.locator('#merge')).toBeHidden();
+ await expect(page.locator('#reload')).toBeFocused();
+});
 test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
