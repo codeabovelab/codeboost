@@ -147,7 +147,8 @@ it.each([
   const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
   // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
   // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
-  // removals' stdout (the removed IDs or names in 27.4) is not read. The network line holds only the fields the sweep
+  // removals' stdout (the removed IDs or names in 27.4) is not read. The second case's answer is invented: it stands in
+  // for an unexpected inspect failure that still printed some holders, which 27.4 is not known to give. The network line holds only the fields the sweep
   // reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope), and the inspect an empty endpoint for
   // the network, where 27.4 gives its full settings: the sweep reads only the network names.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,

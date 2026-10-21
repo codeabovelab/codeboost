@@ -2562,6 +2562,7 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', filesystems.keeper);
     // Tracked for afterAll too: its create may land after the finally (#189).
     containers.add(filesystems.keeper);
+    let passed = false;
     try {
       // Inside the try: this keeper carries another runner's label, so only the finally below removes it (#189).
       docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
@@ -2570,13 +2571,16 @@ describe('real Docker agent isolation', () => {
       expect(() => removeTaskFilesystems(filesystems)).toThrow('did not settle');
       expect(docker('container', 'inspect', '--format', '{{.State.Running}}', filesystems.keeper)).toBe('true');
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
+      passed = true;
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
-      // Never throws, so a failure above is the one reported: what the removal leaves, the allocation sweep below removes,
-      // the keeper with another runner's label included (#189). The sweep may take up to 5.5 minutes, which the test's
-      // budget allows for.
-      try { removeTaskFilesystems(filesystems); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
+      // A failure above stays the one reported: what the removal leaves, the allocation sweep below removes, the keeper
+      // with another runner's label included (#189). After a pass, the storage must release once the foreign keeper is
+      // gone, so its failure fails the test. The sweep may take up to 5.5 minutes, which the test's budget allows for.
+      let released: unknown;
+      try { removeTaskFilesystems(filesystems); } catch (error) { released = error; console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
+      if (passed && released) throw released;
     }
   }, 7 * 60_000);
 
@@ -2586,15 +2590,20 @@ describe('real Docker agent isolation', () => {
     // It carries another runner's label, so no sweep of this run finds it: removed here, and whatever still carries its
     // allocation when the test finishes, should its creation or removal not settle or the test time out (#189).
     sweepWhenFinished('io.codeboost.allocation', allocationId);
+    let passed = false;
     try {
       foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
         metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
       { runnerOwner: 'f'.repeat(32), attemptId: 'other-runner', allocationId });
       await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
         inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
+      passed = true;
     } finally {
-      // Never throws, so a failure above is the one reported; the sweep removes whatever the removal left.
-      try { if (foreign) removeTaskFilesystems(foreign); } catch (error) { console.warn('cleanup: removing the storage failed:', error); }
+      // A failure above stays the one reported, and the sweep removes whatever the removal left. After a pass, the
+      // storage must release by its handle, so its failure fails the test.
+      let released: unknown;
+      try { if (foreign) removeTaskFilesystems(foreign); } catch (error) { released = error; console.warn('cleanup: removing the storage failed:', error); }
+      if (passed && released) throw released;
     }
   }, 60_000);
 
