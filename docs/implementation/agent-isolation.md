@@ -200,7 +200,7 @@ Use only these entry points to run an agent:
    and recovery removes it only with the runner's own token, the probe kind and no attempt, allocation or other
    kind label (other labels, such as the image's or Docker's anonymous-volume label, are allowed), and a name the
    probe gives (`codeboost-path-identity-<uuid>`, or Docker's 64-hex name for its volume). Containers go first; a
-   probe volume another container still mounts is kept for a later start. It keeps task storage whole (both volumes and the keeper) and returns one recovery
+   probe volume another container still mounts is kept, and the first start after that container is gone removes it. It keeps task storage whole (both volumes and the keeper) and returns one recovery
    handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts

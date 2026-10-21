@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage). For a
-// volume it answers as Docker 27.4.0 does: `volume rm --force` of a missing name exits 0 and prints the name, of a
-// volume a container mounts exits 1 with "volume is in use", and `volume inspect` of a missing name exits 1 with "no
-// such volume". Its other errors are shorter than Docker's; the code reads only the exit status and, through `absent`,
-// "No such" or "not found".
+// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage). Its
+// removals answer as Docker 27.4.0 does: `rm --force` of a missing container exits 0 and says "No such container" on
+// stderr; `volume rm --force` of a missing name exits 0 and prints the name, and of a volume a container mounts exits 1
+// with "volume is in use"; `volume inspect` of a missing name exits 1 with "no such volume". Its other errors are
+// shorter than Docker's; the code reads only the exit status and, through `absent`, "No such" or "not found".
 interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string>;
   /** For a container: the names of the volumes it mounts. */
   mounts?: string[] }
@@ -49,6 +49,8 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
   const [kind, ref] = args[0] === 'rm' ? ['container', args[2]!] : [args[0]!, args[args.length - 1]!];
   const object = find(kind, ref);
   if (!object && kind === 'volume' && args.includes('--force')) return { status: 0, stdout: ref, stderr: '' };
+  if (!object && kind === 'container' && args.includes('--force'))
+    return { status: 0, stdout: '', stderr: `Error response from daemon: No such container: ${ref}` };
   if (!object) return { status: 1, stdout: '', stderr: 'Error: No such object' };
   const holder = kind === 'volume' && daemon.objects.find(other => other.mounts?.includes(object.name));
   if (holder) return { status: 1, stdout: '', stderr: `Error response from daemon: remove ${object.name}: volume is in use - [${holder.id}]` };
@@ -438,6 +440,8 @@ describe('recoverLeftovers', () => {
     const report = await recoverLeftovers(A, 120_000, { unowned: false });
     expect(report.removed).toEqual([]);
     expect(names()).toEqual([volume.name]);
+    // Another runner's now: neither removed nor reported as this runner's.
+    expect(report.unowned).toEqual([]);
   });
 
   it('removes no probe volume while its container\'s removal is not confirmed (#181)', async () => {

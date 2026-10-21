@@ -161,7 +161,10 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     network: [] as RecoveredResource[] };
   const unowned: UnownedResource[] = [];
   for (const kind of ['container', 'volume', 'network'] as const) {
-    owned[kind] = await inspect(kind, await list(kind, `${RUNNER_LABEL}=${runnerOwner}`, remaining), remaining);
+    // An object inspected with another runner's label replaced the one listed under the same name: it is not this
+    // runner's, so recovery neither removes nor reports it.
+    owned[kind] = (await inspect(kind, await list(kind, `${RUNNER_LABEL}=${runnerOwner}`, remaining), remaining))
+      .filter(resource => resource.labels[RUNNER_LABEL] === runnerOwner);
     if (options.unowned === false) continue;
     // Docker cannot filter on a missing label, so list every codeboost object of this kind and keep those without one.
     const candidates = unique((await Promise.all(KIND_LABELS.map(label => list(kind, label, remaining)))).flat());
@@ -190,9 +193,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     if (PROBE_LABEL in labels) {
       const scoped = [ATTEMPT_LABEL, ALLOCATION_LABEL, INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL]
         .some(label => label in labels);
-      // The runner label again: a volume is listed, inspected and removed by name, and a same-named one could replace it.
-      return !scoped && labels[PROBE_LABEL] === 'path-identity' && labels[RUNNER_LABEL] === runnerOwner
-        ? 'probe:path-identity' : undefined;
+      return !scoped && labels[PROBE_LABEL] === 'path-identity' ? 'probe:path-identity' : undefined;
     }
     if (!isLabelAttemptId(labels[ATTEMPT_LABEL]) || !isAllocationId(labels[ALLOCATION_LABEL])) return undefined;
     const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in labels);
@@ -241,9 +242,9 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       await removeById(resource, remaining);
       confirmed.push(resource);
     } catch (error) {
-      // Every container recovery removes is gone by now, so the holder is one it leaves: one it reports as unowned, or
-      // a probe an earlier process's orphaned client created after the scan. The volume is kept; once its holder is
-      // gone, a later start removes it.
+      // Every container recovery removes is gone by now, so the holder is one it leaves: one it reports as unowned, one
+      // without codeboost labels, or a probe an earlier process's orphaned client created after the scan. The volume is
+      // kept, and a start after its holder is gone removes it.
       if (!(error instanceof VolumeInUse)) failures.push(error);
     }
   }

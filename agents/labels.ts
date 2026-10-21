@@ -93,7 +93,7 @@ export const hasOwnerLabels = (labels: Readonly<Record<string, string>> | null |
  * an allocation, so it carries only the runner label and this one. Startup recovery, under the runner lock, removes
  * this runner's leftover probes: only one process holds a runner token at a time, so a probe found then is an earlier
  * process's. A Docker client that process left may still be creating one after recovery's scan: recovery then keeps
- * its volume, which the new container holds, and a later start removes both.
+ * its volume, which the new container holds, and the next start removes both.
  */
 export const PROBE_LABEL = 'io.codeboost.probe';
 /** The probes D runs: `path-identity` measures task storage's path identity at runner startup (#162). */
