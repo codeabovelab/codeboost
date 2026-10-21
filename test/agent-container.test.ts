@@ -2375,8 +2375,9 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
     const owner = { runnerOwner, attemptId: 'unsettled-allocation', allocationId: randomUUID() };
     // Another runner's objects, so no sweep of this run finds them: removed by allocation when the test finishes (#189).
-    // After a pass, nothing of the allocation may be left once that sweep has run, as on main; this check, registered
-    // first, runs after the sweep (Vitest runs onTestFinished hooks in reverse order).
+    // After a pass, a listing that fails fails the test, as on main, and now nothing of the allocation may be left once
+    // that sweep has run either; this check, registered first, runs after the sweep (Vitest runs onTestFinished hooks
+    // in reverse order).
     let passed = false;
     onTestFinished(() => { if (passed) expect(byAllocation(owner.allocationId)).toEqual([]); }, 2 * 60_000);
     sweepWhenFinished('io.codeboost.allocation', owner.allocationId);
