@@ -833,8 +833,14 @@ describe('real Docker agent isolation', () => {
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
       // And it says nothing of that gone holder: Docker's own answer is not a failure.
       const sweepWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-      try { removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker')); } finally { sweepWarn.mockRestore(); }
-      expect(sweepWarn.mock.calls.filter(call => String(call[0]).endsWith('failed:'))).toEqual([]);
+      // Copied before the restore, which clears the calls.
+      let sweepCalls: unknown[][] = [];
+      try {
+        removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
+        sweepCalls = [...sweepWarn.mock.calls];
+      } finally { sweepWarn.mockRestore(); }
+      expect(sweepCalls.filter(call => String(call[0]).endsWith('failed:'))).toEqual([]);
+      expect(sweepCalls.length).toBeGreaterThan(0);
       // afterAll removes tracked names with removeByName, as here: an object of exactly that name goes, and a name that
       // is gone says nothing.
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
