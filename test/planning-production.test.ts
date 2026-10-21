@@ -339,7 +339,7 @@ describe('the planning check (#164)', () => {
     expect(issueAccess).toHaveBeenCalledTimes(2);
   });
 
-  it('refuses a request with the check\'s reason, before it reads the issue, and checks again only after the wait', async () => {
+  it('refuses a request with the check\'s reason, before it reads the issue, and does not check again within the wait', async () => {
     const { deps, probe, issueAccess } = checked(async () => { throw new Error('Claude could not sign in.'); });
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
@@ -404,7 +404,7 @@ describe('the planning check (#164)', () => {
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
   });
 
-  it('refuses to invoke an agent whose check has not passed, when Settings changed after the recorded action', async () => {
+  it('refuses to invoke an agent whose check has not passed for the vendor chosen at the call', async () => {
     const made = checked(async () => undefined);
     await made.deps.describe(signal());
     vi.spyOn(made.service.store, 'questionProvider').mockReturnValue('codex');
@@ -517,6 +517,25 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
+  it('fails a check that does not settle in time, so the next request after the wait checks again', async () => {
+    let count = 0;
+    const check = new PlanningCheck((_vendor, probeSignal) => {
+      count += 1;
+      return count === 1 ? new Promise<void>(() => undefined) : Promise.resolve();
+    }, () => 'claude', { timeoutMs: 50, recheckMs: 0, waitMs: 1_000 });
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('The planning check did not finish within');
+    await expect(check.admit(signal())).resolves.toBeUndefined();
+    expect(count).toBe(2);
+  });
+
+  it('promises no recheck when the check says planning is off until a restart', async () => {
+    const reason = 'The agent container worker stopped. Its containers and storage may still exist, so planning is off until codeboost restarts.';
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. The check said: ${reason}`);
+  });
+
   it('starts no check after close', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
     const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
@@ -571,7 +590,7 @@ describe('the planning check (#164)', () => {
       vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
       return text(number);
     });
-    // (The provider, too, checks again when it is invoked: "refuses to invoke an agent whose check has not passed".)
+    // (The provider, too, checks again when it is invoked: "refuses to invoke an agent whose check has not passed …".)
     const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());

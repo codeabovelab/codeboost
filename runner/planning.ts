@@ -95,7 +95,15 @@ type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?:
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. The first check after `
   + 'codeboost starts can take several minutes while the agent image is built. Retry in a minute.';
-const duration = (ms: number) => ms === 60_000 ? 'a minute' : `${Math.max(1, Math.round(ms / 1_000))} s`;
+const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment' : `${Math.round(ms / 1_000)} s`;
+// An abandoned worker (question-agent.ts) and unconfirmed cleanup (planning-provider.ts) refuse every job until codeboost
+// restarts, so a recheck cannot help.
+const UNTIL_RESTART = /until codeboost restarts/;
+/**
+ * How long one check may take before it fails, so a check that never settles (a stuck recovery, say) cannot keep
+ * planning "still checking": a real request's budget, as the probe has, and a minute for the worker to settle.
+ */
+export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
 /**
  * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at
  * startup, and `admit`, called before anything about a request is recorded, waits for it. The last check is kept: a
@@ -109,6 +117,7 @@ export class PlanningCheck {
   readonly #vendor: () => Provider | null;
   readonly #recheckMs: number;
   readonly #waitMs: number;
+  readonly #timeoutMs: number;
   readonly #abort = new AbortController();
   readonly #running = new Set<Promise<void>>();
   #current?: Check;
@@ -116,11 +125,12 @@ export class PlanningCheck {
   // listener, removed when the wait ends, so no settled request stays attached.
   readonly #events = new EventTarget();
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
-    options: { recheckMs?: number; waitMs?: number } = {}) {
+    options: { recheckMs?: number; waitMs?: number; timeoutMs?: number } = {}) {
     // One listener per waiting request and per running check, each removed when it ends: many at once are no leak.
     setMaxListeners(0, this.#events, this.#abort.signal);
     this.#probe = probe; this.#vendor = vendor;
     this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
+    this.#timeoutMs = options.timeoutMs ?? PLANNING_CHECK_TIMEOUT_MS;
   }
   /** Begin the check for the chosen vendor, if any, without waiting for it. */
   start(): void {
@@ -149,10 +159,19 @@ export class PlanningCheck {
     let probe: Promise<void>;
     // Started now, so close can cancel it; a probe that throws instead of rejecting fails the check the same way.
     try { probe = this.#probe(vendor, abort.signal); } catch (error) { probe = Promise.reject(error); }
+    // Bounded: a check that has not settled in time fails, and is cancelled, so the recheck path applies to it.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`The planning check did not finish within ${Math.round(this.#timeoutMs / 60_000)} minutes.`);
+        abort.abort(error); reject(error);
+      }, this.#timeoutMs);
+      timer.unref?.();
+    });
     // Never rejects: the outcome is kept on the check, so every waiting request gets it.
-    const done = probe.then(() => { check.passed = true; }, (error: unknown) => {
+    const done = Promise.race([probe, late]).then(() => { check.passed = true; }, (error: unknown) => {
       check.failure = { error, at: performance.now() };
-    }).finally(() => this.#abort.signal.removeEventListener('abort', stop));
+    }).finally(() => { clearTimeout(timer); this.#abort.signal.removeEventListener('abort', stop); });
     check.done = done;
     this.#running.add(done);
     void done.finally(() => this.#running.delete(done));
@@ -214,7 +233,11 @@ export class PlanningCheck {
   }
   #verdict(check: Check): void {
     if (check.passed) return;
-    // The reason comes last and as it is: some end with a command a person may copy.
+    // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
+    // gets no promise of a recheck, which could not help.
+    if (check.failure && UNTIL_RESTART.test(messageOf(check.failure.error)))
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
+        + `The check said: ${messageOf(check.failure.error)}`);
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
       + `it checks again on the next request after ${duration(this.#recheckMs)}. `
       + `The check said: ${messageOf(check.failure.error)}`);

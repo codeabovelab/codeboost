@@ -34,14 +34,16 @@ export function productionPlanning(config: ReviewConfig, options: {
     options.verifyLock();
     service.store.settleInterruptedRequests();
     const provider = options.agent?.(service) ?? new PlanningAgent(service);
-    // Started now, before the server listens. If startup fails after this, the process exits, and the next start's
-    // planning recovery removes what the check left (its objects carry planning's owner).
+    // Started now, before the server listens. If startup fails after this, the CLI exits (web/cli.ts), and the next start's
+    // planning recovery removes what the check left (its objects carry planning's owner). Another caller of startServer
+    // is left with the check running: startServer does not close planning when a later startup step fails (follow-up).
     const check = new PlanningCheck((vendor, signal) => provider.probe(vendor, signal), () => service.store.questionProvider(),
       { recheckMs: options.recheckMs, waitMs: options.admitWaitMs });
     check.start();
     return {
-      // Checked once more when the coordinator invokes the provider, after the recorded action: Settings may have changed
-      // in between, and the provider reads the vendor again. A refusal here settles the request as failed.
+      // Checked once more when the provider is invoked, as defence in depth: E3 invokes it in a microtask right after the
+      // recorded action, where Settings cannot change, but a later caller might not. A refusal here settles the request as
+      // failed.
       provider: { async invoke(request, signal) { check.assertPassed(); return provider.invoke(request, signal); } },
       async describe(signal) {
         await check.admit(signal);
