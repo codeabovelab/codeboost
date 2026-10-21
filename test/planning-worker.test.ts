@@ -9,7 +9,7 @@ import { createDemo } from '../scripts/demo.ts';
 import { AgentWorker } from '../runner/question-agent.ts';
 import { ASK_NAMING, createWorkerRoot, LeftoverLedger, PLANNING_NAMING } from '../runner/question-leftovers.ts';
 import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
-import { NO_PLANNING_AGENT, PlanningAgent } from '../runner/planning.ts';
+import { isPlanningProbeAnswer, NO_PLANNING_AGENT, PLANNING_PROBE_PROMPT, PLANNING_PROBE_SCHEMA, PlanningAgent } from '../runner/planning.ts';
 import { ReviewService } from '../runner/review.ts';
 
 // Planning's worker, ledger and owner (#117), driven through the stub worker, which reports what reached it.
@@ -154,4 +154,44 @@ it.each([
   const acquire = vi.spyOn(LeftoverLedger.prototype, 'acquire');
   await expect(agent(service).invoke(request(service), new AbortController().signal)).rejects.toThrow(message);
   expect(acquire).not.toHaveBeenCalled();
+});
+
+// #164: the planning check runs as a planning job in planning's own worker, and passes only with the schema's answer.
+it('passes the planning check with the schema\'s answer from the worker', async () => {
+  const service = review();
+  await expect(agent(service).probe('claude', new AbortController().signal)).resolves.toBeUndefined();
+});
+
+it('fails the planning check without a sign-in or with Codex, before the review\'s lock is taken', async () => {
+  const service = review(), acquire = vi.spyOn(LeftoverLedger.prototype, 'acquire');
+  const unsigned = new PlanningAgent(service, { url: STUB, env: {} });
+  closers.push(() => unsigned.close());
+  await expect(unsigned.probe('claude', new AbortController().signal)).rejects.toThrow('CLAUDE_CODE_OAUTH_TOKEN');
+  await expect(agent(service).probe('codex', new AbortController().signal)).rejects.toThrow(CODEX_PLANNING_REFUSED);
+  expect(acquire).not.toHaveBeenCalled();
+});
+
+it('runs the planning check on the review\'s code at the snapshot\'s head, with the check\'s prompt and schema', async () => {
+  const service = review(), plan = vi.spyOn(AgentWorker.prototype, 'plan');
+  await agent(service).probe('claude', new AbortController().signal);
+  const run = plan.mock.calls[0]![0], snapshot = service.store.getSnapshot(service.config.identity);
+  expect(run).toMatchObject({ provider: 'claude', repository: service.reviewRepository().path, head: snapshot.head,
+    prompt: PLANNING_PROBE_PROMPT, schemaText: PLANNING_PROBE_SCHEMA,
+    context: { snapshotId: snapshot.id, planId: service.config.identity.planId, referencedCodeHash: snapshot.head } });
+  expect(run.taskId).toMatch(/^planning-probe-[0-9a-f-]{36}$/);
+  expect(run.deadline - Date.now()).toBeGreaterThan(PLANNING_BUDGET_MS - 30_000);
+});
+
+it('fails the planning check when the agent answers anything but the schema\'s answer', async () => {
+  const service = review(), wrong = new PlanningAgent(service, { url: STUB, env: { CLAUDE_CODE_OAUTH_TOKEN: 'probe-wrong-answer' } });
+  closers.push(() => wrong.close());
+  await expect(wrong.probe('claude', new AbortController().signal)).rejects.toThrow('did not give the check\'s answer');
+});
+
+it('passes the planning check only with exactly the schema\'s answer', () => {
+  expect(isPlanningProbeAnswer('{"ok":true}')).toBe(true);
+  expect(isPlanningProbeAnswer(' { "ok": true }\n')).toBe(true);
+  for (const text of ['', 'ok', 'true', '{"ok":false}', '{"ok":"true"}', '{"ok":true,"extra":1}', '[{"ok":true}]', 'null', '{}',
+    '{"ok":false,"ok":true}', '{"o\\u006b":true}', '\uFEFF{"ok":true}', '{\u00a0"ok":true}'])
+    expect(isPlanningProbeAnswer(text)).toBe(false);
 });
