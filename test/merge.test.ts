@@ -1678,7 +1678,7 @@ it.each([
 ] as const)('fails closed for an invalid %s check app identity', async (_source, rules, requiredStatusChecks) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } }] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([rules]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });

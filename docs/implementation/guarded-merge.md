@@ -68,7 +68,7 @@ The read fails closed:
 - These fail the inspection with codeboost's own reason: an answer with errors or a malformed field, an answer for another commit, a suite with more than 100 runs of the pinned name, more than 10 pages of suites, and suites that change between pages.
 - The merge status shows the reason after “Could not read GitHub merge state.”
 - A deadline that stops the read keeps the inspection's timeout as the reason.
-- When the inspection's stages stop each other, the first stage's failure is reported. This holds even when a stopped read then settles with its own gh error: its gh had already exited, and its output closed after the stop.
+- When the inspection's stages stop each other, the first stage's failure is reported, unless the inspection's deadline fires while the stopped stages settle and that failure was not gh's own exit: then the timeout is reported. Either way the read fails closed. The first failure is kept even when a stopped read then settles with its own gh error: its gh had already exited, and its output closed after the stop.
 
 Recordings in `test/fixtures/gh/` back this:
 
