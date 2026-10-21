@@ -1005,7 +1005,7 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
  else await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/,{timeout:6_000});
  expect(Date.now()-released).toBeLessThan(5_000);
 });
-for (const reload of ['unavailable','failed'] as const) test(`moves focus off Cancel to Refresh when a reload ${reload==='failed'?'fails':'hides the merge control'} (D16)`,async({page})=>{
+for (const reload of ['unavailable','failed','ended'] as const) test(`moves focus off Cancel when a reload ${{failed:'fails',unavailable:'hides the merge control',ended:'shows the job ended'}[reload]} (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
  app=await startServer(config,0,undefined,gateway);
@@ -1019,7 +1019,9 @@ for (const reload of ['unavailable','failed'] as const) test(`moves focus off Ca
  // The reload answers a review whose merging is not available (the merge control hides), or fails (every merge control hides).
  await page.route('**/api/review',async route=>{
   if(reloaded&&reload==='failed'){await route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({error:'Could not read this branch\'s history.'})});return;}
-  const response=await route.fetch(),body=await response.json();body.merge=reloaded?{...body.merge,available:false}:runnerMerge(body.merge,{ready:true,action:'merge',job:null});
+  const response=await route.fetch(),body=await response.json();
+  body.merge=reloaded?(reload==='ended'?runnerMerge(body.merge,{ready:false,action:null,job:mergeJobRecord({...waiting,state:'merged',step:null,revision:6,url:'https://github.com/owner/repo/pull/7'})}):{...body.merge,available:false})
+   :runnerMerge(body.merge,{ready:true,action:'merge',job:null});
   await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
@@ -1031,8 +1033,14 @@ for (const reload of ['unavailable','failed'] as const) test(`moves focus off Ca
  await page.locator('#review-link').dispatchEvent('click');
  await answered;
  await expect(page.locator('#merge-steps-bar')).toBeHidden();
- await expect(page.locator('#merge')).toBeHidden();
- await expect(page.locator('#reload')).toBeFocused();
+ if(reload==='ended'){
+  // The merge control is still shown, so focus moves to it.
+  await expect(page.locator('#merge')).toBeVisible();
+  await expect(page.locator('#merge')).toBeFocused();
+ } else {
+  await expect(page.locator('#merge')).toBeHidden();
+  await expect(page.locator('#reload')).toBeFocused();
+ }
 });
 for (const refusal of ['ended','older','newer'] as const) test(`keeps what the poll showed when a cancel's refusal carrying ${{ended:'the ended job',older:'an older record of it',newer:'a newer running job'}[refusal]} arrives after the poll saw the job end (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
