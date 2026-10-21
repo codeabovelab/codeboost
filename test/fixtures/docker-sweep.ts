@@ -28,7 +28,8 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? result.stderr.trim());
-    return result.status === 0 ? result.stdout.split('\n').filter(Boolean) : [];
+    // An inspect of several objects exits 1 if one is gone, yet prints the rest, so stdout is read whatever the status.
+    return result.stdout?.split('\n').filter(Boolean) ?? [];
   };
   for (const kind of ['container', 'network', 'volume'] as const) {
     // Networks by name: `ps --filter network=` finds a created, never started container by the name only (Docker 27.4).

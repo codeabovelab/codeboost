@@ -38,8 +38,8 @@ afterAll(async () => {
   try { if (network) await removeVendorNetwork(network); }
   finally {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
-    // makes without the runner label are not found here; those tests remove their own. It may not run before a hook
-    // timeout.
+    // makes without the runner label are found here only while they hold one of this run's networks or volumes; those
+    // tests remove their own. It may not run before a hook timeout.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 6 * 60_000);

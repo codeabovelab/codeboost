@@ -149,11 +149,11 @@ afterAll(async () => {
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
     // volumes or networks: those made through `withoutRunnerLabel` are found by their test-run IDs, and the other tests
     // remove their own. It may not run before a hook timeout, and its budget does not cover every Docker call taking
-    // its full 30 s.
+    // its full 30 s (eleven per sweep).
     for (const testRun of testRuns) removeLabelledObjects(TEST_RUN_LABEL, testRun, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 120_000);
+}, 10 * 60_000);
 
 describe('real Docker agent isolation', () => {
   it.each([
@@ -422,13 +422,19 @@ describe('real Docker agent isolation', () => {
     await expect(validateContainer(valid.name, valid)).rejects.toThrow('unexpected external mount');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
-    const rogue = `codeboost-work-${randomUUID()}`; docker('volume', 'create', rogue);
+    const rogue = `codeboost-work-${randomUUID()}`;
     try {
+      // Inside the try: the volume has no labels, so only the finally below removes it (#189).
+      docker('volume', 'create', rogue);
       const rogueArgs = valid.args.map(value => value.replace(data.filesystems.workVolume, rogue));
       docker(...rogueArgs); containers.add(valid.name);
       await expect(validateContainer(valid.name, valid)).rejects.toThrow('captured identity');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
-    } finally { spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' }); }
+    } finally {
+      // The container first: a volume it mounts cannot be removed.
+      spawnSync('docker', ['rm', '--force', valid.name], { stdio: 'ignore' });
+      spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' });
+    }
   }, 60_000);
 
   it('rejects cloned profiles while sealed snapshots ignore later host changes', async () => {
@@ -645,9 +651,9 @@ describe('real Docker agent isolation', () => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
     testRuns.push(testRun);
-    // Up to ten synchronous Docker calls of 30 s each, which a timer cannot cut short: the budget covers them, so a slow
-    // removal is not reported as a hook timeout (10 s by default).
-    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 5 * 60_000);
+    // Up to eleven synchronous Docker calls of 30 s each, which a timer cannot cut short: the budget covers them, so a
+    // slow removal is not reported as a hook timeout (10 s by default).
+    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 6 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -708,24 +714,27 @@ describe('real Docker agent isolation', () => {
   // #189: the sweep removes what holds a swept network or volume, even a container created and never started, and
   // nothing on a network or volume it does not sweep, even one whose ID starts with a swept network's name.
   it('removes the containers that hold a swept network or volume, and nothing else', () => {
-    const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, made: { kind: string; ref: string }[] = [];
-    const make = (kind: 'container' | 'network' | 'volume', ...args: string[]) => {
-      const ref = docker(...(kind === 'container' ? [] : [kind]), ...args);
-      made.push({ kind, ref });
-      return ref;
+    // The test-run ID goes to afterAll too, and each object is recorded by name before it is made, so a failure here
+    // leaves nothing behind (#189).
+    const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, made: { kind: 'container' | 'network' | 'volume'; ref: string }[] = [];
+    testRuns.push(run);
+    const make = (kind: 'container' | 'network' | 'volume', name: string, ...args: string[]) => {
+      made.push({ kind, ref: name });
+      return docker(...(kind === 'container' ? [args[0]!, '--name', name, ...args.slice(1)] : [kind, args[0]!, ...args.slice(1), name]));
     };
+    const named = (what: string) => `codeboost-${what}-${randomUUID()}`;
     try {
-      const bystanderNetwork = make('network', 'create', `codeboost-bystander-${randomUUID()}`);
-      const bystanderVolume = make('volume', 'create', `codeboost-bystander-${randomUUID()}`);
-      const bystanders = [make('container', 'run', '--detach', '--network', bystanderNetwork, '--entrypoint', 'sleep', imageId, '300'),
-        make('container', 'create', '--mount', `type=volume,source=${bystanderVolume},target=/x`, '--entrypoint', 'true', imageId)];
-      const network = make('network', 'create', '--label', label, `codeboost-swept-${randomUUID()}`);
+      const bystanderNetwork = make('network', named('bystander'), 'create');
+      const bystanderVolume = make('volume', named('bystander'), 'create');
+      const bystanders = [make('container', named('bystander'), 'run', '--detach', '--network', bystanderNetwork, '--entrypoint', 'sleep', imageId, '300'),
+        make('container', named('bystander'), 'create', '--mount', `type=volume,source=${bystanderVolume},target=/x`, '--entrypoint', 'true', imageId)];
+      const network = make('network', named('swept'), 'create', '--label', label);
       // Named like the start of the bystander network's ID: Docker's network filter also matches that prefix.
-      make('network', 'create', '--label', label, bystanderNetwork.slice(0, 12));
-      const volume = make('volume', 'create', '--label', label, `codeboost-swept-${randomUUID()}`);
-      const holders = [make('container', 'create', '--network', network, '--entrypoint', 'true', imageId),
-        make('container', 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
-        make('container', 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
+      make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label);
+      const volume = make('volume', named('swept'), 'create', '--label', label);
+      const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
+        make('container', named('holder'), 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
+        make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
       removeLabelledObjects(TEST_RUN_LABEL, run, 'test');
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
@@ -733,14 +742,14 @@ describe('real Docker agent isolation', () => {
       for (const bystander of bystanders) expect(exists('container', bystander)).toBe(true);
       expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume)]).toEqual([true, true]);
     } finally {
-      for (const { kind, ref } of made.filter(object => object.kind === 'container'))
+      for (const { ref } of made.filter(object => object.kind === 'container'))
         spawnSync('docker', ['rm', '--force', ref], { stdio: 'ignore' });
       for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
         spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
     }
   }, 120_000);
 
-  // #189: these two run in order. The first stops after making a keeper without its runner label, before the removal
+  // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after making a keeper without its runner label, before the removal
   // its sibling test above ends with; the second checks that the keeper went when the first finished. `it.fails` passes
   // on any failure, so the first records the storage only once its checks passed, just before its deliberate stop.
   let stoppedEarly: ReturnType<typeof fixture> | undefined;
@@ -830,13 +839,20 @@ describe('real Docker agent isolation', () => {
     ].join('\n');
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    const left = docker('network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`);
+    // Listed in the finally too: the network carries another runner's label, so no sweep of this run finds it (#189).
+    const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
+      { encoding: 'utf8' }).stdout.trim();
+    let left = '';
     try {
+      left = listed();
       expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
       const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
       expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
       expect(left).not.toBe('');
-    } finally { if (left) spawnSync('docker', ['network', 'rm', ...left.split('\n')], { stdio: 'ignore' }); }
+    } finally {
+      const remaining = listed();
+      if (remaining) spawnSync('docker', ['network', 'rm', ...remaining.split('\n')], { stdio: 'ignore' });
+    }
   }, 60_000);
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
