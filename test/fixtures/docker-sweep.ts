@@ -22,6 +22,20 @@ export const TEST_RUN_LABEL = 'io.codeboost.test-run';
 export const TEST_FILE_LABEL = 'io.codeboost.test-file';
 
 /**
+ * Removes the container, network or volume named exactly `name`, by its full ID (a volume by its name, which is its
+ * ID). Docker would read a missing name as an ID prefix, so an object found under another name is left alone. Never
+ * throws; each call has a 30 s limit.
+ */
+export function removeByName(kind: 'container' | 'network' | 'volume', name: string, docker = REAL_DOCKER): void {
+  const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const };
+  const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{.Name}}' : '{{.Id}} {{.Name}}', name], options);
+  if (found.status !== 0 || found.error) return;
+  const [id, actual] = kind === 'volume' ? [name, found.stdout.trim()] : found.stdout.trim().split(' ');
+  if (actual?.replace(/^\//, '') !== name || !id) return;
+  spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
+}
+
+/**
  * Removes the containers, networks and volumes labelled with one runner owner, and every container that holds one of
  * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it after
  * its other cleanup, and a test that makes objects under its own runner owner sweeps them, by owner here or by

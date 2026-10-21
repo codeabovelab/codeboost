@@ -9,7 +9,7 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { REAL_DOCKER, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
+import { removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
@@ -43,8 +43,7 @@ afterAll(async () => {
   try {
     for (const { kind, name, file } of unlabelled) {
       const ref = name ?? (file && existsSync(file) ? readFileSync(file, 'utf8') : '');
-      if (ref) spawnSync(REAL_DOCKER, kind === 'container' ? ['rm', '--force', ref] : ['network', 'rm', ref],
-        { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
+      if (ref) removeByName(kind, ref);
     }
     if (network) await removeVendorNetwork(network);
   }

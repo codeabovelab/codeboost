@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { REAL_DOCKER, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { REAL_DOCKER, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -52,6 +52,8 @@ const containers = new Set<string>();
  * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `volumes`).
  */
 const TEST_FILE_RUN = randomUUID();
+/** Networks a test makes without this run's runner label, removed by name in afterAll as `volumes` are. */
+const networks = new Set<string>();
 /**
  * Volumes a test makes without this run's runner label, removed in afterAll if the test did not remove them (it may
  * have timed out).
@@ -60,8 +62,9 @@ const volumes = new Set<string>();
 /**
  * For an async test that makes objects under another runner's owner, or its own random one, which no afterAll sweep
  * finds: removes what carries `label=value` when the test finishes, passed, failed or timed out (a timed-out body runs
- * on, and its finally may never run), with the sweep's own 6-minute budget (#189). Not covered: an object a timed-out
- * body makes after this sweep has run.
+ * on, and its finally may never run), with the sweep's own budget: up to eleven synchronous Docker calls of 30 s each,
+ * which a timer cannot cut short, so 6 minutes rather than a hook's default 10 s (#189). Not covered: an object that
+ * lands after this sweep has run, from a timed-out body or a killed process's Docker client.
  */
 const sweepWhenFinished = (label: string, value: string) =>
   onTestFinished(() => removeLabelledObjects(label, value, 'onTestFinished'), 6 * 60_000);
@@ -152,10 +155,10 @@ afterEach(async () => {
 }, 120_000);
 afterAll(async () => {
   try {
-    for (const container of containers)
-      spawnSync(REAL_DOCKER, ['rm', '--force', container], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
-    for (const volume of volumes)
-      spawnSync(REAL_DOCKER, ['volume', 'rm', '--force', volume], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
+    // By exact name: some are named like the start of another object's ID.
+    for (const container of containers) removeByName('container', container);
+    for (const network of networks) removeByName('network', network);
+    for (const volume of volumes) removeByName('volume', volume);
     // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
     // every failure is reported.
     const failures: unknown[] = [];
@@ -703,9 +706,7 @@ describe('real Docker agent isolation', () => {
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
-    // Up to eleven synchronous Docker calls of 30 s each, which a timer cannot cut short: the budget covers them, so a
-    // slow removal is not reported as a hook timeout (10 s by default).
-    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 6 * 60_000);
+    sweepWhenFinished(TEST_RUN_LABEL, testRun);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = requireRealDocker();
@@ -776,6 +777,8 @@ describe('real Docker agent isolation', () => {
     const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, fileLabel = `${TEST_FILE_LABEL}=${TEST_FILE_RUN}`, made: { kind: 'container' | 'network' | 'volume'; ref: string }[] = [];
     const make = (kind: 'container' | 'network' | 'volume', name: string, ...args: string[]) => {
       made.push({ kind, ref: name });
+      // For afterAll too: the daemon can still create an object after its client's 60 s limit and this test's finally.
+      (kind === 'container' ? containers : kind === 'network' ? networks : volumes).add(name);
       return docker(...(kind === 'container' ? [args[0]!, '--name', name, ...args.slice(1)] : [kind, args[0]!, ...args.slice(1), name]));
     };
     const named = (what: string) => `codeboost-${what}-${randomUUID()}`;
@@ -929,11 +932,10 @@ describe('real Docker agent isolation', () => {
       'result = run(args);',
       "process.kill(process.pid, 'SIGKILL');",
     ].join('\n');
-    const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--no-trunc', '--filter',
-      `label=io.codeboost.allocation=${allocationId}`], { encoding: 'utf8' }).stdout?.trim() ?? '';
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    const left = listed();
+    const left = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
+      { encoding: 'utf8' }).stdout?.trim() ?? '';
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
     expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
@@ -960,6 +962,8 @@ describe('real Docker agent isolation', () => {
   it('removes a task keeper by the ID it inspected, never a same-named replacement created after the inspect', async () => {
     const data = fixture(), filesystems = data.filesystems, swapped = join(data.root, 'swapped');
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
+    // Tracked before the shim runs: the stand-in has no labels, so afterAll's removal by name is the only other one (#189).
+    containers.add(filesystems.keeper);
     // Right after cleanup inspects the keeper, its name is taken over by another container.
     const swap = [
       'result = run(args);',
@@ -2567,7 +2571,8 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('startup probe refuses to exec when seccomp filtering is disabled', async () => {
-    // Named and tracked before it is made: it has no labels, so afterAll's removal by name is the only one (#189).
+    // Named and tracked before it is made: it has no labels, so if `--rm` never applies (its client killed before the
+    // start), afterAll's removal by name is the only one (#189).
     const name = `codeboost-seccomp-probe-${randomUUID()}`;
     containers.add(name);
     const result = spawnSync('docker', ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
