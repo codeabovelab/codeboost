@@ -36,7 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
-| A planning request over its model budget is refused before the start, and a planning run stops at its 50-turn limit (see [planning model budget](#planning-model-budget)) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
+| A planning request over its model budget is refused before the start, and the planning command passes `--max-turns 50` (see [planning model budget](#planning-model-budget) for what is and is not shown about the stop) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
 | A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
@@ -103,7 +103,8 @@ Use only these entry points to run an agent:
      Leave out a draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan
      format](../plan-format.md)).
    - <a id="planning-model-budget"></a>**Planning model budget (#163).** `createClaudeCommand` checks it when it
-     builds the planning command, so the start call throws before anything is allocated. The budget has two parts:
+     builds the planning command, so the adapter's start call throws before it creates a container or network. The
+     runner's host clone and task storage already exist by then, and the runner removes them. The budget has two parts:
      - *Input, before the start.* The prompt and the schema together must be at most `MAX_PLANNING_INPUT_BYTES`
        (64 KiB) of UTF-8: the 32 KiB prompt plus 32 KiB of schema text. A larger request is refused with an error
        that gives its size and asks the person to narrow the issue, the paths or the lessons. Bytes stand in for
