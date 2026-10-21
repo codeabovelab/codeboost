@@ -157,7 +157,7 @@ it.each([
 });
 
 // #164: the planning check runs as a planning job in planning's own worker, and passes only with the schema's answer.
-it('runs the planning check as a planning job in planning\'s worker, and passes with the schema\'s answer', async () => {
+it('passes the planning check with the schema\'s answer from the worker', async () => {
   const service = review();
   await expect(agent(service).probe('claude', new AbortController().signal)).resolves.toBeUndefined();
 });
@@ -171,7 +171,7 @@ it('fails the planning check without a sign-in or with Codex, before the review\
   expect(acquire).not.toHaveBeenCalled();
 });
 
-it('runs the planning check on the review\'s code at the snapshot\'s head, read-only, with the check\'s prompt and schema', async () => {
+it('runs the planning check on the review\'s code at the snapshot\'s head, with the check\'s prompt and schema', async () => {
   const service = review(), plan = vi.spyOn(AgentWorker.prototype, 'plan');
   await agent(service).probe('claude', new AbortController().signal);
   const run = plan.mock.calls[0]![0], snapshot = service.store.getSnapshot(service.config.identity);

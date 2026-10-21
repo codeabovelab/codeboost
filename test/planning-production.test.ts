@@ -543,6 +543,7 @@ describe('the planning check (#164)', () => {
 
   it.each([
     ['a database file with other hard links', 'Planning is off: the review database /r/db has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.'],
+    ['its own cleanup that did not settle', 'Planning agent timed out. Cleanup also did not settle: docker rm failed'],
   ])('promises no recheck for %s, which only a restart can change', async (_label, reason) => {
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
@@ -556,17 +557,39 @@ describe('the planning check (#164)', () => {
     expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
   });
 
-  it('reports a Store it cannot read, while waiting, as a failed check, not a stopped wait', async () => {
+  it('reports a Store it cannot read, once a wait has begun, as an unavailable check, not a stopped wait', async () => {
     const config = production(), service = new ReviewService(config); closers.push(() => service.close());
     service.store.setQuestionProvider('claude');
+    let pass!: () => void;
     const deps = productionPlanning(config, { ...verified, issues: issues(async number => text(number)),
-      agent: () => closable(undefined, (_vendor, probeSignal) => new Promise<void>((_, reject) =>
-        probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true }))) })!(service);
+      agent: () => closable(undefined, (_vendor, probeSignal) => new Promise<void>((resolve, reject) => {
+        pass = resolve; probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true });
+      })) })!(service);
+    const waiting = Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    // The read after the wait fails: the database went bad while the check ran.
+    await new Promise(resolve => setTimeout(resolve, 10));
     vi.spyOn(service.store, 'questionProvider').mockImplementation(() => { throw new Error('database disk image is malformed'); });
-    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    pass();
+    const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost could not check the planning agent: database disk image is malformed`);
+    vi.mocked(service.store.questionProvider).mockRestore();
     await deps.close!();
+  });
+
+  it('refuses with "planning is stopping" after close, never with a recheck promise', async () => {
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>((_, reject) =>
+      probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true })), () => 'claude');
+    check.start();
+    await check.close();
+    expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+  });
+
+  it('tells Codex to choose another agent, not to wait for a recheck', async () => {
+    const check = new PlanningCheck(async () => { throw new Error('Codex cannot write plans yet.'); }, () => 'codex');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choosing another agent in Settings checks it at once. The check said: Codex cannot write plans yet.`);
   });
 
   it('waits on close for a timed-out check\'s probe to stop, within its bound', async () => {

@@ -33,8 +33,8 @@ export function isPlanningProbeAnswer(text: string): boolean {
  * The production planning provider (#117): every request runs in planning's own worker thread, so lane D's synchronous
  * setup never blocks the server. The worker's TMPDIR is a planning root recorded in a ledger beside the review
  * database, and every Docker object it creates carries the database's planning owner. The first job of a process that
- * can sign in (the planning check at startup, or the first check a request starts) removes what earlier sessions left,
- * by that owner only, so Ask's and the runner's agents are never touched.
+ * can sign in (always a planning check: at startup, or one a request starts) removes what earlier sessions left, by
+ * that owner only, so Ask's and the runner's agents are never touched.
  *
  * The code is the review's repository at the current snapshot's head; E3 discards a reply whose snapshot or revision
  * changed meanwhile. The vendor is the one chosen in Settings for Ask; Codex is refused (#93).
@@ -99,13 +99,16 @@ const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the 
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
   : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
 // Reasons a recheck cannot help, so only a restart can: an abandoned worker (question-agent.ts), unconfirmed cleanup
-// (planning-provider.ts), a database file with other hard links (question-leftovers.ts), and a missing token, since
-// codeboost's environment is fixed while it runs. Matched only on codeboost's own text, before any vendor output.
-const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
+// (planning-provider.ts, and the check's own cleanup that did not settle, after which planning stays off), a database
+// file with other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while
+// it runs. Matched only on codeboost's own text, before any vendor output.
+const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links|did not settle/;
 const ownText = (message: string) => message.split(' Claude said:')[0]!;
 /**
- * How long one check may take before it fails, so a check that never settles (a stuck recovery, say) cannot keep
- * planning "still checking": a real request's budget, as the probe has, and a minute for the worker to settle.
+ * How long one check may take before it fails: a real request's budget, as the probe has, and a minute for the worker
+ * to settle. Waiting requests are then refused with the failure, and the next one after the recheck window checks
+ * again. A recheck joins the worker's one startup recovery, so a recovery that never ends fails each recheck the same
+ * way until codeboost restarts.
  */
 export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
 /**
@@ -190,7 +193,11 @@ export class PlanningCheck {
   /**
    * Resolve once the check for the vendor chosen now has passed; reject with a `GuardRefusal` naming why when it
    * failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
-   * requests may share.
+   * requests may share: an aborted wait rejects with `signal.reason`, and a vendor that cannot be read (a Store error)
+   * with that error; the caller maps both.
+   *
+   * A passed check is kept for the life of the process: a worker that is abandoned later, cleanup that does not settle
+   * later, or a token revoked later shows as a failed request, not as "Planning is unavailable".
    */
   async admit(signal: AbortSignal): Promise<void> {
     const deadline = performance.now() + this.#waitMs;
@@ -241,6 +248,12 @@ export class PlanningCheck {
   }
   #verdict(check: Check): void {
     if (check.passed) return;
+    // After close no check starts, so no recheck can be promised.
+    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    // Codex is refused whatever happens (#93); only choosing another agent helps, and that starts its check at once.
+    if (check.failure && check.vendor === 'codex')
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choosing another `
+        + `agent in Settings checks it at once. The check said: ${messageOf(check.failure.error)}`);
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
