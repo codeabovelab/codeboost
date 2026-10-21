@@ -1790,3 +1790,15 @@ it('asks GitHub to merge even when the step-list callback throws, since it is di
   expect(called).toBe(1);
   expect(f.gh.merged).toEqual([oid(2)]);
 });
+
+it('does not tell the step list again when a merge click is replayed from its saved outcome', async () => {
+  const f = setup();
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(done).toMatchObject({ state: 'merged' });
+  // The job's own guarded merge saved its outcome under its merge action ID; a resend of that click replays it.
+  let told = 0;
+  await f.merges.merge('review-token', done.mergeActionId!, undefined, () => { told++; });
+  expect(told).toBe(0);
+  expect(f.gh.merged).toEqual([oid(2)]);
+});

@@ -1014,10 +1014,11 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
   // The held poll answers the job's older running record: Cancel stays unavailable until the outcome shows.
   await heldAnswered;
   await page.waitForTimeout(300);
-  // The next poll comes 2 s after the held one, so the outcome is not shown yet.
-  await expect(page.locator('#merge')).not.toHaveText('Merged');
-  await expect(page.locator('#merge-cancel')).toHaveAttribute('aria-disabled','true');
-  await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
+  // The next poll comes 2 s after the held one, so the outcome is not shown yet. Read once, not retried: the later
+  // Merged state also marks Cancel unavailable.
+  expect(await page.evaluate(()=>{const cancel=document.getElementById('merge-cancel')!,merge=document.getElementById('merge')!;
+   return {merge:merge.textContent,shown:!cancel.hidden,unavailable:cancel.getAttribute('aria-disabled'),label:cancel.textContent};}))
+   .toEqual({merge:expect.not.stringMatching(/^Merged$/),shown:true,unavailable:'true',label:'Cancel requested'});
   await expect(page.locator('#merge')).toHaveText('Merged',{timeout:6_000});
   expect(Date.now()-released).toBeLessThan(5_000);
  } else {

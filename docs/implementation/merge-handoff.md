@@ -61,7 +61,7 @@ A rebase moves the pull request's base. The guarded merge would then scan only t
 
 ## Step list and Cancel
 
-While a job runs, a step list under the review strip shows the design's seven steps (D16), in order: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows an icon, a word and its elapsed time (from the step's saved times to the browser's clock, so a clock difference between browser and server can skew a running step's time): ○ Waiting, ● Running, ✓ Done, – Skipped, ✕ Failed, ! Stopped or ! Unknown.
+While a job runs, a step list under the review strip shows the design's seven steps (D16), in order: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows an icon, a word and its elapsed time (from the step's saved times to the browser's clock, so a clock difference between browser and server can skew a running step's time; a step ended by startup settlement after a restart counts the time the server was down): ○ Waiting, ● Running, ✓ Done, – Skipped, ✕ Failed, ! Stopped or ! Unknown.
 
 | Step | Running while | Skipped when |
 |---|---|---|
