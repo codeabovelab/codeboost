@@ -53,8 +53,11 @@ afterAll(async () => {
   try {
     for (const { kind, name, file } of unlabelled) {
       // A record holds one name per line: should a test time out with its shim still on PATH, later creates add theirs.
-      for (const ref of name ? [name] : file && existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [])
-        removeByName(kind, ref, 'afterAll');
+      // A record that cannot be read is reported, and the rest still run.
+      let refs: string[] = [];
+      try { refs = name ? [name] : file && existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (error) { console.warn('afterAll: reading a record failed:', error); }
+      for (const ref of refs) removeByName(kind, ref, 'afterAll');
     }
     if (network) await removeVendorNetwork(network);
   }

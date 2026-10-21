@@ -99,6 +99,10 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['network', 'raced'], ['container', 'junk'], ['container', 'odd'], ['container', 'nospace'], ['container', 'optid'],
     ['container', '--help'], ['volume', '-v']] as const;
   expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
+  // Each missing name reached its inspect, so the quiet answer was Docker's missing one.
+  for (const kind of ['container', 'network'] as const)
+    expect(readFileSync(calls, 'utf8').split('\n')).toContain(`${kind} inspect --format {{json .Id}} {{json .Name}} gone`);
+  expect(readFileSync(calls, 'utf8').split('\n')).toContain('volume inspect --format {{json .Name}} gone');
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
     .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy', `network rm ${raced}`]);
@@ -207,7 +211,7 @@ it('says nothing of a network gone since the listing, and reports any other fail
 });
 
 it.each([
-  ['says nothing of a holder gone since the listing', 'Error response from daemon: No such container: b', []],
+  ['says nothing of a holder gone since the listing', `Error response from daemon: No such container: ${'b'.repeat(64)}`, []],
   ['reports any other failure to read the holders', 'permission denied', [['test: reading holders: docker container inspect --format {{json .Id}} {{json .NetworkSettings.Networks}} HOLDERS failed:', 'permission denied']]],
 ])('%s, and still removes the holders it read', (_label, stderr, warnings) => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
@@ -297,4 +301,34 @@ it('reports and skips listed lines that are not a container ID, a network or a v
     ['test: listing networks: docker printed a line that is not a network:', '{"ID":"--help","Name":"x"}'],
     ['test: listing volumes: docker printed a line that is not a volume name:', '-v']]);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm |^ps /.test(line))).toEqual([]);
+});
+
+it('counts an object gone only on Docker\'s missing answer, and throws on any other failure, at the loaded daemon', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const bin = join(root, 'bin'), seen = join(root, 'seen'); mkdirSync(bin);
+  symlinkSync(spawnSync('sh', ['-c', 'command -v sh'], { encoding: 'utf8' }).stdout.trim(), join(bin, 'sh'));
+  // Answers as Docker 27.4 does for `inspect` of an object that exists, of a missing container, network and volume,
+  // and for an unknown context; one call is killed by a signal. Each call records its daemon address. Only the exit
+  // status and stderr are read.
+  writeFileSync(join(bin, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
+    'case "$1 $3" in',
+    "  'container there') echo '[]';;",
+    "  'container gone') echo; echo 'Error response from daemon: No such container: gone' >&2; exit 1;;",
+    "  'network gone') echo; echo 'Error response from daemon: network gone not found' >&2; exit 1;;",
+    "  'volume gone') echo; echo 'Error response from daemon: get gone: no such volume' >&2; exit 1;;",
+    "  'container killed') kill -9 $$;;",
+    "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \\\"x\\\": context not found' >&2; exit 1;;",
+    'esac; exit 0'].join('\n'), { mode: 0o755 });
+  vi.stubEnv('PATH', bin);
+  vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-loaded.sock');
+  vi.stubEnv('DOCKER_CONTEXT', 'codeboost-loaded');
+  vi.resetModules();
+  const fresh = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+  vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-changed.sock');
+  vi.stubEnv('DOCKER_CONTEXT', 'codeboost-changed');
+  expect(fresh.objectExists('container', 'there')).toBe(true);
+  for (const kind of ['container', 'network', 'volume'] as const) expect(fresh.objectExists(kind, 'gone')).toBe(false);
+  expect(() => fresh.objectExists('container', 'killed')).toThrow('docker container inspect killed failed: killed by SIGKILL');
+  expect(() => fresh.objectExists('container', 'lost')).toThrow('docker container inspect lost failed: Failed to initialize');
+  expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
 });
