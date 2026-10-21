@@ -973,8 +973,11 @@ describe('real Docker agent isolation', () => {
     ].join('\n');
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
-    const left = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
-      { encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL' }).stdout?.trim() ?? '';
+    const listing = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
+      { encoding: 'utf8', ...CLIENT_LIMIT });
+    // A listing that failed fails here with its cause, as main's helper did.
+    expect(listing.status, listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr)).toBe(0);
+    const left = listing.stdout.trim();
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
     expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
@@ -2639,7 +2642,7 @@ describe('real Docker agent isolation', () => {
     containers.add(name);
     const result = spawnSync('docker', ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=unconfined', '--network=none', imageId, 'true'],
-      { encoding: 'utf8', timeout: 60_000 });
+      { encoding: 'utf8', ...CLIENT_LIMIT });
     expect(result.status).toBe(78);
     expect(result.stderr).toContain('seccomp syscall filter must be enforced');
   }, 60_000);

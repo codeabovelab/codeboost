@@ -27,7 +27,7 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
 const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${network.name}`,
   '--env', `HTTPS_PROXY=${network.proxyUrl}`, ...(direct ? ['--env', 'NO_PROXY=*'] : []),
   '--entrypoint', 'curl', imageId, '--silent', '--show-error', '--output', '/dev/null', '--write-out', '%{http_code}',
-  '--max-time', '15', url], { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  '--max-time', '15', url], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
 
 beforeAll(async () => {
   imageId = buildAgentImage();
@@ -316,7 +316,7 @@ describe('vendor-only egress', () => {
         "const dns=require('node:dns');dns.setServers(['127.0.0.11']);",
         "dns.resolve4('example.com',(error)=>process.exit(error?0:1));",
         'setTimeout(()=>process.exit(0),3000);',
-      ].join('')], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      ].join('')], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
     expect(result.status).toBe(0);
   }, 30_000);
 
@@ -340,7 +340,7 @@ describe('vendor-only egress', () => {
         '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
       const result = spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${other.name}`, '--entrypoint', 'node', imageId,
         '-e', "const s=require('node:net').connect(4567,'codeboost-peer');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(2),3000)"],
-      { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
       expect(result.status).not.toBe(0);
     } finally {
       spawnSync('docker', ['rm', '--force', peer], { stdio: 'ignore' });

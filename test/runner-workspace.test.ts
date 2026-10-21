@@ -15,7 +15,7 @@ import { attemptRef, openRunnerRepository } from '../runner/runner-repository.ts
 import { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import { createTaskWorkspace } from '../runner/workspace.ts';
-import { removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit as git } from './fixtures/git.ts';
 
 // F2b against the real lane D (#87): each item runs in fresh task storage cloned from the runner-owned repository, an
@@ -43,7 +43,8 @@ afterAll(() => {
     removeRunnerObjects(RUNNER_OWNER);
   }
 }, 7 * 60_000);
-const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  ...CLIENT_LIMIT }).trim();
 
 async function setup(agent: Record<string, string>) {
   const root = mkdtempSync(join(tmpdir(), 'runner-workspace-')); roots.push(root);

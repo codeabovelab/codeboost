@@ -30,6 +30,8 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
 const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
+/** Label-less containers, by name, removed in afterAll should their create land after their test's finally (#189). */
+const unlabelled = new Set<string>();
 let imageId = '';
 const git = fixtureGit;
 
@@ -70,6 +72,7 @@ async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
 beforeAll(async () => { imageId = buildAgentImage(); }, 10 * 60_000);
 afterAll(async () => {
   try {
+    for (const name of unlabelled) removeByName('container', name, 'afterAll');
     for (const profile of profiles) await disposeContainerProfile(profile);
     for (const allocation of allocations.reverse()) removeTaskFilesystems(allocation);
     for (const root of roots.reverse()) {
@@ -653,8 +656,11 @@ describe('container invocation supervisor', () => {
   it('writes the deferred output acknowledgement idempotently, repairing a partial one', () => {
     const token = randomUUID(), file = `/run/codeboost-control/collected-${token}`;
     const name = `codeboost-ack-script-${randomUUID()}`;
+    // Tracked before it is made: it has no labels, and a create that lands after its client was killed is never started,
+    // so `--rm` does not apply and only removal by name finds it (#189).
+    unlabelled.add(name);
     try {
-      // Inside the try: the container has no labels, so only the finally below removes it (#189).
+      // Inside the try: the container has no labels, so the finally below removes it, and afterAll by name (#189).
       execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
         '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
         '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
