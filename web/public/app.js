@@ -362,6 +362,8 @@ function renderMergeSteps() {
   const shown = !!job?.steps && (job.state === "running" || ended);
   $("merge-steps-bar").hidden = !shown;
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
+  // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the merge control instead.
+  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) $("merge").focus();
   if (!shown) return;
   // Rebuilt only when a step changes; the timer below rewrites the elapsed times alone, so a screen reader keeps its place.
   const key = JSON.stringify(job.steps);
@@ -375,8 +377,6 @@ function renderMergeSteps() {
   }
   updateMergeStepTimes(job);
   const cancel = $("merge-cancel");
-  // Hiding a focused Cancel would drop keyboard focus to the page: it moves to the merge control instead.
-  if (job.state !== "running" && document.activeElement === cancel) $("merge").focus();
   cancel.hidden = job.state !== "running";
   // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
   const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
@@ -384,6 +384,8 @@ function renderMergeSteps() {
   if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
   cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancel requested" : "Cancel merge";
   cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
+  // A disabled Cancel ignores clicks, so the reason is also written out (and is the button's description).
+  $("merge-cancel-note").hidden = !(asked && job.state === "running");
   if (job.state === "running" && !mergeStepTimer) mergeStepTimer = setInterval(() => {
     const current = data?.merge?.job;
     if (current?.steps && current.state === "running") updateMergeStepTimes(current);
@@ -402,13 +404,15 @@ $("merge-cancel").onclick = async () => {
   if (!job || job.state !== "running" || $("merge-cancel").getAttribute("aria-disabled") === "true") return;
   mergeCancelPending = true;
   renderMergeSteps();
-  let endedAnswer = false;
+  let pollNow = false;
   const adopt = answered => {
-    // Only a later running record of the job shown. A job that ended (here or in another tab) is the poll's to show:
-    // it presents the outcome, follows a queued attempt and keeps the step list, so it is asked at once.
+    // Only a later running record of the job shown is adopted. Any other answer (the job ended, here or in another tab,
+    // or a newer job runs) is the poll's to show: it presents the outcome, follows a queued attempt and keeps the step
+    // list, so it is asked at once.
     const shownJob = data?.merge?.job;
-    if (!answered || shownJob?.id !== answered.id || !(answered.revision > shownJob.revision)) return;
-    if (answered.state !== "running") { endedAnswer = true; return; }
+    if (!answered) return;
+    if (shownJob?.id !== answered.id || answered.state !== "running") { pollNow = true; return; }
+    if (!(answered.revision > shownJob.revision)) return;
     mergeObservationGeneration++;
     data = { ...data, merge: { ...data.merge, job: answered } };
     $("banner").textContent = mergeJobText(answered);
@@ -420,10 +424,16 @@ $("merge-cancel").onclick = async () => {
   } finally {
     mergeCancelPending = false;
     renderMerge();
-    // A poll in flight for an older generation is discarded when it settles, so it does not stand in for this one.
-    if (endedAnswer && mergePollInFlight?.generation !== mergeGeneration) {
-      if (mergePollTimer) clearTimeout(mergePollTimer);
-      void pollMergeQueue(mergeGeneration);
+    if (pollNow) {
+      if (mergePollInFlight?.generation === mergeGeneration) {
+        // That poll may have read the job before it ended: whatever it answers, the next poll comes 2 s after it.
+        mergePollState = null;
+        mergePollDelay = 2000;
+      } else {
+        // A poll in flight for an older generation is discarded when it settles, so it does not stand in for this one.
+        if (mergePollTimer) clearTimeout(mergePollTimer);
+        void pollMergeQueue(mergeGeneration);
+      }
     }
   }
 };
