@@ -48,7 +48,7 @@ afterAll(async () => {
     for (const { kind, name, file } of unlabelled) {
       // A record holds one name per line: should a test time out with its shim still on PATH, later creates add theirs.
       for (const ref of name ? [name] : file && existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [])
-        removeByName(kind, ref);
+        removeByName(kind, ref, 'afterAll');
     }
     if (network) await removeVendorNetwork(network);
   }
@@ -128,7 +128,7 @@ describe('vendor-only egress', () => {
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-      for (const name of made) removeByName('network', name);
+      for (const name of made) removeByName('network', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
@@ -184,7 +184,7 @@ describe('vendor-only egress', () => {
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-      for (const name of made) removeByName('container', name);
+      for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
@@ -240,7 +240,7 @@ describe('vendor-only egress', () => {
       impostor = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
-      for (const name of made) removeByName('container', name);
+      for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
     expect(impostor).toMatch(/^codeboost-proxy-/);

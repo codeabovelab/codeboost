@@ -80,18 +80,18 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
     ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost']] as const;
-  for (const [kind, name] of objects) removeByName(kind, name, join(root, 'docker'));
+  for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker'));
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
     .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy']);
   expect(warn.mock.calls).toEqual([
-    ['removing container busy: docker container rm failed:',
+    ['test: removing container busy: docker rm failed:',
       `Error response from daemon: removal of container ${id} is already in progress`],
-    ['removing network busy: docker network rm failed:',
+    ['test: removing network busy: docker network rm failed:',
       `Error response from daemon: error while removing network: network busy id ${other} has active endpoints`],
-    ['removing volume busy: docker volume rm failed:', `Error response from daemon: remove busy: volume is in use - [${id}]`],
-    ['removing container killed: docker inspect failed:', 'killed by SIGKILL'],
-    ['removing container lost: docker inspect failed:',
+    ['test: removing volume busy: docker volume rm failed:', `Error response from daemon: remove busy: volume is in use - [${id}]`],
+    ['test: removing container killed: docker container inspect failed:', 'killed by SIGKILL'],
+    ['test: removing container lost: docker container inspect failed:',
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
   ]);
 });
@@ -107,7 +107,7 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
   vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-missing.sock');
   vi.stubEnv('DOCKER_CONTEXT', 'codeboost-missing');
   try {
-    removeByName('container', 'x', join(root, 'docker'));
+    removeByName('container', 'x', 'test', join(root, 'docker'));
     removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   } finally { vi.unstubAllEnvs(); }
   const lines = readFileSync(seen, 'utf8').split('\n').filter(Boolean);

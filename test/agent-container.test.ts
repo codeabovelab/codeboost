@@ -158,9 +158,9 @@ afterEach(async () => {
 afterAll(async () => {
   try {
     // By exact name: some are named like the start of another object's ID.
-    for (const container of containers) removeByName('container', container);
-    for (const network of networks) removeByName('network', network);
-    for (const volume of volumes) removeByName('volume', volume);
+    for (const container of containers) removeByName('container', container, 'afterAll');
+    for (const network of networks) removeByName('network', network, 'afterAll');
+    for (const volume of volumes) removeByName('volume', volume, 'afterAll');
     // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
     // every failure is reported.
     const failures: unknown[] = [];
@@ -832,17 +832,17 @@ describe('real Docker agent isolation', () => {
       // is gone says nothing.
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
       try {
-        for (const [kind, name] of byName) removeByName(kind, name);
+        for (const [kind, name] of byName) removeByName(kind, name, 'test');
         expect(byName.filter(([kind, name]) => spawnSync('docker', [kind, 'inspect', name], { stdio: 'ignore' }).status === 0)).toEqual([]);
-        for (const [kind, name] of byName) removeByName(kind, name);
+        for (const [kind, name] of byName) removeByName(kind, name, 'test');
         expect(warn).not.toHaveBeenCalled();
       } finally { warn.mockRestore(); }
       // A missing name that Docker resolves to a live object's ID, as a tracked name gone since would be: removeByName
       // must leave that object alone. The network has no endpoints, so Docker would remove it if asked.
       expect(docker('network', 'inspect', '--format', '{{.Id}}', lookalike.slice(0, 12))).toBe(lookalike);
-      removeByName('network', lookalike.slice(0, 12));
+      removeByName('network', lookalike.slice(0, 12), 'test');
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
-      removeByName('container', bystanders[0]!.slice(0, 12));
+      removeByName('container', bystanders[0]!.slice(0, 12), 'test');
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);
@@ -853,7 +853,7 @@ describe('real Docker agent isolation', () => {
     } finally {
       // By exact name: some are named like the start of another object's ID. Containers first, as they hold the rest.
       for (const { kind, ref } of [...made.filter(object => object.kind === 'container'), ...made.filter(object => object.kind !== 'container')])
-        removeByName(kind, ref);
+        removeByName(kind, ref, 'finally');
     }
   // The budget covers the sweep's worst case (5.5 minutes) and ordinary Docker calls, removals by name included, not
   // every call at its own limit.
