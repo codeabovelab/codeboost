@@ -120,7 +120,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container nospace: docker printed what is not JSON:', '"nospace"\n'],
     ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
     ['test: removing container --help: refused a name that could read as an option'],
-    ['test: removing volume -v: refused a name that could read as an option'],
+    ['test: removing volume -v: refused a name that is not a volume name Docker allows'],
   ]);
 });
 
@@ -336,4 +336,33 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
   expect(() => fresh.objectExists('container', '--help')).toThrow('Refused to inspect container "--help"');
   expect(() => fresh.objectExists('network', '')).toThrow('Refused to inspect network ""');
   expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
+});
+
+it('gives every docker call its time limit, killed with SIGKILL: 30 s for the removals, 60 s for objectExists', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  // Answers as Docker 27.4 does for an `ls` with no match and an inspect of a missing container; only the options each
+  // call is given are checked.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh',
+    'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const options: { timeout?: number; killSignal?: unknown }[] = [];
+  vi.doMock('node:child_process', async original => {
+    const actual = await original<typeof import('node:child_process')>();
+    return { ...actual, spawnSync: (command: string, args: string[], given: { timeout?: number; killSignal?: unknown }) => {
+      if (!['sh'].includes(command)) options.push(given);
+      return actual.spawnSync(command, args, given as never);
+    } };
+  });
+  vi.stubEnv('PATH', `${root}:${process.env.PATH}`);
+  vi.resetModules();
+  try {
+    const fresh = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+    fresh.removeByName('container', 'x', 'test', join(root, 'docker'));
+    fresh.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+    const removals = options.length;
+    expect(fresh.objectExists('container', 'x')).toBe(false);
+    expect(removals).toBeGreaterThan(3);
+    expect(options.slice(0, removals).every(given => given.timeout === 30_000 && given.killSignal === 'SIGKILL')).toBe(true);
+    expect(options.slice(removals)).toMatchObject([{ timeout: 60_000, killSignal: 'SIGKILL' }]);
+  } finally { vi.doUnmock('node:child_process'); vi.resetModules(); }
 });

@@ -137,7 +137,10 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
-      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
@@ -198,7 +201,10 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
-      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
@@ -260,7 +266,10 @@ describe('vendor-only egress', () => {
     } finally {
       process.env.PATH = path;
       // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
-      const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
       impostor = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
       // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
