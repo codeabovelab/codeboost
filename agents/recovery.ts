@@ -113,6 +113,8 @@ const inspectBatch = async (kind: Kind, refs: readonly string[], remaining: () =
 };
 const unique = (values: readonly string[]) => [...new Set(values)];
 
+/** Docker refused to remove a volume because a container mounts it. */
+class VolumeInUse extends Error {}
 // Remove one object by its full ID (a volume by its name, which is its identity), and confirm it is gone.
 const removeById = async (resource: RecoveredResource, remaining: () => number) => {
   const ref = resource.kind === 'volume' ? resource.name : resource.id!;
@@ -120,6 +122,9 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
     : resource.kind === 'volume' ? ['volume', 'rm', '--force', ref] : ['rm', '--force', ref];
   const result = await runDocker(args, { timeoutMs: remaining() });
   if (result.status === 0) return;
+  // Docker 27.4: "remove <name>: volume is in use - [<container IDs>]".
+  if (resource.kind === 'volume' && /volume is in use/.test(result.stderr))
+    throw new VolumeInUse(`Volume ${resource.name} is in use.`);
   if (!absent(await runDocker([resource.kind, 'inspect', ref], { timeoutMs: remaining() })))
     throw new Error(`Could not remove ${resource.kind} ${resource.name}: ${(result.error?.message ?? result.stderr).trim()}`);
 };
@@ -185,7 +190,9 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     if (PROBE_LABEL in labels) {
       const scoped = [ATTEMPT_LABEL, ALLOCATION_LABEL, INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL]
         .some(label => label in labels);
-      return !scoped && labels[PROBE_LABEL] === 'path-identity' ? 'probe:path-identity' : undefined;
+      // The runner label again: a volume is listed, inspected and removed by name, and a same-named one could replace it.
+      return !scoped && labels[PROBE_LABEL] === 'path-identity' && labels[RUNNER_LABEL] === runnerOwner
+        ? 'probe:path-identity' : undefined;
     }
     if (!isLabelAttemptId(labels[ATTEMPT_LABEL]) || !isAllocationId(labels[ALLOCATION_LABEL])) return undefined;
     const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in labels);
@@ -207,7 +214,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       || kind === 'agent' || kind === 'egress')
       remove.push(resource);
     // Only one process holds this runner's token, and it probes after recovery, so a probe found now is an earlier
-    // process's. One that process's orphaned client creates during the scan holds its volume, and recovery then fails.
+    // process's. One that process's orphaned client creates during the scan holds its volume, which is then kept.
     else if (kind === 'probe:path-identity' && PATH_IDENTITY_PROBE_NAME.test(resource.name)) remove.push(resource);
     else unknown(resource);
   }
@@ -233,7 +240,12 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
     try {
       await removeById(resource, remaining);
       confirmed.push(resource);
-    } catch (error) { failures.push(error); }
+    } catch (error) {
+      // Every container recovery removes is gone by now, so the holder is one it leaves: one it reports as unowned, or
+      // a probe an earlier process's orphaned client created after the scan. The volume is kept; once its holder is
+      // gone, a later start removes it.
+      if (!(error instanceof VolumeInUse)) failures.push(error);
+    }
   }
   if (failures.length) {
     const detail = failures.map(error => (error as Error).message).join('; ');
@@ -258,6 +270,6 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));
     }
   }
-  return Object.freeze({ removed: Object.freeze([...remove, ...probeVolumes, ...networks]), storage: Object.freeze(handles),
+  return Object.freeze({ removed: Object.freeze(confirmed), storage: Object.freeze(handles),
     unowned: Object.freeze(unowned) });
 }

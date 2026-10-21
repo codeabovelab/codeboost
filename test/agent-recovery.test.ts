@@ -409,6 +409,37 @@ describe('recoverLeftovers', () => {
       .toEqual(objects.map(object => [object.name, 'no-runner-label']).sort());
   });
 
+  it('removes a probe volume whose container is already gone (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.objects.splice(daemon.objects.indexOf(container), 1);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).toEqual([volume.name]);
+    expect(names()).toEqual([]);
+  });
+
+  it('keeps a probe volume a container it leaves still mounts, and reports that container (#181)', async () => {
+    const [, volume] = probe(A);
+    const holder: FakeObject = { kind: 'container', id: id(), name: `codeboost-other-${randomUUID()}`,
+      labels: { 'io.codeboost.runner': A }, mounts: [volume.name] };
+    daemon.objects.push(holder);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).not.toContain(volume.name);
+    expect(names()).toContain(volume.name);
+    expect(report.unowned.map(resource => [resource.name, resource.reason])).toEqual([[holder.name, 'unknown-kind']]);
+  });
+
+  it('leaves a probe volume whose runner label changed between the list and the inspect (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.objects.splice(daemon.objects.indexOf(container), 1);
+    // Listed as A's; by the inspect, a same-named volume of another runner holds the name.
+    daemon.beforeSingleInspect = ref => {
+      if (ref === volume.name) volume.labels = { ...volume.labels, 'io.codeboost.runner': B };
+    };
+    const report = await recoverLeftovers(A, 120_000, { unowned: false });
+    expect(report.removed).toEqual([]);
+    expect(names()).toEqual([volume.name]);
+  });
+
   it('removes no probe volume while its container\'s removal is not confirmed (#181)', async () => {
     const [container, volume] = probe(A);
     daemon.refuseRemoval.add(container.name);
