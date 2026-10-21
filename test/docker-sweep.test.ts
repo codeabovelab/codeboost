@@ -8,8 +8,9 @@ import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/
 // The test sweep's handling of output it cannot read (#189). The fake `docker` answers as no real daemon does for
 // `network ls`: a line that is not JSON, a JSON null and one network without a name. To every other call it answers
 // nothing and exit 0, as Docker 27.4 does for `ls` with no match; the sweep reads only stdout, the exit status,
-// whether a signal killed the call and whether it could start, and stderr only to report a failure. What Docker 27.4
-// really prints is covered against the daemon in agent-container.
+// whether a signal killed the call and whether it could start, and stderr only to report a failure. `removeByName`
+// also reads an inspect's stderr to tell a missing object from a failure. What Docker 27.4 really prints is covered
+// against the daemon in agent-container.
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -48,24 +49,42 @@ it('reads nothing from a docker call that was killed, whose output may be cut sh
 
 it('removes by name only an object of exactly that name, and reports failures other than no such object', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const calls = join(root, 'calls'), id = 'b'.repeat(64);
-  // Answers as Docker 27.4 does, read for `--format '{{json .Id}} {{json .Name}}'`: a missing name, another object found
-  // by an ID prefix, one whose removal is refused, and an inspect killed by a signal.
+  const calls = join(root, 'calls'), id = 'b'.repeat(64), other = 'c'.repeat(64);
+  // Answers as Docker 27.4 does for `inspect --format '{{json .Id}} {{json .Name}}'` (a volume: '{{json .Name}}') and
+  // `rm`, in the parts removeByName reads: stdout of an inspect that succeeded, stderr and the exit status. A missing
+  // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and a
+  // failure before the daemon (an unknown context). The stdout of a failed call, a bare newline in 27.4, is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     'for arg; do name="$arg"; done',
-    'if [ "$2" = inspect ]; then case "$name" in',
-    "  gone) echo 'Error response from daemon: No such container: gone' >&2; exit 1;;",
-    `  prefix) printf '%s\\n' '"${id}" "/someone-else"';;`,
-    `  busy) printf '%s\\n' '"${id}" "/busy"';;`,
-    '  killed) kill -9 $$;;', 'esac; exit 0; fi',
-    "if [ \"$1\" = rm ]; then echo 'Error response from daemon: conflict' >&2; exit 1; fi", 'exit 0'].join('\n'),
+    'if [ "$2" = inspect ]; then case "$1 $name" in',
+    "  'container gone') echo; echo 'Error response from daemon: No such container: gone' >&2; exit 1;;",
+    "  'network gone') echo; echo 'Error response from daemon: network gone not found' >&2; exit 1;;",
+    "  'volume gone') echo; echo 'Error response from daemon: get gone: no such volume' >&2; exit 1;;",
+    `  'container prefix') printf '%s\\n' '"${id}" "/someone-else"';;`,
+    `  'network prefix') printf '%s\\n' '"${other}" "someone-else"';;`,
+    `  'container busy') printf '%s\\n' '"${id}" "/busy"';;`,
+    `  'network busy') printf '%s\\n' '"${other}" "busy"';;`,
+    `  'volume busy') printf '%s\\n' '"busy"';;`,
+    "  'container killed') kill -9 $$;;",
+    "  'container lost') echo 'context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
+    'esac; exit 0; fi',
+    "if [ \"$1\" = rm ]; then echo 'Error response from daemon: removal of container is already in progress' >&2; exit 1; fi",
+    "if [ \"$1 $2\" = 'network rm' ]; then echo 'Error response from daemon: error while removing network: network busy has active endpoints' >&2; exit 1; fi",
+    "if [ \"$1 $2\" = 'volume rm' ]; then echo 'Error response from daemon: remove busy: volume is in use' >&2; exit 1; fi",
+    'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  for (const name of ['gone', 'prefix', 'busy', 'killed']) removeByName('container', name, join(root, 'docker'));
-  // Only the exact name is removed, and by its full ID.
-  expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([`rm --force ${id}`]);
+  const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
+    ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost']] as const;
+  for (const [kind, name] of objects) removeByName(kind, name, join(root, 'docker'));
+  // Only the exact names are removed, by full ID (a volume's name is its ID).
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
+    .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy']);
   expect(warn.mock.calls).toEqual([
-    ['removing container busy: docker container rm failed:', 'Error response from daemon: conflict'],
+    ['removing container busy: docker container rm failed:', 'Error response from daemon: removal of container is already in progress'],
+    ['removing network busy: docker network rm failed:', 'Error response from daemon: error while removing network: network busy has active endpoints'],
+    ['removing volume busy: docker volume rm failed:', 'Error response from daemon: remove busy: volume is in use'],
     ['removing container killed: docker inspect failed:', 'killed by SIGKILL'],
+    ['removing container lost: docker inspect failed:', 'context "x": context not found: open /x/meta.json: no such file or directory'],
   ]);
 });

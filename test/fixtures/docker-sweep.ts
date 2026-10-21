@@ -32,8 +32,10 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
   const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name], options);
-  // Docker 27.4's answers for a missing object: "No such container", "network … not found", "no such volume".
-  if (found.error || found.status !== 0) { if (found.status === null || !/no such|not found/i.test(found.stderr)) failed(found, 'inspect'); return; }
+  // Docker 27.4's answers for a missing object, each naming it, so a failure before the daemon (an unknown context's
+  // "context not found: … no such file or directory") is still reported.
+  const missing = { container: `No such container: ${name}`, network: `network ${name} not found`, volume: `get ${name}: no such volume` }[kind];
+  if (found.error || found.status !== 0) { if (found.status === null || !found.stderr.includes(missing)) failed(found, 'inspect'); return; }
   let id: unknown, actual: unknown;
   try {
     const at = found.stdout.indexOf(' ');

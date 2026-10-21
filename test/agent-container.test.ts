@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { REAL_DOCKER, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -49,7 +49,8 @@ const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
 /**
  * Put, beside its test-run ID, on every object the `withoutRunnerLabel` wrapper makes and on the holder test's swept
- * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`, `volumes`).
+ * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`, `volumes`), or found as holders of this run's
+ * networks and volumes.
  */
 const TEST_FILE_RUN = randomUUID();
 /** Networks a test makes without this run's runner label, removed by name in afterAll as `volumes` are. */
@@ -953,12 +954,14 @@ describe('real Docker agent isolation', () => {
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
-    // The create lands without the runner label, and its client is killed before it reports the ID.
+    // The create lands without the runner label, and its client is killed before it reports the ID. Only this
+    // container's: should the test time out with the shim still on PATH, other tests' creates pass through.
     const unlabelled = [
+      `if (args[2] !== ${JSON.stringify(live.name)}) result = run(args); else {`,
       "const at = args.findIndex(arg => arg.startsWith('io.codeboost.runner='));",
       'args.splice(at - 1, 2);',
       'result = run(args);',
-      "process.kill(process.pid, 'SIGKILL');",
+      "process.kill(process.pid, 'SIGKILL'); }",
     ].join('\n');
     try {
       await withDockerShim(['create', '--name'], unlabelled, () =>
