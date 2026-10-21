@@ -33,8 +33,9 @@ export function isPlanningProbeAnswer(text: string): boolean {
  * The production planning provider (#117): every request runs in planning's own worker thread, so lane D's synchronous
  * setup never blocks the server. The worker's TMPDIR is a planning root recorded in a ledger beside the review
  * database, and every Docker object it creates carries the database's planning owner. The first job of a process that
- * can sign in (always a planning check: at startup, or one a request starts) removes what earlier sessions left, by
- * that owner only, so Ask's and the runner's agents are never touched.
+ * can sign in (in production, web/planning.ts, always a planning check: at startup, or one a request starts) removes
+ * what earlier sessions left, by that owner only, so Ask's and the runner's agents are never touched. A first job whose
+ * recovery fails leaves it to the next job.
  *
  * The code is the review's repository at the current snapshot's head; E3 discards a reply whose snapshot or revision
  * changed meanwhile. The vendor is the one chosen in Settings for Ask; Codex is refused (#93).
@@ -248,7 +249,8 @@ export class PlanningCheck {
       // Never throws: an exception here would end the process. A Store that cannot be read starts nothing.
       try { const now = this.#vendor(); if (now) this.#check(now); } catch { /* stopping, or no Store: nothing to start */ }
     });
-    throw new GuardRefusal(STILL_CHECKING);
+    throw new GuardRefusal(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost is `
+      + 'checking it now. Retry in a minute.');
   }
   #verdict(check: Check): void {
     if (check.passed) return;

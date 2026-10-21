@@ -414,7 +414,7 @@ describe('the planning check (#164)', () => {
     const request = {} as Parameters<typeof made.deps.provider.invoke>[0];
     // A rejection, as `AuthorProvider.invoke` promises: E3 then settles the request as failed with this reason
     // (test/planning-suggestions.test.ts covers a provider whose invoke fails).
-    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('still checking');
+    await expect(made.deps.provider.invoke(request, signal())).rejects.toThrow('is checking it now');
     expect(made.agent.invoke).not.toHaveBeenCalled();
   });
 
@@ -497,7 +497,7 @@ describe('the planning check (#164)', () => {
     const uncaught = vi.fn();
     process.on('uncaughtException', uncaught);
     try {
-      expect(() => check.assertPassed()).toThrow('still checking');
+      expect(() => check.assertPassed()).toThrow('is checking it now');
       fail = true;
       await new Promise(resolve => setImmediate(resolve));
       expect(uncaught).not.toHaveBeenCalled();
@@ -684,7 +684,7 @@ describe('the planning check (#164)', () => {
     const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());
-    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent.`);
+    expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost is checking it now.`);
     // validate runs inside the Store's transaction, so the new vendor's check starts only on the next turn.
     expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
     await new Promise(resolve => setImmediate(resolve));
