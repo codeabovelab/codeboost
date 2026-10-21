@@ -5,6 +5,9 @@ import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, t
 import { planningCredential } from './planning-provider.ts';
 import type { RecoverReply, ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
 import { ASK_NAMING, createWorkerRoot, removeWorkerRoot, type LeftoverLedger, type WorkerNaming } from './question-leftovers.ts';
+
+/** Why a feature is off after its worker was given up on: planning's check (#164) matches its wording. */
+export const abandonedWorkerText = (naming: WorkerNaming, why: string) => `The agent container worker ${why}. Its containers and storage may still exist, so ${naming.label} is off until codeboost restarts. The first ${naming.job} after the restart removes them.`;
 export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
@@ -113,7 +116,7 @@ export class AgentWorker {
   async #abandonOnce(why: string) {
     const worker = this.worker;
     this.worker = undefined;
-    this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so ${this.naming.label} is off until codeboost restarts. The first ${this.naming.job} after the restart removes them.`);
+    this.crashed ??= new Error(abandonedWorkerText(this.naming, why));
     for (const release of this.releases.values()) release(null);
     this.releases.clear();
     this.#failRecoveries(this.crashed);

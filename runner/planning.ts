@@ -102,15 +102,16 @@ const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a mo
 // Reasons a recheck cannot help, so only a restart can, once any cause is fixed: an abandoned worker
 // (question-agent.ts), unconfirmed cleanup (planning-provider.ts' "off until codeboost restarts"), a database file with
 // other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while it runs.
-// Each is codeboost's own message, given before any vendor output. A run whose cleanup did not settle is not among them: its storage is retried before the
-// next run, and if planning did go off, the recheck reports that with these words.
+// Each is codeboost's own message, given before any vendor output. A run whose cleanup did not settle is not among
+// them: its storage is retried before the next run, and if planning did go off, the recheck reports that with these
+// words.
 const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
 const ownText = (message: string) => message.split(' Claude said:')[0]!;
 /**
  * How long one check may take before it fails: a real request's budget, as the probe has, and a minute for the worker
  * to settle. No request waits that long (see PLANNING_ADMIT_WAIT_MS): requests after it are refused with the failure
- * until the recheck window passes, and the next one after that checks again. A recheck joins the worker's one startup recovery, so a recovery that never ends fails each recheck the same
- * way until codeboost restarts.
+ * until the recheck window passes, and the next one after that checks again. A recheck joins the worker's one startup
+ * recovery, so a recovery that never ends fails each recheck the same way until codeboost restarts.
  */
 export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
 /**
@@ -135,8 +136,9 @@ export class PlanningCheck {
   readonly #events = new EventTarget();
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
     options: { recheckMs?: number; waitMs?: number; timeoutMs?: number } = {}) {
-    // One listener per waiting request and per running check, each removed when it ends: many at once are no leak.
-    setMaxListeners(0, this.#events, this.#abort.signal);
+    // One listener per waiting request, each removed when its wait ends: many at once are no leak. (Node 26 warns of
+    // none on an AbortSignal, which holds one per running check.)
+    setMaxListeners(0, this.#events);
     this.#probe = probe; this.#vendor = vendor;
     this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
     this.#timeoutMs = options.timeoutMs ?? PLANNING_CHECK_TIMEOUT_MS;
@@ -223,11 +225,14 @@ export class PlanningCheck {
       finally {
         signal.removeEventListener('abort', release); this.#events.removeEventListener('replaced', moved); clearTimeout(timer);
       }
-      if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
+      // A vendor changed meanwhile is checked (or, if none is chosen now, the request goes on) within what is left of
+      // the wait, which has passed: only a check that has already settled gives its verdict.
+      if (outcome === 'timeout' && this.#vendor() === vendor) throw new GuardRefusal(STILL_CHECKING);
       // Settings changed while this request waited, or its check was replaced (the vendor changed and changed back):
       // check the vendor it will run with, within the same wait. A replaced check is never `#current` again.
       if (this.#vendor() !== vendor || check !== this.#current) continue;
-      // Settled, so passed or failed. This check's own verdict: calling #check again could start a recheck once the window has passed.
+      // Settled, so passed or failed. This check's own verdict: calling #check again could start a recheck once the
+      // window has passed.
       return this.#verdict(check);
     }
   }

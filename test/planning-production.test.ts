@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { linkSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -10,11 +10,12 @@ import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
+import { PLANNING_BUDGET_MS, PLANNING_LEFTOVERS, planningCredential } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
-import { PLANNING_NAMING } from '../runner/question-leftovers.ts';
+import { LeftoverLedger, PLANNING_NAMING } from '../runner/question-leftovers.ts';
+import { abandonedWorkerText } from '../runner/question-agent.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -521,6 +522,17 @@ describe('the planning check (#164)', () => {
     } finally { process.off('warning', warned); }
   });
 
+  it('lets a request go on when Settings clear the agent while it waits, even once the wait has passed', async () => {
+    let vendor: 'claude' | null = 'claude';
+    const check = new PlanningCheck((_vendor, probeSignal) => new Promise<void>(resolve =>
+      probeSignal.addEventListener('abort', () => resolve(), { once: true })), () => vendor, { waitMs: 50 });
+    const waiting = check.admit(signal());
+    vendor = null;
+    // No check replaces Claude's, so only the wait's end sees the change.
+    await expect(waiting).resolves.toBeUndefined();
+    await check.close(2_000);
+  });
+
   it('fails and cancels a check that does not settle in time, and checks again after the recheck window', async () => {
     let count = 0, late!: () => void;
     const signals: AbortSignal[] = [];
@@ -540,14 +552,6 @@ describe('the planning check (#164)', () => {
     await new Promise(resolve => setTimeout(resolve, 2_100));
     await expect(check.admit(signal())).resolves.toBeUndefined();
     expect(count).toBe(2);
-  });
-
-  it.each([
-    ['a database file with other hard links', 'Planning is off: the review database /r/db has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.'],
-  ])('promises no recheck for %s, which only a restart can change', async (_label, reason) => {
-    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
-    const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toContain('only a restart of codeboost can change that');
   });
 
   it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
@@ -613,16 +617,21 @@ describe('the planning check (#164)', () => {
     expect(order).toEqual(['probe stopped', 'closed']);
   });
 
-  it('promises no recheck when the sign-in is missing, which only a restart can change', async () => {
-    const reason = 'Planning with Claude Code needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`.';
-    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
-    const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that; fix the cause first if the reason names one. The check said: ${reason}`);
-  });
-
-  it('promises no recheck when the check says planning is off until a restart', async () => {
-    // AgentWorker's own text after the planning worker exits (question-agent.ts).
-    const reason = `The agent container worker stopped (exit code 1). Its containers and storage may still exist, so ${PLANNING_NAMING.label} is off until codeboost restarts. The first ${PLANNING_NAMING.job} after the restart removes them.`;
+  // Each reason as the code that gives it words it, so a reworded message that no longer matches fails here.
+  const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
+  const hardLinked = () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-linked-')); closers.push(() => rmSync(root, { recursive: true, force: true }));
+    writeFileSync(join(root, 'review.db'), ''); linkSync(join(root, 'review.db'), join(root, 'other.db'));
+    const ledger = LeftoverLedger.forDatabase(join(root, 'review.db'), PLANNING_NAMING);
+    return thrown(() => { ledger.acquire(); ledger.release(); });
+  };
+  it.each([
+    ['the sign-in is missing', () => thrown(() => planningCredential('claude', {}))],
+    ['the worker was given up on', () => abandonedWorkerText(PLANNING_NAMING, 'stopped (exit code 1)')],
+    ['cleanup could not be confirmed', () => PLANNING_LEFTOVERS.untracked()],
+    ['the database file has other hard links', hardLinked],
+  ])('promises no recheck when %s, which only a restart can change', async (_label, reasonOf) => {
+    const reason = reasonOf();
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that; fix the cause first if the reason names one. The check said: ${reason}`);
@@ -678,19 +687,20 @@ describe('the planning check (#164)', () => {
 
   it('refuses at the start a vendor chosen while the issue was read, and checks it (#164)', async () => {
     let service!: ReviewService;
+    // Settings take Claude while the issue is read, after a request with none chosen was admitted unchecked.
     const issueText = vi.fn(async (number: number) => {
-      vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+      service.store.setQuestionProvider('claude');
       return text(number);
     });
     // (The provider, too, checks again when it is invoked: "refuses to invoke an agent whose check has not passed …".)
-    const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
+    const made = checked(async () => undefined, null, undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());
     expect(() => described.validate()).toThrow(`${PLANNING_UNAVAILABLE} the planning agent chosen in Settings changed, and codeboost is checking it now.`);
     // validate runs inside the Store's transaction, so the new vendor's check starts only on the next turn.
-    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+    expect(made.probe).not.toHaveBeenCalled();
     await new Promise(resolve => setImmediate(resolve));
-    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude']);
     // Once that check passed, the same request is admitted.
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(() => described.validate()).not.toThrow();
