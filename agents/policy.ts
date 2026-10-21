@@ -138,8 +138,8 @@ export function assertPlanningInput(prompt: string, schema: string): string {
   const promptBytes = Buffer.byteLength(prompt, 'utf8'), schemaBytes = Buffer.byteLength(schema, 'utf8');
   if (promptBytes + schemaBytes > MAX_PLANNING_INPUT_BYTES)
     throw new Error(`Planning request is ${promptBytes + schemaBytes} bytes (prompt ${promptBytes}, schema ${schemaBytes}), `
-      + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. Narrow the issue and comments, the selected paths or the `
-      + 'lessons, then retry.');
+      + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. Narrow the request (the issue and comments, the selected `
+      + 'paths, the lessons, the feedback or the previous plan), then retry.');
   return schema;
 }
 
