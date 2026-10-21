@@ -109,9 +109,10 @@ describe('vendor-only egress', () => {
     execFileSync('sleep', ['3']);
     // A network landing later still carries this run's runner label (the shim passes production's arguments on), so
     // afterAll's runner sweep removes it.
+    // First, so a shim that recorded something else is reported as itself.
+    expect(name).toMatch(/^codeboost-egress-/);
     const orphaned = objectExists('network', name);
     if (orphaned) docker('network', 'rm', name);
-    expect(name).toMatch(/^codeboost-egress-/);
     expect(orphaned).toBe(false);
   }, 60_000);
 
@@ -171,9 +172,10 @@ describe('vendor-only egress', () => {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow('failed to start');
       proxyId = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const leaked = objectExists('container', proxyId);
-    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore' });
+    // First, so a shim that recorded something else is reported as itself.
     expect(proxyId).toMatch(/^[0-9a-f]{64}$/);
+    const leaked = objectExists('container', proxyId);
+    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore', ...CLIENT_LIMIT });
     expect(leaked).toBe(false);
   }, 60_000);
 

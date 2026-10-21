@@ -48,6 +48,8 @@ const missingAnswer = (kind: 'container' | 'network' | 'volume', ref: string) =>
  * gone, and any other failure (a killed call, a daemon that cannot be reached) throws, naming the command.
  */
 export function objectExists(kind: 'container' | 'network' | 'volume', ref: string): boolean {
+  // The ref is passed on: one that could read as an option is refused, naming it.
+  if (!ref || ref.startsWith('-')) throw new Error(`Refused to inspect ${kind} ${JSON.stringify(ref)}: it could read as an option.`);
   const args = [kind, 'inspect', ref];
   const found = spawnSync(REAL_DOCKER, args, { encoding: 'utf8', ...CLIENT_LIMIT, env: dockerEnv() });
   if (found.status === 0) return true;

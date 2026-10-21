@@ -333,5 +333,7 @@ it('counts an object gone only on Docker\'s missing answer, and throws on any ot
   for (const kind of ['container', 'network', 'volume'] as const) expect(fresh.objectExists(kind, 'gone')).toBe(false);
   expect(() => fresh.objectExists('container', 'killed')).toThrow('docker container inspect killed failed: killed by SIGKILL');
   expect(() => fresh.objectExists('container', 'lost')).toThrow('docker container inspect lost failed: Failed to initialize');
+  expect(() => fresh.objectExists('container', '--help')).toThrow('Refused to inspect container "--help"');
+  expect(() => fresh.objectExists('network', '')).toThrow('Refused to inspect network ""');
   expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
 });
