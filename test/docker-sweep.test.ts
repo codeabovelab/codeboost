@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -172,4 +172,27 @@ it.each([
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls.filter(call => String(call[0]).endsWith('failed:'))).toEqual(warnings);
   expect(readFileSync(calls, 'utf8').split('\n')).toContain(`rm --force ${a}`);
+});
+
+it('finds the real docker once, at load, and refuses a shim when none was found', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  // Two directories, each with a docker and the sh the lookup runs, and one with only sh.
+  const bin = (name: string, docker: boolean) => {
+    const dir = join(root, name); mkdirSync(dir);
+    symlinkSync(spawnSync('sh', ['-c', 'command -v sh'], { encoding: 'utf8' }).stdout.trim(), join(dir, 'sh'));
+    if (docker) writeFileSync(join(dir, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    return dir;
+  };
+  const first = bin('first', true), second = bin('second', true), none = bin('none', false);
+  vi.stubEnv('PATH', first);
+  vi.resetModules();
+  const loaded = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+  // A shim put on PATH later does not change it.
+  vi.stubEnv('PATH', second);
+  expect(loaded.REAL_DOCKER).toBe(join(first, 'docker'));
+  expect(loaded.requireRealDocker()).toBe(join(first, 'docker'));
+  vi.stubEnv('PATH', none);
+  vi.resetModules();
+  const missing = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
+  expect(() => missing.requireRealDocker()).toThrow('No docker on PATH when the test files loaded.');
 });

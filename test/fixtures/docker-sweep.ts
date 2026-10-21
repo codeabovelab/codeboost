@@ -1,4 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { isAbsolute, resolve } from 'node:path';
 import { RUNNER_LABEL } from '../../agents/labels.ts';
 
 /**
@@ -6,7 +7,9 @@ import { RUNNER_LABEL } from '../../agents/labels.ts';
  * shim is still on PATH (after a test timed out inside one) would otherwise wait on the shim's own child, which the
  * call's SIGKILL does not reach.
  */
-export const REAL_DOCKER = spawnSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).stdout?.trim() || 'docker';
+const FOUND_DOCKER = spawnSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).stdout?.trim();
+// Resolved, as a PATH entry may be relative.
+export const REAL_DOCKER = FOUND_DOCKER ? resolve(FOUND_DOCKER) : 'docker';
 /**
  * The daemon `docker` talks to when this module loads. A test that times out may leave DOCKER_HOST or DOCKER_CONTEXT
  * changed (agent-supervisor points DOCKER_HOST at a missing socket until its handle settles), so every call here
@@ -20,7 +23,7 @@ const dockerEnv = () => {
 };
 /** The real `docker` for a shim to call; refuses when none was found, since a shim calling `docker` would call itself. */
 export function requireRealDocker(): string {
-  if (!REAL_DOCKER.startsWith('/')) throw new Error('No docker on PATH when the test files loaded.');
+  if (!isAbsolute(REAL_DOCKER)) throw new Error('No docker on PATH when the test files loaded.');
   return REAL_DOCKER;
 }
 

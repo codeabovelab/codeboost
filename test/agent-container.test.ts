@@ -983,8 +983,8 @@ describe('real Docker agent isolation', () => {
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
-    // Tracked for afterAll should the test time out: never started and without the runner label, it is no holder a
-    // sweep finds once its network is gone (#189).
+    // Tracked for afterAll should the test time out: it has no runner label, and until it goes the task volumes it
+    // mounts cannot be removed (#189).
     containers.add(live.name);
     // The create lands without the runner label, and its client is killed before it reports the ID. Only this
     // container's: should the test time out with the shim still on PATH, other tests' creates pass through.
