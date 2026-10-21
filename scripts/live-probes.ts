@@ -24,6 +24,8 @@ export const LIVE_PROBES = [
   { file: 'test/agent-supervisor.test.ts',
     name: 'container invocation supervisor returns a schema-constrained Claude planning answer as bare JSON from the '
       + 'mounted schema (live Claude)' },
+  { file: 'test/agent-planning.test.ts',
+    name: 'planning in the agent container passes the planning check with a real sign-in (live Claude)' },
 ] as const;
 
 export const LIVE_PROBE_FILES = [...new Set(LIVE_PROBES.map(probe => probe.file))];

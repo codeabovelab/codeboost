@@ -10,7 +10,7 @@ settings are not stored in the repository.
 | --- | --- | --- | --- |
 | `.github/workflows/ci.yml` | `test` | every pull request; pushes to `main` and `codex/**` | Type check; every top-level `test/*.test.ts` file except the Docker-backed files; the Playwright browser suite |
 | `.github/workflows/agent-isolation.yml` | `real-docker` | every pull request; pushes to `main` and `codex/**` | Type check; the complete Vitest suite against real Docker |
-| `.github/workflows/live-probes.yml` | `live-probes` | started by hand (`workflow_dispatch`); every night at 06:23 UTC | The four live Claude startup probes only |
+| `.github/workflows/live-probes.yml` | `live-probes` | started by hand (`workflow_dispatch`); every night at 06:23 UTC | The five live Claude startup probes only |
 
 `test` and `real-docker` have no path filters. They run on every pull request,
 so both can be required checks. A required check that a path filter skips
@@ -112,8 +112,9 @@ The job:
    missing. A missing secret never gives a passing run.
 2. Runs the Docker Vitest project with `CODEBOOST_RUN_AUTH_PROBES=1`. It selects
    only the tests whose titles end in `(live Claude)`, in
-   `test/agent-container.test.ts`, `test/agent-question.test.ts` and
-   `test/agent-supervisor.test.ts`. The files run one at a time.
+   `test/agent-container.test.ts`, `test/agent-question.test.ts`,
+   `test/agent-supervisor.test.ts` and `test/agent-planning.test.ts` (the
+   planning check, #164). The files run one at a time.
 3. Runs `node scripts/live-probes.ts check` on the Vitest JSON report. Vitest
    exits with success when it skips every test, so this step fails unless each
    probe listed in `scripts/live-probes.ts` passed and no other test ran.
