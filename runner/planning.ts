@@ -147,7 +147,8 @@ export class PlanningCheck {
     this.#timeoutMs = options.timeoutMs ?? PLANNING_CHECK_TIMEOUT_MS;
   }
   /**
-   * Begin the check for the chosen vendor, if any, without waiting for it. After close it throws "planning is stopping".
+   * Begin the check for the chosen vendor, if any, without waiting for it. After close it throws "planning is
+   * stopping".
    */
   start(): void {
     const vendor = this.#vendor();
