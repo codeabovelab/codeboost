@@ -859,6 +859,8 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
+ // An enabled Cancel is not described by the hidden "GitHub has been asked" note.
+ await expect(cancel).toHaveAccessibleDescription('Stop this merge. The task and its pull request stay open.');
  const stalePoll=page.waitForResponse(response=>response.url().endsWith('/api/merge')&&cancelAsked);
  await cancel.click();
  expect(cancels).toEqual([{action:'cancel-merge',jobId:id}]);
@@ -875,6 +877,8 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(page.locator('#banner')).toContainText('Merge cancelled. You cancelled the merge; the task and its pull request stay open.');
  await expect(steps.getByRole('listitem').nth(1)).toHaveText('! Rebase Stopped, 1 s');
  await expect(page.locator('#merge-cancel')).toBeHidden();
+ // The click left focus on Cancel; once it hides, focus moves to the merge control, not the page.
+ await expect(page.locator('#merge')).toBeFocused();
  expect(cancels).toHaveLength(1);
 });
 test('shows the outcome at once when a cancel is answered with a job that already ended (D16)',async({page})=>{
@@ -909,6 +913,30 @@ test('shows the outcome at once when a cancel is answered with a job that alread
  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').last()).toHaveText('✓ Merge Done, 1 s');
  await expect(page.locator('#merge-cancel')).toBeHidden();
+ await expect(page.locator('#merge')).toBeFocused();
+});
+test('moves focus off Cancel to the merge control when the whole step bar hides (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const id='0f6b0000-0000-4000-8000-0000000000d7';
+ const waiting=mergeJobRecord({id,state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
+ // While Cancel holds focus, the poll stops reporting the job: the page ends it with no record, so the whole bar hides.
+ let gone=false;
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:waiting}),job:waiting})});});
+ await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:gone?null:waiting})}));
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.locator('#merge-cancel')).toBeVisible({timeout:10_000});
+ await page.locator('#merge-cancel').focus();
+ gone=true;
+ await expect(page.locator('#merge-steps-bar')).toBeHidden({timeout:15_000});
+ await expect(page.locator('#merge')).toHaveText('Merge ended');
+ await expect(page.locator('#merge')).toBeFocused();
 });
 test('shows a cancelled merge within seconds even after the merge-status poll has backed off (D16)',async({page})=>{
  test.setTimeout(120_000);

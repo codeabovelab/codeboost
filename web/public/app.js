@@ -116,6 +116,8 @@ function showFailure(message, planStatusOwner) {
   ])
     $(id).innerHTML = "";
   $("approve").hidden = true;
+  // Focus on a merge control about to be hidden moves to Refresh rather than falling to the page.
+  if (["merge", "merge-details", "merge-cancel"].includes(document.activeElement?.id)) $("reload").focus();
   $("merge").hidden = true;
   $("merge-details").hidden = true;
   $("merge-steps-bar").hidden = true;
@@ -362,8 +364,9 @@ function renderMergeSteps() {
   const shown = !!job?.steps && (job.state === "running" || ended);
   $("merge-steps-bar").hidden = !shown;
   if (mergeStepTimer && !(shown && job.state === "running")) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
-  // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the merge control instead.
-  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) $("merge").focus();
+  // Hiding a focused Cancel (or the whole bar) would drop keyboard focus to the page: it moves to the merge control
+  // instead, or to Refresh when that control is hidden too.
+  if ((!shown || job.state !== "running") && document.activeElement === $("merge-cancel")) ($("merge").hidden ? $("reload") : $("merge")).focus();
   if (!shown) return;
   // Rebuilt only when a step changes; the timer below rewrites the elapsed times alone, so a screen reader keeps its place.
   const key = JSON.stringify(job.steps);
@@ -384,8 +387,11 @@ function renderMergeSteps() {
   if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
   cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancel requested" : "Cancel merge";
   cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
-  // A disabled Cancel ignores clicks, so the reason is also written out (and is the button's description).
-  $("merge-cancel-note").hidden = !(asked && job.state === "running");
+  // A disabled Cancel ignores clicks, so the reason is also written out, and describes the button only while shown (a
+  // hidden element named by aria-describedby is still read).
+  const noted = asked && job.state === "running";
+  $("merge-cancel-note").hidden = !noted;
+  if (noted) cancel.setAttribute("aria-describedby", "merge-cancel-note"); else cancel.removeAttribute("aria-describedby");
   if (job.state === "running" && !mergeStepTimer) mergeStepTimer = setInterval(() => {
     const current = data?.merge?.job;
     if (current?.steps && current.state === "running") updateMergeStepTimes(current);
