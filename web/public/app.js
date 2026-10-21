@@ -349,7 +349,8 @@ const mergeStepNames = { fetch: "Fetch", rebase: "Rebase", push: "Push", command
   "already-fixed": "Already-fixed check", merge: "Merge" };
 const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running"], done: ["✓", "Done"], skipped: ["–", "Skipped"],
   failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
-let mergeCancelPending = false;
+/** The ID of the job a cancel request is on its way for, or null. */
+let mergeCancelPending = null;
 let mergeStepTimer = null;
 function mergeStepElapsed(step, now = Date.now()) {
   if (!step.startedAt) return "";
@@ -386,9 +387,10 @@ function renderMergeSteps() {
   cancel.hidden = job.state !== "running";
   // GitHub was asked once the merge step started: stopping then could only make the outcome unknown, so the server refuses.
   const asked = job.steps.some(step => step.name === "merge" && step.state !== "pending");
-  const blocked = asked || job.cancelRequested || mergeCancelPending;
+  const pending = mergeCancelPending === job.id;
+  const blocked = asked || job.cancelRequested || pending;
   if (blocked) cancel.setAttribute("aria-disabled", "true"); else cancel.removeAttribute("aria-disabled");
-  cancel.textContent = job.cancelRequested || mergeCancelPending ? "Cancel requested" : "Cancel merge";
+  cancel.textContent = job.cancelRequested || pending ? "Cancel requested" : "Cancel merge";
   cancel.title = asked ? "GitHub has been asked to merge; wait for its outcome." : "Stop this merge. The task and its pull request stay open.";
   // A disabled Cancel ignores clicks, so the reason is also written out, and describes the button only while shown (a
   // hidden element named by aria-describedby is still read).
@@ -411,7 +413,7 @@ function updateMergeStepTimes(job) {
 $("merge-cancel").onclick = async () => {
   const job = data?.merge?.job;
   if (!job || job.state !== "running" || $("merge-cancel").getAttribute("aria-disabled") === "true") return;
-  mergeCancelPending = true;
+  mergeCancelPending = job.id;
   renderMergeSteps();
   let pollNow = false;
   const adopt = answered => {
@@ -444,7 +446,7 @@ $("merge-cancel").onclick = async () => {
     if (data?.merge?.job?.id === job.id && data.merge.job.state === "running")
       $("banner").textContent = `Could not cancel the merge. ${error.message}`;
   } finally {
-    mergeCancelPending = false;
+    mergeCancelPending = null;
     renderMerge();
     if (pollNow) {
       if (mergePollInFlight?.generation === mergeGeneration) {

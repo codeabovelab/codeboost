@@ -142,6 +142,8 @@ export class MergeJobCoordinator {
     if (!job || job.refused) throw new GuardRefusal('There is no such merge to cancel.');
     if (job.state !== 'running') throw new GuardRefusal('This merge has already ended.');
     if (this.#activeId !== jobId) throw new GuardRefusal('This merge shows as running until the server restarts; it cannot be cancelled.');
+    // A task cancel already stops this job and closes the task's pull requests, so the merge-only cancel would be wrong.
+    if (this.#cancelled()) throw new GuardRefusal('The task is being cancelled.');
     const attempt = job.mergeActionId ? store.getMergeAttempt(identity) : null;
     if (attempt && attempt.actionId === job.mergeActionId) throw new GuardRefusal('GitHub has been asked to merge; wait for its outcome.');
     // Saved before anything stops, so a restart before the job ends settles it cancelled rather than failed.
@@ -295,7 +297,8 @@ export class MergeJobCoordinator {
   }
   /**
    * A cancelled task ends the job, however the job learned of it; so does a cancel of the merge alone, which leaves the
-   * task as it is. A task cancel wins over an earlier merge cancel. Shutdown leaves the job running on disk for startup.
+   * task as it is. A task cancel wins over an earlier merge cancel. Shutdown alone leaves the job running on disk for
+   * startup; after a cancel of either kind the job ends cancelled.
    */
   #end(job: MergeJob, signal: AbortSignal): void {
     const code = (signal.reason as { code?: string } | undefined)?.code;

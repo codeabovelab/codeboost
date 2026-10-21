@@ -372,7 +372,7 @@ Added by the design review. Each rule cites the design-review decision (Dn) that
 | Approved, merge blocked | "GitHub refused the merge:" plus GitHub's exact message | **Retry merge** | Open on GitHub |
 
 **While merging (D16).**
-- The header turns into a step list: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows its status and elapsed time. A **Cancel** button is always shown.
+- The header turns into a step list: **Fetch → Rebase → Push → Re-run checks → GitHub checks → Already-fixed check → Merge**. Each step shows its status and elapsed time. A **Cancel** button is always shown. *Amended 2026-10-21 (user decision, PR #194):* **Cancel merge** shows only while the merge job runs; an ended job has nothing to cancel.
 - You can leave the screen. The steps keep running, and the task row in the Queue shows the current step.
 - Each failure ends in a named banner that jumps to the first affected item, for example:
   - "Rebase changed P2 and P4. Review them again."

@@ -1745,3 +1745,16 @@ it('ends a cancelled merge cancelled when an inspection answers a failing check 
   expect(answered).toBe(1);
   expect(f.store.getTask(identity).status).toBe('in review');
 });
+
+it('refuses a merge-only cancel while the task itself is being cancelled, and the job ends as a cancelled task', async () => {
+  const f = setup(), held = holdPreparation(f);
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await held.started;
+  f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID());
+  expect(f.store.getTask(identity).cancelRequested ?? f.store.getTask(identity).status).toBeTruthy();
+  expect(() => f.coordinator.cancelMerge(job.id)).toThrow(new GuardRefusal('The task is being cancelled.'));
+  expect(f.store.getMergeJob(identity, job.id)?.cancelRequested).toBeUndefined();
+  f.coordinator.cancel();
+  held.finish('failed', 'Task cancelled.');
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
+});
