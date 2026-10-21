@@ -79,7 +79,8 @@ afterAll(async () => {
   } finally {
     // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
     // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout.
-    // The hook's budget is a minute over this sweep's worst case (eleven calls of 30 s), for the cleanup before it.
+    // The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for the
+    // cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 7 * 60_000);

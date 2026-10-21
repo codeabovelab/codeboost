@@ -37,7 +37,8 @@ afterAll(() => {
   } finally {
     // Then remove the task storage this run still owns, even when a test failed or the cleanup above threw. The path
     // identity probe carries no owner labels, so it is not found here. It may not run before a hook timeout.
-    // The hook's budget is a minute over this sweep's worst case (eleven calls of 30 s), for the cleanup before it.
+    // The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for the
+    // cleanup before it.
     removeRunnerObjects(RUNNER_OWNER);
   }
 }, 7 * 60_000);

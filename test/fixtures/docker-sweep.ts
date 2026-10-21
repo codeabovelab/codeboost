@@ -36,11 +36,12 @@ export function removeLabelledObjects(label: string, value: string, when: string
   for (const kind of ['container', 'network', 'volume'] as const) {
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
     // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
+    // As JSON: a network's name may hold spaces.
     const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
-      ? ['--no-trunc', '--format', '{{.ID}} {{.Name}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
+      ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
-      .map(line => line.split(' '));
-    const ids = listed.map(([id]) => id!), names = listed.map(([id, name]) => name ?? id!);
+      .map(line => kind === 'network' ? JSON.parse(line) as { ID: string; Name: string } : { ID: line, Name: line });
+    const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
     if (kind !== 'container') {
@@ -50,9 +51,10 @@ export function removeLabelledObjects(label: string, value: string, when: string
       const candidates = run(['ps', '--all', '--quiet', '--no-trunc',
         ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
       const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
-        '{{.Id}} {{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}', ...candidates])
-        .map(line => line.split(' ').filter(Boolean)).filter(([, ...on]) => on.some(name => names.includes(name)))
-        .map(([id]) => id!);
+        '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).map(line => {
+        const at = line.indexOf(' ');
+        return { id: JSON.parse(line.slice(0, at)) as string, on: Object.keys(JSON.parse(line.slice(at + 1)) ?? {}) };
+      }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
         run(['rm', '--force', ...holders]);

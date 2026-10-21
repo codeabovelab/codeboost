@@ -768,8 +768,10 @@ describe('real Docker agent isolation', () => {
       const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
         make('container', named('holder'), 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
         make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
-      // The same for containers: Docker resolves a name before an ID prefix.
+      // The same for containers: Docker resolves a name before an ID prefix. A holder and a swept container each have one.
       const holderLookalike = make('container', holders[0]!.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
+      const labelled = make('container', named('swept'), 'create', '--label', label, '--entrypoint', 'true', imageId);
+      const labelledLookalike = make('container', labelled.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
@@ -784,7 +786,8 @@ describe('real Docker agent isolation', () => {
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
-      for (const bystander of [...bystanders, holderLookalike]) expect(exists('container', bystander)).toBe(true);
+      expect(exists('container', labelled)).toBe(false);
+      for (const bystander of [...bystanders, holderLookalike, labelledLookalike]) expect(exists('container', bystander)).toBe(true);
       expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
         .toEqual([true, true, true]);
     } finally {
@@ -2526,7 +2529,10 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('startup probe refuses to exec when seccomp filtering is disabled', async () => {
-    const result = spawnSync('docker', ['run', '--rm', '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
+    // Named and tracked before it is made: it has no labels, so afterAll's removal by name is the only one (#189).
+    const name = `codeboost-seccomp-probe-${randomUUID()}`;
+    containers.add(name);
+    const result = spawnSync('docker', ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=unconfined', '--network=none', imageId, 'true'],
       { encoding: 'utf8', timeout: 60_000 });
     expect(result.status).toBe(78);
