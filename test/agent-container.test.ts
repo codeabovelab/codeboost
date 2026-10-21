@@ -484,7 +484,8 @@ describe('real Docker agent isolation', () => {
       volumes.add(rogue);
       docker('volume', 'create', rogue);
       const rogueArgs = valid.args.map(value => value.replace(data.filesystems.workVolume, rogue));
-      docker(...rogueArgs); containers.add(valid.name);
+      // Tracked before the create: should it land late, afterAll removes it before the volume it mounts.
+      containers.add(valid.name); docker(...rogueArgs);
       await expect(validateContainer(valid.name, valid)).rejects.toThrow('captured identity');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     } finally {
