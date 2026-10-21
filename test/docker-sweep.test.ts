@@ -192,11 +192,11 @@ it('takes the daemon set at load, not the default, when one was set, for every c
 
 it('says nothing of a network gone since the listing, and reports any other failure to remove one', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const net = 'd'.repeat(64), answer = join(root, 'answer');
+  const net = 'd'.repeat(64), answer = join(root, 'answer'), calls = join(root, 'calls');
   // Answers as Docker 27.4 does for one swept network with no holder, whose removal gives the stderr in `answer`; every
   // other call gets no output and exit 0, as for `ls` with no match. The network line holds only the fields the sweep
   // reads. The second answer is invented, as a failure 27.4 might give.
-  writeFileSync(join(root, 'docker'), ['#!/bin/sh',
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1 $2" = "network rm" ]; then cat '${answer}' >&2; exit 1; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
@@ -204,6 +204,8 @@ it('says nothing of a network gone since the listing, and reports any other fail
   const failures = () => warn.mock.calls.filter(call => String(call[0]).endsWith('failed:'));
   writeFileSync(answer, `Error response from daemon: network ${net} not found\n`);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  // The removal ran and gave that answer, so the silence is the gone answer's.
+  expect(readFileSync(calls, 'utf8').split('\n')).toContain(`network rm ${net}`);
   expect(failures()).toEqual([]);
   writeFileSync(answer, 'Error response from daemon: permission denied\n');
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));

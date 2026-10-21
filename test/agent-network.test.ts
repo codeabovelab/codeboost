@@ -171,7 +171,7 @@ describe('vendor-only egress', () => {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow('failed to start');
       proxyId = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const leaked = spawnSync('docker', ['container', 'inspect', proxyId], { stdio: 'ignore' }).status === 0;
+    const leaked = objectExists('container', proxyId);
     if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore' });
     expect(proxyId).toMatch(/^[0-9a-f]{64}$/);
     expect(leaked).toBe(false);
@@ -237,7 +237,8 @@ describe('vendor-only egress', () => {
     const realDocker = requireRealDocker();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup. Only an exec in a
     // proxy: any other call passes through, so the shim never makes a stand-in with an empty, random name. Its exit 1
-    // with no stderr is invented, as an exec that failed; the code reads only the status.
+    // with no stderr is invented, as an exec that failed: the code branches only on the status, and stderr goes only into
+    // the error message, which the test does not check.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
       `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" 2>/dev/null | sed 's#^/##')`,
       '  case "$name" in codeboost-proxy-*)',
