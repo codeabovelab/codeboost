@@ -14,7 +14,7 @@ import { listGitPaths } from '../runner/list-git-paths.ts';
 import { outsideConflictDigest } from '../runner/hash-outside-conflict.ts';
 import { UpstreamFailure } from '../runner/lifecycle.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
-import { CommandFailed } from '../github/run-with-input.ts';
+import { ghIssueNotFound } from './fixtures/gh-answers.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
 const roots: string[] = [];
@@ -681,7 +681,7 @@ describe('trusted pre-merge rebase', () => {
     // The last row is a failure that is neither a timeout nor gh's answer: the same order reports the stop, as before.
     const answers = [
       ['its own timeout', () => new RemoteTimeout('Issue retrieval timed out.'), true],
-      ["gh's answer", () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', ''), true],
+      ["gh's answer", ghIssueNotFound, true],
       ['a failure of another kind', () => new Error('The trust read failed.'), false],
     ] as const;
     const run = (s: Awaited<ReturnType<typeof setup>>, runner: GitRebaser, attemptId: string, signal?: AbortSignal) =>

@@ -22,7 +22,7 @@ import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.
 import { BranchPushRefused } from '../runner/branch-push.ts';
 import { UpstreamFailure } from '../runner/lifecycle.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
-import { CommandFailed } from '../github/run-with-input.ts';
+import { ghIssueNotFound } from './fixtures/gh-answers.ts';
 
 // A passthrough, so a test can act while a preparation's worker history read is in flight.
 const historyReads = vi.hoisted(() => ({ during: undefined as (() => void) | undefined }));
@@ -431,7 +431,7 @@ it('keeps a failed rebase bound to the review that started it when that review c
 
 it.each([
   ['timed out', () => new RemoteTimeout('Issue retrieval timed out.')],
-  ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', '')],
+  ['was answered by gh', ghIssueNotFound],
 ] as const)('saves a preparation whose issue-trust read %s before shutdown with that answer, not the shutdown (#48)', async (_case, answer) => {
   const actionId = randomUUID();
   let stoppedFirst = false;
@@ -456,7 +456,7 @@ it.each([
 const REAL_REBASE_TEST_TIMEOUT_MS = 60_000;
 const resolverTrustAnswers = [
   ['timed out', () => new RemoteTimeout('Issue retrieval timed out.')],
-  ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', '')],
+  ['was answered by gh', ghIssueNotFound],
 ] as const;
 const resolverStops = {
   cancel: { reason: 'Task cancelled.', stop: (service: ReviewService, coordinator: PreMergeCoordinator) =>

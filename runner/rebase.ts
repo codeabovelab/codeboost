@@ -442,9 +442,11 @@ export class GitRebaser {
       catch (error) {
         // Retained ownership outranks cancellation/deadline reporting: live cleanup must preserve its parent workspace.
         if (error instanceof RebaseResourcesUnsettled) throw error;
-        // A remote read that timed out on its own (as the issue-trust read can), or that gh answered, keeps that reason
-        // though a cancel, shutdown or this deadline became pending while it stopped (#174). Had the stop come first,
-        // the read would have reported the stop instead: the gateways and the server's trust read keep the first reason.
+        // A remote read that timed out on its own, or that gh answered, keeps that reason though a cancel, shutdown or
+        // this deadline became pending while it stopped (#174). Had the stop come first, the read would have reported
+        // the stop instead: the gateways and the server's trust read keep the first reason. This relies on the
+        // issue-trust read being the production resolver's only GitHub read. A later gh call in the resolver must also
+        // report a stop that came first as the stop, or this check would report its answer in the stop's place.
         if (timedOut(error) || ghAnswered(error)) throw error;
         abortExpired();
         controller.signal.throwIfAborted();
