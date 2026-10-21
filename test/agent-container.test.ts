@@ -974,7 +974,7 @@ describe('real Docker agent isolation', () => {
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
     const left = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
-      { encoding: 'utf8' }).stdout?.trim() ?? '';
+      { encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL' }).stdout?.trim() ?? '';
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
     expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);

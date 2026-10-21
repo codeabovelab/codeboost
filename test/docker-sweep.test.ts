@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
 import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
@@ -174,23 +174,31 @@ it.each([
   expect(readFileSync(calls, 'utf8').split('\n')).toContain(`rm --force ${a}`);
 });
 
-it('finds the real docker once, at load, and refuses a shim when none was found', async () => {
+it('finds the real docker once, at load, uses it by default, and refuses a shim when none was found', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  // Two directories, each with a docker and the sh the lookup runs, and one with only sh.
+  // Two directories, each with a docker and the sh the lookup runs, and one with only sh. Each docker records its calls
+  // and answers as Docker 27.4 does for a missing container and for an `ls` with no match; nothing else is asked of it.
   const bin = (name: string, docker: boolean) => {
     const dir = join(root, name); mkdirSync(dir);
     symlinkSync(spawnSync('sh', ['-c', 'command -v sh'], { encoding: 'utf8' }).stdout.trim(), join(dir, 'sh'));
-    if (docker) writeFileSync(join(dir, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    if (docker) writeFileSync(join(dir, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${join(dir, 'calls')}'`,
+      'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+    { mode: 0o755 });
     return dir;
   };
   const first = bin('first', true), second = bin('second', true), none = bin('none', false);
-  vi.stubEnv('PATH', first);
+  // A relative PATH entry, resolved at load.
+  vi.stubEnv('PATH', relative(process.cwd(), first));
   vi.resetModules();
   const loaded = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
-  // A shim put on PATH later does not change it.
+  // A shim put on PATH later does not change it, and the removals use it when given no docker.
   vi.stubEnv('PATH', second);
   expect(loaded.REAL_DOCKER).toBe(join(first, 'docker'));
   expect(loaded.requireRealDocker()).toBe(join(first, 'docker'));
+  loaded.removeByName('container', 'x', 'test');
+  loaded.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test');
+  expect(readFileSync(join(first, 'calls'), 'utf8').split('\n').filter(Boolean).length).toBeGreaterThan(1);
+  expect(existsSync(join(second, 'calls'))).toBe(false);
   vi.stubEnv('PATH', none);
   vi.resetModules();
   const missing = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
