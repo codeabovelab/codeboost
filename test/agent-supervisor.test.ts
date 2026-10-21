@@ -81,7 +81,7 @@ afterAll(async () => {
     // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 3 * 60_000);
+}, 6 * 60_000);
 
 describe('container invocation supervisor', () => {
   it('preserves the first cancellation reason while retained setup cleanup settles', async () => {
@@ -385,9 +385,10 @@ describe('container invocation supervisor', () => {
 
   it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
-    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
-      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
     try {
+      // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
+      execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
+        '--entrypoint', 'true', imageId], { stdio: 'ignore' });
       const result = await startProfileInvocation(current).settled;
       expect(result.stopReason).toBe('capture-failure');
       expect(result.stderr).toMatch(/already in use|Conflict/);
@@ -436,9 +437,9 @@ describe('container invocation supervisor', () => {
   it('releases only the profile when rejecting before creation, even if its name is held elsewhere', async () => {
     const current = await profile(fixture(), 'noop');
     // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
-    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
-      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
     try {
+      execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
+        '--entrypoint', 'true', imageId], { stdio: 'ignore' });
       await expectRejected(startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 }), 'ceiling');
       expect(isContainerProfileAuthentic(current)).toBe(false);
       expect(spawnSync('docker', ['container', 'inspect', current.name], { stdio: 'ignore' }).status).toBe(0);

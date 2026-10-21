@@ -21,7 +21,7 @@ export function removeRunnerObjects(runnerOwner: string): void {
  * or not: a test can make a network or volume with one owner and the container that holds it with another, or without
  * one. Containers and volumes go by force; a network another container joins meanwhile stays. It reports what it finds
  * and any Docker call that fails, prefixed with `when`, and never throws, so cleanup can call it without hiding an
- * earlier error. Each call has a 30 s limit, so all ten can take up to 5 minutes.
+ * earlier error. Each call has a 30 s limit, so all eleven can take up to 5.5 minutes.
  */
 export function removeLabelledObjects(label: string, value: string, when: string): void {
   const run = (args: string[]) => {
@@ -37,8 +37,13 @@ export function removeLabelledObjects(label: string, value: string, when: string
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${ids.join(' ')}`);
     if (kind !== 'container') {
-      // Filters with one key match any of their values.
-      const holders = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `${kind}=${id}`])]);
+      // Filters with one key match any of their values. The network filter also matches the start of another network's
+      // ID, so a container counts only if it is on one of these networks by name.
+      const listed = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `${kind}=${id}`])]);
+      const holders = kind === 'volume' || !listed.length ? listed : run(['container', 'inspect', '--format',
+        '{{.Id}} {{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}', ...listed])
+        .map(line => line.split(' ').filter(Boolean)).filter(([, ...names]) => names.some(name => ids.includes(name)))
+        .map(([id]) => id!);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
         run(['rm', '--force', ...holders]);

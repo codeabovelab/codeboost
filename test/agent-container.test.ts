@@ -563,8 +563,10 @@ describe('real Docker agent isolation', () => {
     const moved = `${live.name}-moved`, replacement = live.name;
     // Someone renames our container and puts a same-named, same-labelled container in its place.
     docker('rename', live.name, moved); containers.add(moved);
+    // Tracked before the create, so afterAll removes it even if the create's client fails after the daemon made it.
+    containers.add(replacement);
     docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
-      '--entrypoint', 'true', imageId); containers.add(replacement);
+      '--entrypoint', 'true', imageId);
     const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
     await disposeValidatedContainer(live);
     expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
@@ -582,8 +584,10 @@ describe('real Docker agent isolation', () => {
     await expect(disposeValidatedContainer(live)).rejects.toThrow('did not settle');
     expect(isContainerProfileAuthentic(live)).toBe(true);
     // A same-named, same-labelled container appears before the retry.
+    // Tracked before the create, so afterAll removes it even if the create's client fails after the daemon made it.
+    containers.add(replacement);
     docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
-      '--entrypoint', 'true', imageId); containers.add(replacement);
+      '--entrypoint', 'true', imageId);
     const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
     docker('rm', '--force', blocker); containers.delete(blocker);
     await disposeValidatedContainer(live);
@@ -597,8 +601,10 @@ describe('real Docker agent isolation', () => {
     const originalId = docker('container', 'inspect', '--format', '{{.Id}}', live.name);
     const moved = `${live.name}-moved`, replacement = live.name;
     docker('rename', live.name, moved); containers.add(moved);
+    // Tracked before the create, so afterAll removes it even if the create's client fails after the daemon made it.
+    containers.add(replacement);
     docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
-      '--entrypoint', 'true', imageId); containers.add(replacement);
+      '--entrypoint', 'true', imageId);
     expect(await startValidatedContainer(live)).toBe('stdout-marker');
     // The replacement was never started, and cleanup removed only ours.
     expect(docker('container', 'inspect', '--format', '{{.State.StartedAt}}', replacement)).toBe('0001-01-01T00:00:00Z');
@@ -639,7 +645,8 @@ describe('real Docker agent isolation', () => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
     testRuns.push(testRun);
-    // Up to ten Docker calls of 30 s each, so the removal gets their worst case, not the 10 s a hook gets by default.
+    // Up to ten synchronous Docker calls of 30 s each, which a timer cannot cut short: the budget covers them, so a slow
+    // removal is not reported as a hook timeout (10 s by default).
     onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 5 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
@@ -697,6 +704,41 @@ describe('real Docker agent isolation', () => {
       expect(createValidatedContainer(live)).rejects.toThrow('lockdown'));
     expect(spawnSync('docker', ['container', 'inspect', live.name]).status).not.toBe(0);
   }, 60_000);
+
+  // #189: the sweep removes what holds a swept network or volume, even a container created and never started, and
+  // nothing on a network or volume it does not sweep, even one whose ID starts with a swept network's name.
+  it('removes the containers that hold a swept network or volume, and nothing else', () => {
+    const run = randomUUID(), label = `${TEST_RUN_LABEL}=${run}`, made: { kind: string; ref: string }[] = [];
+    const make = (kind: 'container' | 'network' | 'volume', ...args: string[]) => {
+      const ref = docker(...(kind === 'container' ? [] : [kind]), ...args);
+      made.push({ kind, ref });
+      return ref;
+    };
+    try {
+      const bystanderNetwork = make('network', 'create', `codeboost-bystander-${randomUUID()}`);
+      const bystanderVolume = make('volume', 'create', `codeboost-bystander-${randomUUID()}`);
+      const bystanders = [make('container', 'run', '--detach', '--network', bystanderNetwork, '--entrypoint', 'sleep', imageId, '300'),
+        make('container', 'create', '--mount', `type=volume,source=${bystanderVolume},target=/x`, '--entrypoint', 'true', imageId)];
+      const network = make('network', 'create', '--label', label, `codeboost-swept-${randomUUID()}`);
+      // Named like the start of the bystander network's ID: Docker's network filter also matches that prefix.
+      make('network', 'create', '--label', label, bystanderNetwork.slice(0, 12));
+      const volume = make('volume', 'create', '--label', label, `codeboost-swept-${randomUUID()}`);
+      const holders = [make('container', 'create', '--network', network, '--entrypoint', 'true', imageId),
+        make('container', 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
+        make('container', 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
+      removeLabelledObjects(TEST_RUN_LABEL, run, 'test');
+      const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
+      for (const holder of holders) expect(exists('container', holder)).toBe(false);
+      expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
+      for (const bystander of bystanders) expect(exists('container', bystander)).toBe(true);
+      expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume)]).toEqual([true, true]);
+    } finally {
+      for (const { kind, ref } of made.filter(object => object.kind === 'container'))
+        spawnSync('docker', ['rm', '--force', ref], { stdio: 'ignore' });
+      for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
+        spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
+    }
+  }, 120_000);
 
   // #189: these two run in order. The first stops after making a keeper without its runner label, before the removal
   // its sibling test above ends with; the second checks that the keeper went when the first finished. `it.fails` passes
@@ -2375,15 +2417,16 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
     docker('rm', '--force', filesystems.keeper);
-    docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
-      '--label', `io.codeboost.attempt=${owner.attemptId}`, '--label', `io.codeboost.allocation=${owner.allocationId}`,
-      '--network=none', '--entrypoint', 'sleep', imageId, 'infinity');
     try {
+      // Inside the try: this keeper carries another runner's label, so only the finally below removes it (#189).
+      docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
+        '--label', `io.codeboost.attempt=${owner.attemptId}`, '--label', `io.codeboost.allocation=${owner.allocationId}`,
+        '--network=none', '--entrypoint', 'sleep', imageId, 'infinity');
       expect(() => removeTaskFilesystems(filesystems)).toThrow('did not settle');
       expect(docker('container', 'inspect', '--format', '{{.State.Running}}', filesystems.keeper)).toBe('true');
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
     } finally {
-      docker('rm', '--force', filesystems.keeper);
+      spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
       removeTaskFilesystems(filesystems);
     }
   }, 60_000);

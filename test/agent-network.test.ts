@@ -42,7 +42,7 @@ afterAll(async () => {
     // timeout.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 4 * 60_000);
+}, 6 * 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {

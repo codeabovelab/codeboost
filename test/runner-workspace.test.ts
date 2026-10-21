@@ -39,7 +39,7 @@ afterAll(() => {
     // identity probe carries no owner labels, so it is not found here. It may not run before a hook timeout.
     removeRunnerObjects(RUNNER_OWNER);
   }
-}, 4 * 60_000);
+}, 6 * 60_000);
 const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 async function setup(agent: Record<string, string>) {

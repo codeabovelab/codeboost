@@ -52,7 +52,7 @@ const boundedScratch = tmpfs('/tmp', 'size=32m,nr_inodes=4096');
 
 beforeAll(() => { imageId = buildAgentImage(); }, 10 * 60_000);
 // The file has no other cleanup: a probe container whose client timed out may still be running.
-afterAll(() => removeRunnerObjects(TEST_RUNNER_OWNER), 4 * 60_000);
+afterAll(() => removeRunnerObjects(TEST_RUNNER_OWNER), 6 * 60_000);
 
 describe('isolation gate detects breaches', () => {
   it.each([
