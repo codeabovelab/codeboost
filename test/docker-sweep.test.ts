@@ -56,7 +56,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
   // Answers as Docker 27.4 does for `inspect --format '{{json .Id}} {{json .Name}}'` (a volume: '{{json .Name}}') and
   // `rm`, in the parts removeByName reads: stdout of an inspect that succeeded, stderr and the exit status. A missing
   // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and a
-  // failure before the daemon (an unknown context). The stdout of a failed call, a bare newline in 27.4, is not read.
+  // failure before the daemon (an unknown context; its meta.json path shortened). The stdout of a failed call, a bare
+  // newline in 27.4, is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     'for arg; do name="$arg"; done',
     'if [ "$2" = inspect ]; then case "$1 $name" in',
@@ -93,4 +94,23 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['removing container lost: docker inspect failed:',
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
   ]);
+});
+
+it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or DOCKER_CONTEXT since', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const seen = join(root, 'seen');
+  // Records the address each call is given, and answers as Docker 27.4 does for a missing container and an empty `ls`.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
+    'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const loaded = `${process.env.DOCKER_HOST ?? 'unset'}|${process.env.DOCKER_CONTEXT ?? 'unset'}`;
+  vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-missing.sock');
+  vi.stubEnv('DOCKER_CONTEXT', 'codeboost-missing');
+  try {
+    removeByName('container', 'x', join(root, 'docker'));
+    removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  } finally { vi.unstubAllEnvs(); }
+  const lines = readFileSync(seen, 'utf8').split('\n').filter(Boolean);
+  expect(lines.length).toBeGreaterThan(1);
+  expect(new Set(lines)).toEqual(new Set([loaded]));
 });

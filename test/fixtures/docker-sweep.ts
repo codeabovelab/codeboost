@@ -7,6 +7,17 @@ import { RUNNER_LABEL } from '../../agents/labels.ts';
  * call's SIGKILL does not reach.
  */
 export const REAL_DOCKER = spawnSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).stdout?.trim() || 'docker';
+/**
+ * The daemon `docker` talks to when this module loads. A test that times out may leave DOCKER_HOST or DOCKER_CONTEXT
+ * changed (agent-supervisor points DOCKER_HOST at a missing socket until its handle settles), so every call here
+ * restores them.
+ */
+const LOADED_ENV = { DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT };
+const dockerEnv = () => {
+  const env = { ...process.env };
+  for (const [name, value] of Object.entries(LOADED_ENV)) if (value === undefined) delete env[name]; else env[name] = value;
+  return env;
+};
 /** The real `docker` for a shim to call; refuses when none was found, since a shim calling `docker` would call itself. */
 export function requireRealDocker(): string {
   if (!REAL_DOCKER.startsWith('/')) throw new Error('No docker on PATH when the test files loaded.');
@@ -27,7 +38,7 @@ export const TEST_FILE_LABEL = 'io.codeboost.test-file';
  * reports a failed call, other than an inspect that finds no such object, and never throws; each call has a 30 s limit.
  */
 export function removeByName(kind: 'container' | 'network' | 'volume', name: string, docker = REAL_DOCKER): void {
-  const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const };
+  const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const, env: dockerEnv() };
   const failed = (result: SpawnSyncReturns<string>, what: string) => console.warn(`removing ${kind} ${name}: docker ${what} failed:`,
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
@@ -67,7 +78,7 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
  */
 export function removeLabelledObjects(label: string, value: string, when: string, docker = REAL_DOCKER): void {
   const run = (args: string[]) => {
-    const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
+    const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: dockerEnv() });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
     // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call
