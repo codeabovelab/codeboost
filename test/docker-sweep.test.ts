@@ -128,12 +128,19 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
   expect(new Set(lines)).toEqual(new Set([loaded]));
 });
 
-it('takes the daemon set at load, not the default, when one was set', async () => {
+it('takes the daemon set at load, not the default, when one was set, for every call', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const seen = join(root, 'seen');
-  // Records the address each call is given, and answers as Docker 27.4 does for a missing container and an empty `ls`.
-  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" >> '${seen}'`,
-    'if [ "$2" = inspect ]; then echo; echo "Error response from daemon: No such container: x" >&2; exit 1; fi', 'exit 0'].join('\n'),
+  const seen = join(root, 'seen'), net = 'n'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64);
+  // Records the address and command of each call. Answers as Docker 27.4 does, in the parts the code reads, for one
+  // swept network with one holder and for a container named x; every other call gets no output and exit 0, as for
+  // `ls` with no match, and the removals' stdout is not read. The network line holds only the fields the sweep reads.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', 'for arg; do last="$arg"; done',
+    `printf '%s|%s|%s %s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" "$1" "$2" >> '${seen}'`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1" = ps ]; then printf '%s\\n' ${holder}; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ] && [ "$last" = x ]; then printf '%s\\n' '"${named}" "/x"'; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '"${holder}" {"swept":{}}'; exit 0; fi`,
+    'exit 0'].join('\n'),
   { mode: 0o755 });
   // A fresh copy of the module, loaded while a daemon is set, as on a machine with Colima or rootless Docker.
   vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-loaded.sock');
@@ -146,7 +153,12 @@ it('takes the daemon set at load, not the default, when one was set', async () =
     fresh.removeByName('container', 'x', 'test', join(root, 'docker'));
     fresh.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   } finally { vi.unstubAllEnvs(); }
-  expect(new Set(readFileSync(seen, 'utf8').split('\n').filter(Boolean))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
+  const lines = readFileSync(seen, 'utf8').split('\n').filter(Boolean).map(line => line.split('|'));
+  // Every kind of call the two make: inspect and removal by name, the listings, the holder lookup and read, the
+  // holders' removal and the network's.
+  expect(new Set(lines.map(line => line[2]))).toEqual(new Set(['container inspect', 'rm --force', 'container ls', 'network ls',
+    'volume ls', 'ps --all', 'network rm']));
+  expect(new Set(lines.map(line => `${line[0]}|${line[1]}`))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
 });
 
 it.each([

@@ -2591,8 +2591,10 @@ describe('real Docker agent isolation', () => {
       let released: unknown;
       try { removeTaskFilesystems(filesystems); } catch (error) { released = error; console.warn('cleanup: removing the storage failed:', error); }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
-      if (passed && keeperRemoved.status !== 0) throw new Error(`docker rm --force ${filesystems.keeper} failed: `
-        + (keeperRemoved.error?.message ?? (keeperRemoved.signal ? `killed by ${keeperRemoved.signal}` : keeperRemoved.stderr?.trim())));
+      const keeperFailure = keeperRemoved.status === 0 ? undefined : `docker rm --force ${filesystems.keeper} failed: `
+        + (keeperRemoved.error?.message ?? (keeperRemoved.signal ? `killed by ${keeperRemoved.signal}` : keeperRemoved.stderr?.trim()));
+      if (keeperFailure && !passed) console.warn('cleanup:', keeperFailure);
+      if (keeperFailure && passed) throw new Error(keeperFailure);
       if (passed && released) throw released;
     }
   }, 7 * 60_000);
