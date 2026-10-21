@@ -343,7 +343,7 @@ describe('the planning check (#164)', () => {
     const { deps, probe, issueAccess } = checked(async () => { throw new Error('Claude could not sign in.'); });
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
-    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*Claude could not sign in\\. `));
+    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*The check said: Claude could not sign in\\.$`));
     // Inside the wait, the same failure refuses at once.
     await expect(deps.describe(signal())).rejects.toThrow('Claude could not sign in.');
     expect(probe).toHaveBeenCalledTimes(1);
@@ -404,6 +404,15 @@ describe('the planning check (#164)', () => {
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
   });
 
+  it('refuses to invoke an agent whose check has not passed, when Settings changed after the recorded action', async () => {
+    const made = checked(async () => undefined);
+    await made.deps.describe(signal());
+    vi.spyOn(made.service.store, 'questionProvider').mockReturnValue('codex');
+    const request = {} as Parameters<typeof made.deps.provider.invoke>[0];
+    expect(() => made.deps.provider.invoke(request, signal())).toThrow('still checking');
+    expect(made.agent.invoke).not.toHaveBeenCalled();
+  });
+
   it('cancels a running check on close, and closes the agent only once it stopped', async () => {
     const order: string[] = [];
     // The check settles a while after it is cancelled, as a worker job does.
@@ -437,6 +446,30 @@ describe('the planning check (#164)', () => {
     expect(signals[1]!.aborted).toBe(true);
   });
 
+  it('keeps a multi-line reason whole, at the end of the refusal', async () => {
+    const reason = 'Planning stays off until they are deleted. Delete them, then retry:\nrm -rf \'/tmp/codeboost-planning-x\'';
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message.endsWith(`The check said: ${reason}`)).toBe(true);
+  });
+
+  it('keeps waiting, rather than failing, when its check was replaced and the vendor changed back', async () => {
+    let vendor: 'claude' | 'codex' = 'claude', count = 0;
+    const check = new PlanningCheck((_probed, probeSignal) => {
+      count += 1;
+      // The third check (Claude again) passes; the first two wait until cancelled.
+      if (count === 3) return Promise.resolve();
+      return new Promise<void>((_, reject) => probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true }));
+    }, () => vendor);
+    const waiting = check.admit(signal());
+    vendor = 'codex';
+    const other = check.admit(signal()).catch(() => undefined);
+    vendor = 'claude';
+    await expect(Promise.all([waiting, check.admit(signal())])).resolves.toEqual([undefined, undefined]);
+    await other;
+    expect(count).toBe(3);
+  });
+
   it('starts no check after close', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
     const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
@@ -451,18 +484,18 @@ describe('the planning check (#164)', () => {
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    // Claude's check passes at 150 ms, after the vendor changed; Codex's never ends.
+    // Claude's check passes at 600 ms, after the vendor changed; Codex's never ends.
     const check = new PlanningCheck(probed => new Promise<void>(resolve => {
-      if (probed === 'claude') setTimeout(resolve, 150);
-    }), () => vendor, { waitMs: 200 });
+      if (probed === 'claude') setTimeout(resolve, 600);
+    }), () => vendor, { waitMs: 1_000 });
     const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await new Promise(resolve => setTimeout(resolve, 100));
     vendor = 'codex';
-    // One deadline ends the wait at 200 ms; a fresh 200 ms for Codex would end it at 350 ms.
+    // One deadline ends the wait at 1 s; a fresh 1 s for Codex would end it at 1.6 s.
     const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toContain('still checking');
-    expect(performance.now() - started).toBeLessThan(320);
+    expect(performance.now() - started).toBeLessThan(1_450);
     await check.close(10);
   });
 
@@ -491,6 +524,7 @@ describe('the planning check (#164)', () => {
       vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
       return text(number);
     });
+    // (The provider, too, checks again as the request starts; see the next test.)
     const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
     service = made.service;
     const described = await made.deps.describe(signal());

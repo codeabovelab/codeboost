@@ -89,7 +89,7 @@ export const PLANNING_CHECK_CLOSE_MS = 20_000;
 
 /** One run of the planning check, for one vendor. `passed` or `failure` is set once it settles. */
 type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number };
-  abort: AbortController };
+  abort: AbortController; replaced?: boolean };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`;
 /**
@@ -130,8 +130,10 @@ export class PlanningCheck {
     if (covering) return covering;
     if (this.#abort.signal.aborted) throw new GuardRefusal('Planning is stopping.');
     // A check for another vendor no longer admits anything: stop it, so replaced checks do not pile up in the worker.
-    if (this.#current && !this.#current.passed && !this.#current.failure)
+    if (this.#current && !this.#current.passed && !this.#current.failure) {
+      this.#current.replaced = true;
       this.#current.abort.abort(new Error('The planning agent chosen in Settings changed.'));
+    }
     const abort = new AbortController(), stop = () => abort.abort(this.#abort.signal.reason);
     this.#abort.signal.addEventListener('abort', stop, { once: true });
     const check: Check = { vendor, done: Promise.resolve(), passed: false, abort };
@@ -169,8 +171,9 @@ export class PlanningCheck {
       try { outcome = await Promise.race([check.done, stopped]); }
       finally { signal.removeEventListener('abort', release); clearTimeout(timer); }
       if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
-      // Settings changed while this request waited: check the vendor it will run with, within the same wait.
-      if (this.#vendor() !== vendor) continue;
+      // Settings changed while this request waited, or its check was replaced and cancelled (the vendor changed and
+      // changed back): check the vendor it will run with, within the same wait.
+      if (this.#vendor() !== vendor || check.replaced) continue;
       // This request's own check: a recheck started since must not replace the outcome it waited for.
       return PlanningCheck.#verdict(check);
     }
@@ -194,12 +197,10 @@ export class PlanningCheck {
   }
   static #verdict(check: Check): void {
     if (check.passed) return;
-    if (check.failure) {
-      const reason = messageOf(check.failure.error).trim();
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
-        + `${reason}${/[.!?]$/.test(reason) ? '' : '.'} codeboost checks again on the next request after a minute, `
-        + 'or at once when another agent is chosen in Settings.');
-    }
+    // The reason comes last and as it is: some end with a command a person may copy.
+    if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
+      + 'it checks again on the next request after a minute, or at once when another agent is chosen in Settings. '
+      + `The check said: ${messageOf(check.failure.error)}`);
     throw new GuardRefusal(STILL_CHECKING);
   }
   /** Cancel any running check and wait up to `waitMs` for it to stop. No check starts afterwards. */

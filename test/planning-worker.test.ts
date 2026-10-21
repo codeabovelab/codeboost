@@ -162,7 +162,7 @@ it('runs the planning check as a planning job in planning\'s worker, and passes 
   await expect(agent(service).probe('claude', new AbortController().signal)).resolves.toBeUndefined();
 });
 
-it('fails the planning check without a sign-in or with Codex, before any lock, worker or Docker work', async () => {
+it('fails the planning check without a sign-in or with Codex, before the review\'s lock is taken', async () => {
   const service = review(), acquire = vi.spyOn(LeftoverLedger.prototype, 'acquire');
   const unsigned = new PlanningAgent(service, { url: STUB, env: {} });
   closers.push(() => unsigned.close());
