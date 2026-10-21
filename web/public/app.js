@@ -381,10 +381,10 @@ function mergeStepElapsed(step, now = Date.now()) {
   return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${String(seconds % 60).padStart(2, "0")} s`;
 }
 /**
- * The step list under the review strip, with Cancel, while a job runs and after the page saw it end (until Refresh).
- * A job saved before step lists existed has none: the control and banner say its step, as before.
+ * The step list under the review strip, with Cancel, while a job runs and after the page saw it end (until the review
+ * reloads). A job saved before step lists existed has none: the control and banner say its step, as before. `focused` is
+ * the element that had focus before the update began (the caller reads it before any control hides).
  */
-/** `focused` is the element that had focus before the update began (the caller reads it before any control hides). */
 function renderMergeSteps(focused = document.activeElement) {
   const job = data?.merge?.available ? data.merge.job : null;
   const ended = data?.merge?.blockers?.some(blocker => blocker.code === "job-refresh") || (!!job && data.merge.endedJobShown === job.id);
