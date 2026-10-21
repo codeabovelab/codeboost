@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { ISSUE_READ_ACTIVE_MS, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
@@ -13,6 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { PLANNING_UNAVAILABLE } from '../runner/planning.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -34,7 +35,9 @@ const text = (number: number): IssueText => ({ number, title: 'Retries ignore th
 const issues = (issueText: (number: number, options?: { trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => Promise<IssueText>, collaborator = true) => ({
   issueAccess: async (number: number) => ({ number, authorLogin: 'outside', collaborator }), issueText,
 });
-const closable = (close = vi.fn(async () => undefined)) => ({ close, invoke: vi.fn() }) as unknown as PlanningAgent;
+const closable = (close = vi.fn(async () => undefined),
+  probe: (vendor: string, signal: AbortSignal) => Promise<void> = vi.fn(async () => undefined)) =>
+  ({ close, invoke: vi.fn(), probe }) as unknown as PlanningAgent;
 const verified = { verifyLock: () => undefined };
 
 it('is off in a demo and without a github block, so neither plans', () => {
@@ -309,4 +312,128 @@ it('ends a planning request that does not settle after shutdown aborts it by clo
     await closing;
     expect(order).toEqual(['planning closed', 'server closed']);
   } finally { vi.useRealTimers(); }
+});
+
+// #164: the planning check, through productionPlanning's setup with a stand-in agent whose `probe` is the check.
+describe('the planning check (#164)', () => {
+  /** The production setup on a review whose Settings chose `vendor`, with a stand-in agent and issue reads. */
+  function checked(probe: (vendor: string, signal: AbortSignal) => Promise<void>, vendor: 'claude' | 'codex' | null = 'claude',
+    recheckMs?: number) {
+    const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+    if (vendor) service.store.setQuestionProvider(vendor);
+    const issueAccess = vi.fn(async (number: number) => ({ number, authorLogin: 'outside', collaborator: true }));
+    const issueText = vi.fn(async (number: number) => text(number));
+    const close = vi.fn(async () => undefined), agent = closable(close, vi.fn(probe));
+    const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => agent, recheckMs })!(service);
+    return { deps, service, agent, issueAccess, close, probe: vi.mocked(agent.probe) };
+  }
+  const signal = () => new AbortController().signal;
+
+  it('starts at setup with the vendor chosen in Settings, and runs once for every request after', async () => {
+    const { deps, probe, issueAccess } = checked(async () => undefined);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls[0]![0]).toBe('claude');
+    await deps.describe(signal());
+    await deps.describe(signal());
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a request with the check\'s reason, before it reads the issue, and checks again only after the wait', async () => {
+    const { deps, probe, issueAccess } = checked(async () => { throw new Error('Claude could not sign in.'); });
+    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*Claude could not sign in\\. `));
+    // Inside the wait, the same failure refuses at once.
+    await expect(deps.describe(signal())).rejects.toThrow('Claude could not sign in.');
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(issueAccess).not.toHaveBeenCalled();
+  });
+
+  it('checks again once the wait after a failure is over, and admits once a check passes', async () => {
+    let fail = true;
+    const { deps, probe, issueAccess } = checked(async () => { if (fail) throw new Error('Docker is not running.'); }, 'claude', 0);
+    await expect(deps.describe(signal())).rejects.toThrow('Docker is not running.');
+    fail = false;
+    await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+    expect(probe).toHaveBeenCalledTimes(2);
+    // A passed check is kept: the wait applies only to a failure.
+    fail = true;
+    await deps.describe(signal());
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
+  });
+
+  it('makes every request wait for the one running check, and a request that stops waiting leaves it running', async () => {
+    let pass!: () => void;
+    const { deps, probe } = checked((_vendor, probeSignal) => new Promise<void>((resolve, reject) => {
+      pass = resolve; probeSignal.addEventListener('abort', () => reject(probeSignal.reason), { once: true });
+    }));
+    const leaving = new AbortController(), left = deps.describe(leaving.signal), waiting = deps.describe(signal());
+    leaving.abort(new Error('The browser went away.'));
+    await expect(left).rejects.toThrow('The browser went away.');
+    pass();
+    await expect(waiting).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls[0]![1].aborted).toBe(false);
+  });
+
+  it('checks nothing while no agent is chosen, then checks the vendor chosen before its first request', async () => {
+    const { deps, service, probe, issueAccess } = checked(async () => undefined, null);
+    expect(probe).not.toHaveBeenCalled();
+    // No vendor: the request goes on, and the agent refuses it later with NO_PLANNING_AGENT, as before.
+    await deps.describe(signal());
+    expect(probe).not.toHaveBeenCalled();
+    service.store.setQuestionProvider('claude');
+    await deps.describe(signal());
+    // Settings refuse Codex now, but a database from before #75 may still hold it.
+    vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+    await deps.describe(signal());
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+    expect(issueAccess).toHaveBeenCalledTimes(3);
+  });
+
+  it('checks the vendor chosen while a request waited, before it admits the request', async () => {
+    let pass!: () => void;
+    const { deps, service, probe } = checked(vendor => vendor === 'claude' ? new Promise<void>(resolve => { pass = resolve; })
+      : Promise.reject(new Error('Codex cannot write plans yet.')));
+    const waiting = Promise.resolve(deps.describe(signal()));
+    vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+    pass();
+    await expect(waiting).rejects.toThrow('Codex cannot write plans yet.');
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+  });
+
+  it('cancels a running check on close, before it closes the agent', async () => {
+    const order: string[] = [];
+    const { deps, probe, close } = checked((_vendor, probeSignal) => new Promise<void>((_, reject) =>
+      probeSignal.addEventListener('abort', () => { order.push('check stopped'); reject(probeSignal.reason); }, { once: true })));
+    close.mockImplementation(async () => { order.push('agent closed'); });
+    await deps.close!();
+    expect(probe.mock.calls[0]![1].aborted).toBe(true);
+    expect(order).toEqual(['check stopped', 'agent closed']);
+  });
+
+  it('refuses a start through the server with 409, recording no request and starting no agent', async () => {
+    const config = production(), probe = vi.fn(async () => { throw new Error('Claude could not sign in.'); });
+    const service = new ReviewService(config); service.store.setQuestionProvider('claude'); service.close();
+    const agent = closable(undefined, probe), issueAccess = vi.fn();
+    const setup = productionPlanning(config, { ...verified, issues: { issueAccess, issueText: vi.fn() }, agent: () => agent })!;
+    const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup);
+    closers.push(() => app.close());
+    const api = async (method: string, path: string, body?: unknown) => {
+      const response = await fetch(`${new URL(app.url).origin}${path}`, { method, headers: { 'x-codeboost-token': app.token,
+        ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    const view = (await api('GET', '/api/review')).body;
+    const started = await api('POST', '/api/plan/suggestions', { expectedRevision: view.plan.revision,
+      snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID() });
+    expect(started.status).toBe(409);
+    expect(started.body.error).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*Claude could not sign in\\.`));
+    const db = new DatabaseSync(config.database);
+    try { expect((db.prepare('SELECT COUNT(*) AS n FROM requests').get() as { n: number }).n).toBe(0); } finally { db.close(); }
+    expect(agent.invoke).not.toHaveBeenCalled();
+    expect(issueAccess).not.toHaveBeenCalled();
+  });
 });

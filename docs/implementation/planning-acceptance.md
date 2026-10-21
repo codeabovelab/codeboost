@@ -82,6 +82,24 @@ suggestion timer and the request share one ten-minute budget. The recording
 script still runs the provider in its own process and prints its runner label if
 it leaves anything.
 
+The planning check (#164) proves that the vendor chosen in Settings can run a
+planning invocation before any request does. It is one planning job in the same
+worker and profile as a real request (read, list and search only, vendor-only
+egress, a mounted schema), on the review's code at the snapshot's head. It asks
+for the schema's own answer, `{"ok": true}`, within a two-minute budget, so it
+covers sign-in, the schema-constrained answer and the read-only profile
+(`PlanningAgent.probe`). `PlanningCheck` starts it when the server starts, and
+again before the first request after the vendor changes. `productionPlanning`'s
+`describe` waits for it before it reads the issue or records anything. A failed
+check refuses the request with a `GuardRefusal` that starts "Planning is
+unavailable:" and names the reason; the server records that refusal and starts no
+agent. Requests within a minute of the failure are refused with it, and the next
+request after that checks again. With no vendor chosen nothing is checked, and
+the request is refused later, as before. Shutdown cancels a running check and waits
+up to 20 s for it before closing the worker. Tests: `test/planning-production.test.ts`
+("the planning check (#164)", with a check that passes and one that fails) and
+`test/planning-worker.test.ts` (the check in planning's worker).
+
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now
 composes the browser with production planning setup, lane D's provider boundary,

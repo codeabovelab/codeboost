@@ -41,6 +41,11 @@ parentPort!.on('message', (message: WorkerRequest) => {
   // A planning job carries a ReadOnlyRun; the stub reads the same fields from either kind (#117).
   const job = message.type === 'ask' ? message.question : { ...message.run, noteId: message.run.taskId };
   const { prompt, provider, noteId, attemptId } = job;
+  // The planning check (#164) passes with the schema's own answer.
+  if (message.type === 'plan' && message.run.taskId.startsWith('planning-probe-')) {
+    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: '{"ok":true}' });
+    return;
+  }
   if (prompt === 'crash') throw new Error('stub crashed');
   if (prompt === 'leak') {
     remaining++;
