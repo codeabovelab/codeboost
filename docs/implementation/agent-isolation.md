@@ -105,15 +105,16 @@ Use only these entry points to run an agent:
    - <a id="planning-model-budget"></a>**Planning model budget (#163).** `createClaudeCommand` checks it when it
      builds the planning command, so the adapter's start call throws before it creates a container or network. The
      runner's host clone and task storage already exist by then, and the runner removes them. The budget has two parts:
-     - *Input, before the start.* The prompt and the schema together must be at most `MAX_PLANNING_INPUT_BYTES`
-       (64 KiB) of UTF-8: the 32 KiB prompt plus 32 KiB of schema text. A larger request is refused with an error
-       that gives its size, split into prompt and schema, and asks the person to narrow the request (the issue and
-       comments, the paths, the lessons, the feedback or the previous plan). Bytes stand in for tokens because Claude's tokenizer is not available offline. A count of bytes is an upper bound on the tokens
-       if every token covers at least one byte; this is assumed, not verified against Claude's tokenizer.
-       `prepareDraft` and `prepareSuggestions` already limit the prompt and the schema text to 32 KiB each, so this
-       check refuses nothing they produce. It is a backstop for a caller that skips them. A test checks a draft at the
-       prompt limit with today's schema; no test fails if the 32 KiB schema bound in `core/planning-author.ts` is
-       removed. It does not count Claude Code's own system prompt and tool definitions, or the tokens of the answer.
+     - *Input, before the start.* The prompt and the schema together must be at most `MAX_PLANNING_INPUT_BYTES` (64 KiB)
+       of UTF-8: the 32 KiB prompt plus 32 KiB of schema text. A larger request is refused with an error that gives its
+       size, split into prompt and schema, and asks the person to narrow the request (the issue and comments, the paths,
+       the lessons, the feedback or the previous plan). Bytes stand in for tokens because Claude's tokenizer is not
+       available offline. A count of bytes is an upper bound on the tokens if every token covers at least one byte; this
+       is assumed, not verified against Claude's tokenizer. `prepareDraft` and `prepareSuggestions` already limit the
+       prompt and the schema text to 32 KiB each, so this check refuses nothing they produce. It is a backstop for a
+       caller that skips them. A test checks a draft at the prompt limit with today's schema; no test fails if the
+       32 KiB schema bound in `core/planning-author.ts` is removed. It does not count Claude Code's own system prompt
+       and tool definitions, or the tokens of the answer.
      - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
        window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
        itself, such as compaction, may not count as turns, and the bound is loose (about 50 context windows; the CLI
@@ -122,12 +123,12 @@ Use only these entry points to run an agent:
        `error_max_turns` result and exit status 1. This was checked with `--max-turns 1` in a run of the 2.1.281 macOS
        arm64 build outside the container; the Linux build in the image was read from its bundled source only. The
        adapter reports that result as a provider failure whose text is the result's `errors` strings ("Reached maximum
-       number of turns (1)" in that run). The planning error then names the 50-turn limit, asks the person to narrow the
-       request, and quotes that text. A token or dollar limit was not chosen: `--max-budget-usd` counts the dollar cost
-       of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag that limits the tokens
-       of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning run reads files and
-       answers, so most turns are reads. Lower it if runs are seen to loop; raise it only with a recorded run that needs
-       more.
+       number of turns (1)" in that run). That holds in every Claude phase, so a failed question run quotes them too.
+       The planning error then names the 50-turn limit, asks the person to narrow the request, and quotes that text. A
+       token or dollar limit was not chosen: `--max-budget-usd` counts the dollar cost of API calls, which is not what
+       an OAuth subscription token pays, and the CLI has no flag that limits the tokens of a whole run. 50 turns is
+       about 12 s for each turn in the ten-minute budget; a planning run reads files and answers, so most turns are
+       reads. Lower it if runs are seen to loop; raise it only with a recorded run that needs more.
      The other phases do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
