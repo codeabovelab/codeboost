@@ -70,6 +70,8 @@ describe('production agent adapters', () => {
       .toEqual({ text: 'Reached maximum number of turns (50)', providerFailed: true });
     expect(parseClaudeOutput(Buffer.from('{"subtype":"error_during_execution","is_error":true,"result":"r","errors":["e"]}'),
       structured)).toEqual({ text: 'r', providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_during_execution","is_error":true,"result":"","errors":["e"]}'),
+      structured)).toEqual({ text: 'e', providerFailed: true });
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":1,"is_error":false,"result":"x"}'), structured))
       .toThrow('malformed');
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":"success","is_error":false,"result":3}'), structured))

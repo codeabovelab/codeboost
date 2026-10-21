@@ -103,7 +103,11 @@ it('names the turn limit when Claude stops a planning run at --max-turns (#163)'
   const { text } = parseClaudeOutput(Buffer.from('{"type":"result","subtype":"error_max_turns","is_error":true,'
     + '"num_turns":50,"errors":["Reached maximum number of turns (50)"]}'), true);
   await expect(provider(fakeDeps({ exitCode: 1, stdout: text }).deps).invoke(draftRequest(), new AbortController().signal))
-    .rejects.toThrow('Claude said: Reached maximum number of turns (50)');
+    .rejects.toThrow('Claude could not write the plan. Planning stopped at its 50-turn limit before Claude answered. '
+      + 'Narrow the request, then retry. Claude said: Reached maximum number of turns (50)');
+  // Any other failure keeps the sign-in advice.
+  await expect(provider(fakeDeps({ exitCode: 1, stdout: 'login required' }).deps).invoke(draftRequest(),
+    new AbortController().signal)).rejects.toThrow('Check its sign-in and usage limits. Claude said: login required');
 });
 
 it.each([

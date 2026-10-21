@@ -109,15 +109,20 @@ Use only these entry points to run an agent:
        that gives its size and asks the person to narrow the issue, the paths or the lessons. Bytes stand in for
        tokens because Claude's tokenizer is not available offline. A count of bytes is an upper bound on the tokens
        if every token covers at least one byte; this is assumed, not verified against Claude's tokenizer.
-     - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). Each turn sends at most one context
-       window, so a turn limit bounds the tokens a run can use with no tokenizer. Claude Code 2.1.281 accepts the
-       flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns` result (both read from
-       its bundled source, not from a run). The adapter reports that result as a provider failure whose text is the
-       result's `errors` strings, so the planning error quotes "Reached maximum number of turns (50)". A token or dollar limit was not chosen: `--max-budget-usd` counts the
-       dollar cost of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag that
-       limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning
-       run reads files and answers, so most turns are reads. Lower it if runs are seen to stop early for no reason; never raise it without a
-       recorded run that needs more.
+       `prepareDraft` and `prepareSuggestions` already limit the prompt and the schema text to 32 KiB each, so this
+       check refuses nothing they produce: it is a backstop for a caller that skips them. It does not count Claude
+       Code's own system prompt and tool definitions, or the tokens of the answer.
+     - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
+       window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
+       itself, such as compaction, may not count as turns, and the bound is loose (50 context windows). Claude Code
+       2.1.281 accepts the flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns`
+       result (both read from its bundled source, not from a run). The adapter reports that result as a provider failure
+       whose text is the result's `errors` strings. The planning error then names the turn limit, asks the person to
+       narrow the request, and quotes "Reached maximum number of turns (50)". A token or dollar limit was not chosen:
+       `--max-budget-usd` counts the dollar cost of API calls, which is not what an OAuth subscription token pays, and
+       the CLI has no flag that limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute
+       budget; a planning run reads files and answers, so most turns are reads. Lower it if runs are seen to loop; raise
+       it only with a recorded run that needs more.
      The other phases do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).

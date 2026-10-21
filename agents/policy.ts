@@ -77,13 +77,15 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
 }
 
 /**
- * Planning's model budget (#163), checked when the command is built, before any container exists. The first request's
- * input is counted in UTF-8 bytes of the prompt and schema: Claude's tokenizer is not available offline, and a count
- * of bytes bounds the tokens if every token covers at least one byte (assumed, not verified against Claude's
- * tokenizer). 64 KiB is the 32 KiB prompt plus the 32 KiB of schema text that the notes in prompts/plan-author.md
- * allow. The run is bounded by turns: each turn sends at most one context window, so `--max-turns` bounds the tokens
- * a run can use. Claude stops at the limit with an `error_max_turns` result, which the adapter reports as a provider
- * failure. See docs/implementation/agent-isolation.md, "Planning model budget".
+ * Planning's model budget (#163), checked when the command is built, before any container exists. The input is
+ * counted in UTF-8 bytes of the prompt and schema: Claude's tokenizer is not available offline, and a count of bytes
+ * bounds the tokens if every token covers at least one byte (assumed, not verified against Claude's tokenizer).
+ * 64 KiB is the 32 KiB prompt plus the 32 KiB of schema text that core/planning-author.ts allows, so this is a backstop
+ * for callers that skip it; it does not count Claude Code's own system prompt and tools, or the answer. The run is
+ * bounded by turns: if each turn sends at most one context window (assumed; the CLI's own calls, such as compaction,
+ * are not counted), `--max-turns` bounds the tokens a run can use. Claude stops at the limit with an
+ * `error_max_turns` result, which the adapter reports as a provider failure. See
+ * docs/implementation/agent-isolation.md, "Planning model budget".
  */
 export const MAX_PLANNING_INPUT_BYTES = 64 * 1024;
 export const PLANNING_MAX_TURNS = 50;
