@@ -1422,6 +1422,9 @@ const failedCheckRunReads: Array<[string, (args: readonly string[]) => Promise<s
     ? checkRunsAnswer(args, passing, { page: () => ({ totalCount: 3 }) })
     : checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2, hasNextPage: true, endCursor: 'PAGE_2' }) }), /changed while they were read/],
   ['the pages hold fewer suites than GitHub counts', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2 }) }), /changed while they were read/],
+  // Defensive: GitHub has not been seen to answer a next page without a cursor to it.
+  ['GitHub says there is a next page but gives no cursor to it (defensive)', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2, hasNextPage: true, endCursor: null }) }),
+    /^GitHub returned incomplete check runs\.$/],
   ['the app has more than 1,000 check suites on the head', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 1001, hasNextPage: true, endCursor: 'NEXT' }) }),
     /more check suites from app 10 than codeboost can read/],
 ];
