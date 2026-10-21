@@ -55,12 +55,14 @@ it('reads nothing from a docker call that was killed, whose output may be cut sh
 
 it('removes by name only an object of exactly that name, and reports failures other than no such object', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const calls = join(root, 'calls'), id = 'b'.repeat(64), other = 'c'.repeat(64);
+  const calls = join(root, 'calls'), id = 'b'.repeat(64), other = 'c'.repeat(64), raced = 'd'.repeat(64);
   // Answers as Docker 27.4 does for `inspect --format '{{json .Id}} {{json .Name}}'` (a volume: '{{json .Name}}') and
   // `rm`, in the parts removeByName reads: stdout of an inspect that succeeded, stderr and the exit status. A missing
   // object, an object found under another name (by an ID prefix), a refused removal, an inspect killed by a signal, and a
-  // failure before the daemon (an unknown context; its meta.json path shortened). The stdout of a failed call (a bare
-  // newline for a missing object in 27.4, nothing for the others) is not read.
+  // failure before the daemon (an unknown context; its meta.json path shortened). Also a network gone between its
+  // inspect and its removal, which 27.4 answers "network <ID> not found", and an inspect answer that is not JSON, which
+  // 27.4 is not known to give. The stdout of a failed call (a bare newline for a missing object in 27.4, nothing for
+  // the others) is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     'for arg; do name="$arg"; done',
     'if [ "$2" = inspect ]; then case "$1 $name" in',
@@ -72,21 +74,25 @@ it('removes by name only an object of exactly that name, and reports failures ot
     `  'container busy') printf '%s\\n' '"${id}" "/busy"';;`,
     `  'network busy') printf '%s\\n' '"${other}" "busy"';;`,
     `  'volume busy') printf '%s\\n' '"busy"';;`,
+    `  'network raced') printf '%s\\n' '"${raced}" "raced"';;`,
+    "  'container junk') echo 'not json';;",
     "  'container killed') kill -9 $$;;",
     "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
     'esac; exit 0; fi',
     `if [ "$1" = rm ]; then echo 'Error response from daemon: removal of container ${id} is already in progress' >&2; exit 1; fi`,
+    `if [ "$1 $2 $3" = 'network rm ${raced}' ]; then echo 'Error response from daemon: network ${raced} not found' >&2; exit 1; fi`,
     `if [ "$1 $2" = 'network rm' ]; then echo 'Error response from daemon: error while removing network: network busy id ${other} has active endpoints' >&2; exit 1; fi`,
     `if [ "$1 $2" = 'volume rm' ]; then echo 'Error response from daemon: remove busy: volume is in use - [${id}]' >&2; exit 1; fi`,
     'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
-    ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost']] as const;
-  for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker'));
+    ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost'],
+    ['network', 'raced'], ['container', 'junk']] as const;
+  expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
-    .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy']);
+    .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy', `network rm ${raced}`]);
   expect(warn.mock.calls).toEqual([
     ['test: removing container busy: docker rm failed:',
       `Error response from daemon: removal of container ${id} is already in progress`],
@@ -96,6 +102,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
     ['test: removing container killed: docker container inspect failed:', 'killed by SIGKILL'],
     ['test: removing container lost: docker container inspect failed:',
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
+    ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
   ]);
 });
 
@@ -148,8 +155,8 @@ it.each([
   // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
   // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
   // removals' stdout (the removed IDs or names in 27.4) is not read. The second case's answer is invented: it stands in
-  // for an unexpected inspect failure that still printed some holders, which 27.4 is not known to give. The network line holds only the fields the sweep
-  // reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope), and the inspect an empty endpoint for
+  // for an unexpected inspect failure that still printed some holders, which 27.4 is not known to give. The network
+  // line holds only the fields the sweep reads (27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope), and the inspect an empty endpoint for
   // the network, where 27.4 gives its full settings: the sweep reads only the network names.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,

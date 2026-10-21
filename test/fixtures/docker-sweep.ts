@@ -55,7 +55,10 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
   } catch { console.warn(`${when}: removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
   if (typeof id !== 'string' || typeof actual !== 'string' || (kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
   const removed = spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
-  if (removed.error || removed.status !== 0) failed(removed, kind === 'container' ? 'rm' : `${kind} rm`);
+  // A network gone since the inspect is gone: Docker 27.4 answers "network <ID> not found" (rm --force of a missing
+  // container or volume exits 0).
+  const raced = kind === 'network' && removed.status === 1 && removed.stderr.includes(`network ${id} not found`);
+  if ((removed.error || removed.status !== 0) && !raced) failed(removed, kind === 'container' ? 'rm' : `${kind} rm`);
 }
 
 /**

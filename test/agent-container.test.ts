@@ -2564,7 +2564,8 @@ describe('real Docker agent isolation', () => {
     containers.add(filesystems.keeper);
     let passed = false;
     try {
-      // Inside the try: this keeper carries another runner's label, so only the finally below removes it (#189).
+      // Inside the try: this keeper carries another runner's label, so no sweep of this run finds it; the finally below
+      // removes it, and afterAll by name (#189).
       docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
         '--label', `io.codeboost.attempt=${owner.attemptId}`, '--label', `io.codeboost.allocation=${owner.allocationId}`,
         '--network=none', '--entrypoint', 'sleep', imageId, 'infinity');
