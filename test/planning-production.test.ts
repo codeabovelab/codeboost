@@ -779,7 +779,7 @@ describe('the planning check (#164)', () => {
     await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
   });
 
-  it('refuses at the start a vendor chosen while the issue was read, and checks it (#164)', async () => {
+  it('refuses at the start a vendor chosen while the issue was read, and checks it', async () => {
     let service!: ReviewService;
     // Settings take Claude while the issue is read, after a request with none chosen was admitted unchecked.
     const issueText = vi.fn(async (number: number) => {
