@@ -443,10 +443,10 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
             check.done = true;
             continue;
           }
+          // A next page without a cursor to it is a malformed answer, not a long one, on any page.
+          if (typeof connection.pageInfo.endCursor !== 'string' || !connection.pageInfo.endCursor) throw new Error('GitHub returned incomplete check runs.');
           if (page === PINNED_SUITE_PAGES)
             throw new Error(`The pull request head has more check suites from app ${check.appId} than codeboost can read.`);
-          // A next page without a cursor to it is a malformed answer, not a long one.
-          if (typeof connection.pageInfo.endCursor !== 'string' || !connection.pageInfo.endCursor) throw new Error('GitHub returned incomplete check runs.');
           check.cursor = connection.pageInfo.endCursor;
         }
       }

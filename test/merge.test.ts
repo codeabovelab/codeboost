@@ -1425,6 +1425,11 @@ const failedCheckRunReads: Array<[string, (args: readonly string[]) => Promise<s
   // Defensive: GitHub has not been seen to answer a next page without a cursor to it.
   ['GitHub says there is a next page but gives no cursor to it (defensive)', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2, hasNextPage: true, endCursor: null }) }),
     /^GitHub returned incomplete check runs\.$/],
+  // Defensive, as above, on the last page codeboost reads: the missing cursor, not the page limit, is the reason.
+  ['GitHub says there is a page after the 10th but gives no cursor to it (defensive)', async args => {
+    const after = pinnedVariables(args)[0]!.after, page = after === null ? 1 : Number(after.slice('PAGE_'.length));
+    return checkRunsAnswer(args, passing, { page: () => ({ totalCount: 1001, hasNextPage: true, endCursor: page === 10 ? null : `PAGE_${page + 1}` }) });
+  }, /^GitHub returned incomplete check runs\.$/],
   ['the app has more than 1,000 check suites on the head', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 1001, hasNextPage: true, endCursor: 'NEXT' }) }),
     /more check suites from app 10 than codeboost can read/],
 ];
