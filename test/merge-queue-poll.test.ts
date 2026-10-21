@@ -10,6 +10,7 @@ import { Store } from '../runner/store.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
 import { fixtureGit } from './fixtures/git.ts';
+import { ghIssueNotFound } from './fixtures/gh-answers.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
 import { CommandFailed } from '../github/run-with-input.ts';
 
@@ -349,7 +350,7 @@ it('answers a merge click whose issue-trust read gh answered before the merge de
       // The first read admits the click; the refresh before admission is held until the deadline aborts it.
       if (++reads === 1) { slowNext = true; return { number, authorLogin: 'member', collaborator: true }; }
       readStarted(); await new Promise(resolve => options.signal?.addEventListener('abort', resolve, { once: true }));
-      throw new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', '', '');
+      throw ghIssueNotFound();
     },
     async issueText(number: number) { return { number, title: '', body: '', comments: [] }; },
   };
@@ -362,7 +363,7 @@ it('answers a merge click whose issue-trust read gh answered before the merge de
   }), { github: true, issues });
   try {
     const answer = async (response: Response) => ({ status: response.status, error: (await response.json() as { error: string }).error });
-    const expected = { status: 502, error: 'Issue trust could not be verified: gh failed (exit 1): HTTP 404: Not Found' };
+    const expected = { status: 502, error: `Issue trust could not be verified: ${ghIssueNotFound().message}` };
     expect(await answer(await send())).toEqual(expected);
     await reading;
     // Saved: resending the same click replays the answer without reading trust again.

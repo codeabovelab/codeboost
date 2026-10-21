@@ -492,8 +492,9 @@ it.each(resolverTrustAnswers.flatMap(([read, answer]) => (['cancel', 'shutdown']
     await fixture.coordinator.close(); await fixture.runner.close();
   }, REAL_REBASE_TEST_TIMEOUT_MS);
 
-it.each(resolverTrustAnswers.flatMap(([read, answer]) => (['cancel', 'shutdown'] as const).map(stop => [stop, read, answer] as const)))(
-  "saves a preparation as stopped by a %s that came before the conflict resolver's issue-trust read %s (#174)", async (stopKind, _read, answer) => {
+// The stop comes before the read can answer, so which answer it would have given does not matter: one is enough.
+it.each(['cancel', 'shutdown'] as const)(
+  "saves a preparation as stopped by a %s that came before the conflict resolver's issue-trust read (#174)", async stopKind => {
     const actionId = randomUUID();
     const { reason, stop } = resolverStops[stopKind];
     let reads = 0, abortedBeforeRead = false;
@@ -503,7 +504,8 @@ it.each(resolverTrustAnswers.flatMap(([read, answer]) => (['cancel', 'shutdown']
       abortedBeforeRead = signal.aborted;
       // The stop came first: the gateway and readIssueAccess report it, not the answer the read would have given.
       if (signal.aborted) throw signal.reason;
-      throw new UpstreamFailure(`Issue trust could not be verified: ${answer().message}`, { cause: answer() });
+      const answer = new RemoteTimeout('Issue retrieval timed out.');
+      throw new UpstreamFailure(`Issue trust could not be verified: ${answer.message}`, { cause: answer });
     } });
     expect(reads).toBe(2); expect(fixture.resolverReads()).toBe(1);
     expect(abortedBeforeRead).toBe(true);

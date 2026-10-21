@@ -729,13 +729,14 @@ describe('trusted pre-merge rebase', () => {
       expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
     });
 
-    it.each(answers.slice(0, 2))('reports a cancel that came before the trust read could give %s', async (_case, answer) => {
+    // The cancel comes before the read can answer, so which answer it would have given does not matter: one is enough.
+    it('reports a cancel that came before the trust read could answer', async () => {
       const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
       let abortedBeforeRead: boolean | null = null;
       const runner = createRebaser(s, { resolveForeignConflict: async input => {
         stop.abort(new Error('Task cancelled.'));
         abortedBeforeRead = input.signal!.aborted;
-        await trustRead(input.signal!, answer());
+        await trustRead(input.signal!, new RemoteTimeout('Issue retrieval timed out.'));
       } });
       const error = await run(s, runner, attemptId, stop.signal);
       expect(abortedBeforeRead).toBe(true);
