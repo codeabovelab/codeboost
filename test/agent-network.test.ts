@@ -215,15 +215,17 @@ describe('vendor-only egress', () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
-    // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
+    // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup. Only an exec in a
+    // proxy: any other call passes through, so the shim never makes a stand-in with an empty, random name.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
-      `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" | sed 's#^/##')`,
+      `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" 2>/dev/null | sed 's#^/##')`,
+      '  case "$name" in codeboost-proxy-*)',
       `  label=$('${realDocker}' inspect -f '{{index .Config.Labels "io.codeboost.egress"}}' "$2")`,
       `  '${realDocker}' rm --force "$2" >/dev/null`,
       // Recorded before the stand-in exists, so the test can remove it even if the run is cut short.
       `  printf '%s\\n' "$name" >> '${recorded}'`,
       `  '${realDocker}' run --detach --name "$name" --label "io.codeboost.egress=$label" --entrypoint sleep ${imageId} 300 >/dev/null`,
-      '  exit 1', 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+      '  exit 1;;', '  esac', 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const failing = captureInvocation({ ...invocation, attemptId: `failed-setup-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
