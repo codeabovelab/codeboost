@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -9,19 +9,25 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, objectExists, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
+/**
+ * On the unnamed `run --rm` containers that join a vendor network (#189): a client killed after the create but before
+ * the start leaves a container `--rm` never removes, which is no holder once its network is gone (Docker 27.4 removes
+ * a network a created, never started container still names). afterAll sweeps this label.
+ */
+const TEST_FILE_RUN = randomUUID(), fileLabel = ['--label', `${TEST_FILE_LABEL}=${TEST_FILE_RUN}`];
 
 let imageId = '', network: VendorNetwork, invocation: InvocationInput;
 const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
-const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm', `--network=${network.name}`,
+const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${network.name}`,
   '--env', `HTTPS_PROXY=${network.proxyUrl}`, ...(direct ? ['--env', 'NO_PROXY=*'] : []),
   '--entrypoint', 'curl', imageId, '--silent', '--show-error', '--output', '/dev/null', '--write-out', '%{http_code}',
-  '--max-time', '15', url], { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  '--max-time', '15', url], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
 
 beforeAll(async () => {
   imageId = buildAgentImage();
@@ -33,21 +39,45 @@ beforeAll(async () => {
   });
   network = await createVendorNetwork(invocation, imageId, randomUUID());
 }, 10 * 60_000);
+/**
+ * Objects a test makes without this run's runner label, by name or by the file its shim records the name in, so
+ * afterAll removes them should the test time out before its own removal runs (#189). The record files live in
+ * `records`, not in the shims, so a name a late client adds after the test's own removal is still read here.
+ */
+const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
+// Made by the first test that records, so a run that selects none of this file's tests leaves no directory.
+let records = '';
+const recordFile = () => join(records ||= mkdtempSync(join(tmpdir(), 'codeboost-records-')), randomUUID());
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => {
-  try { if (network) await removeVendorNetwork(network); }
+  try {
+    for (const { kind, name, file } of unlabelled) {
+      // A record holds one name per line: should a test time out with its shim still on PATH, later creates add theirs.
+      // A record that cannot be read is reported, and the rest still run.
+      let refs: string[] = [];
+      try { refs = name ? [name] : file && existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (error) { console.warn('afterAll: reading a record failed:', error); }
+      for (const ref of refs) removeByName(kind, ref, 'afterAll');
+    }
+    if (network) await removeVendorNetwork(network);
+  }
   finally {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
-    // makes without the runner label are not found here; those tests remove their own. It may not run before a hook
-    // timeout.
+    // makes without the runner label are found here only while they hold one of this run's networks or volumes, or
+    // carry this file's run ID; the tests remove their own, and the try above removes those registered in
+    // `unlabelled`. It may not run before a hook timeout. The hook's 13 minutes leave two over the worst case of these
+    // two sweeps (eleven calls of 30 s each), for the cleanup before them.
+    // The records were read above; removed first, so a hook timeout during the sweeps does not leave them.
+    try { if (records) rmSync(records, { recursive: true, force: true }); } catch (error) { console.warn('afterAll: removing the records failed:', error); }
+    removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 4 * 60_000);
+}, 13 * 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // Every network operation hangs, so both setup and cleanup can only end by deadline.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = network ]; then exec sleep 30; fi',
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
@@ -60,7 +90,7 @@ describe('vendor-only egress', () => {
 
   it('removes a network that lands in the daemon after its create client was killed', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), requested = join(shim, 'network-name');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The create client hangs until killed, and the real create lands after that, inside the cleanup reserve.
     // The shim records this test's network name, since other suites may create egress networks concurrently.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
@@ -77,42 +107,60 @@ describe('vendor-only egress', () => {
       name = readFileSync(requested, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     execFileSync('sleep', ['3']);
-    const orphaned = spawnSync('docker', ['network', 'inspect', name], { stdio: 'ignore' }).status === 0;
-    if (orphaned) docker('network', 'rm', name);
+    // A network landing later still carries this run's runner label (the shim passes production's arguments on), so
+    // afterAll's runner sweep removes it.
+    // First, so a shim that recorded something else is reported as itself.
     expect(name).toMatch(/^codeboost-egress-/);
+    const orphaned = objectExists('network', name);
+    if (orphaned) docker('network', 'rm', name);
     expect(orphaned).toBe(false);
   }, 60_000);
 
   it('leaves a same-named network alone when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
-    // The name is taken by someone else's network just before our create, so the daemon refuses it.
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
+    unlabelled.push({ kind: 'network', file: recorded });
+    const realDocker = requireRealDocker();
+    // The name is taken by someone else's network just before our create, so the daemon refuses it. The refusal is
+    // Docker 27.4's own text, and the shim makes the network with the real docker.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
-        + `'${realDocker}' network create "$last" >/dev/null; printf %s "$last" > '${recorded}'; `
+        + `printf '%s\\n' "$last" >> '${recorded}'; '${realDocker}' network create "$last" >/dev/null; `
         + `echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-network-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown;
+    let foreign = '', error: unknown, survived: boolean | Error = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
-      foreign = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
+      foreign = made[0] ?? '';
+      // afterAll reads the record again: the object may land after this removal (#189).
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (foreign) try { survived = objectExists('network', foreign); } catch (caught) { survived = caught as Error; }
+      for (const name of made) removeByName('network', name, 'finally');
+      rmSync(shim, { recursive: true, force: true });
+    }
     // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
+    // First, so a shim that no longer matches is reported as itself.
+    expect(foreign, 'the shim recorded no foreign network').not.toBe('');
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already exists/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
   it('removes a proxy that was created even though its start failed', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'proxy');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     // The proxy container is created, then its start fails: a container this allocation owns by ID.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = start ] && [ "$2" != --attach ]; then printf %s "$2" > '${recorded}'; `
@@ -127,35 +175,50 @@ describe('vendor-only egress', () => {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow('failed to start');
       proxyId = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const leaked = spawnSync('docker', ['container', 'inspect', proxyId], { stdio: 'ignore' }).status === 0;
-    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore' });
+    // First, so a shim that recorded something else is reported as itself.
     expect(proxyId).toMatch(/^[0-9a-f]{64}$/);
+    const leaked = objectExists('container', proxyId);
+    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore', ...CLIENT_LIMIT });
     expect(leaked).toBe(false);
   }, 60_000);
 
   it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
+    unlabelled.push({ kind: 'container', file: recorded });
+    const realDocker = requireRealDocker();
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
-        + `'${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; printf %s "$3" > '${recorded}'; fi`,
+        + `printf '%s\\n' "$3" >> '${recorded}'; '${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-proxy-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown;
+    let foreign = '', error: unknown, survived: boolean | Error = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
-      foreign = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
+      foreign = made[0] ?? '';
+      // afterAll reads the record again: the object may land after this removal (#189).
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (foreign) try { survived = objectExists('container', foreign); } catch (caught) { survived = caught as Error; }
+      for (const name of made) removeByName('container', name, 'finally');
+      rmSync(shim, { recursive: true, force: true });
+    }
     // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
+    // First, so a shim that no longer matches is reported as itself.
+    expect(foreign, 'the shim recorded no foreign proxy').not.toBe('');
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already in use|Conflict/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -177,27 +240,45 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
-    // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
+    unlabelled.push({ kind: 'container', file: recorded });
+    const realDocker = requireRealDocker();
+    // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup. Only an exec in a
+    // proxy: any other call passes through, so the shim never makes a stand-in with an empty, random name. Its exit 1
+    // with no stderr is invented, as an exec that failed: the code branches only on the status, and stderr goes only into
+    // the error message, which the test does not check.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
-      `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" | sed 's#^/##')`,
+      `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" 2>/dev/null | sed 's#^/##')`,
+      '  case "$name" in codeboost-proxy-*)',
       `  label=$('${realDocker}' inspect -f '{{index .Config.Labels "io.codeboost.egress"}}' "$2")`,
       `  '${realDocker}' rm --force "$2" >/dev/null`,
+      // Recorded before the stand-in exists, so the test can remove it even if the run is cut short.
+      `  printf '%s\\n' "$name" >> '${recorded}'`,
       `  '${realDocker}' run --detach --name "$name" --label "io.codeboost.egress=$label" --entrypoint sleep ${imageId} 300 >/dev/null`,
-      `  printf %s "$name" > '${recorded}'; exit 1`, 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+      '  exit 1;;', '  esac', 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const failing = captureInvocation({ ...invocation, attemptId: `failed-setup-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let impostor = '';
+    let impostor = '', survived: boolean | Error = false;
     try {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow();
-      impostor = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
+      // A record that cannot be read is reported, not thrown, so the body's own failure stays the one reported.
+      let made: string[] = [];
+      try { made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : []; }
+      catch (caught) { console.warn('finally: reading the record failed:', caught); }
+      impostor = made[0] ?? '';
+      // afterAll reads the record again: the object may land after this removal (#189).
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (impostor) try { survived = objectExists('container', impostor); } catch (caught) { survived = caught as Error; }
+      for (const name of made) removeByName('container', name, 'finally');
+      rmSync(shim, { recursive: true, force: true });
+    }
     expect(impostor).toMatch(/^codeboost-proxy-/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -205,12 +286,13 @@ describe('vendor-only egress', () => {
     const partial = captureInvocation({ ...invocation, attemptId: `partial-removal-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const created = await createVendorNetwork(partial, imageId, randomUUID()), blocker = `codeboost-blocker-${randomUUID()}`;
+    unlabelled.push({ kind: 'container', name: blocker });
     const [proxy, net] = vendorNetworkResources(created);
     expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
     expect(net).toMatchObject({ kind: 'network', name: created.name });
     // A foreign endpoint keeps the network busy, so the proxy is removed but `network rm` fails.
-    docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
     try {
+      docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
       await expect(removeVendorNetwork(created, 10_000)).rejects.toThrow('did not settle');
       expect(vendorNetworkResources(created)).toEqual([net]);
     } finally { spawnSync('docker', ['rm', '--force', blocker], { stdio: 'ignore' }); }
@@ -256,12 +338,12 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('does not forward arbitrary DNS even when the embedded resolver is addressed directly', async () => {
-    const result = spawnSync('docker', ['run', '--rm', `--network=${network.name}`, '--dns=127.0.0.1',
+    const result = spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${network.name}`, '--dns=127.0.0.1',
       '--entrypoint', 'node', imageId, '-e', [
         "const dns=require('node:dns');dns.setServers(['127.0.0.11']);",
         "dns.resolve4('example.com',(error)=>process.exit(error?0:1));",
         'setTimeout(()=>process.exit(0),3000);',
-      ].join('')], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      ].join('')], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
     expect(result.status).toBe(0);
   }, 30_000);
 
@@ -278,12 +360,14 @@ describe('vendor-only egress', () => {
     const otherInvocation = captureInvocation({ ...invocation, attemptId: 'concurrent-network-probe',
       deadline: Date.now() + 60_000 });
     const other = await createVendorNetwork(otherInvocation, imageId, randomUUID()), peer = `codeboost-peer-${randomUUID()}`;
+    // Tracked for afterAll: its create may land after the finally, and once the network is gone it is no holder (#189).
+    unlabelled.push({ kind: 'container', name: peer });
     try {
       docker('run', '--detach', '--name', peer, `--network=${network.name}`, '--network-alias', 'codeboost-peer',
         '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
-      const result = spawnSync('docker', ['run', '--rm', `--network=${other.name}`, '--entrypoint', 'node', imageId,
+      const result = spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${other.name}`, '--entrypoint', 'node', imageId,
         '-e', "const s=require('node:net').connect(4567,'codeboost-peer');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(2),3000)"],
-      { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
       expect(result.status).not.toBe(0);
     } finally {
       spawnSync('docker', ['rm', '--force', peer], { stdio: 'ignore' });
@@ -312,6 +396,8 @@ describe('vendor-only egress', () => {
       { Config: { Labels: Record<string, string> }; NetworkSettings: { Networks: Record<string, { IPAddress: string }> } };
     const allocation = inspected.Config.Labels['io.codeboost.egress'];
     const proxyIp = inspected.NetworkSettings.Networks[replacement.name]!.IPAddress;
+    // Tracked for afterAll: the stand-in has no runner label, and its create may land after the finally (#189).
+    unlabelled.push({ kind: 'container', name: replacement.proxyContainer });
     try {
       docker('rm', '--force', replacement.proxyContainer);
       // Same name, label, image, lockdown and IP as the original, so only the extra option and the object ID differ.

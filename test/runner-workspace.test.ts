@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { pathIdentityProbeArgs, probeTaskStoragePathIdentity, type TaskFilesystems } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
@@ -15,7 +15,7 @@ import { attemptRef, openRunnerRepository } from '../runner/runner-repository.ts
 import { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import { createTaskWorkspace } from '../runner/workspace.ts';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit as git } from './fixtures/git.ts';
 
 // F2b against the real lane D (#87): each item runs in fresh task storage cloned from the runner-owned repository, an
@@ -36,12 +36,15 @@ afterAll(() => {
     for (const store of stores) store.close();
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   } finally {
-    // Then remove the task storage and path identity probes this run still owns, even when a test failed or the cleanup
-    // above threw. It may not run before a hook timeout.
+    // Then remove the task storage and path identity probes this run still owns, and every container that holds one of
+    // their volumes or networks, even when a test failed or the cleanup above threw. It may not run before a hook
+    // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
+    // the cleanup before it.
     removeRunnerObjects(RUNNER_OWNER);
   }
-}, 4 * 60_000);
-const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}, 7 * 60_000);
+const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  ...CLIENT_LIMIT }).trim();
 
 async function setup(agent: Record<string, string>) {
   const root = mkdtempSync(join(tmpdir(), 'runner-workspace-')); roots.push(root);
@@ -163,7 +166,7 @@ describe('task storage path identity (#162)', () => {
   // run from another checkout) or a container a dead runner left behind does not count.
   async function watchedProbe() {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')); roots.push(shim);
-    const names = join(shim, 'names'), realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const names = join(shim, 'names'), realDocker = requireRealDocker();
     // Not a fake: it records the argument after each separate `--name` (the form the probe uses; if that changed, no name
     // is recorded and the test fails) and runs the real docker with the same arguments, so every exit status, stdout
     // and stderr the probe reads is Docker's own.
@@ -232,31 +235,30 @@ describe('task storage path identity (#162)', () => {
       expect(probe.volume).toMatch(/^[0-9a-f]{64}$/);
       expect(docker('volume', 'inspect', '--format', '{{json .Options}}', probe.volume)).toContain('size=1048576,nr_inodes=64,');
     } finally { if (probe) docker('rm', '--force', '--volumes', probe.name); }
-    expect(() => docker('volume', 'inspect', probe.volume)).toThrow();
+    expect(() => docker('volume', 'inspect', probe.volume)).toThrow(/no such volume/i);
   }, 120_000);
   it('removes a probe a killed runner left, with its volume, in the next startup\'s recovery, and no other runner\'s (#181)', async () => {
     // Tokens of their own: recovery removes every agent container of its runner, and this file's may have some.
     const mine = randomBytes(16).toString('hex'), theirs = randomBytes(16).toString('hex');
-    try {
-      const left = leftoverProbe(mine), other = leftoverProbe(theirs);
-      // Both parts carry the runner's token and the probe kind.
-      for (const labels of [docker('container', 'inspect', '--format', '{{json .Config.Labels}}', left.name),
-        docker('volume', 'inspect', '--format', '{{json .Labels}}', left.volume)])
-        expect(JSON.parse(labels)).toMatchObject({ 'io.codeboost.runner': mine, 'io.codeboost.probe': 'path-identity' });
-      // A container of this runner, named like a probe, without the probe kind label: reported, never removed.
-      const unmarked = `codeboost-path-identity-${randomUUID()}`;
-      docker('create', '--name', unmarked, '--label', `io.codeboost.runner=${mine}`, '--entrypoint', 'true', imageId);
-      const report = await recoverLeftovers(mine, 120_000, { unowned: false });
-      expect(report.removed.map(resource => resource.name).sort()).toEqual([left.name, left.volume].sort());
-      expect(() => docker('container', 'inspect', left.name)).toThrow(/No such container/);
-      expect(() => docker('volume', 'inspect', left.volume)).toThrow(/no such volume/i);
-      expect(report.unowned).toEqual([expect.objectContaining({ name: unmarked, reason: 'unknown-kind' })]);
-      for (const ref of [other.name, unmarked]) expect(docker('container', 'inspect', '--format', '{{.State.Status}}', ref)).toBe('created');
-      expect(docker('volume', 'inspect', '--format', '{{.Name}}', other.volume)).toBe(other.volume);
-    } finally {
-      removeRunnerObjects(mine);
-      removeRunnerObjects(theirs);
-    }
+    // This test's own random runners, so no sweep of this run finds them: each is swept when the test finishes, however
+    // it ends (a timed-out body runs on, and its finally may never run), with the sweep's own budget (#189).
+    for (const runner of [mine, theirs])
+      onTestFinished(() => removeRunnerObjects(runner, 'onTestFinished'), 6 * 60_000);
+    const left = leftoverProbe(mine), other = leftoverProbe(theirs);
+    // Both parts carry the runner's token and the probe kind.
+    for (const labels of [docker('container', 'inspect', '--format', '{{json .Config.Labels}}', left.name),
+      docker('volume', 'inspect', '--format', '{{json .Labels}}', left.volume)])
+      expect(JSON.parse(labels)).toMatchObject({ 'io.codeboost.runner': mine, 'io.codeboost.probe': 'path-identity' });
+    // A container of this runner, named like a probe, without the probe kind label: reported, never removed.
+    const unmarked = `codeboost-path-identity-${randomUUID()}`;
+    docker('create', '--name', unmarked, '--label', `io.codeboost.runner=${mine}`, '--entrypoint', 'true', imageId);
+    const report = await recoverLeftovers(mine, 120_000, { unowned: false });
+    expect(report.removed.map(resource => resource.name).sort()).toEqual([left.name, left.volume].sort());
+    expect(() => docker('container', 'inspect', left.name)).toThrow(/No such container/);
+    expect(() => docker('volume', 'inspect', left.volume)).toThrow(/no such volume/i);
+    expect(report.unowned).toEqual([expect.objectContaining({ name: unmarked, reason: 'unknown-kind' })]);
+    for (const ref of [other.name, unmarked]) expect(docker('container', 'inspect', '--format', '{{.State.Status}}', ref)).toBe('created');
+    expect(docker('volume', 'inspect', '--format', '{{.Name}}', other.volume)).toBe(other.volume);
   }, 120_000);
   it('runs only the image the trusted builder produced', async () => {
     await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`, RUNNER_OWNER)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');

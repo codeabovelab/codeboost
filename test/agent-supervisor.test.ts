@@ -1,11 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { removeRunnerObjects } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, objectExists, removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput } from '../agents/adapters/codex.ts';
 import { ACKNOWLEDGEMENT_SCRIPT, isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
@@ -30,6 +30,11 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
 const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
+/**
+ * Containers without this run's runner label, by name, removed in afterAll should their create land after their test's
+ * finally (#189).
+ */
+const unlabelled = new Set<string>();
 let imageId = '';
 const git = fixtureGit;
 
@@ -70,6 +75,7 @@ async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
 beforeAll(async () => { imageId = buildAgentImage(); }, 10 * 60_000);
 afterAll(async () => {
   try {
+    for (const name of unlabelled) removeByName('container', name, 'afterAll');
     for (const profile of profiles) await disposeContainerProfile(profile);
     for (const allocation of allocations.reverse()) removeTaskFilesystems(allocation);
     for (const root of roots.reverse()) {
@@ -79,9 +85,11 @@ afterAll(async () => {
   } finally {
     // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
     // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout.
+    // The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for the
+    // cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 3 * 60_000);
+}, 7 * 60_000);
 
 describe('container invocation supervisor', () => {
   it('preserves the first cancellation reason while retained setup cleanup settles', async () => {
@@ -330,7 +338,7 @@ describe('container invocation supervisor', () => {
   const hangingDocker = (match: string) => {
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-slow-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
-    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    const realDocker = requireRealDocker();
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh', `case "$*" in ${match}) exec sleep 60;; esac`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     return `${shim}:${process.env.PATH}`;
@@ -385,20 +393,30 @@ describe('container invocation supervisor', () => {
 
   it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = await profile(fixture(), 'finite-output', 'foreign-name');
-    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
-      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189). Tracked
+    // for afterAll too, should its create land after that.
+    unlabelled.add(current.name);
+    onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
+    let passed = false;
     try {
+      // Inside the try, so its removal runs even if the create's client fails after the daemon made it (#189).
+      execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
+        '--entrypoint', 'true', imageId], { stdio: 'ignore', ...CLIENT_LIMIT });
       const result = await startProfileInvocation(current).settled;
       expect(result.stopReason).toBe('capture-failure');
       expect(result.stderr).toMatch(/already in use|Conflict/);
       expect(result.unreleased).toBeUndefined();
       expect(isInvocationActive(attempt('foreign-name'))).toBe(false);
       expect(isContainerProfileAuthentic(current)).toBe(false);
-      expect(spawnSync('docker', ['network', 'inspect', current.network.name], { stdio: 'ignore' }).status).not.toBe(0);
+      expect(objectExists('network', current.network.name)).toBe(false);
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
+      passed = true;
     } finally {
-      execFileSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
+      // A failure above stays the one reported, whatever exit status this Docker version gives for a missing name. After
+      // a pass the container exists, and its removal must succeed, as on main.
+      const removed = spawnSync('docker', ['rm', '--force', current.name], { encoding: 'utf8', ...CLIENT_LIMIT });
+      if (passed && removed.status !== 0) throw new Error(`docker rm --force ${current.name} failed: ${removed.error?.message ?? (removed.signal ? `killed by ${removed.signal}` : removed.stderr?.trim())}`);
     }
   }, 3 * 60_000);
 
@@ -436,9 +454,13 @@ describe('container invocation supervisor', () => {
   it('releases only the profile when rejecting before creation, even if its name is held elsewhere', async () => {
     const current = await profile(fixture(), 'noop');
     // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
-    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
-      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+    // Removed by name when the test finishes, timeouts included: its label value is shared across runs (#189). Tracked
+    // for afterAll too, should its create land after that.
+    unlabelled.add(current.name);
+    onTestFinished(() => removeByName('container', current.name, 'onTestFinished'), 90_000); // two calls of up to 30 s
     try {
+      execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
+        '--entrypoint', 'true', imageId], { stdio: 'ignore', ...CLIENT_LIMIT });
       await expectRejected(startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 }), 'ceiling');
       expect(isContainerProfileAuthentic(current)).toBe(false);
       expect(spawnSync('docker', ['container', 'inspect', current.name], { stdio: 'ignore' }).status).toBe(0);
@@ -641,11 +663,15 @@ describe('container invocation supervisor', () => {
   it('writes the deferred output acknowledgement idempotently, repairing a partial one', () => {
     const token = randomUUID(), file = `/run/codeboost-control/collected-${token}`;
     const name = `codeboost-ack-script-${randomUUID()}`;
-    execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
-      '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
-      '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
-      imageId, '120'], { stdio: 'ignore' });
+    // Tracked before it is made: it has no labels, and a create that lands after its client was killed is never started,
+    // so `--rm` does not apply and only removal by name finds it (#189).
+    unlabelled.add(name);
     try {
+      // Inside the try: the container has no labels, so the finally below removes it, and afterAll by name (#189).
+      execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
+        '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
+        '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
+        imageId, '120'], { stdio: 'ignore', ...CLIENT_LIMIT });
       const acknowledge = () => spawnSync('docker', ['exec', '--user', '0', name, 'node', '-e', ACKNOWLEDGEMENT_SCRIPT,
         token], { encoding: 'utf8' });
       const content = () => execFileSync('docker', ['exec', name, 'cat', file], { encoding: 'utf8' });
