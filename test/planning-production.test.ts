@@ -500,13 +500,28 @@ describe('the planning check (#164)', () => {
     } finally { process.off('uncaughtException', uncaught); }
   });
 
+  it('lets many requests wait on one check without a listener warning', async () => {
+    let pass!: () => void;
+    const check = new PlanningCheck(() => new Promise<void>(resolve => { pass = resolve; }), () => 'claude');
+    const warnings: string[] = [], warned = (warning: Error) => warnings.push(warning.name);
+    process.on('warning', warned);
+    try {
+      const waiting = Array.from({ length: 20 }, () => check.admit(signal()));
+      await new Promise(resolve => setTimeout(resolve, 10));
+      pass();
+      await Promise.all(waiting);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(warnings).not.toContain('MaxListenersExceededWarning');
+    } finally { process.off('warning', warned); }
+  });
+
   it('starts no check after close', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
     const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
     check.start();
     await check.close();
     vendor = 'codex';
-    await expect(check.admit(signal())).rejects.toThrow('Planning is stopping.');
+    await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     expect(() => check.assertPassed()).toThrow('still checking');
     await new Promise(resolve => setImmediate(resolve));
     expect(probe).toHaveBeenCalledTimes(1);

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setMaxListeners } from 'node:events';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { GuardRefusal } from './lifecycle.ts';
 import { AgentWorker, type Provider } from './question-agent.ts';
@@ -30,8 +31,9 @@ export function isPlanningProbeAnswer(text: string): boolean {
 /**
  * The production planning provider (#117): every request runs in planning's own worker thread, so lane D's synchronous
  * setup never blocks the server. The worker's TMPDIR is a planning root recorded in a ledger beside the review
- * database, and every Docker object it creates carries the database's planning owner. The first request of a process
- * removes what earlier sessions left, by that owner only, so Ask's and the runner's agents are never touched.
+ * database, and every Docker object it creates carries the database's planning owner. The first job of a process (the
+ * planning check at startup, or the first request) removes what earlier sessions left, by that owner only, so Ask's
+ * and the runner's agents are never touched.
  *
  * The code is the review's repository at the current snapshot's head; E3 discards a reply whose snapshot or revision
  * changed meanwhile. The vendor is the one chosen in Settings for Ask; Codex is refused (#93).
@@ -115,6 +117,8 @@ export class PlanningCheck {
   readonly #events = new EventTarget();
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
     options: { recheckMs?: number; waitMs?: number } = {}) {
+    // One listener per waiting request and per running check, each removed when it ends: many at once are no leak.
+    setMaxListeners(0, this.#events, this.#abort.signal);
     this.#probe = probe; this.#vendor = vendor;
     this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
   }
@@ -133,7 +137,7 @@ export class PlanningCheck {
   #check(vendor: Provider) {
     const covering = this.#covering(vendor);
     if (covering) return covering;
-    if (this.#abort.signal.aborted) throw new GuardRefusal('Planning is stopping.');
+    if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     // A check for another vendor no longer admits anything: stop it, so replaced checks do not pile up in the worker.
     if (this.#current && !this.#current.passed && !this.#current.failure) {
       this.#current.replaced = true;
