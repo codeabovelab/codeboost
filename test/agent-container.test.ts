@@ -47,6 +47,8 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
+/** The test-run IDs `withoutRunnerLabel` put on objects it made without the runner label (#189). */
+const testRuns: string[] = [];
 const profiles: Awaited<ReturnType<typeof createContainerProfile>>[] = [];
 let imageId = '';
 const vendorNetworks: VendorNetwork[] = [];
@@ -145,8 +147,9 @@ afterAll(async () => {
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
-    // volumes; those tests remove their own (`withoutRunnerLabel` when the test finishes). It may not run before a hook
-    // timeout.
+    // volumes: those made through `withoutRunnerLabel` are found by their test-run IDs, and the other tests remove
+    // their own. It may not run before a hook timeout.
+    for (const testRun of testRuns) removeLabelledObjects(TEST_RUN_LABEL, testRun, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
 }, 120_000);
@@ -626,13 +629,16 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
-  // creates is genuinely mislabelled and only the owner-label checks can catch it. Neither afterAll's runner sweep nor
-  // production cleanup finds such an object, so the wrapper labels it with a test-run ID instead, and the test removes
-  // everything with that ID when it finishes, passed, failed or timed out (#189).
+  // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup refuses such an
+  // object, and afterAll's runner sweep finds it only while it holds one of this run's volumes, so the wrapper labels it
+  // with a test-run ID instead (#189). Whatever has that ID is removed when the test finishes, passed, failed or timed
+  // out, and again in afterAll, for a create that lands after a timed-out test's removal (its body runs on).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
-    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'));
+    testRuns.push(testRun);
+    // Each Docker call may take 30 s, so the removal gets more than the 10 s a hook gets by default.
+    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 3 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -691,22 +697,26 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   // #189: these two run in order. The first stops after making a keeper without its runner label, before the removal
-  // its sibling test above ends with; the second checks that the keeper went when the first finished.
+  // its sibling test above ends with; the second checks that the keeper went when the first finished. `it.fails` passes
+  // on any failure, so the first records the storage only once its checks passed, just before its deliberate stop.
   let stoppedEarly: ReturnType<typeof fixture> | undefined;
   it.fails('stops after making a keeper without its runner label (expected to fail)', async () => {
-    stoppedEarly = await withoutRunnerLabel([['create', '--name']], () => fixture());
-    const keeper = JSON.parse(docker('container', 'inspect', stoppedEarly.filesystems.keeper))[0] as
+    const data = await withoutRunnerLabel([['create', '--name']], () => fixture());
+    const keeper = JSON.parse(docker('container', 'inspect', data.filesystems.keeper))[0] as
       { Config: { Labels: Record<string, string> } };
     expect(keeper.Config.Labels).not.toHaveProperty('io.codeboost.runner');
     expect(keeper.Config.Labels).toHaveProperty(TEST_RUN_LABEL);
+    stoppedEarly = data;
     throw new Error('This test stops before it removes the keeper.');
   }, 60_000);
 
   it('removed the keeper that a test without its runner label left when it stopped', () => {
+    expect(stoppedEarly, 'the test before did not reach its deliberate stop').toBeDefined();
     const left = stoppedEarly!.filesystems, allocationId = taskFilesystemOwner(left).allocationId;
+    // First, so afterAll does not refuse a keeper this test finds left; its runner sweep removes what is.
+    taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
     expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore' }).status).not.toBe(0);
     // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
-    taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
     removeTaskFilesystems(left);
     expect(byAllocation(allocationId)).toEqual([]);
   }, 60_000);

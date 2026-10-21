@@ -20,7 +20,8 @@ export function removeRunnerObjects(runnerOwner: string): void {
  * use. Before it removes a volume it also removes every container that mounts it, labelled or not: a test can make a
  * volume with one owner and the container that holds it without that owner. Containers and volumes go by force; a
  * network that another container still uses stays. It reports what it finds and any Docker call that fails, prefixed
- * with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s limit.
+ * with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s limit, so
+ * all seven can take up to 3.5 minutes.
  */
 export function removeLabelledObjects(label: string, value: string, when: string): void {
   const run = (args: string[]) => {
@@ -34,7 +35,8 @@ export function removeLabelledObjects(label: string, value: string, when: string
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${ids.join(' ')}`);
     if (kind === 'volume') {
-      const holders = [...new Set(ids.flatMap(id => run(['ps', '--all', '--quiet', '--filter', `volume=${id}`])))];
+      // Filters with one key match any of their values.
+      const holders = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `volume=${id}`])]);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
         run(['rm', '--force', ...holders]);
