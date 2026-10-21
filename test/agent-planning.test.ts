@@ -56,5 +56,6 @@ describe('planning in the agent container', () => {
     const owner = owners.at(-1)!;
     for (const kind of ['container', 'volume', 'network'])
       expect(docker(kind, 'ls', ...(kind === 'container' ? ['-a'] : []), '--quiet', '--filter', `label=io.codeboost.runner=${owner}`).stdout.trim(), kind).toBe('');
+    expect(existsSync(`${realpathSync(service.config.database)}.planning-leftovers.json`)).toBe(false);
   }, 11 * 60_000);
 });

@@ -470,6 +470,36 @@ describe('the planning check (#164)', () => {
     expect(count).toBe(3);
   });
 
+  it('moves a waiting request to a newer check at once, without waiting for the replaced one to stop', async () => {
+    let vendor: 'claude' | 'codex' = 'claude', count = 0;
+    // The first check ignores its cancellation, as a worker job stuck in a synchronous build does; the third passes.
+    const check = new PlanningCheck(() => { count += 1; return count === 3 ? Promise.resolve() : new Promise<void>(() => undefined); },
+      () => vendor, { waitMs: 5_000 });
+    const started = performance.now(), waiting = check.admit(signal());
+    vendor = 'codex';
+    void check.admit(signal()).catch(() => undefined);
+    vendor = 'claude';
+    void check.admit(signal()).catch(() => undefined);
+    await expect(waiting).resolves.toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(2_000);
+    await check.close(10);
+  });
+
+  it('never throws from the deferred check when the Store cannot be read', async () => {
+    let fail = false;
+    const probe = vi.fn(async () => undefined);
+    const check = new PlanningCheck(probe, () => { if (fail) throw new Error('database is closed'); return 'claude'; });
+    const uncaught = vi.fn();
+    process.on('uncaughtException', uncaught);
+    try {
+      expect(() => check.assertPassed()).toThrow('still checking');
+      fail = true;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalled();
+    } finally { process.off('uncaughtException', uncaught); }
+  });
+
   it('starts no check after close', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
     const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
@@ -484,18 +514,18 @@ describe('the planning check (#164)', () => {
 
   it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    // Claude's check passes at 500 ms, after the vendor changed; Codex's never ends.
+    // Claude's check passes at 1 s, after the vendor changed; Codex's never ends.
     const check = new PlanningCheck(probed => new Promise<void>(resolve => {
-      if (probed === 'claude') setTimeout(resolve, 500);
-    }), () => vendor, { waitMs: 600 });
+      if (probed === 'claude') setTimeout(resolve, 1_000);
+    }), () => vendor, { waitMs: 1_200 });
     const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
     await new Promise(resolve => setTimeout(resolve, 100));
     vendor = 'codex';
-    // One deadline ends the wait at 600 ms; a fresh 600 ms for Codex would end it at 1.1 s.
+    // One deadline ends the wait at 1.2 s; a fresh 1.2 s for Codex would end it at 2.2 s.
     const refusal = await waiting;
     expect(refusal).toBeInstanceOf(GuardRefusal);
     expect((refusal as Error).message).toContain('still checking');
-    expect(performance.now() - started).toBeLessThan(950);
+    expect(performance.now() - started).toBeLessThan(1_900);
     await check.close(10);
   });
 
@@ -512,7 +542,7 @@ describe('the planning check (#164)', () => {
     const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry shortly.`);
     expect(issueAccess).not.toHaveBeenCalled();
     pass();
     await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });

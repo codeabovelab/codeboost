@@ -91,7 +91,8 @@ export const PLANNING_CHECK_CLOSE_MS = 20_000;
 type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number };
   abort: AbortController; replaced?: boolean };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
-const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`;
+const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry shortly.`;
+const duration = (ms: number) => ms === 60_000 ? 'a minute' : `${Math.max(1, Math.round(ms / 1_000))} s`;
 /**
  * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at
  * startup, and `admit`, called before anything about a request is recorded, waits for it. The last check is kept: a
@@ -108,6 +109,8 @@ export class PlanningCheck {
   readonly #abort = new AbortController();
   readonly #running = new Set<Promise<void>>();
   #current?: Check;
+  // Settles when `#current` is replaced, so a request waiting on an older check moves to the new one at once.
+  #replaced = Promise.withResolvers<void>();
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
     options: { recheckMs?: number; waitMs?: number } = {}) {
     this.#probe = probe; this.#vendor = vendor;
@@ -148,6 +151,8 @@ export class PlanningCheck {
     this.#running.add(done);
     void done.finally(() => this.#running.delete(done));
     this.#current = check;
+    this.#replaced.resolve();
+    this.#replaced = Promise.withResolvers<void>();
     return check;
   }
   /**
@@ -168,14 +173,15 @@ export class PlanningCheck {
       });
       if (signal.aborted) release();
       let outcome: void | 'timeout';
-      try { outcome = await Promise.race([check.done, stopped]); }
+      try { outcome = await Promise.race([check.done, this.#replaced.promise, stopped]); }
       finally { signal.removeEventListener('abort', release); clearTimeout(timer); }
       if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
-      // Settings changed while this request waited, or its check was replaced and cancelled (the vendor changed and
-      // changed back): check the vendor it will run with, within the same wait.
-      if (this.#vendor() !== vendor || check.replaced) continue;
+      // Settings changed while this request waited, or its check was replaced (the vendor changed and changed back):
+      // check the vendor it will run with, within the same wait.
+      if (this.#vendor() !== vendor || check.replaced || check !== this.#current) continue;
+      if (!check.passed && !check.failure) continue;
       // This request's own check: a recheck started since must not replace the outcome it waited for.
-      return PlanningCheck.#verdict(check);
+      return this.#verdict(check);
     }
   }
   /**
@@ -187,19 +193,19 @@ export class PlanningCheck {
     const vendor = this.#vendor();
     if (!vendor) return;
     const covering = this.#covering(vendor);
-    if (covering) return PlanningCheck.#verdict(covering);
+    if (covering) return this.#verdict(covering);
     // The vendor chosen then, which Settings may have changed again since.
     setImmediate(() => {
-      const now = this.#vendor();
-      try { if (now) this.#check(now); } catch { /* stopping: nothing to start */ }
+      // Never throws: an exception here would end the process. A Store that cannot be read starts nothing.
+      try { const now = this.#vendor(); if (now) this.#check(now); } catch { /* stopping, or no Store: nothing to start */ }
     });
     throw new GuardRefusal(STILL_CHECKING);
   }
-  static #verdict(check: Check): void {
+  #verdict(check: Check): void {
     if (check.passed) return;
     // The reason comes last and as it is: some end with a command a person may copy.
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
-      + 'it checks again on the next request after a minute. '
+      + `it checks again on the next request after ${duration(this.#recheckMs)}. `
       + `The check said: ${messageOf(check.failure.error)}`);
     throw new GuardRefusal(STILL_CHECKING);
   }
