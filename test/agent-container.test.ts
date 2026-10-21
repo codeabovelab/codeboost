@@ -780,6 +780,11 @@ describe('real Docker agent isolation', () => {
         .toContain(bystanders[0]);
       expect(docker('container', 'inspect', '--format', '{{.Id}}', holders[0]!.slice(0, 12))).toBe(holderLookalike);
       expect(docker('network', 'inspect', '--format', '{{.Id}}', network.slice(0, 12))).toBe(lookalike);
+      // And an inspect naming a missing container exits non-zero yet prints the others, the answer the shim below gives.
+      const partial = spawnSync('docker', ['container', 'inspect', '--format', '{{.Id}}', holders[0]!, `codeboost-gone-${randomUUID()}`],
+        { encoding: 'utf8' });
+      expect(partial.status).not.toBe(0);
+      expect(partial.stdout).toContain(holders[0]);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
@@ -2431,7 +2436,7 @@ describe('real Docker agent isolation', () => {
       for (const runner of runners) removeRunnerObjects(runner, 'test');
       if (failures.length) throw new AggregateError(failures, 'Recovery test cleanup failed.');
     }
-  }, 14 * 60_000);
+  }, 15 * 60_000);
 
   it('exports through a recovery handle after a restart, then removes the storage by that handle', async () => {
     const data = fixture({ hostile: agentBase });
@@ -2503,8 +2508,9 @@ describe('real Docker agent isolation', () => {
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
       // Never throws, so a failure above is the one reported: the volumes carry the runner label, so afterAll's sweep
-      // removes what this leaves.
+      // removes what this leaves, and the keeper with another runner's label goes by its allocation (#189).
       try { removeTaskFilesystems(filesystems); } catch { /* removed by afterAll's runner sweep */ }
+      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
   }, 60_000);
 
