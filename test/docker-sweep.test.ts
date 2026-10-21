@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { removeLabelledObjects } from './fixtures/docker-sweep.ts';
+import { removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 
 // The test sweep's handling of output it cannot read (#189). The `docker` on PATH answers as no real daemon does: for
 // `network ls` it prints a line that is not JSON, a JSON null and one network without a name, and it answers every
@@ -22,7 +22,7 @@ it('skips output that is not a network, reports what is not JSON, and never thro
   { mode: 0o755 });
   process.env.PATH = `${root}:${savedPath}`;
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  expect(() => removeLabelledObjects('io.codeboost.test-run', 'x', 'test')).not.toThrow();
+  expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test')).not.toThrow();
   expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: docker printed a line that is not JSON:');
   // Nothing it could not read is removed or looked up as a holder.
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);

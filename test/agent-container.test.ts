@@ -809,6 +809,7 @@ describe('real Docker agent isolation', () => {
       for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
         spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
     }
+  // The budget covers the sweep's worst case and ordinary Docker calls, not every call at its own 60 s limit.
   }, 8 * 60_000);
 
   // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after
@@ -2508,11 +2509,12 @@ describe('real Docker agent isolation', () => {
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
       // Never throws, so a failure above is the one reported: the volumes carry the runner label, so afterAll's sweep
-      // removes what this leaves, and the keeper with another runner's label goes by its allocation (#189).
+      // removes what this leaves, and the keeper with another runner's label goes by its allocation (#189). The sweep may
+      // take up to 5.5 minutes, which the test's budget allows for.
       try { removeTaskFilesystems(filesystems); } catch { /* removed by afterAll's runner sweep */ }
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
-  }, 60_000);
+  }, 7 * 60_000);
 
   it('refuses task storage that belongs to another runner', async () => {
     const data = fixture(), allocationId = randomUUID();
