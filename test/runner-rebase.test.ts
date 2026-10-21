@@ -744,11 +744,18 @@ describe('trusted pre-merge rebase', () => {
       expect(error?.message).toBe('Task cancelled.');
     });
 
-    it('keeps retained resource ownership ahead of a trust-read timeout and a later cancel', async () => {
+    // The second row's cause is neither a timeout nor gh's answer, so only the precedence of retained ownership keeps it
+    // from being reported as the pending cancel.
+    it.each([
+      ['a trust-read timeout', () => new RemoteTimeout('Issue retrieval timed out.'),
+        /retained resources for startup recovery: Issue trust could not be verified: Issue retrieval timed out/],
+      ['a failure of another kind', () => new Error('The trust read failed.'),
+        /retained resources for startup recovery: Issue trust could not be verified: The trust read failed/],
+    ] as const)('keeps retained resource ownership ahead of %s and a later cancel', async (_case, failure, message) => {
       const s = await setup('foreign'), attemptId = randomUUID(), stop = new AbortController();
       let pending = false;
       const runner = createRebaser(s, { resolveForeignConflict: async input => {
-        const read = trustRead(input.signal!, new RemoteTimeout('Issue retrieval timed out.'));
+        const read = trustRead(input.signal!, failure());
         stop.abort(new Error('Task cancelled.'));
         pending = input.signal!.aborted;
         // The resolver's cleanup did not settle, so it retains its resources, as createConflictResolver reports it.
@@ -759,7 +766,7 @@ describe('trusted pre-merge rebase', () => {
       const error = await run(s, runner, attemptId, stop.signal);
       expect(pending).toBe(true);
       expect(error).toBeInstanceOf(RebaseResourcesUnsettled);
-      expect(error?.message).toMatch(/retained resources for startup recovery: Issue trust could not be verified: Issue retrieval timed out/);
+      expect(error?.message).toMatch(message);
       expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(true);
     });
   });
