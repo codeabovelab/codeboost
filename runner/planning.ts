@@ -117,7 +117,7 @@ export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
  * startup, and `admit`, called before anything about a request is recorded, waits for it. The last check is kept: a
  * passed one admits every request for its vendor; a failed one refuses them for `recheckMs`, after which the next
  * request checks again. The first request after the vendor changes starts that vendor's check and cancels the one it
- * replaces. A request waits for a check for at most `waitMs` in all, then is refused as still starting. With no vendor
+ * replaces. A request waits for a check for at most `waitMs` in all, then is refused as still checking. With no vendor
  * chosen nothing is checked, and the request is refused later, as before, with `NO_PLANNING_AGENT`.
  */
 export class PlanningCheck {
@@ -254,15 +254,16 @@ export class PlanningCheck {
     if (check.passed) return;
     // After close no check starts, so no recheck can be promised.
     if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
-    // Codex is refused whatever happens (#93); only choosing another agent helps, and that starts its check at once.
-    if (check.failure && check.vendor === 'codex')
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choosing another `
-        + `agent in Settings checks it at once. The check said: ${messageOf(check.failure.error)}`);
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
       throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `
         + `of codeboost can change that. The check said: ${messageOf(check.failure.error)}`);
+    // Codex is refused whatever happens (#93): only choosing another agent helps, and the next request checks that
+    // one. A restart-only reason above keeps its own wording.
+    if (check.failure && check.vendor === 'codex')
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choose another `
+        + `agent in Settings, and the next planning request checks it. The check said: ${messageOf(check.failure.error)}`);
     if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; `
       + `it checks again on the next request after ${duration(this.#recheckMs)}. `
       + `The check said: ${messageOf(check.failure.error)}`);

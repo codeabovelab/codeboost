@@ -191,8 +191,8 @@ function parse(text: string, naming: WorkerNaming): LedgerRecord {
  * Durable record of a feature's host copies (worker roots) that outlived their worker, and the review's lock for that
  * feature. Docker leftovers need no record: the feature labels them with the review's own owner token for it, and the
  * first job of each process that can sign in (for planning, usually its startup check, #164) removes them through lane
- * D's scoped recovery (#51 item 4, #65). Ask and planning each
- * have their own ledger, lock and owner, so neither one's recovery or refusals affect the other (#117).
+ * D's scoped recovery (#51 item 4, #65). Ask and planning each have their own ledger, lock and owner, so neither one's
+ * recovery or refusals affect the other (#117).
  */
 export class LeftoverLedger {
   readonly path: string;

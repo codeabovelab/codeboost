@@ -595,7 +595,7 @@ describe('the planning check (#164)', () => {
   it('tells Codex to choose another agent, not to wait for a recheck', async () => {
     const check = new PlanningCheck(async () => { throw new Error('Codex cannot write plans yet.'); }, () => 'codex');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choosing another agent in Settings checks it at once. The check said: Codex cannot write plans yet.`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed; choose another agent in Settings, and the next planning request checks it. The check said: Codex cannot write plans yet.`);
   });
 
   it('waits on close for a timed-out check\'s probe to stop, within its bound', async () => {
