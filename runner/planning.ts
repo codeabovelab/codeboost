@@ -82,7 +82,10 @@ export class PlanningAgent implements AuthorProvider {
   close(): Promise<void> { return this.#worker.close(); }
 }
 
-/** Starts every refusal from planning admission: a failed or unfinished check, a stopped wait, and planning stopping. */
+/**
+ * Starts every refusal from planning admission, such as a failed or unfinished check, a vendor changed since the
+ * request was admitted, a stopped wait, a Store that cannot be read, and planning stopping.
+ */
 export const PLANNING_UNAVAILABLE = 'Planning is unavailable:';
 /** How long a failed check refuses requests before the next request checks again. */
 export const PLANNING_RECHECK_MS = 60_000;
@@ -148,7 +151,7 @@ export class PlanningCheck {
     const vendor = this.#vendor();
     if (vendor) this.#check(vendor);
   }
-  // The current check if it covers `vendor`: for that vendor, and not failed `recheckMs` ago.
+  // The current check if it covers `vendor`: for that vendor, and passed, running, or failed less than `recheckMs` ago.
   #covering(vendor: Provider) {
     const current = this.#current;
     return current && current.vendor === vendor
@@ -194,7 +197,7 @@ export class PlanningCheck {
     return check;
   }
   /**
-   * Resolve once the check for the vendor chosen now has passed; reject with a `GuardRefusal` naming why when it
+   * Resolve once the check for the vendor chosen now has passed, or at once when no vendor is chosen; reject with a `GuardRefusal` naming why when it
    * failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
    * requests may share: an aborted wait rejects with `signal.reason`, and a vendor that cannot be read (a Store error)
    * with that error; the caller maps both.
@@ -219,7 +222,6 @@ export class PlanningCheck {
         moved = () => resolve('replaced'); this.#events.addEventListener('replaced', moved, { once: true });
         timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - performance.now()));
       });
-      if (signal.aborted) release();
       let outcome: void | 'timeout' | 'replaced';
       try { outcome = await Promise.race([check.done, stopped]); }
       finally {
