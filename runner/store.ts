@@ -2323,8 +2323,9 @@ export class Store {
   }
   /**
    * At startup: a job the server stopped running cannot continue. If it had asked GitHub to merge, its merge attempt's
-   * recorded state is its outcome (a refusal blocks the task, as the job would have); otherwise it fails, and the person
-   * merges again.
+   * recorded state is its outcome (a refusal blocks the task, as the job would have). Otherwise it fails, and the person
+   * merges again, or, when the person had cancelled the merge, it ends cancelled ("Task cancelled." if the task was
+   * cancelled too).
    */
   settleInterruptedMergeJobs(identity: PlanIdentity): void {
     const running = this.runningMergeJob(identity);
