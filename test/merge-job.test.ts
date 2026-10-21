@@ -1751,7 +1751,8 @@ it('refuses a merge-only cancel while the task itself is being cancelled, and th
   const job = await f.coordinator.start('review-token', randomUUID());
   await held.started;
   f.store.cancelTask(identity, f.store.getTask(identity).stateVersion, randomUUID());
-  expect(f.store.getTask(identity).cancelRequested ?? f.store.getTask(identity).status).toBeTruthy();
+  const task = f.store.getTask(identity);
+  expect(task.status === 'cancelled' || task.cancelRequested !== null).toBe(true);
   expect(() => f.coordinator.cancelMerge(job.id)).toThrow(new GuardRefusal('The task is being cancelled.'));
   expect(f.store.getMergeJob(identity, job.id)?.cancelRequested).toBeUndefined();
   f.coordinator.cancel();

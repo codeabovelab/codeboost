@@ -1102,6 +1102,10 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
  await cancel.click();
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.');
  await expect(page.locator('#merge')).toHaveText('Merging…');
+ // The next poll answers the same record: the refusal stays, as the only explanation of the enabled Cancel.
+ const polled=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
+ await polled;await page.waitForTimeout(200);
+ await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.');
 });
 test('disables Cancel once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);

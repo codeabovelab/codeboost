@@ -297,7 +297,9 @@ async function pollMergeQueue(generation) {
         const changed = job.revision !== data.merge.job.revision || job.step !== data.merge.job.step
           || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
         data = { ...data, merge: { ...data.merge, job } };
-        $("banner").textContent = mergeJobText(job);
+        // A cancel's refusal stays in the banner until the job's record changes: it is the only explanation of a Cancel
+        // that stayed enabled.
+        if (mergeCancelRefusalFor !== `${job.id}:${job.revision}`) { mergeCancelRefusalFor = null; $("banner").textContent = mergeJobText(job); }
         if (!changed) backOffMergePoll();
         renderMerge();
         return;
@@ -351,6 +353,8 @@ const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running
   failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
 /** The ID of the job a cancel request is on its way for, or null. */
 let mergeCancelPending = null;
+/** `id:revision` of the job record whose cancel refusal the banner shows, or null. */
+let mergeCancelRefusalFor = null;
 let mergeStepTimer = null;
 function mergeStepElapsed(step, now = Date.now()) {
   if (!step.startedAt) return "";
@@ -443,10 +447,13 @@ $("merge-cancel").onclick = async () => {
     adopt(error.job);
     // Only while the job this cancel was for is still shown running: an outcome the poll showed meanwhile, or a newer
     // job, says more than the refusal.
-    if (data?.merge?.job?.id === job.id && data.merge.job.state === "running")
+    if (data?.merge?.job?.id === job.id && data.merge.job.state === "running") {
       $("banner").textContent = `Could not cancel the merge. ${error.message}`;
+      mergeCancelRefusalFor = `${job.id}:${data.merge.job.revision}`;
+    }
   } finally {
-    mergeCancelPending = null;
+    // Only this cancel's own pending state: a later cancel of a newer job keeps its own.
+    if (mergeCancelPending === job.id) mergeCancelPending = null;
     renderMerge();
     if (pollNow) {
       if (mergePollInFlight?.generation === mergeGeneration) {
