@@ -129,7 +129,7 @@ Use only these entry points to run an agent:
        an OAuth subscription token pays, and the CLI has no flag that limits the tokens of a whole run. 50 turns is
        about 12 s for each turn in the ten-minute budget; a planning run reads files and answers, so most turns are
        reads. Lower it if runs are seen to loop; raise it only with a recorded run that needs more.
-     The other phases do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
+     - *Other phases.* They do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
