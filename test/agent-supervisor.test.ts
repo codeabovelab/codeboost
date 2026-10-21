@@ -413,7 +413,7 @@ describe('container invocation supervisor', () => {
       // A failure above stays the one reported, whatever exit status this Docker version gives for a missing name. After
       // a pass the container exists, and its removal must succeed, as on main.
       const removed = spawnSync('docker', ['rm', '--force', current.name], { encoding: 'utf8', ...CLIENT_LIMIT });
-      if (passed && removed.status !== 0) throw new Error(`Removing ${current.name} failed: ${removed.error?.message ?? (removed.signal ? `killed by ${removed.signal}` : removed.stderr?.trim())}`);
+      if (passed && removed.status !== 0) throw new Error(`docker rm --force ${current.name} failed: ${removed.error?.message ?? (removed.signal ? `killed by ${removed.signal}` : removed.stderr?.trim())}`);
     }
   }, 3 * 60_000);
 

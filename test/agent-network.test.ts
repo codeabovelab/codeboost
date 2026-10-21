@@ -140,10 +140,11 @@ describe('vendor-only egress', () => {
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
+    // First, so a shim that no longer matches is reported as itself.
+    expect(foreign, 'the shim recorded no foreign network').not.toBe('');
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already exists/);
-    expect(foreign, 'the shim recorded no foreign network').not.toBe('');
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -197,10 +198,11 @@ describe('vendor-only egress', () => {
       rmSync(shim, { recursive: true, force: true });
     }
     // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
+    // First, so a shim that no longer matches is reported as itself.
+    expect(foreign, 'the shim recorded no foreign proxy').not.toBe('');
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already in use|Conflict/);
-    expect(foreign, 'the shim recorded no foreign proxy').not.toBe('');
     expect(survived).toBe(true);
   }, 60_000);
 

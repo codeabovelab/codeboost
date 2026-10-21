@@ -979,7 +979,8 @@ describe('real Docker agent isolation', () => {
     const listing = spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
       { encoding: 'utf8', ...CLIENT_LIMIT });
     // A listing that failed fails here with its cause, as main's helper did.
-    expect(listing.status, listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr)).toBe(0);
+    expect(listing.status, `docker network ls --filter label=io.codeboost.allocation=${allocationId} failed: `
+      + (listing.error?.message ?? (listing.signal ? `killed by ${listing.signal}` : listing.stderr))).toBe(0);
     const left = listing.stdout.trim();
     expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
     const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
