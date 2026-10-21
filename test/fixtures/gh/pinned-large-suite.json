@@ -2,7 +2,7 @@
   "gh": "gh version 2.102.0 (2026-09-30)",
   "repository": "microsoft/vscode",
   "pullRequest": 343099,
-  "recordedAt": "2026-10-21T02:14:52.164Z",
+  "recordedAt": "2026-10-21T02:46:52.833Z",
   "calls": [
     {
       "args": [
@@ -33,7 +33,7 @@
         "{total_count, check_suite: {id: .check_runs[0].check_suite.id, head_sha: .check_runs[0].head_sha}, app: {id: .check_runs[0].app.id}}"
       ],
       "exitCode": 0,
-      "stdout": "{\"app\":{\"id\":15368},\"check_suite\":{\"head_sha\":\"b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f\",\"id\":107124344927},\"total_count\":101}\n",
+      "stdout": "{\"app\":{\"id\":15368},\"check_suite\":{\"head_sha\":\"b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f\",\"id\":107124344927},\"total_count\":116}\n",
       "stderr": ""
     }
   ]

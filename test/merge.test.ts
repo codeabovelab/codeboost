@@ -1091,6 +1091,9 @@ it('ignores required reviews in both rule sources and reads only their required 
  * Inspects a pull request whose one required check is `test`, from any app or, with `appId`, from that app, and whose head
  * has these observed runs and statuses in gh's rollup. `checkRuns` answers the read of a pinned check's runs: the head's
  * check suites, or a function of the call's arguments that answers or throws; without it that read is unexpected.
+ * The other answers have gh 2.102.0's shapes (test/fixtures/gh/) and leave out fields the gateway does not read on this
+ * path: the pull request's `url`; each rule's source fields and `do_not_enforce_on_create`; and the branch's `name`,
+ * `commit`, links and `protection` (read only when the branch is protected).
  */
 async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null, checkRuns?: readonly Suite[] | ((args: readonly string[]) => string | Promise<string>)) {
   const run = async (args: readonly string[]) => {
@@ -1099,7 +1102,8 @@ async function requiredTestState(statusCheckRollup: unknown[], appId: number | n
     if (checkRuns !== undefined && isCheckRunRead(args)) return typeof checkRuns === 'function' ? checkRuns(args) : checkRunsAnswer(args, checkRuns);
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: appId }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
-    if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
+    // gh 2.102.0's 404 for a branch no classic protection covers (zero-checks.json), as runWithInput reports it.
+    if (joined.endsWith('/protection')) throw NOT_PROTECTED;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
   };
@@ -1355,7 +1359,8 @@ it('does not read pinned checks when the rules are unknown, so the rules blocker
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: appLessPass });
-    if (isCheckRunRead(args)) { reads++; throw ghExit('gh: Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug.', ''); }
+    // Never answered: the read must not run. Shaped as gh 2.102.0 exits on a GraphQL error (stdout: GitHub's response).
+    if (isCheckRunRead(args)) { reads++; throw ghExit('gh: Something went wrong while executing your query.', '{"data":null,"errors":[{"message":"Something went wrong while executing your query."}]}'); }
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     // Classic protection whose `strict` is malformed: the rules are unknown, after the ruleset's pinned check was read.

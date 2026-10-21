@@ -489,7 +489,12 @@ it('merge-state inspection reports the first stage\'s gh exit when a stopped pin
   // stage ends with the pinned-check read (#176). The list's gh exit comes first and stops that read; gh then exits on
   // its own with another error while it is stopping, which runWithInput reports instead of the abort (#48).
   const first = new CommandFailed('gh failed (exit 1): gh: Bad credentials (HTTP 401)', 'gh: Bad credentials (HTTP 401)', '{"message":"Bad credentials","status":"401"}');
-  const later = new CommandFailed('gh failed (exit 1): gh: Something went wrong while executing your query.', 'gh: Something went wrong while executing your query.', '');
+  // gh 2.102.0 exits 1 on a GraphQL error, with `gh: <message>` on stderr and GitHub's response on stdout. This error's
+  // text is GitHub's usual one; it was not reproduced here (GitHub gives it only on its own failures), and the gateway
+  // reads only that this is gh's own exit, not its text.
+  const wentWrong = 'Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug. Please include `0000:0000:0000000:0000000:00000000` when reporting this issue.';
+  const laterBody = JSON.stringify({ data: null, errors: [{ message: wentWrong }] });
+  const later = new CommandFailed(`gh failed (exit 1): gh: ${wentWrong}\n${laterBody}`, `gh: ${wentWrong}`, laterBody);
   const pinnedStarted = deferred();
   let pinnedStopReason: unknown;
   const run: Run = async (args, options) => {

@@ -7,6 +7,7 @@ import type { ReviewService } from '../runner/review.ts';
 import { Store } from '../runner/store.ts';
 import { commandDigest } from '../runner/checks.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
+import { CommandFailed } from '../github/run-with-input.ts';
 import { loadRecording, replayGh, type RecordedGh } from './fixtures/gh/recorded.ts';
 
 // T12: required checks read from GitHub's real answers, recorded by scripts/record-merge-gh.ts with gh 2.102.0 from the
@@ -123,23 +124,32 @@ it('reads a check both a ruleset and classic protection require once, with a tok
   expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [{ context: 'vite-ecosystem-ci', appId: 2935623, state: 'success' }] });
 });
 
-// Pinned-check reads on public commits whose rules pin no check, recorded 2026-10-21 with gh 2.102.0 by a script that
-// ran the gateway with the fake pull request and ruleset of `inspectPinned` below and sent only the pinned-check read to
-// the real gh. Each file also holds a REST read that shows what makes the commit a case worth recording.
+// Pinned-check reads on public commits whose rules pin no check, recorded 2026-10-21 with gh 2.102.0 by
+// scripts/record-pinned-gh.ts, which runs the gateway with the same fake pull request and rules as `inspectPinned` below
+// and sends only the pinned-check read to the real gh. Each file also holds a REST read that shows what makes the
+// commit a case worth recording.
 // - pinned-rerun: codeabovelab/codeboost commit e3697dd (PR 151's head). REST's list of every run (`filter=all`) shows
 //   suite 102552054061 ran `test` twice: failed at 21:54, passed when re-run at 22:02.
-// - pinned-large-suite: microsoft/vscode commit b3aa5cb (PR 343099's head). REST counts 101 runs in GitHub Actions
-//   suite 107124344927, more than one page of runs holds.
+// - pinned-large-suite: microsoft/vscode commit b3aa5cb (PR 343099's head). REST counts more than 100 runs in GitHub
+//   Actions suite 107124344927, more than one page of runs holds.
 const pinnedRecordings = { rerun: loadRecording('pinned-rerun'), largeSuite: loadRecording('pinned-large-suite') };
-/** Inspects `recording`'s head with `context` pinned to `appId`; only the pinned-check read is answered from the recording. */
+/**
+ * Inspects `recording`'s head with `context` pinned to `appId`; only the pinned-check read is answered from the recording.
+ * The other answers follow the shapes gh 2.102.0 gave in zero-checks.json for a branch no classic protection covers:
+ * the branch read with `name`, `protected` and `protection`, and the protection read's 404 "Branch not protected", as
+ * runWithInput reports it. The pull request read leaves out `url` and gives an empty rollup: the gateway reads `url`
+ * only for display, and a pinned check is never matched from the rollup. The ruleset leaves out each rule's
+ * `ruleset_source_type`, `ruleset_source`, `ruleset_id` and `do_not_enforce_on_create`, which the gateway does not read.
+ */
 async function inspectPinned(recording: RecordedGh, head: string, context: string, appId: number) {
   const replay = replayGh(recording);
+  const notProtected = '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}';
   const run: RunGh = async (args, options) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ number: recording.pullRequest, isDraft: false, baseRefName: 'main', baseRefOid: '0'.repeat(40), headRefName: 'x', headRefOid: head, state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: '0'.repeat(40), headRefName: 'x', headRefOid: head, isDraft: false, mergeable: 'MERGEABLE', number: recording.pullRequest, state: 'OPEN', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context, integration_id: appId }] } }]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
-    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: false, protection: { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } });
+    if (joined.endsWith('/protection')) throw new CommandFailed(`gh failed (exit 1): gh: Branch not protected (HTTP 404)\n${notProtected}`, 'gh: Branch not protected (HTTP 404)', notProtected);
     return replay(args, options);
   };
   const state = await new GhMergeGateway({ repository: recording.repository, pullRequest: recording.pullRequest, issue: 1 }, run, clearCheck(recording.repository)).inspect({ fresh: true });
@@ -164,7 +174,8 @@ it('reads a pinned check from an app whose suite has more than 100 runs', async 
   const { largeSuite } = pinnedRecordings;
   expect(largeSuite.gh).toBe('gh version 2.102.0 (2026-09-30)');
   const count = JSON.parse(largeSuite.calls.find(call => call.args[1]!.includes('/check-suites/'))!.stdout) as { total_count: number; app: { id: number }; check_suite: { id: number; head_sha: string } };
-  expect(count).toEqual({ total_count: 101, app: { id: 15368 }, check_suite: { id: 107124344927, head_sha: 'b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f' } });
+  // The suite had 101 runs when the review found it and 116 when this was recorded, later the same day.
+  expect(count).toEqual({ total_count: 116, app: { id: 15368 }, check_suite: { id: 107124344927, head_sha: 'b3aa5cb6d1d0267f1b60cbb0bffaba898c83ad3f' } });
   // GitHub filters the runs by name, so that suite answers with only the one run asked for.
   const suites = pinnedAnswer(largeSuite).data.repository.object.c0.nodes;
   expect(suites.map(suite => suite.checkRuns.totalCount).sort()).toEqual([0, 0, 0, 0, 1]);
