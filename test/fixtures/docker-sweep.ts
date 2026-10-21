@@ -17,11 +17,11 @@ export function removeRunnerObjects(runnerOwner: string): void {
 
 /**
  * Removes the containers, networks and volumes that carry `label=value`, containers first, as they hold the others in
- * use. Before it removes a volume it also removes every container that mounts it, labelled or not: a test can make a
- * volume with one owner and the container that holds it without that owner. Containers and volumes go by force; a
- * network that another container still uses stays. It reports what it finds and any Docker call that fails, prefixed
- * with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s limit, so
- * all seven can take up to 3.5 minutes.
+ * use. Before it removes a network or a volume it also removes every container attached to it or mounting it, labelled
+ * or not: a test can make a network or volume with one owner and the container that holds it with another, or without
+ * one. Containers and volumes go by force; a network another container joins meanwhile stays. It reports what it finds
+ * and any Docker call that fails, prefixed with `when`, and never throws, so cleanup can call it without hiding an
+ * earlier error. Each call has a 30 s limit, so all ten can take up to 5 minutes.
  */
 export function removeLabelledObjects(label: string, value: string, when: string): void {
   const run = (args: string[]) => {
@@ -31,12 +31,14 @@ export function removeLabelledObjects(label: string, value: string, when: string
     return result.status === 0 ? result.stdout.split('\n').filter(Boolean) : [];
   };
   for (const kind of ['container', 'network', 'volume'] as const) {
-    const ids = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter', `label=${label}=${value}`]);
+    // Networks by name: `ps --filter network=` finds a created, never started container by the name only (Docker 27.4).
+    const ids = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network' ? ['--format', '{{.Name}}']
+      : ['--quiet']), '--filter', `label=${label}=${value}`]);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${ids.join(' ')}`);
-    if (kind === 'volume') {
+    if (kind !== 'container') {
       // Filters with one key match any of their values.
-      const holders = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `volume=${id}`])]);
+      const holders = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `${kind}=${id}`])]);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
         run(['rm', '--force', ...holders]);

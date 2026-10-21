@@ -184,8 +184,10 @@ describe('vendor-only egress', () => {
       `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" | sed 's#^/##')`,
       `  label=$('${realDocker}' inspect -f '{{index .Config.Labels "io.codeboost.egress"}}' "$2")`,
       `  '${realDocker}' rm --force "$2" >/dev/null`,
+      // Recorded before the stand-in exists, so the test can remove it even if the run is cut short.
+      `  printf %s "$name" > '${recorded}'`,
       `  '${realDocker}' run --detach --name "$name" --label "io.codeboost.egress=$label" --entrypoint sleep ${imageId} 300 >/dev/null`,
-      `  printf %s "$name" > '${recorded}'; exit 1`, 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+      '  exit 1', 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const failing = captureInvocation({ ...invocation, attemptId: `failed-setup-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;

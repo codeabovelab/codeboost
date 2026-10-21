@@ -147,8 +147,9 @@ afterAll(async () => {
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
-    // volumes: those made through `withoutRunnerLabel` are found by their test-run IDs, and the other tests remove
-    // their own. It may not run before a hook timeout.
+    // volumes or networks: those made through `withoutRunnerLabel` are found by their test-run IDs, and the other tests
+    // remove their own. It may not run before a hook timeout, and its budget does not cover every Docker call taking
+    // its full 30 s.
     for (const testRun of testRuns) removeLabelledObjects(TEST_RUN_LABEL, testRun, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
@@ -630,15 +631,16 @@ describe('real Docker agent isolation', () => {
 
   // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
   // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup refuses such an
-  // object, and afterAll's runner sweep finds it only while it holds one of this run's volumes, so the wrapper labels it
-  // with a test-run ID instead (#189). Whatever has that ID is removed when the test finishes, passed, failed or timed
-  // out, and again in afterAll, for a create that lands after a timed-out test's removal (its body runs on).
+  // object, and afterAll's runner sweep finds it only while it holds one of this run's volumes or networks, so the
+  // wrapper labels it with a test-run ID instead (#189). Whatever has that ID is removed when the test finishes, passed,
+  // failed or timed out, and again in afterAll, for a create that lands after a timed-out test's removal (its body runs
+  // on).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
     testRuns.push(testRun);
-    // Each Docker call may take 30 s, so the removal gets more than the 10 s a hook gets by default.
-    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 3 * 60_000);
+    // Up to ten Docker calls of 30 s each, so the removal gets their worst case, not the 10 s a hook gets by default.
+    onTestFinished(() => removeLabelledObjects(TEST_RUN_LABEL, testRun, 'onTestFinished'), 5 * 60_000);
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
