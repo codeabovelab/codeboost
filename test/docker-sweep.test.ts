@@ -34,7 +34,9 @@ it('skips output that is not a network, reports what is not JSON, and never thro
 it('reads nothing from a docker call that was killed, whose output may be cut short', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
-  // A well-formed network line, then the client is killed by a signal before it exits by itself.
+  // A well-formed network line, then the client is killed by a signal before it exits by itself. The line holds only
+  // the fields the sweep reads (Docker 27.4 also prints CreatedAt, Driver, IPv6, Internal, Labels and Scope); every
+  // other call gets no output and exit 0, as Docker 27.4 gives for `ls` with no match.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${'a'.repeat(64)}","Name":"swept"}'; kill -9 $$; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
