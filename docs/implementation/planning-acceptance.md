@@ -108,15 +108,18 @@ before. Shutdown cancels a running check and waits up to 20 s for it before
 closing the worker; that wait comes after the server's own 20 s grace for planning
 requests, so the two add up. A check that has not settled within a real request's
 budget and a minute fails, so the recheck applies to it. A reason that holds until
-codeboost restarts (an abandoned worker, cleanup that did not settle, a database
-with other hard links, a missing token) gets no promise of a recheck, and Codex is
-told to choose another agent. A recheck joins the worker's one startup recovery,
-so a recovery that never ends fails each recheck until codeboost restarts. A
-passed check is kept for the life of the process: a worker abandoned later, or a
-token revoked later, shows as a failed request. A check deferred from the Store's
-transaction can start during shutdown, before planning closes; close then waits
-for it within its bound. If startup fails after planning's setup, the CLI exits,
-and the next start's planning recovery removes what the check left. Tests:
+codeboost restarts (an abandoned worker, cleanup codeboost could not confirm, a
+database with other hard links, a missing token) gets no promise of a recheck, and
+Codex is told to choose another agent. A recheck joins the worker's one startup
+recovery, so a recovery that never ends fails each recheck until codeboost
+restarts. A passed check is kept until a check for another vendor replaces it: a
+worker abandoned later, cleanup that did not settle (the check's own run included,
+when its answer still came back), or a token revoked later, shows as a failed
+request. A refusal recorded when a request stopped waiting is replayed if the
+browser resends the same action. A check deferred from the Store's transaction can
+start during shutdown, before planning closes; close then waits for it within its
+bound. If startup fails after planning's setup, the CLI exits, and the next
+start's planning recovery removes what the check left. Tests:
 `test/planning-production.test.ts` ("the planning check (#164)", with a check that
 passes, one that fails and one that does not finish),
 `test/planning-worker.test.ts` (the check in planning's worker, including a wrong

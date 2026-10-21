@@ -543,11 +543,17 @@ describe('the planning check (#164)', () => {
 
   it.each([
     ['a database file with other hard links', 'Planning is off: the review database /r/db has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.'],
-    ['its own cleanup that did not settle', 'Planning agent timed out. Cleanup also did not settle: docker rm failed'],
   ])('promises no recheck for %s, which only a restart can change', async (_label, reason) => {
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
     expect((refusal as Error).message).toContain('only a restart of codeboost can change that');
+  });
+
+  it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
+    const reason = 'Claude could not write the plan. Claude said: no Cleanup also did not settle: docker volume rm failed';
+    const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
+    const refusal = await check.admit(signal()).catch((error: unknown) => error);
+    expect((refusal as Error).message).toContain('it checks again on the next request after a minute');
   });
 
   it('keeps the recheck promise when only the vendor\'s output mentions a restart', async () => {

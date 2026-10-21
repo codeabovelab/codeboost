@@ -99,10 +99,11 @@ const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the 
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
   : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
 // Reasons a recheck cannot help, so only a restart can: an abandoned worker (question-agent.ts), unconfirmed cleanup
-// (planning-provider.ts, and the check's own cleanup that did not settle, after which planning stays off), a database
-// file with other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while
-// it runs. Matched only on codeboost's own text, before any vendor output.
-const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links|did not settle/;
+// (planning-provider.ts' "off until codeboost restarts"), a database file with other hard links (question-leftovers.ts),
+// and a missing token, since codeboost's environment is fixed while it runs. Each is codeboost's own message, given
+// before any vendor output. A run whose cleanup did not settle is not among them: its storage is retried before the
+// next run, and if planning did go off, the recheck reports that with these words.
+const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
 const ownText = (message: string) => message.split(' Claude said:')[0]!;
 /**
  * How long one check may take before it fails: a real request's budget, as the probe has, and a minute for the worker
@@ -196,12 +197,15 @@ export class PlanningCheck {
    * requests may share: an aborted wait rejects with `signal.reason`, and a vendor that cannot be read (a Store error)
    * with that error; the caller maps both.
    *
-   * A passed check is kept for the life of the process: a worker that is abandoned later, cleanup that does not settle
-   * later, or a token revoked later shows as a failed request, not as "Planning is unavailable".
+   * A passed check is kept until a check for another vendor replaces it: a worker that is abandoned later, cleanup that
+   * does not settle later (the check's own run included, when its answer still came back), or a token revoked later
+   * shows as a failed request, not as "Planning is unavailable".
    */
   async admit(signal: AbortSignal): Promise<void> {
     const deadline = performance.now() + this.#waitMs;
     for (;;) {
+      // A request that stopped waiting starts, replaces or cancels no check.
+      signal.throwIfAborted();
       const vendor = this.#vendor();
       if (!vendor) return;
       const check = this.#check(vendor);
