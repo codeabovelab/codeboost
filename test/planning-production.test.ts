@@ -384,7 +384,7 @@ describe('the planning check (#164)', () => {
   it('checks nothing while no agent is chosen, then checks the vendor chosen before its first request', async () => {
     const { deps, service, probe, issueAccess } = checked(async () => undefined, null);
     expect(probe).not.toHaveBeenCalled();
-    // No vendor: the request goes on, and the agent refuses it later with NO_PLANNING_AGENT, as before.
+    // No vendor: the request goes on, and fails later with NO_PLANNING_AGENT, as before.
     await deps.describe(signal());
     expect(probe).not.toHaveBeenCalled();
     service.store.setQuestionProvider('claude');

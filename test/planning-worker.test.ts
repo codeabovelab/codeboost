@@ -192,6 +192,6 @@ it('passes the planning check only with exactly the schema\'s answer', () => {
   expect(isPlanningProbeAnswer('{"ok":true}')).toBe(true);
   expect(isPlanningProbeAnswer(' { "ok": true }\n')).toBe(true);
   for (const text of ['', 'ok', 'true', '{"ok":false}', '{"ok":"true"}', '{"ok":true,"extra":1}', '[{"ok":true}]', 'null', '{}',
-    '{"ok":false,"ok":true}', '{"o\\u006b":true}'])
+    '{"ok":false,"ok":true}', '{"o\\u006b":true}', '\uFEFF{"ok":true}', '{\u00a0"ok":true}'])
     expect(isPlanningProbeAnswer(text)).toBe(false);
 });

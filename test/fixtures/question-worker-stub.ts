@@ -41,7 +41,9 @@ parentPort!.on('message', (message: WorkerRequest) => {
   // A planning job carries a ReadOnlyRun; the stub reads the same fields from either kind (#117).
   const job = message.type === 'ask' ? message.question : { ...message.run, noteId: message.run.taskId };
   const { prompt, provider, noteId, attemptId } = job;
-  // The planning check (#164) passes with the schema's own answer.
+  // The planning check (#164) passes with the schema's own answer, given at once and compact, as the real worker returns
+  // Claude CLI 2.1.281's structured_output (live probe run 39541887939). The stub leaves out cancellation and the
+  // worker's feature check: it never leaves a check pending, and plan() refuses a non-planning worker first.
   if (message.type === 'plan' && message.run.taskId.startsWith('planning-probe-')) {
     // The agent answers the check only when asked for it: the prompt names the answer and the schema requires it.
     const asked = message.run.prompt.includes('{"ok": true}') && message.run.schemaText.includes('"ok":{"const":true}');

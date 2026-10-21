@@ -26,7 +26,7 @@ export const PLANNING_PROBE_SCHEMA = JSON.stringify({ type: 'object', properties
  * once (JSON.parse would let a repeated key's last value win).
  */
 export function isPlanningProbeAnswer(text: string): boolean {
-  return /^\s*\{\s*"ok"\s*:\s*true\s*\}\s*$/.test(text);
+  return /^[ \t\n\r]*\{[ \t\n\r]*"ok"[ \t\n\r]*:[ \t\n\r]*true[ \t\n\r]*\}[ \t\n\r]*$/.test(text);
 }
 
 /**
@@ -81,7 +81,7 @@ export class PlanningAgent implements AuthorProvider {
   close(): Promise<void> { return this.#worker.close(); }
 }
 
-/** Starts with this text when planning is refused because its check failed or has not finished. */
+/** Starts every refusal from planning admission: a failed or unfinished check, a stopped wait, and planning stopping. */
 export const PLANNING_UNAVAILABLE = 'Planning is unavailable:';
 /** How long a failed check refuses requests before the next request checks again. */
 export const PLANNING_RECHECK_MS = 60_000;
@@ -118,7 +118,7 @@ export const PLANNING_CHECK_TIMEOUT_MS = PLANNING_BUDGET_MS + 60_000;
  * passed one admits every request for its vendor; a failed one refuses them for `recheckMs`, after which the next
  * request checks again. The first request after the vendor changes starts that vendor's check and cancels the one it
  * replaces. A request waits for a check for at most `waitMs` in all, then is refused as still checking. With no vendor
- * chosen nothing is checked, and the request is refused later, as before, with `NO_PLANNING_AGENT`.
+ * chosen nothing is checked, and the request fails later, as before, with `NO_PLANNING_AGENT`.
  */
 export class PlanningCheck {
   readonly #probe: (vendor: Provider, signal: AbortSignal) => Promise<void>;
