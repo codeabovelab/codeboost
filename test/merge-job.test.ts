@@ -1844,3 +1844,13 @@ it('does not tell the step list again when a resend joins a merge click still in
   expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
   expect(hold.calls()).toBe(1);
 });
+
+it('keeps the Merge step waiting when the merge attempt cannot be saved, since GitHub was not asked', async () => {
+  const f = setup();
+  f.store.beginMergeAttempt = (() => { throw new Error('disk I/O error'); }) as typeof f.store.beginMergeAttempt;
+  await f.coordinator.start('review-token', randomUUID());
+  const done = await settled(f.coordinator);
+  expect(done.state).toBe('failed');
+  expect(stepStates(done)).toMatchObject({ 'already-fixed': 'failed', merge: 'pending' });
+  expect(f.gh.merged).toEqual([]);
+});

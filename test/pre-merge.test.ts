@@ -939,6 +939,44 @@ it('refuses to record a head moved before preparation when the task changes whil
   await coordinator.close();
 });
 
+it('reports Rebase and Push skipped when neither the base nor the head moved', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-unmoved-')); roots.push(root);
+  const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
+  fixtureGit(repository, 'config', 'user.name', 'Test'); fixtureGit(repository, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repository, 'a.txt'), 'base\n'); fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'base');
+  const base = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-qc', 'feature');
+  writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-am', 'feature', '-q');
+  const head = fixtureGit(repository, 'rev-parse', 'HEAD');
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const config = { database: join(root, 'review.sqlite'), repository, runnerRepository: repository, identity,
+    pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' as const } };
+  const service = new ReviewService(config); services.push(service);
+  const plan: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'One change', questions: [], items: [{ id: 'P1',
+    title: 'Change a', intent: 'Change a', files: [{ path: 'a.txt', kind: 'edit', renamed_from: null, change: 'Change it' }],
+    acceptance: [{ type: 'check', text: 'a changed' }], depends_on: [] }] };
+  const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands: [] };
+  service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
+  let view = await service.load();
+  service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
+  markRunnerOwned(service);
+  view = await service.load(); view = await service.act({ action: 'approve', item: 'P1', token: view.token });
+  // GitHub shows the reviewed pair: nothing to rebase and nothing to push.
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => ({ base, head }), fetch: async () => undefined, ...unusedPush });
+  const task = service.store.getTask(identity);
+  const events: string[] = [];
+  const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id,
+    base, head }, (step, state) => { events.push(`${step}:${state}`); });
+  expect(result).toMatchObject({ state: 'ready', base, head });
+  expect(events).toEqual(['fetch:running', 'fetch:done', 'rebase:skipped', 'push:skipped', 'commands:skipped']);
+  await coordinator.close();
+});
+
 it('refreshes the moved head against its prior base when the PR base and head advance together', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
