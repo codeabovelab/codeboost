@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { CommandFailed } from '../../../github/run-with-input.ts';
+import { ghFailedExit } from '../gh-answers.ts';
 import type { RunGh } from '../../../github/merge.ts';
 
 /**
@@ -40,8 +40,7 @@ export function replayGh(...recordings: RecordedGh[]): RunGh & { calls: string[]
     // The gateway may turn this failure into unknown rules, so callers also assert `unrecorded` is empty.
     if (!answer) { unrecorded.push([...args]); throw new Error(`No recorded answer for gh ${args.join(' ')}`); }
     if (answer.exitCode === 0) return answer.stdout;
-    throw new CommandFailed(`gh failed (exit ${answer.exitCode}): ${answer.stderr.slice(0, 2000)}${answer.stdout ? `\n${answer.stdout.slice(0, 2000)}` : ''}`,
-      answer.stderr, answer.stdout);
+    throw ghFailedExit(answer.exitCode, answer.stderr, answer.stdout);
   };
   return Object.assign(run, { calls, unrecorded });
 }
