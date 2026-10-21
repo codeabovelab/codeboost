@@ -396,9 +396,13 @@ it('marks a failed preparation stale when its final remote inspection was invali
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
-it('leaves an unsettled conflict and its rebase marker for startup recovery', async () => {
-  const fixture = await rebaseFixture('feature\n', undefined, { unsettledRebase: true });
+it('leaves an unsettled conflict and its rebase marker for startup recovery, and saves its message as the action\'s reason', async () => {
+  const actionId = randomUUID();
+  const fixture = await rebaseFixture('feature\n', undefined, { unsettledRebase: true, actionId });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Conflict resources remain owned.' });
+  // The saved prepare-merge answer carries the RebaseResourcesUnsettled message, as a resend replays it.
+  expect(fixture.service.store.savedAction(fixture.service.config.identity, { actionId, kind: 'prepare-merge', request: fixture.actionRequest })?.response)
+    .toMatchObject({ outcome: 'failed', reason: 'Conflict resources remain owned.' });
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(fixture.rebaseAborts()).toBe(0);
   expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).not.toBeNull();
