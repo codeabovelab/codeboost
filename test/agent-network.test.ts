@@ -143,6 +143,7 @@ describe('vendor-only egress', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already exists/);
+    expect(foreign, 'the shim recorded no foreign network').not.toBe('');
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -199,6 +200,7 @@ describe('vendor-only egress', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already in use|Conflict/);
+    expect(foreign, 'the shim recorded no foreign proxy').not.toBe('');
     expect(survived).toBe(true);
   }, 60_000);
 

@@ -317,7 +317,7 @@ describe('CI workflows', () => {
     const job = live.jobs['live-probes']!;
     // No `defaults`, `env`, `strategy` or `container`: any of them could change what the steps run.
     expect(Object.keys(job).toSorted()).toEqual(['runs-on', 'steps', 'timeout-minutes']);
-    expect(job).toMatchObject({ 'runs-on': 'ubuntu-latest', 'timeout-minutes': 90 });
+    expect(job).toMatchObject({ 'runs-on': 'ubuntu-latest', 'timeout-minutes': 100 });
     const token = { CLAUDE_CODE_OAUTH_TOKEN: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}' };
     expect(job.steps.map(step => Object.keys(step).toSorted())).toEqual([['env', 'name', 'run'], ['uses'], ['uses', 'with'],
       ['run'], ['env', 'name', 'run'], ['name', 'run']]);
