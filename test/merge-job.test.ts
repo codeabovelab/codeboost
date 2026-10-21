@@ -1802,3 +1802,45 @@ it('does not tell the step list again when a merge click is replayed from its sa
   expect(told).toBe(0);
   expect(f.gh.merged).toEqual([oid(2)]);
 });
+
+it('marks Fetch failed when preparation stops for review while fetching, leaving later steps waiting', async () => {
+  const f = setup(), held = holdPreparation(f);
+  await f.coordinator.start('review-token', randomUUID());
+  await held.started;
+  held.finish('review-required', 'The pull request head moved; attribution and approvals were refreshed.');
+  const done = await settled(f.coordinator);
+  expect(done.state).toBe('review-required');
+  expect(stepStates(done)).toMatchObject({ fetch: 'failed', rebase: 'pending', checks: 'pending', merge: 'pending' });
+});
+
+it('leaves the job running, deciding nothing, when an inspection answers a failing check after shutdown began', async () => {
+  const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }] });
+  const status = f.merges.status.bind(f.merges);
+  let answered = 0;
+  f.merges.status = (async () => {
+    const read = await status(undefined, true);
+    // Shutdown's first step arrives while GitHub's answer is on its way; the read ignores it and answers.
+    f.coordinator.stop(); answered++;
+    return read;
+  }) as typeof f.merges.status;
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await vi.waitFor(() => expect(answered).toBe(1));
+  await f.coordinator.close();
+  expect(f.store.getMergeJob(identity, job.id)).toMatchObject({ state: 'running' });
+  expect(f.store.getTask(identity).status).toBe('in review');
+});
+
+it('does not tell the step list again when a resend joins a merge click still in progress', async () => {
+  const hold = holdGatewayMerge();
+  const f = setup({ merge: hold.merge });
+  const job = await f.coordinator.start('review-token', randomUUID());
+  await hold.started;
+  const mergeId = f.store.getMergeJob(identity, job.id)!.mergeActionId!;
+  let told = 0;
+  const joined = f.merges.merge('review-token', mergeId, undefined, () => { told++; });
+  hold.release();
+  await joined;
+  expect(told).toBe(0);
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'merged' });
+  expect(hold.calls()).toBe(1);
+});

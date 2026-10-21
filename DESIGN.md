@@ -176,7 +176,7 @@ components:
 | 1280–1439px | The conversation pane collapses to a tab. The plan list narrows to 208px |
 | Below 1280px | A notice asks for a wider window |
 
-**Frame:** a 44px app bar (the shared menu, design review D13), then a 48px review strip (issue, PR, revision, progress, blockers), then full-height panes. Panes can be resized and collapsed.
+**Frame:** a 44px app bar (the shared menu, design review D13), then a 48px review strip (issue, PR, revision, progress, blockers), then, while a merge job runs and until the review reloads, the merge step bar, then full-height panes. Panes can be resized and collapsed.
 
 **Rhythm:** a 4px base grid. Rows are 32px. Pane padding is 12px. Space between sections is 16px or 24px. Keep density tight inside lists and give the code pane the most room.
 
