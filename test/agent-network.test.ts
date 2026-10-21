@@ -9,16 +9,22 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { removeByName, removeRunnerObjects, requireRealDocker } from './fixtures/docker-sweep.ts';
+import { removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
+/**
+ * On the unnamed `run --rm` containers that join a vendor network (#189): a client killed after the create but before
+ * the start leaves a container `--rm` never removes, which is no holder once its network is gone (Docker 27.4 removes
+ * a network a created, never started container still names). afterAll sweeps this label.
+ */
+const TEST_FILE_RUN = randomUUID(), fileLabel = ['--label', `${TEST_FILE_LABEL}=${TEST_FILE_RUN}`];
 
 let imageId = '', network: VendorNetwork, invocation: InvocationInput;
 const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
-const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm', `--network=${network.name}`,
+const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${network.name}`,
   '--env', `HTTPS_PROXY=${network.proxyUrl}`, ...(direct ? ['--env', 'NO_PROXY=*'] : []),
   '--entrypoint', 'curl', imageId, '--silent', '--show-error', '--output', '/dev/null', '--write-out', '%{http_code}',
   '--max-time', '15', url], { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -54,14 +60,15 @@ afterAll(async () => {
   }
   finally {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
-    // makes without the runner label are found here only while they hold one of this run's networks or volumes; the
-    // tests remove their own, and the try above removes those registered in `unlabelled`. It may not run before a hook
-    // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
-    // the cleanup before it.
+    // makes without the runner label are found here only while they hold one of this run's networks or volumes, or
+    // carry this file's run ID; the tests remove their own, and the try above removes those registered in
+    // `unlabelled`. It may not run before a hook timeout. The hook's 13 minutes leave two over the worst case of these
+    // two sweeps (eleven calls of 30 s each), for the cleanup before them.
+    removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
     if (records) rmSync(records, { recursive: true, force: true });
   }
-}, 7 * 60_000);
+}, 13 * 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {
@@ -303,7 +310,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('does not forward arbitrary DNS even when the embedded resolver is addressed directly', async () => {
-    const result = spawnSync('docker', ['run', '--rm', `--network=${network.name}`, '--dns=127.0.0.1',
+    const result = spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${network.name}`, '--dns=127.0.0.1',
       '--entrypoint', 'node', imageId, '-e', [
         "const dns=require('node:dns');dns.setServers(['127.0.0.11']);",
         "dns.resolve4('example.com',(error)=>process.exit(error?0:1));",
@@ -328,7 +335,7 @@ describe('vendor-only egress', () => {
     try {
       docker('run', '--detach', '--name', peer, `--network=${network.name}`, '--network-alias', 'codeboost-peer',
         '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
-      const result = spawnSync('docker', ['run', '--rm', `--network=${other.name}`, '--entrypoint', 'node', imageId,
+      const result = spawnSync('docker', ['run', '--rm', ...fileLabel, `--network=${other.name}`, '--entrypoint', 'node', imageId,
         '-e', "const s=require('node:net').connect(4567,'codeboost-peer');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(2),3000)"],
       { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
       expect(result.status).not.toBe(0);

@@ -2787,6 +2787,8 @@ describe('real Docker agent isolation', () => {
   it('rejects a new endpoint attached to the invocation network before launch', async () => {
     const data = fixture(), valid = await profile(data, 'planning', 'must-not-run');
     const rogue = `codeboost-rogue-${randomUUID()}`;
+    // Tracked for afterAll: its create may land after the finally, and once the network is gone it is no holder (#189).
+    containers.add(rogue);
     try {
       docker('run', '--detach', '--name', rogue, `--network=${valid.network.name}`, '--entrypoint', 'node', imageId,
         '-e', 'setInterval(()=>{},1000)');

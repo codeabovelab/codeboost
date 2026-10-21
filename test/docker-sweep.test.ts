@@ -145,7 +145,8 @@ it.each([
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
   // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
-  // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match.
+  // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
+  // removals' stdout (the removed IDs or names in 27.4) is not read.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${a} ${b}; exit 0; fi`,
