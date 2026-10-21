@@ -6,8 +6,8 @@ import { removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.t
 
 // The test sweep's handling of output it cannot read (#189). The fake `docker` answers as no real daemon does for
 // `network ls`: a line that is not JSON, a JSON null and one network without a name. To every other call it answers
-// nothing and exit 0, as Docker 27.4 does for `ls` with no match; the sweep reads only stdout and the exit status, and
-// stderr only to report a failure. What Docker 27.4 really prints is covered against the daemon in agent-container.
+// nothing and exit 0, as Docker 27.4 does for `ls` with no match; the sweep reads only stdout, the exit status and
+// whether a signal killed the call, and stderr only to report a failure. What Docker 27.4 really prints is covered against the daemon in agent-container.
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });

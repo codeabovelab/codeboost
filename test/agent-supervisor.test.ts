@@ -403,7 +403,7 @@ describe('container invocation supervisor', () => {
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
     } finally {
-      // Never throws: the create may have failed before Docker made anything.
+      // Never throws, whatever exit status this Docker version gives for a missing name.
       spawnSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
     }
   }, 3 * 60_000);

@@ -91,6 +91,8 @@ describe('vendor-only egress', () => {
       name = readFileSync(requested, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     execFileSync('sleep', ['3']);
+    // A network landing later still carries this run's runner label (the shim passes production's arguments on), so
+    // afterAll's runner sweep removes it.
     const orphaned = spawnSync('docker', ['network', 'inspect', name], { stdio: 'ignore' }).status === 0;
     if (orphaned) docker('network', 'rm', name);
     expect(name).toMatch(/^codeboost-egress-/);
@@ -118,6 +120,8 @@ describe('vendor-only egress', () => {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
       foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
+      if (foreign) unlabelled.push({ kind: 'network', name: foreign });
       if (foreign) {
         survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
         spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
@@ -174,6 +178,8 @@ describe('vendor-only egress', () => {
       process.env.PATH = path;
       // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
       foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
+      if (foreign) unlabelled.push({ kind: 'container', name: foreign });
       if (foreign) {
         survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
         spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
@@ -228,6 +234,8 @@ describe('vendor-only egress', () => {
       process.env.PATH = path;
       // The stand-in has no runner label, so no sweep finds it: remove it here, however the test ends (#189).
       impostor = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      // By name too: the record goes with the shim below, and the object may land after this removal (#189).
+      if (impostor) unlabelled.push({ kind: 'container', name: impostor });
       if (impostor) {
         survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
         spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
