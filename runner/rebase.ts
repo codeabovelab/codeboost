@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
 import { GIT_OPTIONS, gitEnvironment } from '../git/clone.ts';
+import { ghAnswered } from '../github/run-with-input.ts';
+import { timedOut } from '../github/timeout.ts';
 import { isUuidV4 } from './lifecycle.ts';
 import { ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
 import { MAX_INDEX_BYTES } from './verify-checkout.ts';
@@ -440,6 +442,10 @@ export class GitRebaser {
       catch (error) {
         // Retained ownership outranks cancellation/deadline reporting: live cleanup must preserve its parent workspace.
         if (error instanceof RebaseResourcesUnsettled) throw error;
+        // A remote read that timed out on its own (as the issue-trust read can), or that gh answered, keeps that reason
+        // though a cancel, shutdown or this deadline became pending while it stopped (#174). Had the stop come first,
+        // the read would have reported the stop instead: the gateways and the server's trust read keep the first reason.
+        if (timedOut(error) || ghAnswered(error)) throw error;
         abortExpired();
         controller.signal.throwIfAborted();
         throw error;

@@ -17,7 +17,8 @@ import { commandCheckDeps } from '../runner/checks.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationResult } from '../agents/contract.ts';
 import type { TaskWorkspace, WorkspaceRef } from '../runner/execution.ts';
-import { MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
+import { GitRebaser, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
+import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { BranchPushRefused } from '../runner/branch-push.ts';
 import { UpstreamFailure } from '../runner/lifecycle.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
@@ -98,7 +99,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
   /** The second argument lets an authorization stop the preparation while its read is settling. */
-  authorize?: (signal: AbortSignal, fixture: { coordinator: PreMergeCoordinator }) => Promise<PreMergeAuthorization>;
+  authorize?: (signal: AbortSignal, fixture: { coordinator: PreMergeCoordinator; service: ReviewService }) => Promise<PreMergeAuthorization>;
+  /**
+   * The base moves a.txt too, so the rebase conflicts, and a real GitRebaser replays it with production's hooks. Its
+   * conflict resolver re-reads authorization as production's does (authorize, refresh, then validate) and resolves a.txt.
+   */
+  conflictRebase?: boolean;
   reserves?: { processMs?: number; commandMs?: number; pushVisibleMs?: number };
   /** The PR API keeps reporting the pre-push head for this many inspections after a push. */
   pushVisibleAfter?: number;
@@ -144,7 +150,9 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-am', 'feature', '-q');
   const head = fixtureGit(repository, 'rev-parse', 'HEAD');
   fixtureGit(repository, 'switch', '-q', '-C', 'main', base);
-  writeFileSync(join(repository, 'b.txt'), 'new base\n'); fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'move base');
+  writeFileSync(join(repository, 'b.txt'), 'new base\n');
+  if (options.conflictRebase) writeFileSync(join(repository, 'a.txt'), 'main\n');
+  fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'move base');
   const onto = fixtureGit(repository, 'rev-parse', 'HEAD');
   fixtureGit(repository, 'switch', '-qc', 'rebased');
   writeFileSync(join(repository, 'a.txt'), rebasedText); fixtureGit(repository, 'commit', '-am', 'rebased feature', '-q');
@@ -189,6 +197,33 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     rebaseAborts++; abortBudgets.push(timeoutMs);
     if (options.rebaseCleanupFailure) throw options.rebaseCleanupFailure;
   } } as never;
+  let gitRebaser: GitRebaser | undefined, resolverReads = 0;
+  if (options.conflictRebase) {
+    const runnerRoot = join(root, 'runner'), runnerOwner = 'c'.repeat(32);
+    const runnerRepository = await openRunnerRepository({ runnerRoot, runnerOwner, repositoryId: 'repo', source: repository });
+    await ensureCommit(runnerRepository, head); await ensureCommit(runnerRepository, onto);
+    const planKey = () => service.store.getTask(identity).planKey;
+    // The hooks production's assembly (runner/production.ts) gives the rebaser, without its capability wrapper.
+    const real = new GitRebaser({ repository: runnerRepository, runnerRoot, runnerOwner,
+      committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+      onProcessStarting: attemptId => service.store.setRebaseProcessGroup(planKey(), attemptId, null, 'spawning'),
+      onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(planKey(), attemptId, 'spawning', group),
+      onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(planKey(), attemptId, group, null),
+      onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(planKey(), attemptId, group, 'unsettled'),
+      onResultPrepared: (attemptId, result, history, conflicts) => service.store.prepareRebaseResult(planKey(), attemptId, result, history, conflicts),
+      onResultState: (attemptId, state) => state === 'ready' ? service.store.completeRebaseResult(planKey(), attemptId)
+        : service.store.setRebaseResultState(planKey(), attemptId, state),
+      // As production's resolver: a fresh authorization read immediately before the conflict agent would launch.
+      resolveConflict: async input => {
+        if (!authorize) throw new Error('This conflict rebase needs an authorization.');
+        resolverReads++;
+        const authorization = await authorize(input.signal!);
+        await authorization.refresh(); authorization.validate();
+        writeFileSync(join(input.repository, 'a.txt'), 'resolved\n');
+      } });
+    gitRebaser = { run: (input: Parameters<GitRebaser['run']>[0]) => { rebaseRuns++; rebaseBudgets.push(input.timeoutMs); return real.run(input); },
+      abort: (...args: Parameters<GitRebaser['abort']>) => { rebaseAborts++; abortBudgets.push(args[3]); return real.abort(...args); } } as never;
+  }
   const checkedHeads: string[] = [];
   const workspace: TaskWorkspace = {
     async materialize(attempt, checkedHead) {
@@ -248,7 +283,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const pushes: { branch: string; from: string; to: string }[] = [];
   let lagging = 0, lagged = remotePair, branchReads = 0, fetchesAfterPush = 0;
   let authorizationChecks = 0;
-  const authorize = options.authorize ? (signal: AbortSignal) => options.authorize!(signal, { coordinator }) : (options.duringAuthorize ? async () => ({
+  const authorize = options.authorize ? (signal: AbortSignal) => options.authorize!(signal, { coordinator, service }) : (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
     validate: () => { remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair; },
   }) : undefined);
@@ -264,7 +299,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }
   coordinator = new PreMergeCoordinator(service,
     runner,
-    rebaser, { inspect: async () => {
+    gitRebaser ?? rebaser, { inspect: async () => {
       if (lagging > 0) { lagging--; options.duringVisibilityWait?.(service); return lagged; }
       remoteReads++;
       // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
@@ -326,7 +361,9 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       remotePair = { ...remotePair, ...pair };
       if (shown) { lagged = { ...remotePair, ...shown }; lagging = reads; } else lagging = 0;
     },
-    rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts, rebaseBudgets, abortBudgets };
+    rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts, rebaseBudgets, abortBudgets,
+    /** Authorization reads the conflict resolver started (`conflictRebase` only). */
+    resolverReads: () => resolverReads };
 }
 
 it('preserves an approval when a moved base leaves its attributed fingerprint unchanged', async () => {
@@ -413,6 +450,69 @@ it.each([
   expect(fixture.rebaseRuns()).toBe(0);
   await fixture.runner.close();
 });
+
+// The conflict resolver's own issue-trust read (#174): the read is the second authorization; the first admitted the rebase.
+// These run a real Git rebase, with about twenty Git and verifier processes, so they get more than the file's 15 s.
+const REAL_REBASE_TEST_TIMEOUT_MS = 60_000;
+const resolverTrustAnswers = [
+  ['timed out', () => new RemoteTimeout('Issue retrieval timed out.')],
+  ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', '')],
+] as const;
+const resolverStops = {
+  cancel: { reason: 'Task cancelled.', stop: (service: ReviewService, coordinator: PreMergeCoordinator) =>
+    expect(coordinator.cancelTask(service.store.getTask(service.config.identity).stateVersion, randomUUID())).toBe('stopping') },
+  shutdown: { reason: 'Server shutdown.', stop: (_service: ReviewService, coordinator: PreMergeCoordinator) => { void coordinator.close(); } },
+} as const;
+
+it.each(resolverTrustAnswers.flatMap(([read, answer]) => (['cancel', 'shutdown'] as const).map(stop => [read, stop, answer] as const)))(
+  "saves a preparation whose conflict resolver's issue-trust read %s before a %s with that answer, not the stop (#174)", async (_read, stopKind, answer) => {
+    const actionId = randomUUID(), cause = answer(), expected = `Issue trust could not be verified: ${cause.message}`;
+    const { reason, stop } = resolverStops[stopKind];
+    let reads = 0, pending: unknown = null;
+    const fixture = await rebaseFixture('feature\n', undefined, { actionId, conflictRebase: true, authorize: async (signal, { coordinator, service }) => {
+      if (++reads === 1) return { refresh: async () => undefined, validate: () => undefined };
+      // The read answered (or ran out of time) first; the stop comes while gh is stopping, so it is pending when the
+      // resolver's error is handled. This is the error the server's readIssueAccess then builds.
+      stop(service, coordinator);
+      pending = signal.aborted ? signal.reason : null;
+      throw new UpstreamFailure(expected, { cause });
+    } });
+    // The second read was the resolver's, made while the rebase waited on the conflict.
+    expect(reads).toBe(2); expect(fixture.resolverReads()).toBe(1);
+    expect((pending as Error | null)?.message).toBe(reason);
+    expect(fixture.result).toMatchObject({ state: 'failed', reason: expected });
+    const identity = fixture.service.config.identity;
+    expect(fixture.service.store.savedAction(identity, { actionId, kind: 'prepare-merge', request: fixture.actionRequest })?.response)
+      .toMatchObject({ outcome: 'failed', reason: expected });
+    // The live cleanup removed the attempt and its durable marker.
+    expect(fixture.rebaseRuns()).toBe(1);
+    expect(fixture.rebaseAborts()).toBe(1);
+    expect(fixture.service.store.getTask(identity).rebaseInProgress).toBeNull();
+    if (stopKind === 'cancel') expect(fixture.service.store.getTask(identity).status).toBe('cancelled');
+    await fixture.coordinator.close(); await fixture.runner.close();
+  }, REAL_REBASE_TEST_TIMEOUT_MS);
+
+it.each(resolverTrustAnswers.flatMap(([read, answer]) => (['cancel', 'shutdown'] as const).map(stop => [stop, read, answer] as const)))(
+  "saves a preparation as stopped by a %s that came before the conflict resolver's issue-trust read %s (#174)", async (stopKind, _read, answer) => {
+    const actionId = randomUUID();
+    const { reason, stop } = resolverStops[stopKind];
+    let reads = 0, abortedBeforeRead = false;
+    const fixture = await rebaseFixture('feature\n', undefined, { actionId, conflictRebase: true, authorize: async (signal, { coordinator, service }) => {
+      if (++reads === 1) return { refresh: async () => undefined, validate: () => undefined };
+      stop(service, coordinator);
+      abortedBeforeRead = signal.aborted;
+      // The stop came first: the gateway and readIssueAccess report it, not the answer the read would have given.
+      if (signal.aborted) throw signal.reason;
+      throw new UpstreamFailure(`Issue trust could not be verified: ${answer().message}`, { cause: answer() });
+    } });
+    expect(reads).toBe(2); expect(fixture.resolverReads()).toBe(1);
+    expect(abortedBeforeRead).toBe(true);
+    expect(fixture.result).toMatchObject({ state: 'failed', reason });
+    expect(fixture.service.store.savedAction(fixture.service.config.identity, { actionId, kind: 'prepare-merge', request: fixture.actionRequest })?.response)
+      .toMatchObject({ outcome: 'failed', reason });
+    expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).toBeNull();
+    await fixture.coordinator.close(); await fixture.runner.close();
+  }, REAL_REBASE_TEST_TIMEOUT_MS);
 
 it('revalidates authorization before starting the delayed local rebase', async () => {
   const calls: string[] = [];

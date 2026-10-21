@@ -16,6 +16,8 @@ import { CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS, copyConflictPaths, createForeig
 import { RebaseResourcesUnsettled, type RebaseConflictInput } from '../runner/rebase.ts';
 import type { RunnerRepository } from '../runner/runner-repository.ts';
 import { Store } from '../runner/store.ts';
+import { UpstreamFailure } from '../runner/lifecycle.ts';
+import { RemoteTimeout } from '../github/timeout.ts';
 
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const context: PlanContext = { identity, issue: 22, baseEntries: [{ path: 'conflict.txt', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
@@ -190,6 +192,29 @@ describe('production rebase conflict resolver', () => {
     await expect(resolve(input(f))).rejects.toThrow(/deadline/);
     expect(calls).toEqual(['read']);
     expect(x.events).not.toContain('start');
+  });
+
+  it('reports an authorization read that timed out before a cancel, not the cancel, and releases resources (#174)', async () => {
+    const f = fixture(), x = deps(f), stop = new AbortController();
+    const cause = new RemoteTimeout('Issue retrieval timed out.');
+    let pending = false;
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      // The read timed out first; the cancel comes while gh is stopping, as the server's readIssueAccess then reports it.
+      authorize: async signal => {
+        stop.abort(new Error('Task cancelled.'));
+        pending = signal.aborted;
+        throw new UpstreamFailure(`Issue trust could not be verified: ${cause.message}`, { cause });
+      },
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const error = await resolve(input(f, stop.signal)).then(() => null, (failure: unknown) => failure as Error);
+    expect(pending).toBe(true);
+    expect(error).toBeInstanceOf(UpstreamFailure);
+    expect(error?.cause).toBe(cause);
+    expect(x.events).not.toContain('start');
+    expect(x.events).toContain('remove');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
   });
 
   it('refuses launch and releases resources when the authorization hook throws synchronously', async () => {
