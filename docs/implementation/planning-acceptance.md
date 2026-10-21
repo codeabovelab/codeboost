@@ -104,9 +104,9 @@ to copy), and a check still running after the wait is refused with the same
 prefix; the server records the refusal and starts no agent. Requests within a
 minute of a failure are refused with it; the next request after that checks again.
 With no vendor chosen nothing is checked, and the request fails later, as before,
-with `NO_PLANNING_AGENT`. After the server's 20 s grace for planning requests,
-shutdown cancels a running check and waits up to 20 s more for it before closing
-the worker. A check that runs before the runner's setup has set the runner-owned
+with `NO_PLANNING_AGENT`. Once planning requests have settled, or after the
+server's 20 s grace for them, shutdown cancels a running check and waits up to
+20 s more for it before closing the worker. A check that runs before the runner's setup has set the runner-owned
 repository fails, on a task with runner commits, with "which is not configured";
 the recheck a minute later passes once the runner's setup has finished, and
 without a runner block it fails each time, as every planning request would. A

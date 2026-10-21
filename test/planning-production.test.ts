@@ -14,6 +14,7 @@ import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
+import { PLANNING_NAMING } from '../runner/question-leftovers.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -543,10 +544,10 @@ describe('the planning check (#164)', () => {
 
   it.each([
     ['a database file with other hard links', 'Planning is off: the review database /r/db has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.'],
-  ])('promises no recheck for %s, which only a restart can change', async (_label, reason) => {
+  ])('promises no recheck for %s, which needs a restart once fixed', async (_label, reason) => {
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toContain('only a restart of codeboost can change that');
+    expect((refusal as Error).message).toContain('codeboost must be restarted after it is fixed');
   });
 
   it('keeps the recheck promise when a run\'s cleanup did not settle, which the next run retries', async () => {
@@ -612,18 +613,19 @@ describe('the planning check (#164)', () => {
     expect(order).toEqual(['probe stopped', 'closed']);
   });
 
-  it('promises no recheck when the sign-in is missing, which only a restart can change', async () => {
+  it('promises no recheck when the sign-in is missing, which needs a restart once fixed', async () => {
     const reason = 'Planning with Claude Code needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`.';
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that. The check said: ${reason}`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and codeboost must be restarted after it is fixed. The check said: ${reason}`);
   });
 
   it('promises no recheck when the check says planning is off until a restart', async () => {
-    const reason = 'The agent container worker stopped. Its containers and storage may still exist, so planning is off until codeboost restarts.';
+    // AgentWorker's own text after the planning worker exits (question-agent.ts).
+    const reason = `The agent container worker stopped (exit code 1). Its containers and storage may still exist, so ${PLANNING_NAMING.label} is off until codeboost restarts. The first ${PLANNING_NAMING.job} after the restart removes them.`;
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
-    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that. The check said: ${reason}`);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and codeboost must be restarted after it is fixed. The check said: ${reason}`);
   });
 
   it('starts no check after close', async () => {

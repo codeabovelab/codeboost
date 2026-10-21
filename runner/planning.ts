@@ -93,15 +93,15 @@ export const PLANNING_CHECK_CLOSE_MS = 20_000;
 
 /** One run of the planning check, for one vendor. `passed` or `failure` is set once it settles. */
 type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number };
-  abort: AbortController; replaced?: boolean };
+  abort: AbortController };
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
-const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. The first check after `
-  + 'codeboost starts can take several minutes while the agent image is built. Retry in a minute.';
+const STILL_CHECKING = `${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. A check can take `
+  + 'several minutes the first time, while the agent image is built. Retry in a minute.';
 const duration = (ms: number) => ms === 60_000 ? 'a minute' : ms < 1_000 ? 'a moment'
   : ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1_000)} s`;
-// Reasons a recheck cannot help, so only a restart can: an abandoned worker (question-agent.ts), unconfirmed cleanup
-// (planning-provider.ts' "off until codeboost restarts"), a database file with other hard links (question-leftovers.ts),
-// and a missing token, since codeboost's environment is fixed while it runs. Each is codeboost's own message, given
+// Reasons a recheck cannot help, so codeboost must be restarted once the cause is fixed: an abandoned worker
+// (question-agent.ts), unconfirmed cleanup (planning-provider.ts' "off until codeboost restarts"), a database file with
+// other hard links (question-leftovers.ts), and a missing token, since codeboost's environment is fixed while it runs. Each is codeboost's own message, given
 // before any vendor output. A run whose cleanup did not settle is not among them: its storage is retried before the
 // next run, and if planning did go off, the recheck reports that with these words.
 const UNTIL_RESTART = /until codeboost restarts|needs CLAUDE_CODE_OAUTH_TOKEN|a database file without hard links/;
@@ -159,7 +159,6 @@ export class PlanningCheck {
     if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     // A check for another vendor no longer admits anything: stop it, so replaced checks do not pile up in the worker.
     if (this.#current && !this.#current.passed && !this.#current.failure) {
-      this.#current.replaced = true;
       this.#current.abort.abort(new Error('The planning agent chosen in Settings changed.'));
     }
     const abort = new AbortController(), stop = () => abort.abort(this.#abort.signal.reason);
@@ -226,8 +225,8 @@ export class PlanningCheck {
       }
       if (outcome === 'timeout') throw new GuardRefusal(STILL_CHECKING);
       // Settings changed while this request waited, or its check was replaced (the vendor changed and changed back):
-      // check the vendor it will run with, within the same wait.
-      if (this.#vendor() !== vendor || check.replaced || check !== this.#current) continue;
+      // check the vendor it will run with, within the same wait. A replaced check is never `#current` again.
+      if (this.#vendor() !== vendor || check !== this.#current) continue;
       if (!check.passed && !check.failure) continue;
       // This check's own verdict: calling #check again could start a recheck once the window has passed.
       return this.#verdict(check);
@@ -259,8 +258,8 @@ export class PlanningCheck {
     // The reason comes last and as it is: some end with a command a person may copy. One that holds until a restart
     // gets no promise of a recheck, which could not help.
     if (check.failure && UNTIL_RESTART.test(ownText(messageOf(check.failure.error))))
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart `
-        + `of codeboost can change that. The check said: ${messageOf(check.failure.error)}`);
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and codeboost must `
+        + `be restarted after it is fixed. The check said: ${messageOf(check.failure.error)}`);
     // Codex is refused whatever happens (#93): only choosing another agent helps, and the next request checks that
     // one. A restart-only reason above keeps its own wording.
     if (check.failure && check.vendor === 'codex')
