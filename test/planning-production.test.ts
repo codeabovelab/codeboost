@@ -689,16 +689,35 @@ describe('the planning check (#164)', () => {
     expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed, and only a restart of codeboost can change that; fix the cause first if the reason names one. The check said: ${reason}`);
   });
 
-  it('starts no check after close', async () => {
+  it('starts no check after close, not even one deferred before it', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
-    const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
+    const probe = vi.fn(async (_probed: string) => undefined), check = new PlanningCheck(probe, () => vendor);
     check.start();
-    await check.close();
+    await new Promise(resolve => setImmediate(resolve));
+    // A changed vendor defers its check to the next turn; close comes first.
     vendor = 'codex';
+    expect(() => check.assertPassed()).toThrow('and codeboost checks it next');
+    await check.close();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(() => check.start()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     await expect(check.admit(signal())).rejects.toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     expect(() => check.assertPassed()).toThrow(`${PLANNING_UNAVAILABLE} planning is stopping.`);
     await new Promise(resolve => setImmediate(resolve));
-    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls.map(call => call[0])).toEqual(['claude']);
+  });
+
+  it('tells a request waiting at close that planning is stopping, even if the check then passes', async () => {
+    let pass!: () => void;
+    // The probe answers after close cancelled it, as an answer already on its way would.
+    const check = new PlanningCheck(() => new Promise<void>(resolve => { pass = resolve; }), () => 'claude');
+    const waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setImmediate(resolve));
+    const closed = check.close(2_000);
+    pass();
+    await closed;
+    const refusal = await waiting;
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} planning is stopping.`);
   });
 
   it.each([['under a check that passed', 'claude'], ['with no agent chosen', null]] as const)(

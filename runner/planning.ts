@@ -261,9 +261,9 @@ export class PlanningCheck {
       + 'it next. Retry in a minute.');
   }
   #verdict(check: Check): void {
-    if (check.passed) return;
-    // After close no check starts, so no recheck can be promised.
+    // After close nothing is admitted, even by a check that passed meanwhile, and no recheck can be promised.
     if (this.#abort.signal.aborted) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} planning is stopping.`);
+    if (check.passed) return;
     // The reason comes last and as it is: some end with a command a person may copy. (The Store records a refusal cut
     // to 4,000 characters, so a resend of the same action may replay it shortened.) One that holds until a restart
     // gets no promise of a recheck, which could not help.
