@@ -61,8 +61,8 @@ describe('production agent adapters', () => {
     for (const envelope of ['{"subtype":"error_max_turns","is_error":false,"structured_output":{"a":1}}',
       '{"subtype":"error_during_execution","is_error":true}',
       '{"subtype":"error_max_structured_output_retries","is_error":false,"result":"gave up"}',
-      // The result Claude Code 2.1.281 builds when `--max-turns` stops a run (#163), read from its bundled source, not
-      // from a run: no result member, and an errors list.
+      // What Claude Code 2.1.281 (macOS arm64 build) wrote, with exit status 1, when `--max-turns 1` stopped a real
+      // run (#163): no result member, and an errors list. Members the parser does not read, such as usage, are left out.
       '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":50,"errors":["Reached maximum number of turns (50)"]}'])
       expect(parseClaudeOutput(Buffer.from(envelope), structured)).toMatchObject({ providerFailed: true });
     expect(parseClaudeOutput(Buffer.from('{"subtype":"error_max_turns","is_error":true,'

@@ -47,11 +47,11 @@ function topLevelMembers(json: string): Map<string, string> {
 
 /**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
- * true, is a provider failure; it can omit `result`, and when `result` is missing or empty its `errors` strings are the text. With `--json-schema`
- * (planning), a successful answer needs `subtype: "success"` and is the schema-validated `structured_output` object. It is returned as the exact JSON text
- * of that member in the CLI's envelope, never re-encoded here, so the plan parser sees any duplicate key or inexact
- * integer the envelope holds (#166). Whether the API or CLI resolves those before writing the envelope is not verified.
- * With a schema, an envelope that repeats a top-level key is malformed, whatever it reports. `result` then holds only
+ * true, is a provider failure; it can omit `result`, and when `result` is missing or empty its `errors` strings are
+ * the text. With `--json-schema` (planning), a successful answer needs `subtype: "success"` and is the
+ * schema-validated `structured_output` object. It is returned as the exact JSON text of that member in the CLI's
+ * envelope, never re-encoded here, so the plan parser sees any duplicate key or inexact integer the envelope holds
+ * (#166). Whether the API or CLI resolves those before writing the envelope is not verified. With a schema, an envelope that repeats a top-level key is malformed, whatever it reports. `result` then holds only
  * Claude's prose. Plain-text envelopes without a `subtype` are still accepted.
  */
 export function parseClaudeOutput(raw: Buffer, structured = false): { text: string; providerFailed: boolean } {

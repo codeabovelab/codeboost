@@ -84,7 +84,8 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
  * for callers that skip it; it does not count Claude Code's own system prompt and tools, or the answer. The run is
  * bounded by turns: if each turn sends at most one context window (assumed; the CLI's own calls, such as compaction,
  * are not counted), `--max-turns` bounds the tokens a run can use. Claude stops at the limit with an
- * `error_max_turns` result, which the adapter reports as a provider failure. See
+ * `error_max_turns` result and exit status 1 (seen in a run of Claude Code 2.1.281 on macOS, outside the container),
+ * which the adapter reports as a provider failure. See
  * docs/implementation/agent-isolation.md, "Planning model budget".
  */
 export const MAX_PLANNING_INPUT_BYTES = 64 * 1024;

@@ -116,7 +116,8 @@ Use only these entry points to run an agent:
        window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
        itself, such as compaction, may not count as turns, and the bound is loose (50 context windows). Claude Code
        2.1.281 accepts the flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns`
-       result (both read from its bundled source, not from a run). The adapter reports that result as a provider failure
+       result and exit status 1. This was checked with `--max-turns 1` in a run of the 2.1.281 macOS arm64 build outside
+       the container; the Linux build in the image was read from its bundled source only. The adapter reports that result as a provider failure
        whose text is the result's `errors` strings. The planning error then names the turn limit, asks the person to
        narrow the request, and quotes "Reached maximum number of turns (50)". A token or dollar limit was not chosen:
        `--max-budget-usd` counts the dollar cost of API calls, which is not what an OAuth subscription token pays, and

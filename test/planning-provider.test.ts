@@ -99,7 +99,8 @@ it('quotes at most 300 code units of a failed run\'s output, with whitespace col
 });
 
 it('names the turn limit when Claude stops a planning run at --max-turns (#163)', async () => {
-  // The supervisor passes on the decoded text, and a nonzero exit, for a provider failure.
+  // The supervisor passes on the decoded text, and a nonzero exit, for a provider failure. The envelope is what Claude
+  // Code 2.1.281 (macOS arm64 build) wrote when `--max-turns` stopped a real run, less members nothing reads.
   const { text } = parseClaudeOutput(Buffer.from('{"type":"result","subtype":"error_max_turns","is_error":true,'
     + '"num_turns":50,"errors":["Reached maximum number of turns (50)"]}'), true);
   await expect(provider(fakeDeps({ exitCode: 1, stdout: text }).deps).invoke(draftRequest(), new AbortController().signal))
