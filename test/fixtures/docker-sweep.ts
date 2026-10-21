@@ -37,15 +37,18 @@ export function removeLabelledObjects(label: string, value: string, when: string
     // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
     // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
     const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
-      ? ['--no-trunc', '--format', '{{.ID}} {{.Name}}'] : ['--quiet']), '--filter', `label=${label}=${value}`])
+      ? ['--no-trunc', '--format', '{{.ID}} {{.Name}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
+      '--filter', `label=${label}=${value}`])
       .map(line => line.split(' '));
     const ids = listed.map(([id]) => id!), names = listed.map(([id, name]) => name ?? id!);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
     if (kind !== 'container') {
       // Filters with one key match any of their values. The network filter also matches the start of another network's
-      // ID, so a container counts only if it is on one of these networks by name.
-      const candidates = run(['ps', '--all', '--quiet', ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
+      // ID, so a container counts only if it is on one of these networks by name (Docker refuses a second local network
+      // of one name). Containers go by full ID: Docker resolves a name before an ID prefix.
+      const candidates = run(['ps', '--all', '--quiet', '--no-trunc',
+        ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
       const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
         '{{.Id}} {{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}', ...candidates])
         .map(line => line.split(' ').filter(Boolean)).filter(([, ...on]) => on.some(name => names.includes(name)))

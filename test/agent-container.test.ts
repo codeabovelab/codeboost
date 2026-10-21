@@ -610,8 +610,9 @@ describe('real Docker agent isolation', () => {
     await createValidatedContainer(live);
     const blocker = `codeboost-blocker-${randomUUID()}`, replacement = live.name;
     // Our container goes, but a foreign endpoint keeps the network busy, so the profile cleanup fails and is retried.
-    docker('run', '--detach', '--name', blocker, '--network', live.network.name, '--entrypoint', 'sleep', imageId, '300');
+    // Tracked before it is made: it has no labels, and once its network is gone no sweep finds it (#189).
     containers.add(blocker);
+    docker('run', '--detach', '--name', blocker, '--network', live.network.name, '--entrypoint', 'sleep', imageId, '300');
     await expect(disposeValidatedContainer(live)).rejects.toThrow('did not settle');
     expect(isContainerProfileAuthentic(live)).toBe(true);
     // A same-named, same-labelled container appears before the retry.
@@ -762,6 +763,8 @@ describe('real Docker agent isolation', () => {
       const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
         make('container', named('holder'), 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
         make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
+      // The same for containers: Docker resolves a name before an ID prefix.
+      const holderLookalike = make('container', holders[0]!.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
@@ -776,7 +779,7 @@ describe('real Docker agent isolation', () => {
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
-      for (const bystander of bystanders) expect(exists('container', bystander)).toBe(true);
+      for (const bystander of [...bystanders, holderLookalike]) expect(exists('container', bystander)).toBe(true);
       expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
         .toEqual([true, true, true]);
     } finally {
@@ -805,7 +808,8 @@ describe('real Docker agent isolation', () => {
   it('removed the keeper that a test without its runner label left when it stopped', () => {
     expect(stoppedEarly, 'the test before did not reach its deliberate stop').toBeDefined();
     const left = stoppedEarly!.filesystems, allocationId = taskFilesystemOwner(left).allocationId;
-    // First, so afterAll does not refuse a keeper this test finds left; its runner sweep removes what is.
+    // First, so afterAll does not refuse a keeper this test finds left: its test-run sweep removes that keeper, then its
+    // runner sweep the volumes.
     taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
     expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore' }).status).not.toBe(0);
     // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
