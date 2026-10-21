@@ -169,7 +169,7 @@ describe('task storage probe against Docker answers', () => {
     expect(existsSync(landAt)).toBe(true);
     const name = probeName();
     expect((failure as Error).message).toBe('docker run failed (client killed or not started): docker run ETIMEDOUT after 2000 ms.'
-      + ` The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`);
+      + ` The probe container ${name} may remain; the next start's recovery removes it, or remove it now with docker rm --force --volumes ${name}.`);
     const cause = (failure as Error).cause as AggregateError;
     expect(cause.errors.map((error: Error) => error.message)).toEqual([expect.stringMatching(/^docker run failed/), `Docker did not confirm that ${name} is gone.`]);
     // The last thing Docker said: the inspect still found the container, or (when giving up fell due during the rm)

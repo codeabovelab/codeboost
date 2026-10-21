@@ -243,8 +243,8 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       confirmed.push(resource);
     } catch (error) {
       // Every container recovery removes is gone by now, so the holder is one it leaves: one it reports as unowned, one
-      // without codeboost labels, or a probe an earlier process's orphaned client created after the scan. The volume is
-      // kept, and a start after its holder is gone removes it.
+      // without codeboost labels, or a probe an earlier process's orphaned client created between the container and
+      // volume listings. The volume is kept, and a start after its holder is gone removes it.
       if (!(error instanceof VolumeInUse)) failures.push(error);
     }
   }

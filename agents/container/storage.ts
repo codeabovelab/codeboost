@@ -458,7 +458,7 @@ export async function probeTaskStoragePathIdentity(imageId: string, runnerOwner:
     const refused = outcome.status !== null && /Error response from daemon/.test(outcome.stderr);
     try { await removeProbeContainer(name, refused ? 0 : PROBE_SETTLE_MS, cleanupMs); }
     catch (error) {
-      throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
+      throw new Error(`${failure.message} The probe container ${name} may remain; the next start's recovery removes it, or remove it now with docker rm --force --volumes ${name}.`,
         { cause: new AggregateError([failure, error]) });
     }
     throw failure;

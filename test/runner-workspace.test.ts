@@ -216,11 +216,11 @@ describe('task storage path identity (#162)', () => {
     expect(() => docker('volume', 'inspect', probe.volumes[0]!)).toThrow(/no such volume/i);
   }, 120_000);
   // A probe container created but never started, as a killed client leaves it: the probe's own arguments, with `create`
-  // in place of `run --rm`. Returns its name and the anonymous volume its mount made.
+  // in place of `run` (`--rm` stays). Returns its name and the anonymous volume its mount made.
   const leftoverProbe = (runnerOwner: string) => {
     const name = `codeboost-path-identity-${randomUUID()}`, args = pathIdentityProbeArgs(imageId, runnerOwner, name);
     expect(args.slice(0, 2)).toEqual(['run', '--rm']);
-    docker('create', ...args.slice(2));
+    docker('create', ...args.slice(1));
     return { name, volume: docker('container', 'inspect', '--format', '{{range .Mounts}}{{.Name}}{{end}}', name) };
   };
   it('removes a never-started probe container and its volume with the cleanup\'s own rm', () => {
