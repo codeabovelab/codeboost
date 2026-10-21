@@ -39,7 +39,9 @@ beforeAll(async () => {
  * `RECORDS`, not in the shims, so a name a late client adds after the test's own removal is still read here.
  */
 const unlabelled: { kind: 'container' | 'network'; name?: string; file?: string }[] = [];
-const RECORDS = mkdtempSync(join(tmpdir(), 'codeboost-records-'));
+// Made by the first test that records, so a run that selects none of this file's tests leaves no directory.
+let RECORDS = '';
+const recordFile = () => join(RECORDS ||= mkdtempSync(join(tmpdir(), 'codeboost-records-')), randomUUID());
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => {
   try {
@@ -57,7 +59,7 @@ afterAll(async () => {
     // timeout. The hook's 7 minutes leave a minute and a half over this sweep's worst case (eleven calls of 30 s), for
     // the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
-    rmSync(RECORDS, { recursive: true, force: true });
+    if (RECORDS) rmSync(RECORDS, { recursive: true, force: true });
   }
 }, 7 * 60_000);
 
@@ -103,7 +105,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('leaves a same-named network alone when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
     unlabelled.push({ kind: 'network', file: recorded });
     const realDocker = requireRealDocker();
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
@@ -160,7 +162,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
@@ -210,7 +212,7 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(RECORDS, randomUUID());
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = recordFile();
     unlabelled.push({ kind: 'container', file: recorded });
     const realDocker = requireRealDocker();
     // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.

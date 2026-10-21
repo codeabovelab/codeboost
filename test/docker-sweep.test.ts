@@ -5,18 +5,18 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
 import { removeByName, removeLabelledObjects, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 
-// The test sweep's handling of output it cannot read (#189). The fake `docker` answers as no real daemon does for
-// `network ls`: a line that is not JSON, a JSON null and one network without a name. To every other call it answers
-// nothing and exit 0, as Docker 27.4 does for `ls` with no match; the sweep reads only stdout, the exit status,
-// whether a signal killed the call and whether it could start, and stderr only to report a failure. `removeByName`
-// also reads an inspect's stderr to tell a missing object from a failure. What Docker 27.4 really prints is covered
-// against the daemon in agent-container.
+// The test sweep's and `removeByName`'s handling of answers they cannot use (#189), each test with its own fake
+// `docker`, described beside it. The sweep reads only stdout, the exit status, whether a signal killed the call and
+// whether it could start, and stderr only to report a failure; `removeByName` also reads an inspect's stderr to tell a
+// missing object from a failure. What Docker 27.4 really prints is covered against the daemon in agent-container.
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
 
+// The fake answers as no real daemon does for `network ls`: a line that is not JSON, a JSON null and one network
+// without a name. To every other call it answers nothing and exit 0, as Docker 27.4 does for `ls` with no match.
 it('skips output that is not a network, reports what is not JSON, and never throws', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
@@ -66,11 +66,11 @@ it('removes by name only an object of exactly that name, and reports failures ot
     `  'network busy') printf '%s\\n' '"${other}" "busy"';;`,
     `  'volume busy') printf '%s\\n' '"busy"';;`,
     "  'container killed') kill -9 $$;;",
-    "  'container lost') echo 'context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
+    "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
     'esac; exit 0; fi',
-    "if [ \"$1\" = rm ]; then echo 'Error response from daemon: removal of container is already in progress' >&2; exit 1; fi",
-    "if [ \"$1 $2\" = 'network rm' ]; then echo 'Error response from daemon: error while removing network: network busy has active endpoints' >&2; exit 1; fi",
-    "if [ \"$1 $2\" = 'volume rm' ]; then echo 'Error response from daemon: remove busy: volume is in use' >&2; exit 1; fi",
+    `if [ "$1" = rm ]; then echo 'Error response from daemon: removal of container ${id} is already in progress' >&2; exit 1; fi`,
+    `if [ "$1 $2" = 'network rm' ]; then echo 'Error response from daemon: error while removing network: network busy id ${other} has active endpoints' >&2; exit 1; fi`,
+    `if [ "$1 $2" = 'volume rm' ]; then echo 'Error response from daemon: remove busy: volume is in use - [${id}]' >&2; exit 1; fi`,
     'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -81,10 +81,13 @@ it('removes by name only an object of exactly that name, and reports failures ot
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
     .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy']);
   expect(warn.mock.calls).toEqual([
-    ['removing container busy: docker container rm failed:', 'Error response from daemon: removal of container is already in progress'],
-    ['removing network busy: docker network rm failed:', 'Error response from daemon: error while removing network: network busy has active endpoints'],
-    ['removing volume busy: docker volume rm failed:', 'Error response from daemon: remove busy: volume is in use'],
+    ['removing container busy: docker container rm failed:',
+      `Error response from daemon: removal of container ${id} is already in progress`],
+    ['removing network busy: docker network rm failed:',
+      `Error response from daemon: error while removing network: network busy id ${other} has active endpoints`],
+    ['removing volume busy: docker volume rm failed:', `Error response from daemon: remove busy: volume is in use - [${id}]`],
     ['removing container killed: docker inspect failed:', 'killed by SIGKILL'],
-    ['removing container lost: docker inspect failed:', 'context "x": context not found: open /x/meta.json: no such file or directory'],
+    ['removing container lost: docker inspect failed:',
+      'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
   ]);
 });

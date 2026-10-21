@@ -49,8 +49,8 @@ const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
 /**
  * Put, beside its test-run ID, on every object the `withoutRunnerLabel` wrapper makes and on the holder test's swept
- * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`, `volumes`), or found as holders of this run's
- * networks and volumes.
+ * objects (#189): afterAll sweeps it. Other label-less objects are tracked by name (`containers`, `networks`,
+ * `volumes`), or found as holders of this run's networks and volumes.
  */
 const TEST_FILE_RUN = randomUUID();
 /** Networks a test makes without this run's runner label, removed by name in afterAll as `volumes` are. */
@@ -177,8 +177,8 @@ afterAll(async () => {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test makes
     // under another owner or without the runner label are not found here, unless they hold one of this run's volumes or
     // networks: those this file labels with its own run ID are found by the file-label sweep, the try above removes
-    // those tracked by name (`containers`, `networks`, `volumes`), and the other tests remove their own. It may not run before a
-    // hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup before them.
+    // those tracked by name (`containers`, `networks`, `volumes`), and the other tests remove their own. It may not run
+    // before a hook timeout. Its budget covers two sweeps of up to 5.5 minutes each and the cleanup before them.
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
@@ -823,9 +823,10 @@ describe('real Docker agent isolation', () => {
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
       removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
       // afterAll removes these tracked names with removeByName. One now gone is the start of a live object's ID, which
-      // Docker resolves it to; removeByName must leave that object alone.
-      expect(docker('network', 'inspect', '--format', '{{.Id}}', bystanderNetwork.slice(0, 12))).toBe(bystanderNetwork);
-      removeByName('network', bystanderNetwork.slice(0, 12));
+      // Docker resolves it to; removeByName must leave that object alone. The network has no endpoints, so Docker would
+      // remove it if asked.
+      expect(docker('network', 'inspect', '--format', '{{.Id}}', lookalike.slice(0, 12))).toBe(lookalike);
+      removeByName('network', lookalike.slice(0, 12));
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
       removeByName('container', bystanders[0]!.slice(0, 12));
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
@@ -841,7 +842,8 @@ describe('real Docker agent isolation', () => {
       for (const { kind, ref } of made.filter(object => object.kind !== 'container'))
         spawnSync('docker', [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), ref], { stdio: 'ignore' });
     }
-  // The budget covers the sweep's worst case and ordinary Docker calls, not every call at its own 60 s limit.
+  // The budget covers the sweep's worst case (5.5 minutes), two removals by name (up to a minute each) and ordinary
+  // Docker calls, not every call at its own 60 s limit.
   }, 8 * 60_000);
 
   // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after
