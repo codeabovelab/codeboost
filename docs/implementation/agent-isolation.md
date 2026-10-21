@@ -197,7 +197,7 @@ Use only these entry points to run an agent:
    token. It removes agent containers, egress proxies, seeders, export, inspection and commit containers and networks,
    and the container and anonymous volume a path identity probe left (#181), and resolves once they are gone. A probe
    is runner-scoped: it carries only the runner label and `io.codeboost.probe=path-identity`, no attempt or allocation,
-   and recovery removes it only with exactly those labels and a name the probe gives (`codeboost-path-identity-<uuid>`,
+   and recovery removes it only with those two labels, no attempt, allocation or other kind label, and a name the probe gives (`codeboost-path-identity-<uuid>`,
    or Docker's 64-hex name for its volume). It keeps task storage whole (both volumes and the keeper) and returns one recovery
    handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without

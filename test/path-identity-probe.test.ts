@@ -92,6 +92,10 @@ const removals = () => logged().slice(1);
 const left = () => existsSync(landAt) && !existsSync(removed);
 
 describe('task storage probe against Docker answers', () => {
+  it('refuses a malformed runner token before it calls Docker (#181)', async () => {
+    await expect(probeTaskStoragePathIdentity(imageId, 'C'.repeat(32))).rejects.toThrow('32 lowercase hex');
+    expect(logged().filter(Boolean)).toEqual([]);
+  });
   it('reads the identity from a probe that ran, and removes nothing by hand (--rm did)', async () => {
     writeFileSync(mode, 'answer');
     expect(await probeTaskStoragePathIdentity(imageId, OWNER)).toEqual({ caseSensitive: true, unicodeNormalization: 'none' });

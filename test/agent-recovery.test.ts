@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage).
-interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string> }
+// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage). For a
+// volume it answers as Docker 27.4.0 does: `volume rm --force` of a missing name exits 0 and prints the name, of a
+// volume a container mounts exits 1 with "volume is in use", and `volume inspect` of a missing name exits 1 with "no
+// such volume". Its other errors are shorter than Docker's; the code reads only the exit status and, through `absent`,
+// "No such" or "not found".
+interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string>;
+  /** For a container: the names of the volumes it mounts. */
+  mounts?: string[] }
 const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][],
   failSingleInspect: new Set<string>(), vanishOnInspect: new Set<string>(), brokenInspect: new Set<string>(),
   beforeSingleInspect: undefined as undefined | ((ref: string) => void) }));
@@ -36,11 +42,16 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
       ? { Id: object!.id, Name: `/${object!.name}`, Config: { Labels: object!.labels } }
       : { ...(object!.kind === 'network' ? { Id: object!.id } : {}), Name: object!.name, Labels: object!.labels });
     return found.every(Boolean) ? { status: 0, stdout: JSON.stringify(json), stderr: '' }
-      : { status: 1, stdout: JSON.stringify(json), stderr: 'Error: No such object' };
+      : { status: 1, stdout: JSON.stringify(json), stderr: args[0] === 'volume'
+        ? `Error response from daemon: get ${args.slice(2).find(ref => !find('volume', ref))}: no such volume`
+        : 'Error: No such object' };
   }
   const [kind, ref] = args[0] === 'rm' ? ['container', args[2]!] : [args[0]!, args[args.length - 1]!];
   const object = find(kind, ref);
+  if (!object && kind === 'volume' && args.includes('--force')) return { status: 0, stdout: ref, stderr: '' };
   if (!object) return { status: 1, stdout: '', stderr: 'Error: No such object' };
+  const holder = kind === 'volume' && daemon.objects.find(other => other.mounts?.includes(object.name));
+  if (holder) return { status: 1, stdout: '', stderr: `Error response from daemon: remove ${object.name}: volume is in use - [${holder.id}]` };
   if (daemon.refuseRemoval.has(object.name)) return { status: 1, stdout: '', stderr: 'Error: daemon refused removal' };
   daemon.objects.splice(daemon.objects.indexOf(object), 1);
   return { status: 0, stdout: ref, stderr: '' };
@@ -346,9 +357,11 @@ describe('recoverLeftovers', () => {
   // created but never started, and its anonymous volume.
   const probe = (runner: string, labels: Record<string, string> = {}, names: { container?: string; volume?: string } = {}) => {
     const probeLabels = { 'io.codeboost.runner': runner, 'io.codeboost.probe': 'path-identity', ...labels };
+    const volume = names.volume ?? id();
     const objects: [FakeObject, FakeObject] = [
-      { kind: 'container', id: id(), name: names.container ?? `codeboost-path-identity-${randomUUID()}`, labels: probeLabels },
-      { kind: 'volume', name: names.volume ?? id(), labels: { 'com.docker.volume.anonymous': '', ...probeLabels } },
+      { kind: 'container', id: id(), name: names.container ?? `codeboost-path-identity-${randomUUID()}`, labels: probeLabels,
+        mounts: [volume] },
+      { kind: 'volume', name: volume, labels: { 'com.docker.volume.anonymous': '', ...probeLabels } },
     ];
     daemon.objects.push(...objects);
     return objects;
@@ -394,6 +407,16 @@ describe('recoverLeftovers', () => {
     expect(names()).toEqual(objects.map(object => object.name).sort());
     expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
       .toEqual(objects.map(object => [object.name, 'no-runner-label']).sort());
+  });
+
+  it('removes no probe volume while its container\'s removal is not confirmed (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.refuseRemoval.add(container.name);
+    const failure = await recoverLeftovers(A).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RecoveryError);
+    expect((failure as Error).message).toContain(`Could not remove container ${container.name}`);
+    expect(daemon.calls.filter(args => args[0] === 'volume' && args[1] === 'rm')).toEqual([]);
+    expect(names()).toEqual([container.name, volume.name].sort());
   });
 
   it('fails recovery, and removes no network after it, when a probe volume\'s removal is not confirmed (#181)', async () => {

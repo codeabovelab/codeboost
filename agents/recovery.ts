@@ -206,7 +206,8 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
       || kind === 'storage:inspect' || kind === 'storage:commit'
       || kind === 'agent' || kind === 'egress')
       remove.push(resource);
-    // Only one process holds this runner's token, and it probes after recovery, so a probe found now is left over.
+    // Only one process holds this runner's token, and it probes after recovery, so a probe found now is an earlier
+    // process's. One that process's orphaned client creates during the scan holds its volume, and recovery then fails.
     else if (kind === 'probe:path-identity' && PATH_IDENTITY_PROBE_NAME.test(resource.name)) remove.push(resource);
     else unknown(resource);
   }
