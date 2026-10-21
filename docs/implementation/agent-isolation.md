@@ -124,11 +124,13 @@ Use only these entry points to run an agent:
        arm64 build outside the container; the Linux build in the image was read from its bundled source only. The
        adapter reports that result as a provider failure whose text is the result's `errors` strings ("Reached maximum
        number of turns (1)" in that run). That holds in every Claude phase, so a failed question run quotes them too.
-       The planning error then names the 50-turn limit, asks the person to narrow the request, and quotes that text. A
-       token or dollar limit was not chosen: `--max-budget-usd` counts the dollar cost of API calls, which is not what
-       an OAuth subscription token pays, and the CLI has no flag that limits the tokens of a whole run. 50 turns is
-       about 12 s for each turn in the ten-minute budget; a planning run reads files and answers, so most turns are
-       reads. Lower it if runs are seen to loop; raise it only with a recorded run that needs more.
+       The planning error then names the 50-turn limit, asks the person to narrow the request, and quotes that text. The
+       planning error finds the stop by that text, so other output that contains it, such as Claude's own `result`, gets
+       the same advice; the output is quoted either way. A token or dollar limit was not chosen: `--max-budget-usd`
+       counts the dollar cost of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag
+       that limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning
+       run reads files and answers, so most turns are reads. Lower it if runs are seen to loop; raise it only with a
+       recorded run that needs more.
      - *Other phases.* They do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
