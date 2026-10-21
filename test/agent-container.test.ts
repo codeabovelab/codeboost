@@ -732,11 +732,13 @@ describe('real Docker agent isolation', () => {
       // Named like the start of the bystander network's ID: Docker's network filter also matches that prefix.
       make('network', bystanderNetwork.slice(0, 12), 'create', '--label', label);
       const volume = make('volume', named('swept'), 'create', '--label', label);
+      // And a bystander named like the start of the swept network's ID: removing by a short ID would remove it.
+      const lookalike = make('network', network.slice(0, 12), 'create');
       const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
         make('container', named('holder'), 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
         make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
-      // prints the others and exits 1, and the sweep must still remove them.
+      // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
       mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
       const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -750,7 +752,8 @@ describe('real Docker agent isolation', () => {
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
       for (const bystander of bystanders) expect(exists('container', bystander)).toBe(true);
-      expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume)]).toEqual([true, true]);
+      expect([exists('network', bystanderNetwork), exists('volume', bystanderVolume), exists('network', lookalike)])
+        .toEqual([true, true, true]);
     } finally {
       for (const { ref } of made.filter(object => object.kind === 'container'))
         spawnSync('docker', ['rm', '--force', ref], { stdio: 'ignore' });

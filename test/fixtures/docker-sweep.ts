@@ -8,8 +8,9 @@ import { RUNNER_LABEL } from '../../agents/labels.ts';
 export const TEST_RUN_LABEL = 'io.codeboost.test-run';
 
 /**
- * Removes the containers, networks and volumes labelled with one runner owner (see `removeLabelledObjects`). A test
- * file's afterAll calls it in a finally block.
+ * Removes the containers, networks and volumes labelled with one runner owner, and every container that holds one of
+ * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it in a
+ * finally block.
  */
 export function removeRunnerObjects(runnerOwner: string): void {
   removeLabelledObjects(RUNNER_LABEL, runnerOwner, 'afterAll');
@@ -28,8 +29,8 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? result.stderr.trim());
-    // An inspect of several objects exits 1 if one is gone, yet prints the rest, so the output of a call that exited by
-    // itself is read whatever its status. A killed call's output may be cut short, so it is not.
+    // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call
+    // that exited by itself is read whatever its status. A killed call's output may be cut short, so it is not.
     return result.error || result.status === null ? [] : result.stdout.split('\n').filter(Boolean);
   };
   for (const kind of ['container', 'network', 'volume'] as const) {
