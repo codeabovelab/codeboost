@@ -5,10 +5,10 @@ import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, t
 import { planningCredential } from './planning-provider.ts';
 import type { RecoverReply, ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
 import { ASK_NAMING, createWorkerRoot, removeWorkerRoot, type LeftoverLedger, type WorkerNaming } from './question-leftovers.ts';
+export type { Provider } from './question-container.ts';
 
 /** Why a feature is off after its worker was given up on: planning's check (#164) matches its wording. */
 export const abandonedWorkerText = (naming: WorkerNaming, why: string) => `The agent container worker ${why}. Its containers and storage may still exist, so ${naming.label} is off until codeboost restarts. The first ${naming.job} after the restart removes them.`;
-export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
 const SETTLE_MARGIN_MS = 5_000;

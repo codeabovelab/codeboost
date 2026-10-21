@@ -321,7 +321,7 @@ it('ends a planning request that does not settle after shutdown aborts it by clo
 // #164: the planning check, through productionPlanning's setup with a stand-in agent whose `probe` is the check.
 describe('the planning check (#164)', () => {
   /** The production setup on a review whose Settings chose `vendor`, with a stand-in agent and issue reads. */
-  function checked(probe: (vendor: string, signal: AbortSignal) => Promise<void>, vendor: 'claude' | 'codex' | null = 'claude',
+  function checked(probe: (vendor: string, signal: AbortSignal) => Promise<void>, vendor: 'claude' | null = 'claude',
     recheckMs?: number, admitWaitMs?: number, issueText = vi.fn(async (number: number) => text(number))) {
     const config = production(), service = new ReviewService(config); closers.push(() => service.close());
     if (vendor) service.store.setQuestionProvider(vendor);
@@ -333,6 +333,12 @@ describe('the planning check (#164)', () => {
   }
   const signal = () => new AbortController().signal;
   const thrown = (run: () => unknown) => { try { run(); } catch (error) { return (error as Error).message; } throw new Error('It did not throw.'); };
+  // A real sign-in failure, as planningOutput words it for a failed run. Tests that only show a reason passed through
+  // whole use any text ('Docker is not running.', 'No worker could start.').
+  const runContext = { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 };
+  const failedRun = (stdout: string) => thrown(() => planningOutput({ attemptId: 'probe', context: runContext, exitCode: 1,
+    signal: null, stderr: '', stdout }, { attemptId: 'probe', context: runContext } as InvocationInput));
+  const signInFailure = failedRun('Invalid API key · Please run /login');
 
   it('starts at setup with the vendor chosen in Settings, and that one check serves every later request', async () => {
     const { deps, probe, issueAccess } = checked(async () => undefined);
@@ -345,12 +351,13 @@ describe('the planning check (#164)', () => {
   });
 
   it('refuses a request with the check\'s reason, before it reads the issue, and does not check again within the recheck window', async () => {
-    const { deps, probe, issueAccess } = checked(async () => { throw new Error('Claude could not sign in.'); });
+    const { deps, probe, issueAccess } = checked(async () => { throw new Error(signInFailure); });
     const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(GuardRefusal);
-    expect((refusal as Error).message).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*The check said: Claude could not sign in\\.$`));
+    expect((refusal as Error).message.startsWith(`${PLANNING_UNAVAILABLE} `)).toBe(true);
+    expect((refusal as Error).message.endsWith(`The check said: ${signInFailure}`)).toBe(true);
     // Inside the recheck window, the same failure refuses at once.
-    await expect(deps.describe(signal())).rejects.toThrow('Claude could not sign in.');
+    await expect(deps.describe(signal())).rejects.toThrow(signInFailure);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(issueAccess).not.toHaveBeenCalled();
   });
@@ -407,11 +414,11 @@ describe('the planning check (#164)', () => {
   it('checks the vendor chosen while a request waited, before it admits the request', async () => {
     let pass!: () => void;
     const { deps, service, probe } = checked(vendor => vendor === 'claude' ? new Promise<void>(resolve => { pass = resolve; })
-      : Promise.reject(new Error('Codex cannot write plans yet.')));
+      : Promise.reject(new Error(CODEX_PLANNING_REFUSED)));
     const waiting = Promise.resolve(deps.describe(signal()));
     vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
     pass();
-    await expect(waiting).rejects.toThrow('Codex cannot write plans yet.');
+    await expect(waiting).rejects.toThrow(CODEX_PLANNING_REFUSED);
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
   });
 
@@ -573,9 +580,7 @@ describe('the planning check (#164)', () => {
 
   it('keeps the recheck promise when only the vendor\'s output mentions a restart', async () => {
     // planningOutput's text for a failed run whose output says so.
-    const context = { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 };
-    const reason = thrown(() => planningOutput({ attemptId: 'probe', context, exitCode: 1, signal: null, stderr: '',
-      stdout: 'planning is off until codeboost restarts' }, { attemptId: 'probe', context } as InvocationInput));
+    const reason = failedRun('planning is off until codeboost restarts');
     expect(reason).toContain(' Claude said: planning is off until codeboost restarts');
     const check = new PlanningCheck(async () => { throw new Error(reason); }, () => 'claude');
     const refusal = await check.admit(signal()).catch((error: unknown) => error);
@@ -719,7 +724,7 @@ describe('the planning check (#164)', () => {
   });
 
   it('refuses a start through the server with 409, recording no request and starting no agent', async () => {
-    const config = production(), probe = vi.fn(async () => { throw new Error('Claude could not sign in.'); });
+    const config = production(), probe = vi.fn(async () => { throw new Error(signInFailure); });
     const service = new ReviewService(config); service.store.setQuestionProvider('claude'); service.close();
     const agent = closable(undefined, probe), issueAccess = vi.fn();
     const setup = productionPlanning(config, { ...verified, issues: { issueAccess, issueText: vi.fn() }, agent: () => agent })!;
@@ -734,7 +739,8 @@ describe('the planning check (#164)', () => {
     const started = await api('POST', '/api/plan/suggestions', { expectedRevision: view.plan.revision,
       snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID() });
     expect(started.status).toBe(409);
-    expect(started.body.error).toMatch(new RegExp(`^${PLANNING_UNAVAILABLE} .*Claude could not sign in\\.`));
+    expect(started.body.error.startsWith(`${PLANNING_UNAVAILABLE} `)).toBe(true);
+    expect(started.body.error).toContain(signInFailure);
     const db = new DatabaseSync(config.database);
     try { expect((db.prepare('SELECT COUNT(*) AS n FROM requests').get() as { n: number }).n).toBe(0); } finally { db.close(); }
     expect(agent.invoke).not.toHaveBeenCalled();

@@ -198,9 +198,9 @@ export class PlanningCheck {
   }
   /**
    * Resolve once the check for the vendor chosen now has passed, or at once when no vendor is chosen; reject with a
-   * `GuardRefusal` naming why when it failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
-   * requests may share: an aborted wait rejects with `signal.reason`, and a vendor that cannot be read (a Store error)
-   * with that error; the caller maps both.
+   * `GuardRefusal` naming why when it failed, or when no check passed within `waitMs`. `signal` stops only this wait,
+   * never the check, which other requests may share: an aborted wait rejects with `signal.reason`, and a vendor that
+   * cannot be read (a Store error) with that error; the caller maps both.
    *
    * A passed check is kept until a check for another vendor replaces it: a worker that is abandoned later, cleanup that
    * does not settle later (the check's own run included, when its answer still came back), or a token revoked later
@@ -239,9 +239,9 @@ export class PlanningCheck {
     }
   }
   /**
-   * Throw a `GuardRefusal` unless the check for the vendor chosen now has passed (or no vendor is chosen). Requests call
-   * it again inside the action that starts them, so a vendor chosen after `admit` never runs unchecked. It starts no
-   * check there (that runs inside the Store's transaction): one it needs is started on the next turn.
+   * Throw a `GuardRefusal` unless the check for the vendor chosen now has passed (or no vendor is chosen). Requests
+   * call it again inside the action that starts them, so a vendor chosen after `admit` never runs unchecked. It starts
+   * no check there (that runs inside the Store's transaction): one it needs is started on the next turn.
    */
   assertPassed(): void {
     const vendor = this.#vendor();
