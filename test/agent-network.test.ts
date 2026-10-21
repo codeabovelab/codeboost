@@ -9,7 +9,7 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
-import { CLIENT_LIMIT, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, objectExists, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL } from './fixtures/docker-sweep.ts';
 // Each run has its own runner owner, so the sweep after this file removes only what this run left behind. Network and
 // proxy names are random, so the fixed attempt IDs below reach only labels, where this owner tells runs apart.
 const TEST_RUNNER_OWNER = randomBytes(16).toString('hex');
@@ -126,7 +126,7 @@ describe('vendor-only egress', () => {
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown, survived = false;
+    let foreign = '', error: unknown, survived: boolean | Error = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
     } finally {
@@ -135,7 +135,8 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (foreign) survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (foreign) try { survived = objectExists('network', foreign); } catch (caught) { survived = caught as Error; }
       for (const name of made) removeByName('network', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
@@ -145,6 +146,7 @@ describe('vendor-only egress', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already exists/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -184,7 +186,7 @@ describe('vendor-only egress', () => {
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown, survived = false;
+    let foreign = '', error: unknown, survived: boolean | Error = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
     } finally {
@@ -193,7 +195,8 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       foreign = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (foreign) survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (foreign) try { survived = objectExists('container', foreign); } catch (caught) { survived = caught as Error; }
       for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
@@ -203,6 +206,7 @@ describe('vendor-only egress', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
     expect(String(error)).toMatch(/already in use|Conflict/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
@@ -242,7 +246,7 @@ describe('vendor-only egress', () => {
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let impostor = '', survived = false;
+    let impostor = '', survived: boolean | Error = false;
     try {
       await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow();
     } finally {
@@ -251,11 +255,13 @@ describe('vendor-only egress', () => {
       const made = existsSync(recorded) ? readFileSync(recorded, 'utf8').split('\n').filter(Boolean) : [];
       impostor = made[0] ?? '';
       // afterAll reads the record again: the object may land after this removal (#189).
-      if (impostor) survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
+      // Only Docker's own missing answer counts as gone; any other failure is kept and reported below, after the body's.
+      if (impostor) try { survived = objectExists('container', impostor); } catch (caught) { survived = caught as Error; }
       for (const name of made) removeByName('container', name, 'finally');
       rmSync(shim, { recursive: true, force: true });
     }
     expect(impostor).toMatch(/^codeboost-proxy-/);
+    if (survived instanceof Error) throw survived;
     expect(survived).toBe(true);
   }, 60_000);
 
