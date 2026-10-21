@@ -56,7 +56,7 @@ What this covers, each checked against GitHub:
 - A suite with many other runs. Only the pinned name is asked for, so a suite with more than 100 runs (microsoft/vscode) does not matter.
 - A re-run inside one suite. `LATEST` leaves out the older run (codeabovelab/codeboost PR 151: `test` failed, then passed when re-run). Runs of the name in several suites are ordered as the rollup's are.
 
-One call holds up to 25 pinned checks, so most inspections make one call of about one second. A check whose app has more than 100 suites on the head is read in pages of 100, up to 10 pages. In practice the inspection's deadline ends the read first. Each call takes about a second, so a fresh six-second inspection fits only a few pages after its other reads. A head with more suites than that fails closed with “GitHub merge-state inspection timed out.”
+One call holds up to 25 pinned checks, so most inspections make one call of about one second. A check whose app has more than 100 suites on the head is read in pages of 100, up to 10 pages. For a fresh inspection, the deadline ends the read first: each call takes about a second, so its six seconds fit only a few pages after the other reads. The display inspection has 12 seconds, which fit about nine. Either way, a head with more suites than fit fails closed with “GitHub merge-state inspection timed out.”
 
 Checks that any app may report are still read from the rollup alone.
 
@@ -68,7 +68,7 @@ The read fails closed:
 - These fail the inspection with codeboost's own reason: an answer with errors or a malformed field, an answer for another commit, a suite with more than 100 runs of the pinned name, more than 10 pages of suites, and suites that change between pages.
 - The merge status shows the reason after “Could not read GitHub merge state.”
 - A deadline that stops the read keeps the inspection's timeout as the reason.
-- When the inspection's stages stop each other, the first stage's failure is reported, even if a stopped read then ends with a gh exit of its own.
+- When the inspection's stages stop each other, the first stage's failure is reported. This holds even when a stopped read then settles with its own gh error: its gh had already exited, and its output closed after the stop.
 
 Recordings in `test/fixtures/gh/` back this:
 

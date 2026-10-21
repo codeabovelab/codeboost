@@ -334,8 +334,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     ]);
     const fixed = await alreadyFixed;
     // The first stage to fail stopped the others, and its error is `failed`'s reason. A stopped stage can still settle
-    // with an error of its own (a gh exit that came while gh was stopping), so the first failure is reported, not the
-    // first stage in this list that failed. Every rejection above aborts `failed`, so the loop after it is a backstop.
+    // with an error of its own (its gh had already exited, and its pipes closed after the stop), so the first failure is
+    // reported, not the first stage in this list that failed. Every rejection above aborts `failed`, so the loop after it is a backstop.
     if (failed.signal.aborted) throw failed.signal.reason;
     for (const read of [ruleRead, listRead]) if (read.status === 'rejected') throw read.reason;
     if (fixed instanceof Error) throw fixed;
@@ -381,8 +381,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    * Only each suite's latest run of a name is asked for (`checkType: LATEST`): a run re-run inside its suite is left out.
    * Each check is one alias in the query, with up to PINNED_CHECKS_PER_READ checks per call; a check whose app has more
    * than 100 suites on the head is paged, up to PINNED_SUITE_PAGES pages. That cap only bounds the work: at about a second
-   * per call, the inspection's deadline (six seconds for a fresh one) usually stops the read after a few pages, and the
-   * inspection then fails with its timeout.
+   * per call, the inspection's deadline usually stops the read first (after a few pages in a fresh six-second inspection,
+   * about nine in a 12-second display one), and the inspection then fails with its timeout.
    *
    * The read fails closed. A gh failure keeps gh's error. GitHub's own errors in an answer, a malformed field, an answer
    * for another commit, a suite with more runs of the name than one page holds, more suites than the page limit, and

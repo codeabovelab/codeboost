@@ -1251,6 +1251,15 @@ it.each([
   expect(await requiredTestState([...rollup])).toEqual([expected]);
 });
 
+/**
+ * The branch read gh 2.102.0 gives for a branch no classic protection covers (zero-checks.json, less the branch's
+ * `commit` and links, which the gateway does not read).
+ */
+const UNPROTECTED_BRANCH = JSON.stringify({ name: 'main', protected: false, protection: { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } });
+// The pinned-check tests below fake gh 2.102.0's other answers in the shapes of test/fixtures/gh/: the protection read's
+// 404 is NOT_PROTECTED and the branch read UNPROTECTED_BRANCH, unless a test says otherwise. They leave out what the
+// gateway does not read on these paths: the pull request's `url` (read only for display) and each rule's
+// `ruleset_source_type`, `ruleset_source`, `ruleset_id` and `do_not_enforce_on_create`.
 // #176: gh's rollup never carries a check run's app (test/fixtures/gh/, gh 2.102.0), so a requirement pinned to an app is
 // matched from the runs GitHub lists for that app and name on the head. Each rollup below holds an app-less passing
 // `test` run, as gh reports one; before #176 every requirement here read as missing.
@@ -1325,7 +1334,7 @@ it('reads several pinned checks in one call, and pages only the check whose app 
     }
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false,
       required_status_checks: [{ context: 'test', integration_id: 10 }, { context: 'lint', integration_id: 11 }] } }]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
     if (joined.endsWith('/protection')) throw NOT_PROTECTED;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
@@ -1344,7 +1353,7 @@ it('reads more pinned checks than one call holds in several calls', async () => 
     if (isCheckRunRead(args)) { calls.push(pinnedVariables(args).length); return checkRunsAnswer(args, [{ app: 10, runs: contexts.map(context => checkRun(context, 'COMPLETED', 'SUCCESS')) }]); }
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false,
       required_status_checks: contexts.map(context => ({ context, integration_id: 10 })) } }]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
     if (joined.endsWith('/protection')) throw NOT_PROTECTED;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
@@ -1362,8 +1371,9 @@ it('does not read pinned checks when the rules are unknown, so the rules blocker
     // Never answered: the read must not run. Shaped as gh 2.102.0 exits on a GraphQL error (stdout: GitHub's response).
     if (isCheckRunRead(args)) { reads++; throw ghExit('gh: Something went wrong while executing your query.', '{"data":null,"errors":[{"message":"Something went wrong while executing your query."}]}'); }
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    // GitHub's branch read also gives `protection`, which the gateway reads only after the protection read answers 404.
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
-    // Classic protection whose `strict` is malformed: the rules are unknown, after the ruleset's pinned check was read.
+    // Classic protection whose `strict` is malformed: the rules are unknown, after the ruleset's pinned check was parsed.
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: 'yes', checks: [] } });
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
@@ -1385,7 +1395,7 @@ function pinnedGateway(answer: (args: readonly string[], signal?: AbortSignal) =
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: appLessPass });
     if (isCheckRunRead(args)) return answer(args, runOptions?.signal);
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
-    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
     if (joined.endsWith('/protection')) throw NOT_PROTECTED;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
@@ -1433,7 +1443,8 @@ it.each(failedCheckRunReads)('blocks the merge with the reason when the read of 
 it('keeps the inspection\'s timeout as the reason when the read of the pinned check outlasts it', async () => {
   let stopped: unknown = null;
   const gateway = pinnedGateway((_args, signal) => new Promise((_resolve, reject) => {
-    signal!.addEventListener('abort', () => { stopped = signal!.reason; reject(new Error('gh was stopped')); }, { once: true });
+    // runWithInput rejects with the abort's reason when the abort stops gh before it exits.
+    signal!.addEventListener('abort', () => { stopped = signal!.reason; reject(signal!.reason); }, { once: true });
   }));
   await expect(gateway.inspect({ fresh: true, timeoutMs: 50 })).rejects.toThrow('GitHub merge-state inspection timed out.');
   // The deadline stopped this read: it was in flight when the deadline fired.
