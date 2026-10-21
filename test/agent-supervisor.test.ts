@@ -399,7 +399,8 @@ describe('container invocation supervisor', () => {
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
     } finally {
-      execFileSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
+      // Never throws: the create may have failed before Docker made anything.
+      spawnSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
     }
   }, 3 * 60_000);
 
@@ -642,11 +643,12 @@ describe('container invocation supervisor', () => {
   it('writes the deferred output acknowledgement idempotently, repairing a partial one', () => {
     const token = randomUUID(), file = `/run/codeboost-control/collected-${token}`;
     const name = `codeboost-ack-script-${randomUUID()}`;
-    execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
-      '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
-      '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
-      imageId, '120'], { stdio: 'ignore' });
     try {
+      // Inside the try: the container has no labels, so only the finally below removes it (#189).
+      execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
+        '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
+        '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
+        imageId, '120'], { stdio: 'ignore' });
       const acknowledge = () => spawnSync('docker', ['exec', '--user', '0', name, 'node', '-e', ACKNOWLEDGEMENT_SCRIPT,
         token], { encoding: 'utf8' });
       const content = () => execFileSync('docker', ['exec', name, 'cat', file], { encoding: 'utf8' });

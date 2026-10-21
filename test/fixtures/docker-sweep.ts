@@ -28,22 +28,26 @@ export function removeLabelledObjects(label: string, value: string, when: string
     const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (result.status !== 0) console.warn(`${when}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? result.stderr.trim());
-    // An inspect of several objects exits 1 if one is gone, yet prints the rest, so stdout is read whatever the status.
-    return result.stdout?.split('\n').filter(Boolean) ?? [];
+    // An inspect of several objects exits 1 if one is gone, yet prints the rest, so the output of a call that exited by
+    // itself is read whatever its status. A killed call's output may be cut short, so it is not.
+    return result.error || result.status === null ? [] : result.stdout.split('\n').filter(Boolean);
   };
   for (const kind of ['container', 'network', 'volume'] as const) {
-    // Networks by name: `ps --filter network=` finds a created, never started container by the name only (Docker 27.4).
-    const ids = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network' ? ['--format', '{{.Name}}']
-      : ['--quiet']), '--filter', `label=${label}=${value}`]);
+    // Networks with their names: `ps --filter network=` finds a created, never started container by the name only
+    // (Docker 27.4). Each is removed by its full ID, which no other network's name can be mistaken for.
+    const listed = run([kind, 'ls', ...(kind === 'container' ? ['--all'] : []), ...(kind === 'network'
+      ? ['--no-trunc', '--format', '{{.ID}} {{.Name}}'] : ['--quiet']), '--filter', `label=${label}=${value}`])
+      .map(line => line.split(' '));
+    const ids = listed.map(([id]) => id!), names = listed.map(([id, name]) => name ?? id!);
     if (!ids.length) continue;
-    console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${ids.join(' ')}`);
+    console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
     if (kind !== 'container') {
       // Filters with one key match any of their values. The network filter also matches the start of another network's
       // ID, so a container counts only if it is on one of these networks by name.
-      const listed = run(['ps', '--all', '--quiet', ...ids.flatMap(id => ['--filter', `${kind}=${id}`])]);
-      const holders = kind === 'volume' || !listed.length ? listed : run(['container', 'inspect', '--format',
-        '{{.Id}} {{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}', ...listed])
-        .map(line => line.split(' ').filter(Boolean)).filter(([, ...names]) => names.some(name => ids.includes(name)))
+      const candidates = run(['ps', '--all', '--quiet', ...names.flatMap(name => ['--filter', `${kind}=${name}`])]);
+      const holders = kind === 'volume' || !candidates.length ? candidates : run(['container', 'inspect', '--format',
+        '{{.Id}} {{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}', ...candidates])
+        .map(line => line.split(' ').filter(Boolean)).filter(([, ...on]) => on.some(name => names.includes(name)))
         .map(([id]) => id!);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);

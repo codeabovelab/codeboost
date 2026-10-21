@@ -735,7 +735,17 @@ describe('real Docker agent isolation', () => {
       const holders = [make('container', named('holder'), 'create', '--network', network, '--entrypoint', 'true', imageId),
         make('container', named('holder'), 'run', '--detach', '--network', network, '--entrypoint', 'sleep', imageId, '300'),
         make('container', named('holder'), 'create', '--mount', `type=volume,source=${volume},target=/x`, '--entrypoint', 'true', imageId)];
-      removeLabelledObjects(TEST_RUN_LABEL, run, 'test');
+      // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
+      // prints the others and exits 1, and the sweep must still remove them.
+      const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
+      mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
+      const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+      writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+        `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
+        `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+      const path = process.env.PATH;
+      process.env.PATH = `${shim}:${path}`;
+      try { removeLabelledObjects(TEST_RUN_LABEL, run, 'test'); } finally { process.env.PATH = path; }
       const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('volume', volume)]).toEqual([false, false]);
@@ -749,9 +759,10 @@ describe('real Docker agent isolation', () => {
     }
   }, 120_000);
 
-  // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after making a keeper without its runner label, before the removal
-  // its sibling test above ends with; the second checks that the keeper went when the first finished. `it.fails` passes
-  // on any failure, so the first records the storage only once its checks passed, just before its deliberate stop.
+  // #189: these two run in order (run alone, the second fails: it checks what the first left). The first stops after
+  // making a keeper without its runner label, before the removal that "rejects a keeper without its runner label"
+  // ends with; the second checks that the keeper went when the first finished. `it.fails` passes on any failure, so the
+  // first records the storage only once its checks passed, just before its deliberate stop.
   let stoppedEarly: ReturnType<typeof fixture> | undefined;
   it.fails('stops after making a keeper without its runner label (expected to fail)', async () => {
     const data = await withoutRunnerLabel([['create', '--name']], () => fixture());

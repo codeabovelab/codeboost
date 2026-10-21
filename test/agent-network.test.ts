@@ -89,20 +89,26 @@ describe('vendor-only egress', () => {
     // The name is taken by someone else's network just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
-        + `'${realDocker}' network create "$last" >/dev/null; printf %s "$last" > '${recorded}'; `
+        + `printf %s "$last" > '${recorded}'; '${realDocker}' network create "$last" >/dev/null; `
         + `echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-network-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown;
+    let foreign = '', error: unknown, survived = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
-      foreign = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // Recorded before it is made, and removed here: the network has no labels, so no sweep finds it (#189).
+      foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      if (foreign) {
+        survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+        spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
+      }
+      rmSync(shim, { recursive: true, force: true });
+    }
     // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
@@ -139,19 +145,25 @@ describe('vendor-only egress', () => {
     // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
       `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
-        + `'${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; printf %s "$3" > '${recorded}'; fi`,
+        + `printf %s "$3" > '${recorded}'; '${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const refused = captureInvocation({ ...invocation, attemptId: `refused-proxy-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let foreign = '', error: unknown;
+    let foreign = '', error: unknown, survived = false;
     try {
       try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
-      foreign = readFileSync(recorded, 'utf8');
-    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
-    spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
+    } finally {
+      process.env.PATH = path;
+      // Recorded before it is made, and removed here: the container has no labels, so no sweep finds it (#189).
+      foreign = existsSync(recorded) ? readFileSync(recorded, 'utf8') : '';
+      if (foreign) {
+        survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+        spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
+      }
+      rmSync(shim, { recursive: true, force: true });
+    }
     // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
