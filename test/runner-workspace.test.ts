@@ -259,7 +259,7 @@ describe('task storage path identity (#162)', () => {
       removeRunnerObjects(mine, 'test');
       removeRunnerObjects(theirs, 'test');
     }
-  }, 13 * 60_000);
+  }, 14 * 60_000);
   it('runs only the image the trusted builder produced', async () => {
     await expect(probeTaskStoragePathIdentity(`sha256:${'0'.repeat(64)}`, RUNNER_OWNER)).rejects.toThrow('Agent image was not produced by the trusted validated builder.');
     await expect(probeTaskStoragePathIdentity('alpine', RUNNER_OWNER)).rejects.toThrow('requires the immutable built image ID');

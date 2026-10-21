@@ -14,7 +14,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it('reports and skips output that is not a network, and never throws', () => {
+it('skips output that is not a network, reports what is not JSON, and never throws', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
@@ -25,5 +25,5 @@ it('reports and skips output that is not a network, and never throws', () => {
   expect(() => removeLabelledObjects('io.codeboost.test-run', 'x', 'test')).not.toThrow();
   expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: docker printed a line that is not JSON:');
   // Nothing it could not read is removed or looked up as a holder.
-  expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm) /.test(line))).toEqual([]);
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);
 });

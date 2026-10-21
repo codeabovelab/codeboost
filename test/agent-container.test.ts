@@ -673,11 +673,11 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
-  // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup refuses such an
-  // object, and afterAll's runner sweep finds it only while it holds one of this run's volumes or networks, so the
-  // wrapper labels it with a test-run ID instead (#189). Whatever has that ID is removed when the test finishes, passed,
-  // failed or timed out, and again in afterAll, for a create that lands after a timed-out test's removal (its body runs
-  // on).
+  // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup may refuse such
+  // an object (task storage has no captured IDs), and afterAll's runner sweep finds it only while it holds one of this
+  // run's volumes or networks, so the wrapper labels it with a test-run ID instead (#189). Whatever has that ID is
+  // removed when the test finishes, passed, failed or timed out, and again in afterAll, for a create that lands after a
+  // timed-out test's removal (its body runs on).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
@@ -901,9 +901,10 @@ describe('real Docker agent isolation', () => {
       expect(left).not.toBe('');
     } finally {
       // The network carries another runner's label, so no sweep of this run finds it: removed by its allocation (#189).
+      // The sweep may take up to 5.5 minutes, which the test's budget allows for.
       removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
     }
-  }, 60_000);
+  }, 7 * 60_000);
 
   it('never removes an agent container found by name after a killed create when a label is missing', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
@@ -2470,10 +2471,11 @@ describe('real Docker agent isolation', () => {
       for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
         expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
     } finally {
-      // Never throws, so a failure above is the one reported. By full ID: Docker resolves a name before an ID prefix.
+      // Never throws, so a failure above is the one reported. By full ID: Docker resolves a name before an ID prefix. The
+      // sweep may take up to 5.5 minutes, which the test's budget allows for.
       removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
     }
-  }, 180_000);
+  }, 9 * 60_000);
 
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
