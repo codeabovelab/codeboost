@@ -329,7 +329,7 @@ describe('the planning check (#164)', () => {
   }
   const signal = () => new AbortController().signal;
 
-  it('starts at setup with the vendor chosen in Settings, and runs once for every request after', async () => {
+  it('starts at setup with the vendor chosen in Settings, and that one check serves every later request', async () => {
     const { deps, probe, issueAccess } = checked(async () => undefined);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(probe.mock.calls[0]![0]).toBe('claude');
@@ -435,6 +435,35 @@ describe('the planning check (#164)', () => {
     expect(signals.map(probeSignal => probeSignal.aborted)).toEqual([true, false]);
     await check.close(10);
     expect(signals[1]!.aborted).toBe(true);
+  });
+
+  it('starts no check after close', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    const probe = vi.fn(async () => undefined), check = new PlanningCheck(probe, () => vendor);
+    check.start();
+    await check.close();
+    vendor = 'codex';
+    await expect(check.admit(signal())).rejects.toThrow('Planning is stopping.');
+    expect(() => check.assertPassed()).toThrow('still checking');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a request\'s whole wait, across a vendor change, by one deadline', async () => {
+    let vendor: 'claude' | 'codex' = 'claude';
+    // Claude's check passes at 150 ms, after the vendor changed; Codex's never ends.
+    const check = new PlanningCheck(probed => new Promise<void>(resolve => {
+      if (probed === 'claude') setTimeout(resolve, 150);
+    }), () => vendor, { waitMs: 200 });
+    const started = performance.now(), waiting = check.admit(signal()).catch((error: unknown) => error);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    vendor = 'codex';
+    // One deadline ends the wait at 200 ms; a fresh 200 ms for Codex would end it at 350 ms.
+    const refusal = await waiting;
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toContain('still checking');
+    expect(performance.now() - started).toBeLessThan(320);
+    await check.close(10);
   });
 
   it('waits a bounded time on close for a check that never stops', async () => {

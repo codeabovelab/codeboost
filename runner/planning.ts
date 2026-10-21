@@ -185,13 +185,21 @@ export class PlanningCheck {
     if (!vendor) return;
     const covering = this.#covering(vendor);
     if (covering) return PlanningCheck.#verdict(covering);
-    setImmediate(() => { try { this.#check(vendor); } catch { /* stopping: nothing to start */ } });
+    // The vendor chosen then, which Settings may have changed again since.
+    setImmediate(() => {
+      const now = this.#vendor();
+      try { if (now) this.#check(now); } catch { /* stopping: nothing to start */ }
+    });
     throw new GuardRefusal(STILL_CHECKING);
   }
   static #verdict(check: Check): void {
     if (check.passed) return;
-    if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
-      + `${messageOf(check.failure.error)} codeboost checks again on the next request after a minute.`);
+    if (check.failure) {
+      const reason = messageOf(check.failure.error).trim();
+      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
+        + `${reason}${/[.!?]$/.test(reason) ? '' : '.'} codeboost checks again on the next request after a minute, `
+        + 'or at once when another agent is chosen in Settings.');
+    }
     throw new GuardRefusal(STILL_CHECKING);
   }
   /** Cancel any running check and wait up to `waitMs` for it to stop. No check starts afterwards. */
