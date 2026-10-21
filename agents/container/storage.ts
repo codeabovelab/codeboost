@@ -12,7 +12,7 @@ import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../proce
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
 import { MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, TREE_SCRIPT } from './tree-script.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
-  ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
+  ownerLabelArgs, releaseAllocationId, type ResourceOwner, runnerProbeLabels, UUID_V4 } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -415,24 +415,37 @@ export const PROBE_VOLUME_MOUNT = ['type=volume', 'target=/work', 'volume-driver
   ...TASK_VOLUME_OPTIONS(1024 * 1024, 64).map(option => `volume-opt=${option}`)]
   // A field with a comma in it is quoted, as Docker's CSV parser reads --mount.
   .map(field => field.includes(',') ? `"${field}"` : field).join(',');
+/** The probe container's name: a fixed prefix and a UUID v4. Recovery removes only containers named so (#181). */
+export const PATH_IDENTITY_PROBE_NAME = new RegExp(`^codeboost-path-identity-${UUID_V4}$`);
+/**
+ * The probe's `docker run` arguments. The container and its anonymous volume carry the runner's token and the probe kind
+ * (#181), so startup recovery finds what a failed or interrupted probe left.
+ */
+export function pathIdentityProbeArgs(imageId: string, runnerOwner: string, name: string): string[] {
+  if (!PATH_IDENTITY_PROBE_NAME.test(name)) throw new Error('The path identity probe needs a name D generates.');
+  const labels = Object.entries(runnerProbeLabels(runnerOwner, 'path-identity')).map(([key, value]) => `${key}=${value}`);
+  return ['run', '--rm', '--name', name, ...labels.flatMap(label => ['--label', label]), '--read-only', '--user', '10001:10001',
+    '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc',
+    '--pids-limit=32', '--memory=128m', '--cpus=.25',
+    '--mount', [PROBE_VOLUME_MOUNT, ...labels.map(label => `volume-label=${label}`)].join(','),
+    '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
+}
 /**
  * The path identity of task storage (#162): how the filesystem the agent edits, where the runner inspects task changes, tells two
  * spellings of a path apart. It is measured, not assumed, on a volume made with the same options as task storage, in a
  * container hardened like the keeper. The volume is anonymous and the container `--rm`, so once the container has
  * started the daemon removes both when it exits, even if this process does not live to see it. A client stopped before
  * then (its deadline) may leave the container created but never started, which `--rm` does not remove, so a failed
- * probe removes its container, and that volume, by the unique name it gave it. Not covered: a create that lands after
- * the settle window, or a runner that dies before the removal; the probe carries no owner labels, so recovery does not
- * find that container (`docker ps -a --filter name=codeboost-path-identity-` does). Nor is the volume's removal
- * confirmed: `--rm` and `rm --volumes` remove it, but Docker only logs a failure to. A recovery sweep is #181.
+ * probe removes its container, and that volume, by the unique name it gave it. What this cannot remove (a create that
+ * lands after the settle window, a runner that dies before the removal, a volume Docker failed to remove, since it
+ * only logs that) carries `runnerOwner` and the probe kind, and the next startup's recovery removes it (#181).
  */
-export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 60_000, cleanupMs = PROBE_CLEANUP_MS): Promise<PathIdentity> {
+export async function probeTaskStoragePathIdentity(imageId: string, runnerOwner: string, timeoutMs = 60_000,
+  cleanupMs = PROBE_CLEANUP_MS): Promise<PathIdentity> {
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('The path identity probe requires the immutable built image ID.');
   assertBuiltAgentImage(imageId);
   const name = `codeboost-path-identity-${randomUUID()}`;
-  const args = ['run', '--rm', '--name', name, '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL',
-    '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m',
-    '--cpus=.25', '--mount', PROBE_VOLUME_MOUNT, '--entrypoint', 'sh', imageId, '-c', PATH_IDENTITY_SCRIPT, 'probe', '/work'];
+  const args = pathIdentityProbeArgs(imageId, runnerOwner, name);
   const outcome = await runInProcessGroup('docker', args, { env: dockerEnvironment(), timeoutMs });
   if (outcome.status !== 0) {
     const failure = new DockerError(args, outcome);
@@ -445,7 +458,7 @@ export async function probeTaskStoragePathIdentity(imageId: string, timeoutMs = 
     const refused = outcome.status !== null && /Error response from daemon/.test(outcome.stderr);
     try { await removeProbeContainer(name, refused ? 0 : PROBE_SETTLE_MS, cleanupMs); }
     catch (error) {
-      throw new Error(`${failure.message} The probe container ${name} may remain; remove it with docker rm --force --volumes ${name}.`,
+      throw new Error(`${failure.message} The probe container ${name} may remain; the next start's recovery removes it, or remove it now with docker rm --force --volumes ${name}.`,
         { cause: new AggregateError([failure, error]) });
     }
     throw failure;

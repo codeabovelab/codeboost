@@ -9,9 +9,11 @@ import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { capAdapterInvocationBudget, createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
+import { MAX_PLANNING_INPUT_BYTES } from '../agents/policy.ts';
 import { MAX_SOURCE_BYTES } from '../core/parse-v1.ts';
 import { prepareDraft } from '../core/planning-author.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+const SCHEMA_TEXT = '{"type":"object"}';
 
 describe('production agent adapters', () => {
   const capturedInvocation = (attemptId: string, deadline: number, vendor: 'codex' | 'claude' = 'codex') =>
@@ -39,10 +41,11 @@ describe('production agent adapters', () => {
       .toEqual({ text: '{"title":"Plan","items":[]}', providerFailed: false });
     // Without a schema the prose result is still the answer.
     expect(parseClaudeOutput(Buffer.from(success))).toEqual({ text: 'Here is the plan.', providerFailed: false });
-    // A failed structured run can omit result; it is a provider failure, not malformed output.
+    // A failed structured run can omit result; it is a provider failure, not malformed output, and its errors are
+    // the text.
     expect(parseClaudeOutput(Buffer.from(
       '{"type":"result","subtype":"error_max_structured_output_retries","is_error":true,"errors":["x"]}'), true))
-      .toEqual({ text: '', providerFailed: true });
+      .toEqual({ text: 'x', providerFailed: true });
     for (const missing of ['{"subtype":"success","result":"{\\"title\\":\\"Plan\\"}","is_error":false}',
       '{"subtype":"success","result":"","is_error":false,"structured_output":null}',
       '{"subtype":"success","result":"","is_error":false,"structured_output":[1]}',
@@ -57,8 +60,18 @@ describe('production agent adapters', () => {
   it.each([false, true])('treats any non-success subtype as a provider failure (structured: %s)', structured => {
     for (const envelope of ['{"subtype":"error_max_turns","is_error":false,"structured_output":{"a":1}}',
       '{"subtype":"error_during_execution","is_error":true}',
-      '{"subtype":"error_max_structured_output_retries","is_error":false,"result":"gave up"}'])
+      '{"subtype":"error_max_structured_output_retries","is_error":false,"result":"gave up"}',
+      // What Claude Code 2.1.281 (macOS arm64 build) wrote, with exit status 1, when `--max-turns 1` stopped a real
+      // run (#163): no result member, and an errors list. Members the parser does not read, such as usage, are left out.
+      '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":2,"errors":["Reached maximum number of turns (1)"]}'])
       expect(parseClaudeOutput(Buffer.from(envelope), structured)).toMatchObject({ providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_max_turns","is_error":true,'
+      + '"errors":["Reached maximum number of turns (50)",3]}'), structured))
+      .toEqual({ text: 'Reached maximum number of turns (50)', providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_during_execution","is_error":true,"result":"r","errors":["e"]}'),
+      structured)).toEqual({ text: 'r', providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_during_execution","is_error":true,"result":"","errors":["e"]}'),
+      structured)).toEqual({ text: 'e', providerFailed: true });
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":1,"is_error":false,"result":"x"}'), structured))
       .toThrow('malformed');
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":"success","is_error":false,"result":3}'), structured))
@@ -104,6 +117,13 @@ describe('production agent adapters', () => {
       expect(() => startClaudeInvocation({ ...missing, inputDirectory: root, invocation: invalid }, 'token'))
         .toThrow('"type": "object"');
       expect(isInvocationActive(invalid.attemptId)).toBe(false);
+      // A request over the planning model budget is refused there too (#163).
+      writeFileSync(join(root, 'schema.json'), SCHEMA_TEXT);
+      const overBudget = captureInvocation({ ...planning, attemptId: 'claude-over-budget' });
+      const prompt = 'p'.repeat(MAX_PLANNING_INPUT_BYTES - Buffer.byteLength(SCHEMA_TEXT) + 1);
+      expect(() => startClaudeInvocation({ ...missing, prompt, inputDirectory: root, invocation: overBudget }, 'token'))
+        .toThrow('model budget');
+      expect(isInvocationActive(overBudget.attemptId)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
     expect(isInvocationActive(planning.attemptId)).toBe(false);
     // Questions carry no schema, so the same request gets past the schema read to the image check.

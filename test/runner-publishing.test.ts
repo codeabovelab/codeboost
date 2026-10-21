@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
+import { ghIssueNotFound } from './fixtures/gh-answers.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
 import { MERGE_CANCELLED, Store, type PublishRecord } from '../runner/store.ts';
@@ -27,7 +28,6 @@ import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
 import { MergeJobCoordinator, SETTLED_BEFORE_JOB_MERGE, type MergeJobTiming } from '../runner/merge-job.ts';
 import type { RemoteMergeState, RequiredCheck } from '../github/merge.ts';
 import { RemoteTimeout } from '../github/timeout.ts';
-import { CommandFailed } from '../github/run-with-input.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -631,7 +631,7 @@ describe('publishing a finished task (#103)', () => {
 
   it.each([
     ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), /could not be verified: Issue retrieval timed out/],
-    ['was answered by gh', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', 'HTTP 404: Not Found', ''), /could not be verified: gh failed \(exit 1\): HTTP 404/],
+    ['was answered by gh', ghIssueNotFound, /could not be verified: gh failed \(exit 1\): gh: Not Found \(HTTP 404\)/],
   ] as const)('records a publish whose issue-trust read %s before shutdown as failed with that answer, not stopped (#48)', async (_case, answer, expected) => {
     const w = world(), reading = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     let accessSignal: AbortSignal | undefined;
@@ -2152,7 +2152,7 @@ describe('the one-click merge job (F6b of #22)', () => {
 
   it.each([
     ['timed out', () => new RemoteTimeout('Issue retrieval timed out.'), 503, 'Issue trust could not be verified: Issue retrieval timed out.'],
-    ['gh answered', () => new CommandFailed('gh failed (exit 1): HTTP 404: Not Found', '', ''), 502, 'Issue trust could not be verified: gh failed (exit 1): HTTP 404: Not Found'],
+    ['gh answered', ghIssueNotFound, 502, `Issue trust could not be verified: ${ghIssueNotFound().message}`],
   ] as const)('keeps a merge click\'s trust read failure (%s) when shutdown starts while gh stops, saving nothing', async (_name, failure, status, error) => {
     const w = world(); moveUserHead(w);
     let storeRef: Store | null = null, hang = false, fail!: (error: Error) => void, reading!: () => void;

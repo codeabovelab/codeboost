@@ -36,6 +36,45 @@ function mergeReads(args: readonly string[], pull: Record<string, unknown> = {})
   if (/\/branches\/[^/]+$/.test(joined)) return JSON.stringify({ protected: false });
   throw new Error(`Unexpected gh call: ${joined}`);
 }
+/**
+ * The gateway's read of the runs of each pinned check (`gh api graphql`, github/merge.ts `#pinnedRuns`). gh's
+ * statusCheckRollup names no app (#176), so this is the read a required check pinned to an app is matched from.
+ */
+const isCheckRunRead = (args: readonly string[]) => args[0] === 'api' && args[1] === 'graphql' && args.some(arg => arg.startsWith('query=') && arg.includes('checkSuites('));
+/** A check suite on the head: the app that reported it and its latest runs (GitHub's `checkType: LATEST`). */
+type Suite = { app: number; runs: Array<Record<string, unknown>> };
+/** Each pinned check the call asks for: its alias index, app, name and cursor, from the call's `-F appN`, `-f nameN`, `-f afterN`. */
+function pinnedVariables(args: readonly string[]): Array<{ index: number; app: number; name: string; after: string | null }> {
+  const value = (flag: string, key: string) => {
+    for (let i = 0; i < args.length - 1; i++) if (args[i] === flag && args[i + 1]!.startsWith(`${key}=`)) return args[i + 1]!.slice(key.length + 1);
+    return undefined;
+  };
+  const indexes = args.flatMap((arg, i) => args[i - 1] === '-F' ? [/^app(\d+)=/.exec(arg)?.[1]].filter(Boolean) as string[] : []);
+  return indexes.map(index => ({ index: Number(index), app: Number(value('-F', `app${index}`)), name: value('-f', `name${index}`)!, after: value('-f', `after${index}`) ?? null }));
+}
+/**
+ * gh 2.102.0's answer to that read: exit 0 with GitHub's response on stdout, in the shape recorded in
+ * test/fixtures/gh/nonadmin-ruleset.json, nonadmin-mixed.json and pinned-rerun.json. As GitHub does, it keeps per alias
+ * only the suites of the asked app and, in each, only the runs of the asked name, in one page (`page` overrides an
+ * alias's count and page info, for the paging tests). It does not model a private app: the query does not ask for a
+ * suite's app, and GitHub's app filter returns such a suite all the same (nonadmin-mixed.json). A failed read is a
+ * CommandFailed (`ghExit`, below).
+ */
+function checkRunsAnswer(args: readonly string[], suites: readonly Suite[], options: { head?: string; page?: (alias: { app: number; name: string; after: string | null }) => { totalCount?: number; hasNextPage?: boolean; endCursor?: string | null } } = {}): string {
+  const aliases = Object.fromEntries(pinnedVariables(args).map(alias => {
+    const nodes = suites.filter(suite => suite.app === alias.app).map(suite => {
+      const runs = suite.runs.filter(run => run.name === alias.name);
+      return { checkRuns: { totalCount: runs.length, nodes: runs } };
+    });
+    const page = options.page?.(alias) ?? {};
+    return [`c${alias.index}`, { totalCount: page.totalCount ?? nodes.length,
+      pageInfo: { hasNextPage: page.hasNextPage ?? false, endCursor: page.endCursor !== undefined ? page.endCursor : nodes.length ? 'Y3Vyc29yOnYyOpHPAAAAGN-eHXo=' : null }, nodes }];
+  }));
+  return JSON.stringify({ data: { repository: { object: { __typename: 'Commit', oid: options.head ?? sha('b'), ...aliases } } } });
+}
+/** One check run as that read gives it: GitHub's GraphQL API answers `null`, not gh's zero time, for a time not reached. */
+const checkRun = (name: string, status: string, conclusion: string | null, startedAt: string | null = '2026-10-11T00:00:00Z', completedAt: string | null = status === 'COMPLETED' ? '2026-10-11T00:01:00Z' : null) =>
+  ({ name, status, conclusion, startedAt, completedAt });
 function readyView(): ReviewView {
   return {
     items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
@@ -915,10 +954,11 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   const run = async (args: readonly string[]) => {
     calls.push([...args]); const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) { pullReads++; return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
-      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } },
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       { name: 'race', status: 'IN_PROGRESS', conclusion: 'SUCCESS' },
       { context: 'lint', state: 'SUCCESS' },
     ] }); }
+    if (isCheckRunRead(args)) return checkRunsAnswer(args, [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }]);
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'merge_queue' }, { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }, { context: 'race', integration_id: null }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.includes('/protection')) return JSON.stringify({ required_status_checks: { strict: false, checks: [{ context: 'lint', app_id: null }] } });
@@ -1047,14 +1087,23 @@ it('ignores required reviews in both rule sources and reads only their required 
     .toMatchObject({ ready: true, blockers: [] });
 });
 
-/** Inspects a pull request whose one required check, `test` from any app, has these observed runs and statuses. */
-async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null) {
+/**
+ * Inspects a pull request whose one required check is `test`, from any app or, with `appId`, from that app, and whose head
+ * has these observed runs and statuses in gh's rollup. `checkRuns` answers the read of a pinned check's runs: the head's
+ * check suites, or a function of the call's arguments that answers or throws; without it that read is unexpected.
+ * The other answers have gh 2.102.0's shapes (test/fixtures/gh/) and leave out fields the gateway does not read on this
+ * path: the pull request's `url`; each rule's source fields and `do_not_enforce_on_create`; and the branch's `name`,
+ * `commit`, links and `protection` (read only when the branch is protected).
+ */
+async function requiredTestState(statusCheckRollup: unknown[], appId: number | null = null, checkRuns?: readonly Suite[] | ((args: readonly string[]) => string | Promise<string>)) {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup });
+    if (checkRuns !== undefined && isCheckRunRead(args)) return typeof checkRuns === 'function' ? checkRuns(args) : checkRunsAnswer(args, checkRuns);
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: appId }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
-    if (joined.endsWith('/protection')) throw new Error('gh: Branch not protected (HTTP 404)');
+    // gh 2.102.0's 404 for a branch no classic protection covers (zero-checks.json), as runWithInput reports it.
+    if (joined.endsWith('/protection')) throw NOT_PROTECTED;
     { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
     throw new Error(`Unexpected gh call: ${joined}`);
   };
@@ -1202,19 +1251,223 @@ it.each([
   expect(await requiredTestState([...rollup])).toEqual([expected]);
 });
 
-// #176, until it is fixed: gh's rollup never carries a check run's app (test/fixtures/gh/, gh 2.102.0), so a requirement
-// pinned to an app finds no matching run and reads as missing. That fails closed: a passing run from any app never
-// satisfies it.
-it('reads a requirement pinned to an app as missing against gh\'s app-less check runs', async () => {
-  expect(await requiredTestState([{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
-    startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z', workflowName: 'CI' }], 10)).toEqual(['missing']);
+/**
+ * The branch read gh 2.102.0 gives for a branch no classic protection covers (zero-checks.json, less the branch's
+ * `commit` and links, which the gateway does not read).
+ */
+const UNPROTECTED_BRANCH = JSON.stringify({ name: 'main', protected: false, protection: { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } });
+// The pinned-check tests below fake gh 2.102.0's other answers in the shapes of test/fixtures/gh/: the protection read's
+// 404 is NOT_PROTECTED and the branch read UNPROTECTED_BRANCH, unless a test says otherwise. They leave out what the
+// gateway does not read on these paths: the pull request's `url` (read only for display) and each rule's
+// `ruleset_source_type`, `ruleset_source`, `ruleset_id` and `do_not_enforce_on_create`.
+// #176: gh's rollup never carries a check run's app (test/fixtures/gh/, gh 2.102.0), so a requirement pinned to an app is
+// matched from the runs GitHub lists for that app and name on the head. Each rollup below holds an app-less passing
+// `test` run, as gh reports one; before #176 every requirement here read as missing.
+const appLessPass = [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
+  startedAt: '2026-10-20T00:00:00Z', completedAt: '2026-10-20T00:01:00Z', workflowName: 'CI', detailsUrl: 'https://github.com/owner/repo/actions/runs/1/job/2' }];
+
+it.each([
+  ['passed', [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }], 'success'],
+  ['was skipped', [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SKIPPED')] }], 'success'],
+  ['is in progress', [{ app: 10, runs: [checkRun('test', 'IN_PROGRESS', null)] }], 'pending'],
+  ['is queued and has not started', [{ app: 10, runs: [checkRun('test', 'QUEUED', null, null)] }], 'pending'],
+  ['failed', [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'FAILURE')] }], 'failure'],
+  ['passed, while another app\'s run of that name failed', [{ app: 11, runs: [checkRun('test', 'COMPLETED', 'FAILURE')] }, { app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }], 'success'],
+  ['passed, in a suite where another check has more than 100 runs', [{ app: 10, runs: [...Array.from({ length: 101 }, (_, n) => checkRun(`job ${n}`, 'COMPLETED', 'FAILURE')), checkRun('test', 'COMPLETED', 'SUCCESS')] }], 'success'],
+  ['was re-run in a new suite that is in progress', [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'FAILURE')] },
+    { app: 10, runs: [checkRun('test', 'IN_PROGRESS', null, '2026-10-11T00:05:00Z')] }], 'pending'],
+] as const)('reads a required check pinned to an app from that app\'s run on the head, which %s', async (_case, suites, expected) => {
+  expect(await requiredTestState(appLessPass, 10, suites as unknown as Suite[])).toEqual([expected]);
 });
 
-it('matches a requirement bound to an app only against that app\'s check runs, never a commit status', async () => {
-  expect(await requiredTestState([
-    { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-11T00:00:00Z', app: { databaseId: 10 } },
-    { context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' },
-  ], 10)).toEqual(['success']);
+it.each([
+  ['a different app', [{ app: 11, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }]],
+  ['nowhere: the head has no check suites', []],
+  ['the pinned app, under another name', [{ app: 10, runs: [checkRun('tests', 'COMPLETED', 'SUCCESS'), checkRun('Test', 'COMPLETED', 'SUCCESS')] }]],
+] as const)('reads a required check pinned to an app as missing when its only passing run is from %s', async (_case, suites) => {
+  expect(await requiredTestState(appLessPass, 10, suites as unknown as Suite[])).toEqual(['missing']);
+});
+
+it('matches a requirement pinned to an app only against that app\'s check runs, never a commit status', async () => {
+  expect(await requiredTestState([{ context: 'test', state: 'SUCCESS', startedAt: '2026-10-11T00:05:00Z' }], 10, [])).toEqual(['missing']);
+  expect(await requiredTestState([{ context: 'test', state: 'FAILURE', startedAt: '2026-10-11T00:05:00Z' }], 10,
+    [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }])).toEqual(['success']);
+});
+
+it('asks GitHub for each pinned check\'s app and name on the exact head the pull request read returned, and only for a pinned check', async () => {
+  const reads: string[][] = [];
+  expect(await requiredTestState(appLessPass, 10, args => { reads.push([...args]); return checkRunsAnswer(args, [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }]); })).toEqual(['success']);
+  expect(reads).toHaveLength(1);
+  expect(reads[0]!.slice(0, 3)).toEqual(['api', 'graphql', '-f']);
+  expect(reads[0]![3]).toMatch(/c0:checkSuites\(first:100,after:\$after0,filterBy:\{appId:\$app0\}\).*checkRuns\(first:100,filterBy:\{checkName:\$name0,checkType:LATEST\}\)/);
+  expect(reads[0]!.slice(4)).toEqual(['-f', 'owner=owner', '-f', 'repo=repo', '-f', `oid=${sha('b')}`, '-F', 'app0=10', '-f', 'name0=test']);
+  // A check any app may report is read from the rollup alone: here gh has no answer for the pinned-check read.
+  expect(await requiredTestState(appLessPass, null)).toEqual(['success']);
+});
+
+it('reads every page of an app\'s check suites on the head, and up to the page limit exactly', async () => {
+  for (const last of [2, 10]) {
+    const pages: (string | null)[] = [];
+    const state = await requiredTestState(appLessPass, 10, args => {
+      const after = pinnedVariables(args)[0]!.after, page = after === null ? 1 : Number(after.slice('PAGE_'.length));
+      pages.push(after);
+      // Each page holds one suite; the last one has the pending run.
+      return checkRunsAnswer(args, [{ app: 10, runs: [page === last ? checkRun('test', 'IN_PROGRESS', null) : checkRun('test', 'COMPLETED', 'SUCCESS')] }],
+        { page: () => ({ totalCount: last, hasNextPage: page < last, endCursor: `PAGE_${page + 1}` }) });
+    });
+    expect(pages).toEqual([null, ...Array.from({ length: last - 1 }, (_, n) => `PAGE_${n + 2}`)]);
+    expect(state).toEqual(['pending']);
+  }
+});
+
+it('reads several pinned checks in one call, and pages only the check whose app has more suites', async () => {
+  const reads: ReturnType<typeof pinnedVariables>[] = [];
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (isCheckRunRead(args)) {
+      const asked = pinnedVariables(args); reads.push(asked);
+      const second = asked.some(alias => alias.after !== null);
+      return checkRunsAnswer(args, second ? [{ app: 11, runs: [checkRun('lint', 'COMPLETED', 'SUCCESS')] }]
+        : [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }, { app: 11, runs: [checkRun('lint', 'COMPLETED', 'FAILURE', '2026-10-10T00:00:00Z')] }],
+        { page: alias => alias.app === 11 ? { totalCount: 2, hasNextPage: !second, endCursor: 'PAGE_2' } : {} });
+    }
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false,
+      required_status_checks: [{ context: 'test', integration_id: 10 }, { context: 'lint', integration_id: 11 }] } }]]);
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
+    if (joined.endsWith('/protection')) throw NOT_PROTECTED;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(reads).toEqual([[{ index: 0, app: 10, name: 'test', after: null }, { index: 1, app: 11, name: 'lint', after: null }], [{ index: 1, app: 11, name: 'lint', after: 'PAGE_2' }]]);
+  // The newer `lint` run, on the second page, passed.
+  expect(state.requiredChecks).toEqual([{ context: 'test', appId: 10, state: 'success' }, { context: 'lint', appId: 11, state: 'success' }]);
+});
+
+it('reads more pinned checks than one call holds in several calls', async () => {
+  const contexts = Array.from({ length: 30 }, (_, n) => `job ${n}`), calls: number[] = [];
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (isCheckRunRead(args)) { calls.push(pinnedVariables(args).length); return checkRunsAnswer(args, [{ app: 10, runs: contexts.map(context => checkRun(context, 'COMPLETED', 'SUCCESS')) }]); }
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false,
+      required_status_checks: contexts.map(context => ({ context, integration_id: 10 })) } }]]);
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
+    if (joined.endsWith('/protection')) throw NOT_PROTECTED;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(calls).toEqual([25, 5]);
+  expect(state.requiredChecks.map(check => check.state)).toEqual(Array(30).fill('success'));
+});
+
+it('does not read pinned checks when the rules are unknown, so the rules blocker stays', async () => {
+  let reads = 0;
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: appLessPass });
+    // Never answered: the read must not run. Shaped as gh 2.102.0 exits on a GraphQL error (stdout: GitHub's response).
+    if (isCheckRunRead(args)) { reads++; throw ghExit('gh: Something went wrong while executing your query.', '{"data":null,"errors":[{"message":"Something went wrong while executing your query."}]}'); }
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    // GitHub's branch read also gives `protection`, which the gateway reads only after the protection read answers 404.
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    // Classic protection whose `strict` is malformed: the rules are unknown, after the ruleset's pinned check was parsed.
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: 'yes', checks: [] } });
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const gateway = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run);
+  const state = await gateway.inspect({ fresh: true });
+  expect(state).toMatchObject({ rulesKnown: false, requiredChecks: [{ context: 'test', appId: 10, state: 'missing' }] });
+  expect(reads).toBe(0);
+  const view = readyView();
+  const status = await new MergeCoordinator(serviceFor(view), gateway).status(view, true);
+  expect(status.blockers).toContainEqual({ code: 'rules', message: 'Required branch checks could not be read.' });
+  expect(status.blockers.some(blocker => blocker.code === 'github')).toBe(false);
+});
+
+/** A gateway for a pull request requiring `test` from app 10, where `answer` answers the read of its runs. */
+function pinnedGateway(answer: (args: readonly string[], signal?: AbortSignal) => Promise<string>) {
+  const run = async (args: readonly string[], runOptions?: { signal?: AbortSignal }) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: appLessPass });
+    if (isCheckRunRead(args)) return answer(args, runOptions?.signal);
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    if (/branches\/main$/.test(joined)) return UNPROTECTED_BRANCH;
+    if (joined.endsWith('/protection')) throw NOT_PROTECTED;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  return new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run);
+}
+
+const passing: Suite[] = [{ app: 10, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }];
+const failedCheckRunReads: Array<[string, (args: readonly string[]) => Promise<string>, RegExp]> = [
+  // As gh 2.102.0 answers a GraphQL error (checked against GitHub): exit 1, `gh: <message>` on stderr, the response on stdout.
+  ['gh exits with GitHub\'s error', async () => { throw ghExit('gh: Could not resolve to a Repository with the name \'owner/repo\'.',
+    '{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"locations":[{"line":1,"column":69}],"message":"Could not resolve to a Repository with the name \'owner/repo\'."}]}'); },
+    /^gh failed \(exit 1\): gh: Could not resolve to a Repository/],
+  // Defensive: gh 2.102.0 exits 1 on such an answer (the case above), so it never prints one on exit 0.
+  ['GitHub answers with errors on exit 0 (defensive)', async () => JSON.stringify({ data: null, errors: [{ message: 'Timeout on validation of query' }] }), /^GitHub returned check runs with errors\.$/],
+  // GitHub's answer for a commit it does not have (checked with gh 2.102.0: exit 0).
+  ['GitHub does not find the head', async () => JSON.stringify({ data: { repository: { object: null } } }), /^GitHub returned no check runs for the pull request head\.$/],
+  ['GitHub answers for another commit', async args => checkRunsAnswer(args, passing, { head: sha('c') }), /^GitHub returned no check runs for the pull request head\.$/],
+  ['the answer leaves out the check', async args => checkRunsAnswer(args, passing).replace('"c0":', '"c9":'), /^GitHub returned incomplete check runs\.$/],
+  ['a suite has more runs of the check\'s name than one page holds', async args => checkRunsAnswer(args, passing).replace('"checkRuns":{"totalCount":1', '"checkRuns":{"totalCount":101'),
+    /more runs named "test" than codeboost can read/],
+  ['a run has an unknown status', async args => checkRunsAnswer(args, [{ app: 10, runs: [checkRun('test', 'DONE', 'SUCCESS')] }]), /^GitHub returned a malformed check run\.$/],
+  ['the suites change between pages', async args => pinnedVariables(args)[0]!.after !== null
+    ? checkRunsAnswer(args, passing, { page: () => ({ totalCount: 3 }) })
+    : checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2, hasNextPage: true, endCursor: 'PAGE_2' }) }), /changed while they were read/],
+  ['the pages hold fewer suites than GitHub counts', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2 }) }), /changed while they were read/],
+  // Defensive: GitHub has not been seen to answer a next page without a cursor to it.
+  ['GitHub says there is a next page but gives no cursor to it (defensive)', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 2, hasNextPage: true, endCursor: null }) }),
+    /^GitHub returned incomplete check runs\.$/],
+  // Defensive, as above, on the last page codeboost reads: the missing cursor, not the page limit, is the reason.
+  ['GitHub says there is a page after the 10th but gives no cursor to it (defensive)', async args => {
+    const after = pinnedVariables(args)[0]!.after, page = after === null ? 1 : Number(after.slice('PAGE_'.length));
+    return checkRunsAnswer(args, passing, { page: () => ({ totalCount: 1001, hasNextPage: true, endCursor: page === 10 ? null : `PAGE_${page + 1}` }) });
+  }, /^GitHub returned incomplete check runs\.$/],
+  ['the app has more than 1,000 check suites on the head', async args => checkRunsAnswer(args, passing, { page: () => ({ totalCount: 1001, hasNextPage: true, endCursor: 'NEXT' }) }),
+    /more check suites from app 10 than codeboost can read/],
+];
+
+it.each(failedCheckRunReads)('fails the inspection with its reason when the read of the pinned check fails: %s', async (_case, answer, reason) => {
+  await expect(pinnedGateway(answer).inspect({ fresh: true })).rejects.toThrow(reason);
+});
+
+it.each(failedCheckRunReads)('blocks the merge with the reason when the read of the pinned check fails: %s', async (_case, answer, reason) => {
+  const view = readyView();
+  const status = await new MergeCoordinator(serviceFor(view), pinnedGateway(answer)).displayStatus(view);
+  expect(status).toMatchObject({ ready: false, action: null, remote: null });
+  expect(status.blockers).toHaveLength(1);
+  expect(status.blockers[0]!.code).toBe('github');
+  expect(status.blockers[0]!.message).toMatch(/^Could not read GitHub merge state\. /);
+  expect(status.blockers[0]!.message.replace(/^Could not read GitHub merge state\. /, '')).toMatch(reason);
+});
+
+it('keeps the inspection\'s timeout as the reason when the read of the pinned check outlasts it', async () => {
+  let stopped: unknown = null;
+  const gateway = pinnedGateway((_args, signal) => new Promise((_resolve, reject) => {
+    // runWithInput rejects with the abort's reason when the abort stops gh before it exits.
+    signal!.addEventListener('abort', () => { stopped = signal!.reason; reject(signal!.reason); }, { once: true });
+  }));
+  await expect(gateway.inspect({ fresh: true, timeoutMs: 50 })).rejects.toThrow('GitHub merge-state inspection timed out.');
+  // The deadline stopped this read: it was in flight when the deadline fired.
+  expect(stopped).toBeInstanceOf(Error);
+  expect((stopped as Error).message).toBe('GitHub merge-state inspection timed out.');
+});
+
+it('is ready to merge when the app-pinned required check passed on the head, and not when another app reported it', async () => {
+  for (const [app, ready] of [[10, true], [11, false]] as const) {
+    const view = readyView();
+    const gateway = pinnedGateway(async args => checkRunsAnswer(args, [{ app, runs: [checkRun('test', 'COMPLETED', 'SUCCESS')] }]));
+    const status = await new MergeCoordinator(serviceFor(view), gateway).status(view, true);
+    expect(status.remote.requiredChecks).toEqual([{ context: 'test', appId: 10, state: ready ? 'success' : 'missing' }]);
+    expect(status.ready).toBe(ready);
+  }
 });
 
 it('rejects an unsupported runtime merge method', () => {
@@ -1425,7 +1678,7 @@ it.each([
 ] as const)('fails closed for an invalid %s check app identity', async (_source, rules, requiredStatusChecks) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } }] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([rules]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });

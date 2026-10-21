@@ -1,13 +1,18 @@
 import { readFileSync } from 'node:fs';
-import { CommandFailed } from '../../../github/run-with-input.ts';
+import { ghFailedExit } from '../gh-answers.ts';
 import type { RunGh } from '../../../github/merge.ts';
 
 /**
- * What `scripts/record-merge-gh.ts` saves: every `gh` call of one real merge inspection, as gh answered it and
- * `runWithInput` (github/run-with-input.ts) reports it to the gateway: stdout in full on exit 0, where stderr is not kept
- * and is saved as ''; on another exit, stderr and stdout with surrounding whitespace trimmed, as runWithInput keeps them.
- * One part is left out: a branch read (`api repos/<repo>/branches/<branch>`) keeps only `name`, `protected` and
- * `protection` of GitHub's answer, since the gateway reads only the last two.
+ * Real `gh` calls, as gh answered them and `runWithInput` (github/run-with-input.ts) reports them to the gateway: stdout
+ * in full on exit 0, where stderr is not kept and is saved as ''; on another exit, stderr and stdout with surrounding
+ * whitespace trimmed, as runWithInput keeps them. Two scripts write these files:
+ * - `scripts/record-merge-gh.ts` (zero-checks, checks-pending, checks-passing, nonadmin-*): every `gh` call of one real
+ *   merge inspection. One part is left out: a branch read (`api repos/<repo>/branches/<branch>`) keeps only `name`,
+ *   `protected` and `protection` of GitHub's answer, since the gateway reads only the last two.
+ * - `scripts/record-pinned-gh.ts` (pinned-rerun, pinned-large-suite, private-app-suites): not a whole inspection. The
+ *   pinned-* files hold the gateway's pinned-check read from an inspection whose other reads were faked, plus one REST
+ *   read that `--jq` filters to a few fields; private-app-suites holds a REST read and a GraphQL read of one commit's
+ *   check suites. The script's header says which.
  */
 export interface RecordedGh {
   gh: string;
@@ -35,8 +40,7 @@ export function replayGh(...recordings: RecordedGh[]): RunGh & { calls: string[]
     // The gateway may turn this failure into unknown rules, so callers also assert `unrecorded` is empty.
     if (!answer) { unrecorded.push([...args]); throw new Error(`No recorded answer for gh ${args.join(' ')}`); }
     if (answer.exitCode === 0) return answer.stdout;
-    throw new CommandFailed(`gh failed (exit ${answer.exitCode}): ${answer.stderr.slice(0, 2000)}${answer.stdout ? `\n${answer.stdout.slice(0, 2000)}` : ''}`,
-      answer.stderr, answer.stdout);
+    throw ghFailedExit(answer.exitCode, answer.stderr, answer.stdout);
   };
   return Object.assign(run, { calls, unrecorded });
 }

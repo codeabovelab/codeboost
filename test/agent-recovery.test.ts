@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage).
-interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string> }
+// A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage). Its
+// removals answer as Docker 27.4.0 does: `rm --force` of a missing container exits 0 and says "No such container" on
+// stderr; `volume rm --force` of a missing name exits 0 and prints the name, and of a volume a container mounts exits 1
+// with "volume is in use"; `volume inspect` of a missing name exits 1 with "no such volume". Its other errors are
+// shorter than Docker's; the code reads only the exit status and, through `absent`, "No such" or "not found".
+interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string>;
+  /** For a container: the names of the volumes it mounts. */
+  mounts?: string[] }
 const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][],
   failSingleInspect: new Set<string>(), vanishOnInspect: new Set<string>(), brokenInspect: new Set<string>(),
   beforeSingleInspect: undefined as undefined | ((ref: string) => void) }));
@@ -36,11 +42,18 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
       ? { Id: object!.id, Name: `/${object!.name}`, Config: { Labels: object!.labels } }
       : { ...(object!.kind === 'network' ? { Id: object!.id } : {}), Name: object!.name, Labels: object!.labels });
     return found.every(Boolean) ? { status: 0, stdout: JSON.stringify(json), stderr: '' }
-      : { status: 1, stdout: JSON.stringify(json), stderr: 'Error: No such object' };
+      : { status: 1, stdout: JSON.stringify(json), stderr: args[0] === 'volume'
+        ? `Error response from daemon: get ${args.slice(2).find(ref => !find('volume', ref))}: no such volume`
+        : 'Error: No such object' };
   }
   const [kind, ref] = args[0] === 'rm' ? ['container', args[2]!] : [args[0]!, args[args.length - 1]!];
   const object = find(kind, ref);
+  if (!object && kind === 'volume' && args.includes('--force')) return { status: 0, stdout: ref, stderr: '' };
+  if (!object && kind === 'container' && args.includes('--force'))
+    return { status: 0, stdout: '', stderr: `Error response from daemon: No such container: ${ref}` };
   if (!object) return { status: 1, stdout: '', stderr: 'Error: No such object' };
+  const holder = kind === 'volume' && daemon.objects.find(other => other.mounts?.includes(object.name));
+  if (holder) return { status: 1, stdout: '', stderr: `Error response from daemon: remove ${object.name}: volume is in use - [${holder.id}]` };
   if (daemon.refuseRemoval.has(object.name)) return { status: 1, stdout: '', stderr: 'Error: daemon refused removal' };
   daemon.objects.splice(daemon.objects.indexOf(object), 1);
   return { status: 0, stdout: ref, stderr: '' };
@@ -340,5 +353,115 @@ describe('recoverLeftovers', () => {
   it('refuses a malformed runner token before listing anything', async () => {
     await expect(recoverLeftovers('A'.repeat(32))).rejects.toThrow('32 lowercase hex');
     expect(daemon.calls).toEqual([]);
+  });
+
+  // #181: what an interrupted path identity probe leaves, labelled as `pathIdentityProbeArgs` labels it: a container
+  // created but never started, and its anonymous volume.
+  const probe = (runner: string, labels: Record<string, string> = {}, names: { container?: string; volume?: string } = {}) => {
+    const probeLabels = { 'io.codeboost.runner': runner, 'io.codeboost.probe': 'path-identity', ...labels };
+    const volume = names.volume ?? id();
+    const objects: [FakeObject, FakeObject] = [
+      { kind: 'container', id: id(), name: names.container ?? `codeboost-path-identity-${randomUUID()}`, labels: probeLabels,
+        mounts: [volume] },
+      { kind: 'volume', name: volume, labels: { 'com.docker.volume.anonymous': '', ...probeLabels } },
+    ];
+    daemon.objects.push(...objects);
+    return objects;
+  };
+
+  it('removes its own leftover path identity probe and its volume, container first, and no other runner\'s (#181)', async () => {
+    const [container, volume] = probe(A), theirs = probe(B), mine = attempt(A, 'attempt-a');
+    const report = await recoverLeftovers(A);
+    const [work, metadata, keeper, seeder, agent, proxy, network] = mine.objects;
+    expect(report.removed.map(resource => resource.name).sort()).toEqual([container.name, volume.name, seeder!.name,
+      agent!.name, proxy!.name, network!.name].sort());
+    expect(names()).toEqual([work!.name, metadata!.name, keeper!.name, ...theirs.map(object => object.name)].sort());
+    expect(report.unowned).toEqual([]);
+    // The container by its full ID, then its volume by name, which it holds until the container is gone.
+    const removals = daemon.calls.filter(args => args[0] === 'rm' || args[1] === 'rm').map(args => args[args.length - 1]);
+    expect(removals.indexOf(container.id!)).toBeGreaterThanOrEqual(0);
+    expect(removals.indexOf(container.id!)).toBeLessThan(removals.indexOf(volume.name));
+    expect(daemon.calls).toContainEqual(['volume', 'rm', '--force', volume.name]);
+  });
+
+  it.each([
+    ['another probe kind', { 'io.codeboost.probe': 'other' }, {}],
+    ['an attempt label', { 'io.codeboost.attempt': 'attempt-a' }, {}],
+    ['an allocation label', { 'io.codeboost.allocation': randomUUID() }, {}],
+    ['a task-storage label', { 'io.codeboost.task-storage': 'work' }, {}],
+    ['names D does not give a probe', {}, { container: `codeboost-agent-${randomUUID()}`, volume: `codeboost-work-${randomUUID()}` }],
+  ] as const)('leaves probe-labelled objects of its runner with %s, and reports them (#181)', async (_label, labels, named) => {
+    const objects = probe(A, labels, named);
+    const report = await recoverLeftovers(A);
+    expect(report.removed).toEqual([]);
+    expect(names()).toEqual(objects.map(object => object.name).sort());
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(objects.map(object => [object.name, 'unknown-kind']).sort());
+  });
+
+  it('reports a path identity probe without a runner label and never removes it (#181)', async () => {
+    const objects = probe(A).map(object => {
+      const { 'io.codeboost.runner': _runner, ...labels } = object.labels;
+      object.labels = labels;
+      return object;
+    });
+    const report = await recoverLeftovers(A);
+    expect(names()).toEqual(objects.map(object => object.name).sort());
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(objects.map(object => [object.name, 'no-runner-label']).sort());
+  });
+
+  it('removes a probe volume whose container is already gone (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.objects.splice(daemon.objects.indexOf(container), 1);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).toEqual([volume.name]);
+    expect(names()).toEqual([]);
+  });
+
+  it('keeps a probe volume a container it leaves still mounts, and reports that container (#181)', async () => {
+    const [, volume] = probe(A);
+    const holder: FakeObject = { kind: 'container', id: id(), name: `codeboost-other-${randomUUID()}`,
+      labels: { 'io.codeboost.runner': A }, mounts: [volume.name] };
+    daemon.objects.push(holder);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).not.toContain(volume.name);
+    expect(names()).toContain(volume.name);
+    expect(report.unowned.map(resource => [resource.name, resource.reason])).toEqual([[holder.name, 'unknown-kind']]);
+  });
+
+  it('leaves a probe volume whose runner label changed between the list and the inspect (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.objects.splice(daemon.objects.indexOf(container), 1);
+    // Listed as A's; by the inspect, a same-named volume of another runner holds the name.
+    daemon.beforeSingleInspect = ref => {
+      if (ref === volume.name) volume.labels = { ...volume.labels, 'io.codeboost.runner': B };
+    };
+    const report = await recoverLeftovers(A, 120_000, { unowned: false });
+    expect(report.removed).toEqual([]);
+    expect(names()).toEqual([volume.name]);
+    // Another runner's now: neither removed nor reported as this runner's.
+    expect(report.unowned).toEqual([]);
+  });
+
+  it('removes no probe volume while its container\'s removal is not confirmed (#181)', async () => {
+    const [container, volume] = probe(A);
+    daemon.refuseRemoval.add(container.name);
+    const failure = await recoverLeftovers(A).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RecoveryError);
+    expect((failure as Error).message).toContain(`Could not remove container ${container.name}`);
+    expect(daemon.calls.filter(args => args[0] === 'volume' && args[1] === 'rm')).toEqual([]);
+    expect(names()).toEqual([container.name, volume.name].sort());
+  });
+
+  it('fails recovery, and removes no network after it, when a probe volume\'s removal is not confirmed (#181)', async () => {
+    const [container, volume] = probe(A), mine = attempt(A, 'attempt-a'), network = mine.objects[6]!;
+    daemon.refuseRemoval.add(volume.name);
+    const failure = await recoverLeftovers(A).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RecoveryError);
+    expect((failure as Error).message).toContain(`Could not remove volume ${volume.name}`);
+    expect((failure as InstanceType<typeof RecoveryError>).removed.map(resource => resource.name)).toContain(container.name);
+    expect(names()).toContain(volume.name);
+    expect(names()).toContain(network.name);
   });
 });
