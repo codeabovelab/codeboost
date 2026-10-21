@@ -36,6 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
+| A planning request over its model budget is refused before the start, and the planning command passes `--max-turns 50` (see [planning model budget](#planning-model-budget) for what is and is not shown about the stop) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
 | A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | The Docker daemon keeps no log of an agent container (#165): the supervisor's bounded capture through `docker start --attach` is the only copy of its output. This covers the agent container only. The runner's other containers keep the daemon's default log: the task-storage script containers (`docker run --rm`, `agents/container/storage.ts`), whose log is removed with the container while the client bounds what it reads, and the storage keeper and egress proxy, which write no output | `agent-container`: the created container's `LogConfig` is driver `none` with no option but `cache-*` ones; the validator refuses a container with a `json-file` log or a bounded `local` log; every probe that returns output shows the attach still delivers it. `agent-daemon-log`: the rule (`keepsNoDaemonLog`) also refuses driver `none` with a log option, which only the API can set, and accepts the `cache-*` options a daemon copies into every container |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
@@ -102,6 +103,36 @@ Use only these entry points to run an agent:
      one link, at most 64 KiB of UTF-8, and a JSON object with `"type": "object"`; otherwise the start call throws.
      Leave out a draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan
      format](../plan-format.md)).
+   - <a id="planning-model-budget"></a>**Planning model budget (#163).** `createClaudeCommand` checks it when it
+     builds the planning command, so the adapter's start call throws before it creates a container or network. The
+     runner's host clone and task storage already exist by then, and the runner removes them. The budget has two parts:
+     - *Input, before the start.* The prompt and the schema together must be at most `MAX_PLANNING_INPUT_BYTES` (64 KiB)
+       of UTF-8: the 32 KiB prompt plus 32 KiB of schema text. A larger request is refused with an error that gives its
+       size, split into prompt and schema, and asks the person to narrow the request (the issue and comments, the paths,
+       the lessons, the feedback or the previous plan). Bytes stand in for tokens because Claude's tokenizer is not
+       available offline. A count of bytes is an upper bound on the tokens if every token covers at least one byte; this
+       is assumed, not verified against Claude's tokenizer. `prepareDraft` and `prepareSuggestions` already limit the
+       prompt and the schema text to 32 KiB each, so this check refuses nothing they produce. It is a backstop for a
+       caller that skips them. A test checks a draft at the prompt limit with today's schema; no test fails if the
+       32 KiB schema bound in `core/planning-author.ts` is removed. It does not count Claude Code's own system prompt
+       and tool definitions, or the tokens of the answer.
+     - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
+       window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
+       itself, such as compaction, may not count as turns, and the bound is loose (about 50 context windows; the CLI
+       reported `num_turns: 2` when it stopped at a limit of 1, so it may make one call more than the limit). Claude
+       Code 2.1.281 accepts the flag in `--print` mode (its help hides it) and stops at the limit with an
+       `error_max_turns` result and exit status 1. This was checked with `--max-turns 1` in a run of the 2.1.281 macOS
+       arm64 build outside the container; the Linux build in the image was read from its bundled source only. The
+       adapter reports that result as a provider failure whose text is the result's `errors` strings ("Reached maximum
+       number of turns (1)" in that run). That holds in every Claude phase, so a failed question run quotes them too.
+       The planning error then names the 50-turn limit, asks the person to narrow the request, and quotes that text. The
+       planning error finds the stop by that text, so other output that contains it, such as Claude's own `result`, gets
+       the same advice; the output is quoted either way. A token or dollar limit was not chosen: `--max-budget-usd`
+       counts the dollar cost of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag
+       that limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning
+       run reads files and answers, so most turns are reads. Lower it if runs are seen to loop; raise it only with a
+       recorded run that needs more.
+     - *Other phases.* They do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before

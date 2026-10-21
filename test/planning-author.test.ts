@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
+import { assertPlanningInput, MAX_PLANNING_INPUT_BYTES } from '../agents/policy.ts';
 import { MAX_PROMPT_BYTES, prepareDraft, prepareSuggestions, type AuthorInput } from '../core/planning-author.ts';
 import type { EditReply, Plan } from '../core/plan.ts';
 
@@ -74,6 +75,18 @@ it('rejects aggregate small fields and post-escaping expansion', () => {
   value.issue.comments = []; value.issue.body = '<'.repeat(6000);
   expect(() => prepareDraft(value)).toThrow(/KiB/);
 });
+it('fits the largest prompt and schema text it prepares into the planning model budget (#163)', () => {
+  // prepare() bounds the prompt and the schema text by MAX_PROMPT_BYTES each, so the backstop refuses none of them.
+  // This checks a draft at the prompt limit with today's schema file, not the schema bound itself.
+  expect(MAX_PLANNING_INPUT_BYTES).toBe(2 * MAX_PROMPT_BYTES);
+  const value = input(), first = prepareDraft(value).request;
+  value.issue.body = 'x'.repeat(MAX_PROMPT_BYTES - Buffer.byteLength(first.prompt));
+  const { prompt, schemaText } = prepareDraft(value).request;
+  expect(Buffer.byteLength(prompt)).toBe(MAX_PROMPT_BYTES);
+  expect(Buffer.byteLength(schemaText)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+  expect(() => assertPlanningInput(prompt, schemaText)).not.toThrow();
+});
+
 it('accepts exactly the prompt byte limit and rejects the next byte without truncation', () => {
   const value = input(); const overhead = Buffer.byteLength(prepareDraft(value).request.prompt);
   value.issue.body = 'x'.repeat(MAX_PROMPT_BYTES - overhead);
