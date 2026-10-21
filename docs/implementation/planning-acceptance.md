@@ -85,20 +85,26 @@ it leaves anything.
 The planning check (#164) proves that the vendor chosen in Settings can run a
 planning invocation before any request does. It is one planning job in the same
 worker and profile as a real request (read, list and search only, vendor-only
-egress, a mounted schema), on the review's code at the snapshot's head. It asks
-for the schema's own answer, `{"ok": true}`, within a two-minute budget, so it
-covers sign-in, the schema-constrained answer and the read-only profile
-(`PlanningAgent.probe`). `PlanningCheck` starts it when the server starts, and
-again before the first request after the vendor changes. `productionPlanning`'s
-`describe` waits for it before it reads the issue or records anything. A failed
-check refuses the request with a `GuardRefusal` that starts "Planning is
-unavailable:" and names the reason; the server records that refusal and starts no
-agent. Requests within a minute of the failure are refused with it, and the next
-request after that checks again. With no vendor chosen nothing is checked, and
-the request is refused later, as before. Shutdown cancels a running check and waits
-up to 20 s for it before closing the worker. Tests: `test/planning-production.test.ts`
-("the planning check (#164)", with a check that passes and one that fails) and
-`test/planning-worker.test.ts` (the check in planning's worker).
+egress, a mounted schema), on the review's code at the snapshot's head, with a
+real request's budget, since a process's first job may build the agent image. It
+asks for the schema's own answer, `{"ok": true}`, so it covers sign-in, the
+schema-constrained answer and the read-only profile (`PlanningAgent.probe`).
+`PlanningCheck` starts it when the server starts, before it listens, and again
+when the vendor changes. `productionPlanning`'s `describe` waits for it, at most
+30 s, before it reads the issue or records anything, and the request checks again
+just before it starts, so a vendor chosen during the issue read never runs
+unchecked. A failed check refuses the request with a `GuardRefusal` that starts
+"Planning is unavailable:" and names the reason, and so does a check still
+running after the wait; the server records the refusal and starts no agent.
+Requests within a minute of a failure are refused with it; the next request after
+that checks again. With no vendor chosen nothing is checked, and the request is
+refused later, as before. Shutdown cancels a running check and waits up to 20 s
+for it before closing the worker. If startup fails after planning's setup, the
+process exits, and the next start's planning recovery removes what the check left.
+Tests: `test/planning-production.test.ts` ("the planning check (#164)", with a
+check that passes, one that fails and one that does not finish),
+`test/planning-worker.test.ts` (the check in planning's worker, including a wrong
+answer) and `test/agent-planning.test.ts` (against the vendor, real Docker).
 
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now

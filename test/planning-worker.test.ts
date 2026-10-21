@@ -171,6 +171,12 @@ it('fails the planning check without a sign-in or with Codex, before any lock, w
   expect(acquire).not.toHaveBeenCalled();
 });
 
+it('fails the planning check when the agent answers anything but the schema\'s answer', async () => {
+  const service = review(), wrong = new PlanningAgent(service, { url: STUB, env: { CLAUDE_CODE_OAUTH_TOKEN: 'probe-wrong-answer' } });
+  closers.push(() => wrong.close());
+  await expect(wrong.probe('claude', new AbortController().signal)).rejects.toThrow('did not give the check\'s answer');
+});
+
 it('passes the planning check only with exactly the schema\'s answer', () => {
   expect(isPlanningProbeAnswer('{"ok":true}')).toBe(true);
   expect(isPlanningProbeAnswer(' { "ok": true }\n')).toBe(true);

@@ -43,7 +43,9 @@ parentPort!.on('message', (message: WorkerRequest) => {
   const { prompt, provider, noteId, attemptId } = job;
   // The planning check (#164) passes with the schema's own answer.
   if (message.type === 'plan' && message.run.taskId.startsWith('planning-probe-')) {
-    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: '{"ok":true}' });
+    // With this token the agent answers something else, which must fail the check.
+    const wrong = workerData?.credentials?.CLAUDE_CODE_OAUTH_TOKEN === 'probe-wrong-answer';
+    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: wrong ? '{"ok":false}' : '{"ok":true}' });
     return;
   }
   if (prompt === 'crash') throw new Error('stub crashed');

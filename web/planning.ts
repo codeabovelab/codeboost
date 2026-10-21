@@ -20,6 +20,8 @@ export function productionPlanning(config: ReviewConfig, options: {
   agent?: (service: ReviewService) => PlanningAgent;
   /** How long a failed planning check refuses requests; `PLANNING_RECHECK_MS` by default. */
   recheckMs?: number;
+  /** How long a request waits for a running check; `PLANNING_ADMIT_WAIT_MS` by default. */
+  admitWaitMs?: number;
 }): PlanningSetup | undefined {
   const github = config.github;
   if (config.demo || !github) return undefined;
@@ -31,8 +33,10 @@ export function productionPlanning(config: ReviewConfig, options: {
     options.verifyLock();
     service.store.settleInterruptedRequests();
     const provider = options.agent?.(service) ?? new PlanningAgent(service);
+    // Started now, before the server listens. If startup fails after this, the process exits, and the next start's
+    // planning recovery removes what the check left (its objects carry planning's owner).
     const check = new PlanningCheck((vendor, signal) => provider.probe(vendor, signal), () => service.store.questionProvider(),
-      { recheckMs: options.recheckMs });
+      { recheckMs: options.recheckMs, waitMs: options.admitWaitMs });
     check.start();
     return {
       provider,
@@ -54,8 +58,10 @@ export function productionPlanning(config: ReviewConfig, options: {
           validate();
           // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
           const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
+          // Run again just before the request starts: Settings may have chosen an unchecked vendor during the read.
+          const admitted = () => { validate(); check.assertPassed(); };
           return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },
-            approvedLessons: [], repo: { name: github.repository, baseRef }, validate };
+            approvedLessons: [], repo: { name: github.repository, baseRef }, validate: admitted };
         });
       },
       // The check runs in the provider's worker, so it stops before the worker does.

@@ -13,7 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
-import { PLANNING_UNAVAILABLE } from '../runner/planning.ts';
+import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -318,13 +318,13 @@ it('ends a planning request that does not settle after shutdown aborts it by clo
 describe('the planning check (#164)', () => {
   /** The production setup on a review whose Settings chose `vendor`, with a stand-in agent and issue reads. */
   function checked(probe: (vendor: string, signal: AbortSignal) => Promise<void>, vendor: 'claude' | 'codex' | null = 'claude',
-    recheckMs?: number) {
+    recheckMs?: number, admitWaitMs?: number, issueText = vi.fn(async (number: number) => text(number))) {
     const config = production(), service = new ReviewService(config); closers.push(() => service.close());
     if (vendor) service.store.setQuestionProvider(vendor);
     const issueAccess = vi.fn(async (number: number) => ({ number, authorLogin: 'outside', collaborator: true }));
-    const issueText = vi.fn(async (number: number) => text(number));
     const close = vi.fn(async () => undefined), agent = closable(close, vi.fn(probe));
-    const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => agent, recheckMs })!(service);
+    const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => agent, recheckMs,
+      admitWaitMs })!(service);
     return { deps, service, agent, issueAccess, close, probe: vi.mocked(agent.probe) };
   }
   const signal = () => new AbortController().signal;
@@ -404,14 +404,52 @@ describe('the planning check (#164)', () => {
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
   });
 
-  it('cancels a running check on close, before it closes the agent', async () => {
+  it('cancels a running check on close, and closes the agent only once it stopped', async () => {
     const order: string[] = [];
+    // The check settles a while after it is cancelled, as a worker job does.
     const { deps, probe, close } = checked((_vendor, probeSignal) => new Promise<void>((_, reject) =>
-      probeSignal.addEventListener('abort', () => { order.push('check stopped'); reject(probeSignal.reason); }, { once: true })));
+      probeSignal.addEventListener('abort', () => setTimeout(() => { order.push('check stopped'); reject(probeSignal.reason); }, 50),
+        { once: true })));
     close.mockImplementation(async () => { order.push('agent closed'); });
     await deps.close!();
     expect(probe.mock.calls[0]![1].aborted).toBe(true);
     expect(order).toEqual(['check stopped', 'agent closed']);
+  });
+
+  it('waits a bounded time on close for a check that never stops', async () => {
+    const check = new PlanningCheck(() => new Promise<void>(() => undefined), () => 'claude');
+    check.start();
+    const started = performance.now();
+    await check.close(100);
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  it('refuses a request as still starting when the check outlasts its wait, and admits it once the check passed', async () => {
+    let pass!: () => void;
+    const { deps, issueAccess } = checked(() => new Promise<void>(resolve => { pass = resolve; }), 'claude', undefined, 50);
+    const refusal = await Promise.resolve(deps.describe(signal())).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GuardRefusal);
+    expect((refusal as Error).message).toBe(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`);
+    expect(issueAccess).not.toHaveBeenCalled();
+    pass();
+    await expect(deps.describe(signal())).resolves.toMatchObject({ issue: { title: 'Retries ignore the cap' } });
+  });
+
+  it('refuses at the start a vendor chosen while the issue was read, and checks it (#164)', async () => {
+    let service!: ReviewService;
+    const issueText = vi.fn(async (number: number) => {
+      vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
+      return text(number);
+    });
+    const made = checked(async () => undefined, 'claude', undefined, undefined, issueText);
+    service = made.service;
+    const described = await made.deps.describe(signal());
+    expect(() => described.validate()).toThrow(GuardRefusal);
+    expect(made.probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
+    // Once that check passed, the same request is admitted.
+    await Promise.resolve();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(() => described.validate()).not.toThrow();
   });
 
   it('refuses a start through the server with 409, recording no request and starting no agent', async () => {

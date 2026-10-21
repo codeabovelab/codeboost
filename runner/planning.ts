@@ -26,8 +26,6 @@ export function isPlanningProbeAnswer(text: string): boolean {
   return typeof answer === 'object' && answer !== null && !Array.isArray(answer) && Object.keys(answer).length === 1
     && (answer as { ok?: unknown }).ok === true;
 }
-/** The whole budget of one check, setup included. Lane D caps the invocation inside it. */
-export const PLANNING_PROBE_BUDGET_MS = 2 * 60_000;
 
 /**
  * The production planning provider (#117): every request runs in planning's own worker thread, so lane D's synchronous
@@ -71,7 +69,8 @@ export class PlanningAgent implements AuthorProvider {
     const run = planningRun({ mode: 'suggest', phase: 'planning', access: 'read-only', identity, requestId, issue: plan.issue,
       revision: plan.revision, prompt: PLANNING_PROBE_PROMPT, schemaText: PLANNING_PROBE_SCHEMA },
     { vendor, repository: this.#service.reviewRepository().path, head: snapshot.head, snapshotId: snapshot.id },
-    Date.now() + PLANNING_PROBE_BUDGET_MS - SETTLE_MARGIN_MS);
+    // A real request's budget: a process's first job may build the agent image, which takes its time from this.
+    Date.now() + PLANNING_BUDGET_MS - SETTLE_MARGIN_MS);
     const text = await this.#worker.plan({ ...run, taskId: `planning-probe-${requestId}` }, signal);
     if (!isPlanningProbeAnswer(text)) throw new Error('The planning agent did not give the check\'s answer.');
   }
@@ -79,32 +78,38 @@ export class PlanningAgent implements AuthorProvider {
   close(): Promise<void> { return this.#worker.close(); }
 }
 
-/** Starts with this text when planning is refused because its check failed. */
+/** Starts with this text when planning is refused because its check failed or has not finished. */
 export const PLANNING_UNAVAILABLE = 'Planning is unavailable:';
 /** How long a failed check refuses requests before the next request checks again. */
 export const PLANNING_RECHECK_MS = 60_000;
+/** How long a request waits for a running check before it is refused, so the browser is never held for long. */
+export const PLANNING_ADMIT_WAIT_MS = 30_000;
 /** How long close waits for a check that is still running after it is cancelled. */
 export const PLANNING_CHECK_CLOSE_MS = 20_000;
 
-/** One run of the planning check, for one vendor. `failure` is set once it failed. */
-type Check = { vendor: Provider; done: Promise<void>; failure?: { error: unknown; at: number } };
+/** One run of the planning check, for one vendor. `passed` or `failure` is set once it settles. */
+type Check = { vendor: Provider; done: Promise<void>; passed: boolean; failure?: { error: unknown; at: number } };
+const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 /**
- * Admission for planning requests (#164). The planning check runs once per process for each vendor chosen in Settings:
- * `start` begins it at startup, and `admit`, called before anything about a request is recorded, waits for it. A
- * request is refused while the check that covers it has failed: for `recheckMs` after the failure, after which the next
- * request checks again. A changed vendor is checked before its first request. With no vendor chosen nothing is
- * checked, and the request is refused later, as before, with `NO_PLANNING_AGENT`.
+ * Admission for planning requests (#164). The check runs for the vendor chosen in Settings: `start` begins it at
+ * startup, and `admit`, called before anything about a request is recorded, waits for it. The last check is kept: a
+ * passed one admits every request for its vendor; a failed one refuses them for `recheckMs`, after which the next
+ * request checks again; a check for another vendor starts when the chosen vendor changes. A request waits for a
+ * running check for at most `waitMs`, then is refused as still starting. With no vendor chosen nothing is checked,
+ * and the request is refused later, as before, with `NO_PLANNING_AGENT`.
  */
 export class PlanningCheck {
   readonly #probe: (vendor: Provider, signal: AbortSignal) => Promise<void>;
   readonly #vendor: () => Provider | null;
   readonly #recheckMs: number;
+  readonly #waitMs: number;
   readonly #abort = new AbortController();
   readonly #running = new Set<Promise<void>>();
   #current?: Check;
   constructor(probe: (vendor: Provider, signal: AbortSignal) => Promise<void>, vendor: () => Provider | null,
-    options: { recheckMs?: number } = {}) {
-    this.#probe = probe; this.#vendor = vendor; this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS;
+    options: { recheckMs?: number; waitMs?: number } = {}) {
+    this.#probe = probe; this.#vendor = vendor;
+    this.#recheckMs = options.recheckMs ?? PLANNING_RECHECK_MS; this.#waitMs = options.waitMs ?? PLANNING_ADMIT_WAIT_MS;
   }
   /** Begin the check for the chosen vendor, if any, without waiting for it. */
   start(): void {
@@ -117,9 +122,12 @@ export class PlanningCheck {
     if (current && current.vendor === vendor
       && !(current.failure && performance.now() - current.failure.at >= this.#recheckMs)) return current;
     if (this.#abort.signal.aborted) throw new GuardRefusal('Planning is stopping.');
-    const check: Check = { vendor, done: Promise.resolve() };
-    // Never rejects: a failure is kept on the check, so every waiting request is refused with it.
-    const done = Promise.resolve().then(() => this.#probe(vendor, this.#abort.signal)).then(() => undefined, (error: unknown) => {
+    const check: Check = { vendor, done: Promise.resolve(), passed: false };
+    let probe: Promise<void>;
+    // Started now, so close can cancel it; a probe that throws instead of rejecting fails the check the same way.
+    try { probe = this.#probe(vendor, this.#abort.signal); } catch (error) { probe = Promise.reject(error); }
+    // Never rejects: the outcome is kept on the check, so every waiting request gets it.
+    const done = probe.then(() => { check.passed = true; }, (error: unknown) => {
       check.failure = { error, at: performance.now() };
     });
     check.done = done;
@@ -130,27 +138,44 @@ export class PlanningCheck {
   }
   /**
    * Resolve once the check for the vendor chosen now has passed; reject with a `GuardRefusal` naming why when it
-   * failed. `signal` stops only this wait, never the check, which other requests may share.
+   * failed, or when it is still running after `waitMs`. `signal` stops only this wait, never the check, which other
+   * requests may share.
    */
   async admit(signal: AbortSignal): Promise<void> {
     for (;;) {
       const vendor = this.#vendor();
       if (!vendor) return;
       const check = this.#check(vendor);
-      let release!: () => void;
-      const aborted = new Promise<never>((_, reject) => {
+      let release!: () => void, timer: ReturnType<typeof setTimeout> | undefined;
+      const stopped = new Promise<'timeout'>((resolve, reject) => {
         release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true });
+        timer = setTimeout(() => resolve('timeout'), this.#waitMs);
       });
       if (signal.aborted) release();
-      try { await Promise.race([check.done, aborted]); }
-      finally { signal.removeEventListener('abort', release); }
+      let outcome: void | 'timeout';
+      try { outcome = await Promise.race([check.done, stopped]); }
+      finally { signal.removeEventListener('abort', release); clearTimeout(timer); }
       // Settings changed while this request waited: check the vendor it will run with.
       if (this.#vendor() !== vendor) continue;
-      if (!check.failure) return;
-      const reason = check.failure.error instanceof Error ? check.failure.error.message : String(check.failure.error);
-      throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. ${reason} `
-        + 'Planning stays off until a check passes; retry in a minute.');
+      // This request's own check: a recheck started since must not replace the outcome it waited for.
+      return PlanningCheck.#verdict(check);
     }
+  }
+  /**
+   * Throw a `GuardRefusal` unless the check for the vendor chosen now has passed (or no vendor is chosen). Requests call
+   * it again just before they start, so a vendor chosen after `admit` is never run unchecked; that vendor's check
+   * starts here.
+   */
+  assertPassed(): void {
+    const vendor = this.#vendor();
+    if (!vendor) return;
+    PlanningCheck.#verdict(this.#check(vendor));
+  }
+  static #verdict(check: Check): void {
+    if (check.passed) return;
+    if (check.failure) throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost's check of the planning agent failed. `
+      + `${messageOf(check.failure.error)} codeboost checks again on the next request after a minute.`);
+    throw new GuardRefusal(`${PLANNING_UNAVAILABLE} codeboost is still checking the planning agent. Retry in a moment.`);
   }
   /** Cancel any running check and wait up to `waitMs` for it to stop. No check starts afterwards. */
   async close(waitMs = PLANNING_CHECK_CLOSE_MS): Promise<void> {
