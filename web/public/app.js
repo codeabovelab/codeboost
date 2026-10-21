@@ -239,7 +239,6 @@ function scheduleMergePoll() {
   mergePollTimer = null;
   const queue = data?.merge?.queue;
   const job = data?.merge?.job;
-  // A new step of the list polls quickly again, as a new job step does.
   // A new step of the list, or a cancel, polls quickly again, as a new job step does: a cancel usually ends the job at once.
   const state = job?.state === "running"
     ? `job:${job.step}:${job.steps?.find(step => step.state === "running")?.name ?? ""}:${job.cancelRequested ? "cancel" : ""}` : queue?.state;
@@ -371,7 +370,7 @@ function renderMergeSteps() {
     $("merge-steps").innerHTML = job.steps.map(step => {
       const [icon, word] = mergeStepStates[step.state] ?? ["?", step.state];
       // Screen readers skip the mark and read the name, the word and the time (DESIGN.md).
-      return `<li class="merge-step merge-step-${esc(step.state)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word">${word}</span><span class="mono muted elapsed"></span></li>`;
+      return `<li class="merge-step merge-step-${esc(step.state)}"><span class="mark" aria-hidden="true">${icon}</span> <span>${esc(mergeStepNames[step.name] ?? step.name)}</span> <span class="word">${esc(word)}</span><span class="mono muted elapsed"></span></li>`;
     }).join("");
   }
   updateMergeStepTimes(job);
@@ -421,7 +420,8 @@ $("merge-cancel").onclick = async () => {
   } finally {
     mergeCancelPending = false;
     renderMerge();
-    if (endedAnswer && !mergePollInFlight) {
+    // A poll in flight for an older generation is discarded when it settles, so it does not stand in for this one.
+    if (endedAnswer && mergePollInFlight?.generation !== mergeGeneration) {
       if (mergePollTimer) clearTimeout(mergePollTimer);
       void pollMergeQueue(mergeGeneration);
     }

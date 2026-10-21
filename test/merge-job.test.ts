@@ -1729,3 +1729,19 @@ it('settles a merge the person cancelled as a cancelled task at restart when the
   store.settleInterruptedMergeJobs(identity);
   expect(store.getMergeJob(identity, job.id)).toMatchObject({ state: 'cancelled', reason: 'Task cancelled.' });
 });
+
+it('ends a cancelled merge cancelled when an inspection answers a failing check after the cancel, leaving the task in review', async () => {
+  const f = setup({ checks: () => [{ context: 'build', appId: null, state: 'failure' }] });
+  // GitHub's answer is already on its way when the person cancels: a status read that ignores the stop and answers.
+  const status = f.merges.status.bind(f.merges);
+  let answered = 0;
+  f.merges.status = (async () => {
+    const read = await status(undefined, true);
+    f.coordinator.cancelMerge(f.store.runningMergeJob(identity)!.id); answered++;
+    return read;
+  }) as typeof f.merges.status;
+  await f.coordinator.start('review-token', randomUUID());
+  expect(await settled(f.coordinator)).toMatchObject({ state: 'cancelled', reason: MERGE_CANCELLED });
+  expect(answered).toBe(1);
+  expect(f.store.getTask(identity).status).toBe('in review');
+});

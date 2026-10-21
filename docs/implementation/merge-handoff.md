@@ -80,11 +80,11 @@ The job saves each change to the list in its `merge_jobs` record, so the list su
 
 The list stays on screen after the job ends, until **Refresh**. **Cancel merge** shows only while the job runs, not "always" as the design says: an ended job has nothing to cancel. When the job ends, keyboard focus on Cancel moves to the merge control. A job saved before the list existed has no `steps`; the page then shows its step as before, without the list or Cancel.
 
-**Cancel merge** stops the job without cancelling the task. It is shown while the job runs. The page sends `{action: "cancel-merge", jobId}` to `POST /api/action`:
+**Cancel merge** stops the job without cancelling the task. The page sends `{action: "cancel-merge", jobId}` to `POST /api/action`:
 
 - The job is marked `cancelRequested` first, then told to stop, and so is its preparation. Preparation stops as for a task cancel: a rebase is aborted and cleaned up, and a `cmd:` check is stopped as cancelled.
 - The job ends `cancelled`, with "You cancelled the merge; the task and its pull request stay open." The task keeps its status (in review, or approved, merge blocked), its pull request stays open, and **Merge PR** may be clicked again. A task cancelled before the job's work stops ends the job as a cancelled task instead.
-- Once the job's merge attempt exists, GitHub has been asked: stopping then could only make the outcome unknown, so the server refuses ("GitHub has been asked to merge; wait for its outcome.") and the page disables the button once the Merge step has started.
+- Once the job's merge attempt exists, GitHub has been asked: stopping then could only make the outcome unknown, so the server refuses ("GitHub has been asked to merge; wait for its outcome.") and the page disables the button once the Merge step has started. If that step's write failed (steps are display only), the button stays enabled, and a click shows the refusal in the banner.
 - If the cancel is answered with a job that already ended (it merged before the page saw it, or another tab cancelled it), the page polls the merge status at once and shows the outcome, as it does when a poll sees a job end.
 - A cancel of a job that ended, a refused click, an unknown job, or a job still running on disk that this server does not run (its ending write failed) is refused (HTTP 409, with the task's latest job). During shutdown it answers 503. A repeat of the same cancel answers the job while it runs (200), and once it has ended is refused as above with the ended job, which the page shows; so the request needs no key of its own.
 - A restart after the cancel was saved, but before GitHub was asked, settles the job `cancelled`, not `failed`.

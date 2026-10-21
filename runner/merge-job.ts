@@ -340,6 +340,8 @@ export class MergeJobCoordinator {
         if (limit.aborted && error === limit.reason) return timedOut();
         return { kind: 'failed', reason: error instanceof Error ? error.message : String(error) };
       }
+      // An inspection that answered after a cancel or shutdown decides nothing: the stop wins, as when it rejects.
+      if (signal.aborted) return { kind: 'cancelled' };
       const verdict = classify(status);
       // Only checks seen passing within the limit count. Work at the end of an inspection can cross the limit before
       // its timer runs, so a ready answer is checked against the clock too; a failing check or other blocker stands.
