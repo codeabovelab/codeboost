@@ -130,13 +130,16 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
 
 it('takes the daemon set at load, not the default, when one was set, for every call', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const seen = join(root, 'seen'), net = 'n'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64);
-  // Records the address and command of each call. Answers as Docker 27.4 does, in the parts the code reads, for one
-  // swept network with one holder and for a container named x; every other call gets no output and exit 0, as for
-  // `ls` with no match, and the removals' stdout is not read. The network line holds only the fields the sweep reads.
+  const seen = join(root, 'seen'), net = 'n'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64), labelled = 'c'.repeat(64);
+  // Records the address and the whole command of each call. Answers as Docker 27.4 does, in the parts the code reads,
+  // for one labelled container, one swept network and one swept volume, each held by one container, and for a container
+  // named x; every other call gets no output and exit 0, and the removals' stdout is not read. The network line holds
+  // only the fields the sweep reads, and the holder's inspect an empty endpoint for its network.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', 'for arg; do last="$arg"; done',
-    `printf '%s|%s|%s %s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" "$1" "$2" >> '${seen}'`,
+    `printf '%s|%s|%s\\n' "\${DOCKER_HOST-unset}" "\${DOCKER_CONTEXT-unset}" "$*" >> '${seen}'`,
+    `if [ "$1 $2" = "container ls" ]; then printf '%s\\n' ${labelled}; exit 0; fi`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' swept-volume; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${holder}; exit 0; fi`,
     `if [ "$1 $2" = "container inspect" ] && [ "$last" = x ]; then printf '%s\\n' '"${named}" "/x"'; exit 0; fi`,
     `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '"${holder}" {"swept":{}}'; exit 0; fi`,
@@ -149,16 +152,45 @@ it('takes the daemon set at load, not the default, when one was set, for every c
   const fresh = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
   vi.stubEnv('DOCKER_HOST', 'unix:///codeboost-changed.sock');
   vi.stubEnv('DOCKER_CONTEXT', 'codeboost-changed');
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   try {
     fresh.removeByName('container', 'x', 'test', join(root, 'docker'));
     fresh.removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   } finally { vi.unstubAllEnvs(); }
   const lines = readFileSync(seen, 'utf8').split('\n').filter(Boolean).map(line => line.split('|'));
-  // Every kind of call the two make: inspect and removal by name, the listings, the holder lookup and read, the
-  // holders' removal and the network's.
-  expect(new Set(lines.map(line => line[2]))).toEqual(new Set(['container inspect', 'rm --force', 'container ls', 'network ls',
-    'volume ls', 'ps --all', 'network rm']));
+  const commands = lines.map(line => line[2]);
+  // Every call the two make, each checked by its own command line.
+  for (const command of [
+    `container inspect --format {{json .Id}} {{json .Name}} x`, `rm --force ${named}`,
+    `container ls --all --quiet --no-trunc --filter label=${TEST_RUN_LABEL}=x`, `container rm --force ${labelled}`,
+    `network ls --no-trunc --format {{json .}} --filter label=${TEST_RUN_LABEL}=x`,
+    'ps --all --quiet --no-trunc --filter network=swept',
+    `container inspect --format {{json .Id}} {{json .NetworkSettings.Networks}} ${holder}`, `rm --force ${holder}`,
+    `network rm ${net}`,
+    `volume ls --quiet --filter label=${TEST_RUN_LABEL}=x`, 'ps --all --quiet --no-trunc --filter volume=swept-volume',
+    'volume rm --force swept-volume',
+  ]) expect(commands).toContain(command);
   expect(new Set(lines.map(line => `${line[0]}|${line[1]}`))).toEqual(new Set(['unix:///codeboost-loaded.sock|codeboost-loaded']));
+});
+
+it('says nothing of a network gone since the listing, and reports any other failure to remove one', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const net = 'd'.repeat(64), answer = join(root, 'answer');
+  // Answers as Docker 27.4 does for one swept network with no holder, whose removal gives the stderr in `answer`; every
+  // other call gets no output and exit 0, as for `ls` with no match. The network line holds only the fields the sweep
+  // reads. The second answer is invented, as a failure 27.4 might give.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh',
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1 $2" = "network rm" ]; then cat '${answer}' >&2; exit 1; fi`, 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  const failures = () => warn.mock.calls.filter(call => String(call[0]).endsWith('failed:'));
+  writeFileSync(answer, `Error response from daemon: network ${net} not found\n`);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(failures()).toEqual([]);
+  writeFileSync(answer, 'Error response from daemon: permission denied\n');
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(failures()).toEqual([['test: removing networks: docker network rm failed:', 'Error response from daemon: permission denied']]);
 });
 
 it.each([

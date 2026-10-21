@@ -10,7 +10,7 @@ jobs:
   real-docker:
     runs-on: ubuntu-latest
     # Covers the 10 min image build and ordinary run times of the Docker-backed files. It does not cover every test
-    # and hook at its own Vitest limit: the five afterAll hooks that sweep allow 46 min between them (#189), which only
+    # and hook at its own Vitest limit: the five afterAll hooks that call the shared sweep allow 46 min between them (#189), which only
     # a stalled daemon reaches.
     timeout-minutes: 45
     steps:

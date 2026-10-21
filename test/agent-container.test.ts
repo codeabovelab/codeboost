@@ -2382,7 +2382,8 @@ describe('real Docker agent isolation', () => {
     // that sweep has run either; this check, registered first, runs after the sweep (Vitest runs onTestFinished hooks
     // in reverse order).
     let passed = false;
-    onTestFinished(() => { if (passed) expect(byAllocation(owner.allocationId)).toEqual([]); }, 2 * 60_000);
+    // Its budget covers byAllocation's three listings at their 60 s limits, plus a minute.
+    onTestFinished(() => { if (passed) expect(byAllocation(owner.allocationId)).toEqual([]); }, 4 * 60_000);
     sweepWhenFinished('io.codeboost.allocation', owner.allocationId);
     // The seeder is refused, and every volume removal fails, so the allocation's cleanup does not settle.
     const failing = [

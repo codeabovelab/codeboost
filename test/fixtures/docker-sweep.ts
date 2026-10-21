@@ -88,17 +88,20 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
  * use. Before it removes a network or a volume it also removes every container attached to it or mounting it, labelled
  * or not: a test can make a network or volume with one owner and the container that holds it with another, or without
  * one. Containers and volumes go by force; a network another container joins meanwhile stays. It reports what it finds
- * and any Docker call that fails (but not a read of holders that fails only because one has gone since the listing),
- * prefixed with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s
+ * and any Docker call that fails (but not one that fails only because what it names has gone since the listing: a
+ * holder it reads, or a network it removes), prefixed with `when`, and never throws, so cleanup can call it without hiding an earlier error. Each call has a 30 s
  * limit, so all eleven can take up to 5.5 minutes. It runs `docker`, the real one by default (`REAL_DOCKER`).
  */
 export function removeLabelledObjects(label: string, value: string, when: string, docker = REAL_DOCKER): void {
   const run = (stage: string, args: string[]) => {
     const result = spawnSync(docker, args, { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: dockerEnv() });
     // A holder gone since the listing is expected: Docker 27.4 answers "No such container" for it, and prints the rest.
-    const holdersGone = stage === 'reading holders' && result.status === 1
-      && result.stderr.trim().split('\n').every(line => line.startsWith('Error response from daemon: No such container: '));
-    if (result.status !== 0 && !holdersGone) console.warn(`${when}: ${stage}: docker ${args.slice(0, 2).join(' ')} failed:`,
+    // So is a network gone since the listing (removed by its own test meanwhile): "network <ID> not found".
+    const errors = result.stderr?.trim().split('\n') ?? [];
+    const gone = result.status === 1 && (stage === 'reading holders'
+      ? errors.every(line => line.startsWith('Error response from daemon: No such container: '))
+      : stage === 'removing networks' && errors.every(line => /^Error response from daemon: network [0-9a-f]{64} not found$/.test(line)));
+    if (result.status !== 0 && !gone) console.warn(`${when}: ${stage}: docker ${args.slice(0, 2).join(' ')} failed:`,
       result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
     // An inspect of several objects exits 1 if one is gone, yet prints the rest (Docker 27.4), so the output of a call
     // that exited by itself is read whatever its status. A killed call's output may be cut short, so it is not.
