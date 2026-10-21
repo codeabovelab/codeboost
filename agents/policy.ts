@@ -98,8 +98,8 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
   if ((policy.phase === 'planning') !== (schema !== undefined))
     throw new Error('Only the Claude planning command carries an answer schema, and it must.');
-  const planningArguments = schema === undefined ? []
-    : ['--json-schema', assertPlanningInput(prompt, assertPlanningSchema(schema)), '--max-turns', String(PLANNING_MAX_TURNS)];
+  const planningArguments = schema === undefined ? [] : ['--json-schema',
+    assertPlanningInput(prompt, assertPlanningSchema(schema)), '--max-turns', String(PLANNING_MAX_TURNS)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.

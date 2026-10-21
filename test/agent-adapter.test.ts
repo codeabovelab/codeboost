@@ -41,10 +41,11 @@ describe('production agent adapters', () => {
       .toEqual({ text: '{"title":"Plan","items":[]}', providerFailed: false });
     // Without a schema the prose result is still the answer.
     expect(parseClaudeOutput(Buffer.from(success))).toEqual({ text: 'Here is the plan.', providerFailed: false });
-    // A failed structured run can omit result; it is a provider failure, not malformed output.
+    // A failed structured run can omit result; it is a provider failure, not malformed output, and its errors are
+    // the text.
     expect(parseClaudeOutput(Buffer.from(
       '{"type":"result","subtype":"error_max_structured_output_retries","is_error":true,"errors":["x"]}'), true))
-      .toEqual({ text: '', providerFailed: true });
+      .toEqual({ text: 'x', providerFailed: true });
     for (const missing of ['{"subtype":"success","result":"{\\"title\\":\\"Plan\\"}","is_error":false}',
       '{"subtype":"success","result":"","is_error":false,"structured_output":null}',
       '{"subtype":"success","result":"","is_error":false,"structured_output":[1]}',
@@ -64,6 +65,11 @@ describe('production agent adapters', () => {
       // from a run: no result member, and an errors list.
       '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":50,"errors":["Reached maximum number of turns (50)"]}'])
       expect(parseClaudeOutput(Buffer.from(envelope), structured)).toMatchObject({ providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_max_turns","is_error":true,'
+      + '"errors":["Reached maximum number of turns (50)",3]}'), structured))
+      .toEqual({ text: 'Reached maximum number of turns (50)', providerFailed: true });
+    expect(parseClaudeOutput(Buffer.from('{"subtype":"error_during_execution","is_error":true,"result":"r","errors":["e"]}'),
+      structured)).toEqual({ text: 'r', providerFailed: true });
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":1,"is_error":false,"result":"x"}'), structured))
       .toThrow('malformed');
     expect(() => parseClaudeOutput(Buffer.from('{"subtype":"success","is_error":false,"result":3}'), structured))

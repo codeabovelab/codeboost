@@ -36,7 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
-| A planning request over its model budget is refused before the start, and a planning run stops after 50 turns (see [planning model budget](#planning-model-budget)) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure |
+| A planning request over its model budget is refused before the start, and a planning run stops after 50 turns (see [planning model budget](#planning-model-budget)) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
 | A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
@@ -111,8 +111,9 @@ Use only these entry points to run an agent:
        if every token covers at least one byte; this is assumed, not verified against Claude's tokenizer.
      - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). Each turn sends at most one context
        window, so a turn limit bounds the tokens a run can use with no tokenizer. Claude Code 2.1.281 accepts the
-       flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns` result, which the
-       adapter reports as a provider failure. A token or dollar limit was not chosen: `--max-budget-usd` counts the
+       flag in `--print` mode (its help hides it) and stops at the limit with an `error_max_turns` result (both read from
+       its bundled source, not from a run). The adapter reports that result as a provider failure whose text is the
+       result's `errors` strings, so the planning error quotes "Reached maximum number of turns (50)". A token or dollar limit was not chosen: `--max-budget-usd` counts the
        dollar cost of API calls, which is not what an OAuth subscription token pays, and the CLI has no flag that
        limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning
        run reads files and answers, so most turns are reads. Lower it if runs are seen to stop early for no reason; never raise it without a

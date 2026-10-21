@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
+import { parseClaudeOutput } from '../agents/adapters/claude.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
 import { SuggestionCoordinator } from '../core/planning-suggestions.ts';
@@ -95,6 +96,14 @@ it('quotes at most 300 code units of a failed run\'s output, with whitespace col
   expect(await quote('a'.repeat(299) + 'b')).toBe('a'.repeat(299) + 'b');
   expect(await quote('a'.repeat(300) + 'TAIL')).toBe('a'.repeat(300));
   expect(await quote(' x \n\t y ')).toBe('x y');
+});
+
+it('names the turn limit when Claude stops a planning run at --max-turns (#163)', async () => {
+  // The supervisor passes on the decoded text, and a nonzero exit, for a provider failure.
+  const { text } = parseClaudeOutput(Buffer.from('{"type":"result","subtype":"error_max_turns","is_error":true,'
+    + '"num_turns":50,"errors":["Reached maximum number of turns (50)"]}'), true);
+  await expect(provider(fakeDeps({ exitCode: 1, stdout: text }).deps).invoke(draftRequest(), new AbortController().signal))
+    .rejects.toThrow('Claude said: Reached maximum number of turns (50)');
 });
 
 it.each([

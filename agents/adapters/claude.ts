@@ -47,8 +47,8 @@ function topLevelMembers(json: string): Map<string, string> {
 
 /**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
- * true, is a provider failure; it can omit `result`. With `--json-schema` (planning), a successful answer needs
- * `subtype: "success"` and is the schema-validated `structured_output` object. It is returned as the exact JSON text
+ * true, is a provider failure; it can omit `result`, and then its `errors` strings are the text. With `--json-schema`
+ * (planning), a successful answer needs `subtype: "success"` and is the schema-validated `structured_output` object. It is returned as the exact JSON text
  * of that member in the CLI's envelope, never re-encoded here, so the plan parser sees any duplicate key or inexact
  * integer the envelope holds (#166). Whether the API or CLI resolves those before writing the envelope is not verified.
  * With a schema, an envelope that repeats a top-level key is malformed, whatever it reports. `result` then holds only
@@ -57,7 +57,7 @@ function topLevelMembers(json: string): Map<string, string> {
 export function parseClaudeOutput(raw: Buffer, structured = false): { text: string; providerFailed: boolean } {
   const source = new TextDecoder('utf-8', { fatal: true }).decode(raw);
   const envelope = JSON.parse(source) as
-    { subtype?: unknown; result?: unknown; is_error?: unknown; structured_output?: unknown };
+    { subtype?: unknown; result?: unknown; is_error?: unknown; structured_output?: unknown; errors?: unknown };
   // Read every member before classifying: JSON.parse keeps only the last of a repeated key, such as `is_error`.
   const members = structured && envelope !== null && typeof envelope === 'object' && !Array.isArray(envelope)
     ? topLevelMembers(source) : null;
@@ -65,8 +65,11 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
     || (envelope.subtype !== undefined && typeof envelope.subtype !== 'string'))
     throw new Error('Claude returned a malformed output envelope.');
   const prose = envelope.result ?? '';
-  if (envelope.is_error || (envelope.subtype !== undefined && envelope.subtype !== 'success'))
-    return Object.freeze({ text: prose, providerFailed: true });
+  if (envelope.is_error || (envelope.subtype !== undefined && envelope.subtype !== 'success')) {
+    // A run the CLI stops itself, such as at `--max-turns` (#163), gives no `result`, only its `errors` strings.
+    const errors = Array.isArray(envelope.errors) ? envelope.errors.filter(error => typeof error === 'string') : [];
+    return Object.freeze({ text: envelope.result ?? errors.join('; '), providerFailed: true });
+  }
   if (!structured) {
     if (envelope.result === undefined) throw new Error('Claude returned a malformed output envelope.');
     return Object.freeze({ text: prose, providerFailed: false });
