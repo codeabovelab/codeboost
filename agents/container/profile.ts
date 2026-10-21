@@ -325,6 +325,10 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=128', '--memory=512m', '--memory-swap=512m',
       '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
+      // The supervisor reads the agent's output through `docker start --attach` and bounds it there. The daemon keeps no
+      // copy (#165): with the daemon's default driver (json-file, unbounded unless the daemon is set otherwise) it could grow
+      // until the supervisor stops the container.
+      '--log-driver=none',
       `--network=${options.network.name}`, '--dns=127.0.0.1', '--env', 'HOME=/home/codeboost',
       '--env', `CODEBOOST_PHASE=${invocation.phase}`,
       '--label', `io.codeboost.invocation=${ownershipId}`, ...ownerLabelArgs(containerOwner),
