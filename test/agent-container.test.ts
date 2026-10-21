@@ -137,18 +137,18 @@ afterEach(async () => {
 afterAll(async () => {
   try {
     for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
-    // Each one, even when an earlier one fails: storage left here is found by the sweep below only by its label.
+    // Each step, even when an earlier one fails: storage left here is found by the sweep below only by its label, and
+    // every failure is reported.
     const failures: unknown[] = [];
-    for (const filesystems of taskFilesystems.reverse()) {
-      try { removeTaskFilesystems(filesystems); } catch (error) { failures.push(error); }
-    }
-    for (const profile of profiles) await disposeContainerProfile(profile);
-    for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
-    for (const root of roots.reverse()) {
+    const attempt = async (step: () => unknown) => { try { await step(); } catch (error) { failures.push(error); } };
+    for (const filesystems of taskFilesystems.reverse()) await attempt(() => removeTaskFilesystems(filesystems));
+    for (const profile of profiles) await attempt(() => disposeContainerProfile(profile));
+    for (const network of vendorNetworks.splice(0).reverse()) await attempt(() => removeVendorNetwork(network));
+    for (const root of roots.reverse()) await attempt(() => {
       chmodSync(join(root, 'input'), 0o700);
       rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-    }
-    if (failures.length) throw new AggregateError(failures, 'Task storage cleanup did not settle.');
+    });
+    if (failures.length) throw new AggregateError(failures, 'Test cleanup failed.');
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
@@ -676,8 +676,9 @@ describe('real Docker agent isolation', () => {
   // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup may refuse such
   // an object (task storage has no captured IDs), and afterAll's runner sweep finds it only while it holds one of this
   // run's volumes or networks, so the wrapper labels it with a test-run ID instead (#189). Whatever has that ID is
-  // removed when the test finishes, passed, failed or timed out, and again in afterAll, for a create that lands after a
-  // timed-out test's removal (its body runs on).
+  // removed when the test finishes (Vitest runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails`
+  // pair below tests the failure), and again in afterAll, for a create that lands after a timed-out test's removal (its
+  // body runs on).
   const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
     if (!prefixes.every(prefix => prefix.includes('create'))) throw new Error('Only create commands can be unlabelled.');
     const testRun = randomUUID();
@@ -772,6 +773,12 @@ describe('real Docker agent isolation', () => {
       const holderLookalike = make('container', holders[0]!.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
       const labelled = make('container', named('swept'), 'create', '--label', label, '--entrypoint', 'true', imageId);
       const labelledLookalike = make('container', labelled.slice(0, 12), 'create', '--entrypoint', 'true', imageId);
+      // The traps are live on this daemon, so the checks below test something: the network filter matches the start of
+      // a network's ID, and a name is resolved before an ID prefix, for networks and containers alike.
+      expect(docker('ps', '--all', '--quiet', '--no-trunc', '--filter', `network=${bystanderNetwork.slice(0, 12)}`).split('\n'))
+        .toContain(bystanders[0]);
+      expect(docker('container', 'inspect', '--format', '{{.Id}}', holders[0]!.slice(0, 12))).toBe(holderLookalike);
+      expect(docker('network', 'inspect', '--format', '{{.Id}}', network.slice(0, 12))).toBe(lookalike);
       // The holders' inspect also names a container that does not exist, as one gone since the listing would be: Docker
       // 27.4 prints the others and exits 1, and the sweep must still remove them.
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
