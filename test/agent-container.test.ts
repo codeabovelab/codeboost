@@ -674,8 +674,9 @@ describe('real Docker agent isolation', () => {
 
   // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
   // creates is genuinely mislabelled and only the owner-label checks can catch it. Production cleanup may refuse such
-  // an object (task storage has no captured IDs), and afterAll's runner sweep finds it only while it holds one of this
-  // run's volumes or networks, so the wrapper labels it with a test-run ID instead (#189). Whatever has that ID is
+  // an object (task storage has no captured IDs), and afterAll's runner sweep finds such a container only while it
+  // holds one of this run's volumes or networks, and such a volume or network never, so the wrapper labels it with a
+  // test-run ID instead (#189). Whatever has that ID is
   // removed when the test finishes (Vitest runs `onTestFinished` after a pass, a failure or a timeout; the `it.fails`
   // pair below tests the failure), and again in afterAll, for a create that lands after a timed-out test's removal (its
   // body runs on).
@@ -2501,7 +2502,9 @@ describe('real Docker agent isolation', () => {
       expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
     } finally {
       spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' });
-      removeTaskFilesystems(filesystems);
+      // Never throws, so a failure above is the one reported: the volumes carry the runner label, so afterAll's sweep
+      // removes what this leaves.
+      try { removeTaskFilesystems(filesystems); } catch { /* removed by afterAll's runner sweep */ }
     }
   }, 60_000);
 
