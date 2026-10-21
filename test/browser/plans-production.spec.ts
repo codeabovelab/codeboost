@@ -91,7 +91,7 @@ function dBackedAgent(service: ReviewService, observations: {
   const snapshot = service.store.getSnapshot(service.config.identity);
   const provider = createPlanningProvider({ vendor: 'claude', repository: service.reviewRepository().path,
     head: snapshot.head, snapshotId: snapshot.id, runnerOwner: '0123456789abcdef0123456789abcdef', deps });
-  const agent: AuthorProvider & { close(): Promise<void> } = {
+  const agent: AuthorProvider & Pick<PlanningAgent, 'close' | 'probe'> = {
     async invoke(request: AuthorRequest, signal: AbortSignal) {
       const current = service.store.getPlan(request.identity);
       const expected = request.mode === 'draft' ? current.revision + 1 : current.revision;
@@ -100,6 +100,8 @@ function dBackedAgent(service: ReviewService, observations: {
       return provider.invoke(request, signal);
     },
     async close() { /* createPlanningProvider has no process-level owner */ },
+    // The planning check (#164) passes here; planning-production and agent-planning test it.
+    async probe() { /* passes */ },
   };
   return agent as PlanningAgent;
 }

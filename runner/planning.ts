@@ -119,7 +119,7 @@ export class PlanningCheck {
     if (this.#abort.signal.aborted) throw new GuardRefusal('Planning is stopping.');
     const check: Check = { vendor, done: Promise.resolve() };
     // Never rejects: a failure is kept on the check, so every waiting request is refused with it.
-    const done = this.#probe(vendor, this.#abort.signal).then(() => undefined, (error: unknown) => {
+    const done = Promise.resolve().then(() => this.#probe(vendor, this.#abort.signal)).then(() => undefined, (error: unknown) => {
       check.failure = { error, at: performance.now() };
     });
     check.done = done;
