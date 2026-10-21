@@ -77,9 +77,11 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
   let id: unknown, actual: unknown;
   try {
     const at = found.stdout.indexOf(' ');
+    if (kind !== 'volume' && at < 0) throw new Error('no space');
     [id, actual] = kind === 'volume' ? [name, JSON.parse(found.stdout)] : [JSON.parse(found.stdout.slice(0, at)), JSON.parse(found.stdout.slice(at + 1))];
   } catch { console.warn(`${when}: removing ${kind} ${name}: docker printed what is not JSON:`, found.stdout); return; }
-  if (typeof id !== 'string' || typeof actual !== 'string') {
+  // A container's or network's ID is checked too, as it is passed on as an argument.
+  if (typeof id !== 'string' || typeof actual !== 'string' || (kind !== 'volume' && !OBJECT_ID.test(id))) {
     console.warn(`${when}: removing ${kind} ${name}: docker printed no ID and name:`, found.stdout); return;
   }
   if ((kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
@@ -101,8 +103,9 @@ export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): voi
   removeLabelledObjects(RUNNER_LABEL, runnerOwner, when);
 }
 
-// What `--quiet --no-trunc` lists for a container, and the names Docker 27.4 allows a volume.
-const CONTAINER_ID = /^[0-9a-f]{64}$/, VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+// A container's or network's full ID, as `--no-trunc` and inspect give it, and the names Docker 27.4 allows a volume.
+// Every value the code passes on as an argument has one of these shapes, so none can read as an option.
+const OBJECT_ID = /^[0-9a-f]{64}$/, VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 /**
  * Removes the containers, networks and volumes that carry `label=value`, containers first, as they hold the others in
  * use. Before it removes a network or a volume it also removes every container attached to it or mounting it, labelled
@@ -132,7 +135,7 @@ export function removeLabelledObjects(label: string, value: string, when: string
   // argument, where a leading dash would read as an option.
   const shaped = (stage: string, pattern: RegExp) => (line: string) => {
     if (pattern.test(line)) return true;
-    console.warn(`${when}: ${stage}: docker printed a line that is not ${pattern === CONTAINER_ID ? 'a container ID' : 'a volume name'}:`, line);
+    console.warn(`${when}: ${stage}: docker printed a line that is not ${pattern === OBJECT_ID ? 'a container ID' : 'a volume name'}:`, line);
     return false;
   };
   // A line Docker printed that is not JSON is reported and skipped, so the sweep never throws.
@@ -148,10 +151,10 @@ export function removeLabelledObjects(label: string, value: string, when: string
       '--filter', `label=${label}=${value}`])
       .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>('listing networks', line)
         .filter((object): object is { ID: string; Name: string } => {
-          if (typeof object?.ID === 'string' && typeof object.Name === 'string') return true;
+          if (typeof object?.ID === 'string' && OBJECT_ID.test(object.ID) && typeof object.Name === 'string') return true;
           console.warn(`${when}: listing networks: docker printed a line that is not a network:`, line); return false;
         })
-        : shaped(`listing ${kind}s`, kind === 'container' ? CONTAINER_ID : VOLUME_NAME)(line) ? [{ ID: line, Name: line }] : []);
+        : shaped(`listing ${kind}s`, kind === 'container' ? OBJECT_ID : VOLUME_NAME)(line) ? [{ ID: line, Name: line }] : []);
     const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
     if (!ids.length) continue;
     console.warn(`${when} removes leftover ${kind}s labelled ${label}=${value}: ${names.join(' ')}`);
@@ -160,13 +163,14 @@ export function removeLabelledObjects(label: string, value: string, when: string
       // ID, so a container counts only if it is on one of these networks by name (Docker refuses a second local network
       // of one name). Containers go by full ID: Docker resolves a name before an ID prefix.
       const candidates = run('finding holders', ['ps', '--all', '--quiet', '--no-trunc',
-        ...names.flatMap(name => ['--filter', `${kind}=${name}`])]).filter(shaped('finding holders', CONTAINER_ID));
+        ...names.flatMap(name => ['--filter', `${kind}=${name}`])]).filter(shaped('finding holders', OBJECT_ID));
       const holders = kind === 'volume' || !candidates.length ? candidates : run('reading holders', ['container', 'inspect', '--format',
         '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
         const at = line.indexOf(' ');
         if (at < 0) { console.warn(`${when}: reading holders: docker printed a line that is not an ID and networks:`, line); return []; }
         const id = parsed<string>('reading holders', line.slice(0, at)), on = parsed<Record<string, unknown>>('reading holders', line.slice(at + 1));
-        if (typeof id[0] === 'string' && typeof on[0] === 'object' && on[0] !== null) return [{ id: id[0], on: Object.keys(on[0]) }];
+        if (typeof id[0] === 'string' && OBJECT_ID.test(id[0]) && typeof on[0] === 'object' && on[0] !== null)
+          return [{ id: id[0], on: Object.keys(on[0]) }];
         // A line already reported as not JSON is not reported again.
         if (id.length && on.length) console.warn(`${when}: reading holders: docker printed a line that is not an ID and networks:`, line);
         return [];

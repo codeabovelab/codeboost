@@ -82,6 +82,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
     `  'network raced') printf '%s\\n' '"${raced}" "raced"';;`,
     "  'container junk') echo 'not json';;",
     "  'container odd') echo '1 2';;",
+    "  'container nospace') echo '\"nospace\"';;",
+    "  'container optid') echo '\"--help\" \"/optid\"';;",
     "  'container killed') kill -9 $$;;",
     "  'container lost') echo 'Failed to initialize: unable to resolve docker endpoint: context \"x\": context not found: open /x/meta.json: no such file or directory' >&2; exit 1;;",
     'esac; exit 0; fi',
@@ -94,7 +96,7 @@ it('removes by name only an object of exactly that name, and reports failures ot
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   const objects = [['container', 'gone'], ['network', 'gone'], ['volume', 'gone'], ['container', 'prefix'], ['network', 'prefix'],
     ['container', 'busy'], ['network', 'busy'], ['volume', 'busy'], ['container', 'killed'], ['container', 'lost'],
-    ['network', 'raced'], ['container', 'junk'], ['container', 'odd']] as const;
+    ['network', 'raced'], ['container', 'junk'], ['container', 'odd'], ['container', 'nospace'], ['container', 'optid']] as const;
   expect(() => { for (const [kind, name] of objects) removeByName(kind, name, 'test', join(root, 'docker')); }).not.toThrow();
   // Only the exact names are removed, by full ID (a volume's name is its ID).
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
@@ -110,6 +112,8 @@ it('removes by name only an object of exactly that name, and reports failures ot
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
     ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
+    ['test: removing container nospace: docker printed what is not JSON:', '"nospace"\n'],
+    ['test: removing container optid: docker printed no ID and name:', '"--help" "/optid"\n'],
   ]);
 });
 
@@ -134,7 +138,7 @@ it('talks to the daemon set when it loaded, though a test changed DOCKER_HOST or
 
 it('takes the daemon set at load, not the default, when one was set, for every call', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const seen = join(root, 'seen'), net = 'n'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64), labelled = 'c'.repeat(64);
+  const seen = join(root, 'seen'), net = 'f'.repeat(64), holder = 'a'.repeat(64), named = 'b'.repeat(64), labelled = 'c'.repeat(64);
   const volumeHolder = 'e'.repeat(64);
   // Records the address and the whole command of each call. Answers as Docker 27.4 does, in the parts the code reads,
   // for one labelled container, one swept network and one swept volume, each held by one container, and for a container
@@ -204,7 +208,7 @@ it.each([
   ['reports any other failure to read the holders', 'permission denied', [['test: reading holders: docker container inspect --format {{json .Id}} {{json .NetworkSettings.Networks}} HOLDERS failed:', 'permission denied']]],
 ])('%s, and still removes the holders it read', (_label, stderr, warnings) => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
-  const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
+  const calls = join(root, 'calls'), net = 'f'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
   // Answers as Docker 27.4 does for one swept network with two candidate holders, one gone before the inspect: the
   // inspect prints the other and exits 1. Every other call gets no output and exit 0, as for `ls` with no match; the
   // removals' stdout (the removed IDs or names in 27.4) is not read. The second case's answer is invented: it stands in
@@ -265,26 +269,29 @@ it('reports a holder line that is not an ID and networks, and removes no holder 
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
     `if [ "$1" = ps ]; then printf '%s\\n' ${'a'.repeat(64)}; exit 0; fi`,
-    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null'; exit 0; fi`, 'exit 0'].join('\n'),
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null' '"--all" {"swept":{}}'; exit 0; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '123 null']);
+  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '"--all" {"swept":{}}']);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
 });
 
-it('reports and skips listed lines that are not a container ID or a volume name, so none becomes an option', () => {
+it('reports and skips listed lines that are not a container ID, a network or a volume name, so none becomes an option', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
   // Lines Docker 27.4 is not known to print for these listings; every other call gets no output and exit 0, as for
   // `ls` with no match.
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
     `if [ "$1 $2" = "container ls" ]; then printf '%s\\n' '--all'; exit 0; fi`,
-    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' '-v'; exit 0; fi`, 'exit 0'].join('\n'),
+    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' '-v'; exit 0; fi`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"--help","Name":"x"}'; exit 0; fi`, 'exit 0'].join('\n'),
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls).toEqual([['test: listing containers: docker printed a line that is not a container ID:', '--all'],
+    ['test: listing networks: docker printed a line that is not a network:', '{"ID":"--help","Name":"x"}'],
     ['test: listing volumes: docker printed a line that is not a volume name:', '-v']]);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm |^ps /.test(line))).toEqual([]);
 });
