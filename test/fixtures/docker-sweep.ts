@@ -9,8 +9,8 @@ export const TEST_RUN_LABEL = 'io.codeboost.test-run';
 
 /**
  * Removes the containers, networks and volumes labelled with one runner owner, and every container that holds one of
- * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it, after
- * its other cleanup.
+ * those networks or volumes, whatever its labels (see `removeLabelledObjects`). A test file's afterAll calls it after
+ * its other cleanup, and a test that makes objects under its own runner owner calls it in its finally.
  */
 export function removeRunnerObjects(runnerOwner: string, when = 'afterAll'): void {
   removeLabelledObjects(RUNNER_LABEL, runnerOwner, when);

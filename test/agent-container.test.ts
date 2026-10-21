@@ -2418,9 +2418,12 @@ describe('real Docker agent isolation', () => {
       for (const step of undo.reverse()) {
         try { await step(); } catch (error) { failures.push(error); }
       }
+      // Both runners are this test's own random owners, so no sweep of this run finds what an undo step could not
+      // remove or never recorded (#189). Each sweep may take up to 5.5 minutes, which the test's budget allows for.
+      for (const runner of runners) removeRunnerObjects(runner, 'test');
       if (failures.length) throw new AggregateError(failures, 'Recovery test cleanup failed.');
     }
-  }, 180_000);
+  }, 14 * 60_000);
 
   it('exports through a recovery handle after a restart, then removes the storage by that handle', async () => {
     const data = fixture({ hostile: agentBase });
@@ -2507,8 +2510,9 @@ describe('real Docker agent isolation', () => {
       await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
         inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
     } finally {
-      try { if (foreign) removeTaskFilesystems(foreign); }
-      finally { removeLabelledObjects('io.codeboost.allocation', allocationId, 'test'); }
+      // Never throws, so a failure above is the one reported; the sweep removes whatever the removal left.
+      try { if (foreign) removeTaskFilesystems(foreign); } catch { /* removed by allocation below */ }
+      removeLabelledObjects('io.codeboost.allocation', allocationId, 'test');
     }
   }, 7 * 60_000);
 
