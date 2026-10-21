@@ -95,7 +95,8 @@ export function planningOutput(result: InvocationResult, invocation: InvocationI
     throw new Error(`Claude stopped unexpectedly${result.signal ? ` (${result.signal})` : ''}.`);
   if (result.exitCode !== 0) {
     const detail = result.stdout.replace(/\s+/g, ' ').trim().slice(0, 300);
-    // Claude Code's own text when `--max-turns` stops the run (#163); any other failure keeps the general advice.
+    // Claude Code's own text when `--max-turns` stops the run (#163). The decoder keeps no subtype, so this matches the
+    // text: a stop whose text starts otherwise gets the general advice, with the text still quoted.
     const advice = detail.startsWith('Reached maximum number of turns')
       ? `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.`
       : 'Check its sign-in and usage limits.';
