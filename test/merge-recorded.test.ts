@@ -52,6 +52,60 @@ it('reads the ruleset\'s required checks as pending, then as passing at the same
     { context: 'test', appId: null, state: 'success' }, { context: 'real-docker', appId: null, state: 'success' }] });
 });
 
+// The same reads by a token without admin rights, recorded 2026-10-20 with gh 2.102.0 from public repositories this
+// token may only read. Each classic protection read answers 404 "Not Found", so classic checks come from the branch read.
+// - nonadmin-ruleset: vitejs/vite PR 23837 into main, which only a ruleset covers (`protection.enabled` false);
+// - nonadmin-classic: cli/cli PR 14716 into trunk, with classic required checks and no ruleset checks;
+// - nonadmin-mixed: sveltejs/svelte PR 19050 into main, where a ruleset and classic protection both require one check.
+const nonAdmin = { ruleset: loadRecording('nonadmin-ruleset'), classic: loadRecording('nonadmin-classic'), mixed: loadRecording('nonadmin-mixed') };
+
+it('records the 404 a token without admin rights gets, and the branch read\'s classic checks', () => {
+  for (const recording of Object.values(nonAdmin)) {
+    expect(recording.gh).toBe('gh version 2.102.0 (2026-09-30)');
+    const classic = recording.calls.find(call => call.args.at(-1)!.endsWith('/protection'))!;
+    expect(classic).toMatchObject({ exitCode: 1, stderr: 'gh: Not Found (HTTP 404)' });
+    expect(JSON.parse(classic.stdout)).toMatchObject({ message: 'Not Found', status: '404' });
+  }
+  const protectionOf = (recording: RecordedGh) => JSON.parse(recording.calls.find(call => /^repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(call.args.at(-1)!))!.stdout) as
+    { protected: boolean; protection: { enabled: boolean; required_status_checks: Record<string, unknown> } };
+  expect(protectionOf(nonAdmin.ruleset)).toEqual({ name: 'main', protected: true, protection: { enabled: false,
+    required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } });
+  // No `strict` here: a reader without admin rights cannot see whether the branch must be up to date.
+  expect(protectionOf(nonAdmin.classic).protection).toEqual({ enabled: true, required_status_checks: { enforcement_level: 'non_admins',
+    contexts: ['build (macos-latest)', 'build (ubuntu-latest)', 'build (windows-latest)'],
+    checks: [{ context: 'build (macos-latest)', app_id: null }, { context: 'build (ubuntu-latest)', app_id: null }, { context: 'build (windows-latest)', app_id: null }] } });
+  expect(protectionOf(nonAdmin.mixed).protection.required_status_checks).toEqual({ enforcement_level: 'non_admins',
+    contexts: ['vite-ecosystem-ci'], checks: [{ context: 'vite-ecosystem-ci', app_id: 2935623 }] });
+});
+
+it('reads a ruleset-only branch\'s required checks with a token without admin rights', async () => {
+  const run = replayGh(nonAdmin.ruleset), state = await gatewayFor(nonAdmin.ruleset, run).inspect({ fresh: true });
+  expect(run.unrecorded).toEqual([]);
+  // The ruleset binds each check to GitHub Actions (app 15368). gh's rollup names no app (#176), so app-bound checks
+  // read as missing, though runs of these names passed: fail closed until #176.
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, mergeQueue: false, requiredChecks: [
+    { context: 'Semantic Pull Request', appId: 15368, state: 'missing' },
+    { context: 'Build & Test Passed or Skipped', appId: 15368, state: 'missing' },
+    { context: 'Lint: node-24, ubuntu-latest', appId: 15368, state: 'missing' }] });
+});
+
+it('reads a classic-protected branch\'s required checks with a token without admin rights', async () => {
+  const run = replayGh(nonAdmin.classic), state = await gatewayFor(nonAdmin.classic, run).inspect({ fresh: true });
+  expect(run.unrecorded).toEqual([]);
+  // `strict` is unknown to this reader, so classic protection gives no base guard, and an automatic merge stays blocked.
+  expect(state).toMatchObject({ base: pullOf(nonAdmin.classic).baseRefOid, head: pullOf(nonAdmin.classic).headRefOid,
+    rulesKnown: true, atomicBaseGuard: false, mergeQueue: false, requiredChecks: [
+      { context: 'build (macos-latest)', appId: null, state: 'success' },
+      { context: 'build (ubuntu-latest)', appId: null, state: 'success' },
+      { context: 'build (windows-latest)', appId: null, state: 'success' }] });
+});
+
+it('reads a check both a ruleset and classic protection require once, with a token without admin rights', async () => {
+  const run = replayGh(nonAdmin.mixed), state = await gatewayFor(nonAdmin.mixed, run).inspect({ fresh: true });
+  expect(run.unrecorded).toEqual([]);
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [{ context: 'vite-ecosystem-ci', appId: 2935623, state: 'missing' }] });
+});
+
 // The job, against the real Store and guarded merge, with GitHub answered from the recordings. Its preparation is a
 // fake that records readiness, as in test/merge-job.test.ts.
 const identity = { repositoryId: 'repo', taskId: 'Task_183', planId: 'plan' };

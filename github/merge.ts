@@ -188,13 +188,32 @@ function observedCheckStart(check: Record<string, unknown>): number {
 function observedCheckOlderThan(check: Record<string, unknown>): number {
   return Number.isNaN(observedCheckStart(check)) ? observedTime(check.completedAt) : NaN;
 }
-/** GitHub's own 404 answer for a branch with no classic protection: the body gh prints, not only its message. */
-function branchNotProtected(error: Error): boolean {
-  if (!(error instanceof CommandFailed)) return false;
+/**
+ * The message of GitHub's own 404 answer, from the body gh prints, not only from gh's message: "Branch not protected"
+ * for a branch with no classic protection, "Not Found" for a token that may not read it (or for a branch deleted since
+ * the branch read). Null for any other failure.
+ */
+function github404(error: Error): string | null {
+  if (!(error instanceof CommandFailed)) return null;
   try {
     const body = JSON.parse(error.stdout) as { message?: unknown; status?: unknown } | null;
-    return body?.message === 'Branch not protected' && body.status === '404';
-  } catch { return false; }
+    return body?.status === '404' && typeof body.message === 'string' ? body.message : null;
+  } catch { return null; }
+}
+/**
+ * Classic required checks from the branch read's `protection.required_status_checks`, which a token with read access
+ * got on the public repositories recorded in test/fixtures/gh/nonadmin-*.json, in the shape of the protection read's.
+ * GitHub leaves `strict` out there, so it reads as false: that only withholds the base guard. `enforced` is false for
+ * enforcement level `off`. Null when the answer's shape is wrong or contradicts itself (checks listed while enforcement
+ * is off); its entries are checked as the protection read's are.
+ */
+function classicFromBranch(required: unknown): { enforced: boolean; strict: false; contexts: unknown[]; checks: unknown[] } | null {
+  if (!required || typeof required !== 'object' || Array.isArray(required)) return null;
+  const value = required as { enforcement_level?: unknown; contexts?: unknown; checks?: unknown };
+  if (!['off','non_admins','everyone'].includes(value.enforcement_level as string) || !Array.isArray(value.contexts) || !Array.isArray(value.checks)) return null;
+  const enforced = value.enforcement_level !== 'off';
+  if (!enforced && (value.contexts.length || value.checks.length)) return null;
+  return { enforced, strict: false, contexts: value.contexts, checks: value.checks };
 }
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
@@ -348,21 +367,29 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     try {
       rules = flattenPages(await this.#json(['api','--paginate','--slurp',`repos/${this.config.repository}/rules/branches/${branch}`], signal));
       const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as
-        { protected?: unknown; protection?: { enabled?: unknown } | null };
+        { protected?: unknown; protection?: { enabled?: unknown; required_status_checks?: unknown } | null };
       if (typeof branchState.protected !== 'boolean') throw new Error('GitHub returned an incomplete branch state.');
-      let protection: unknown | null = null, unprotected = false;
+      let protection: unknown | null = null, answer404: string | null = null;
       try { protection = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}/protection`], signal); }
       catch (error) {
         if (!(error instanceof Error) || !/HTTP 404|not found/i.test(error.message)) throw error;
-        unprotected = branchNotProtected(error);
+        answer404 = github404(error);
       }
       if (protection === null) {
-        // `protected` is also true when only a ruleset applies; GitHub then answers 404 "Branch not protected" here, and
-        // the branch read shows classic protection off (`protection.enabled` false; both recorded in test/fixtures/gh/).
-        // Anything else on a protected branch may hide classic rules (a token without admin rights gets "Not Found"):
-        // fail closed.
-        const classicOff = unprotected && branchState.protection?.enabled === false;
-        if (branchState.protected && !classicOff) throw new Error('Branch protection is present but unreadable.');
+        // `protected` is also true when only a ruleset applies. The branch read then shows classic protection off
+        // (`protection.enabled` false), and the protection read answers 404: "Branch not protected" to a token with
+        // admin rights, "Not Found" to one without. With classic protection on, a token without admin rights gets
+        // "Not Found" too, and the branch read lists the required checks (all recorded in test/fixtures/gh/). Any
+        // other answer on a protected branch may hide classic rules: fail closed.
+        if (branchState.protected) {
+          const enabled = branchState.protection?.enabled, fromBranch = classicFromBranch(branchState.protection?.required_status_checks);
+          // Classic protection off must also show no enforced checks.
+          const classicOff = enabled === false && fromBranch?.enforced === false && (answer404 === 'Branch not protected' || answer404 === 'Not Found');
+          if (!classicOff) {
+            if (!(enabled === true && answer404 === 'Not Found' && fromBranch)) throw new Error('Branch protection is present but unreadable.');
+            classic = fromBranch;
+          }
+        }
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
         throw new Error('GitHub returned incomplete branch protection.');
       } else {

@@ -1,0 +1,51 @@
+{
+  "gh": "gh version 2.102.0 (2026-09-30)",
+  "repository": "cli/cli",
+  "pullRequest": 14716,
+  "recordedAt": "2026-10-20T20:50:27.159Z",
+  "calls": [
+    {
+      "args": [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/cli/cli/rules/branches/trunk"
+      ],
+      "exitCode": 0,
+      "stdout": "[[{\"type\":\"copilot_code_review\",\"parameters\":{\"review_on_push\":false,\"review_draft_pull_requests\":true},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"cli/cli\",\"ruleset_id\":4898070}]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/cli/cli/branches/trunk"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"name\":\"trunk\",\"protected\":true,\"protection\":{\"enabled\":true,\"required_status_checks\":{\"enforcement_level\":\"non_admins\",\"contexts\":[\"build (macos-latest)\",\"build (ubuntu-latest)\",\"build (windows-latest)\"],\"checks\":[{\"context\":\"build (macos-latest)\",\"app_id\":null},{\"context\":\"build (ubuntu-latest)\",\"app_id\":null},{\"context\":\"build (windows-latest)\",\"app_id\":null}]}}}",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "repos/cli/cli/branches/trunk/protection"
+      ],
+      "exitCode": 1,
+      "stdout": "{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+      "stderr": "gh: Not Found (HTTP 404)"
+    },
+    {
+      "args": [
+        "pr",
+        "view",
+        "14716",
+        "--repo",
+        "cli/cli",
+        "--json",
+        "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"baseRefName\":\"trunk\",\"baseRefOid\":\"b1c8c0ae5aec75ec8caf6e537071efc15d274f45\",\"headRefName\":\"dependabot/github_actions/actions/create-github-app-token-3.3.0\",\"headRefOid\":\"936921fa9e67cdbf78fb25abc6252afabafef056\",\"isDraft\":false,\"mergeable\":\"MERGEABLE\",\"number\":14716,\"state\":\"OPEN\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128887480\",\"name\":\"label-external\",\"startedAt\":\"2026-10-19T14:51:18Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:54:13Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694875/job/118128876438\",\"name\":\"CodeQL-Build (go, manual, ./.github/codeql/codeql-config.yml)\",\"startedAt\":\"2026-10-19T14:51:19Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Code Scanning\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:56:32Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128877234\",\"name\":\"build (ubuntu-latest)\",\"startedAt\":\"2026-10-19T14:51:19Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:52:06Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694875/job/118128876935\",\"name\":\"CodeQL-Build (actions, none, security-and-quality)\",\"startedAt\":\"2026-10-19T14:51:19Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Code Scanning\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T15:01:21Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128877056\",\"name\":\"build (windows-latest)\",\"startedAt\":\"2026-10-19T14:51:20Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:57:47Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128877286\",\"name\":\"build (macos-latest)\",\"startedAt\":\"2026-10-19T14:51:24Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128887180\",\"name\":\"close-from-default-branch\",\"startedAt\":\"2026-10-19T14:51:18Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:52:55Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128876429\",\"name\":\"integration-tests (ubuntu-latest)\",\"startedAt\":\"2026-10-19T14:51:20Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:53:25Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128877029\",\"name\":\"integration-tests (windows-latest)\",\"startedAt\":\"2026-10-19T14:51:20Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:52:24Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272694853/job/118128877341\",\"name\":\"integration-tests (macos-latest)\",\"startedAt\":\"2026-10-19T14:51:23Z\",\"status\":\"COMPLETED\",\"workflowName\":\"Unit and Integration Tests\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128888357\",\"name\":\"check-requirements / check-requirements\",\"startedAt\":\"2026-10-19T14:51:18Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128963838\",\"name\":\"check-requirements / close-unmet-requirements\",\"startedAt\":\"2026-10-19T14:51:27Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128951905\",\"name\":\"close-unmet-requirements\",\"startedAt\":\"2026-10-19T14:51:25Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128886135\",\"name\":\"close-no-help-wanted\",\"startedAt\":\"2026-10-19T14:51:18Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:51:17Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/cli/cli/actions/runs/39272695107/job/118128968155\",\"name\":\"ready-for-review\",\"startedAt\":\"2026-10-19T14:51:27Z\",\"status\":\"COMPLETED\",\"workflowName\":\"PR Triaging\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-19T14:52:00Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://github.com/cli/cli/runs/118129227691\",\"name\":\"CodeQL\",\"startedAt\":\"2026-10-19T14:51:57Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"}],\"url\":\"https://github.com/cli/cli/pull/14716\"}\n",
+      "stderr": ""
+    }
+  ]
+}

@@ -951,7 +951,7 @@ it('parses required checks from both rule sources and pins the gh merge head', a
  *   `__typename`, `detailsUrl` and `workflowName`;
  * - each rule's `ruleset_source_type`, `ruleset_source`, `ruleset_id` and, for checks, `do_not_enforce_on_create`;
  * - the branch's `commit` and links, and its `protection` where the protection read succeeds (the gateway reads
- *   `protection.enabled` only after that read answers "Branch not protected");
+ *   the branch's `protection` only after that read answers 404 on a protected branch);
  * - classic protection's fields other than `required_status_checks`, and the URLs inside it;
  * - all output of `gh pr merge`, which answers exit 0 with nothing printed (the gateway reads only the exit status).
  */
@@ -1830,23 +1830,77 @@ const PROTECTION_DOCS = 'https://docs.github.com/rest/branches/branch-protection
 const NOT_PROTECTED = ghExit('gh: Branch not protected (HTTP 404)', `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}`);
 /** The branch read's `protection` as GitHub gives it for a branch with classic protection off (recorded in test/fixtures/gh/). */
 const CLASSIC_OFF = { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } };
+/** The same with classic protection requiring `build` from any app, as GitHub shows it to any reader (nonadmin-classic.json). */
+const CLASSIC_ON = { enabled: true, required_status_checks: { enforcement_level: 'non_admins', contexts: ['build'], checks: [{ context: 'build', app_id: null }] } };
+const withRequired = (required: unknown) => ({ ...CLASSIC_ON, required_status_checks: required });
+// GitHub's answer to a token without admin rights on a protected branch (recorded in test/fixtures/gh/nonadmin-*.json).
+const NOT_FOUND = ghExit('gh: Not Found (HTTP 404)', `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`);
+const RULESET_ONLY = [{ context: 'test', appId: null, state: 'missing' }];
+const WITH_BUILD = [...RULESET_ONLY, { context: 'build', appId: null, state: 'missing' }];
 it.each([
-  // As recorded in test/fixtures/gh/ for a branch only a ruleset covers.
-  ['GitHub\'s "Branch not protected" answer with classic protection off', 'absent', NOT_PROTECTED, CLASSIC_OFF, true],
+  // As recorded in test/fixtures/gh/ for a branch only a ruleset covers, read with and without admin rights.
+  ['GitHub\'s "Branch not protected" answer with classic protection off', 'absent', NOT_PROTECTED, CLASSIC_OFF, RULESET_ONLY],
+  ['the "Not Found" a token without admin rights gets, with classic protection off', 'absent', NOT_FOUND, CLASSIC_OFF, RULESET_ONLY],
+  // As recorded for a classic-protected branch: its checks come from the branch read.
+  ['the "Not Found" a token without admin rights gets, with classic protection on', 'the branch read\'s checks', NOT_FOUND, CLASSIC_ON, WITH_BUILD],
+  // Seen with gh 2.102.0 on 2026-10-20 without admin rights on withastro/astro `main`.
+  ['the "Not Found" answer, with classic protection on and its checks not enforced', 'present, with no required checks', NOT_FOUND,
+    withRequired({ enforcement_level: 'off', contexts: [], checks: [] }), RULESET_ONLY],
+  // Seen the same way on biomejs/biome `main` (2026-10-20): required checks enforced with none listed, as the protection
+  // read's `contexts: []` is read.
+  ['the "Not Found" answer, with classic checks enforced and none listed', 'present, with no required checks', NOT_FOUND,
+    withRequired({ enforcement_level: 'non_admins', contexts: [], checks: [] }), RULESET_ONLY],
+  // Seen the same way on python/cpython `main` (2026-10-20).
+  ['the "Not Found" answer, with classic protection enforced for everyone', 'the branch read\'s checks', NOT_FOUND,
+    withRequired({ ...CLASSIC_ON.required_status_checks, enforcement_level: 'everyone' }), WITH_BUILD],
   // The branch read must agree: a "Branch not protected" answer alone does not show that no classic rule applies.
-  ['a "Branch not protected" answer while the branch shows classic protection on', 'unknown (fail closed)', NOT_PROTECTED,
-    { ...CLASSIC_OFF, enabled: true }, false],
-  ['a "Branch not protected" answer while the branch read has no protection', 'unknown (fail closed)', NOT_PROTECTED, undefined, false],
-  // GitHub's answer to a token without admin rights on a protected branch (cli/cli trunk, read 2026-10-20).
-  ['the 404 a token without admin rights gets', 'unknown (fail closed)', ghExit('gh: Not Found (HTTP 404)',
-    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), CLASSIC_OFF, false],
+  ['a "Branch not protected" answer while the branch shows classic protection on', 'unknown (fail closed)', NOT_PROTECTED, CLASSIC_ON, null],
+  ['a "Branch not protected" answer while the branch read has no protection', 'unknown (fail closed)', NOT_PROTECTED, undefined, null],
+  // Classic protection off must also show no enforced checks, for either 404.
+  ['a "Branch not protected" answer while classic protection off lists enforced checks', 'unknown (fail closed)', NOT_PROTECTED,
+    { ...CLASSIC_ON, enabled: false }, null],
+  ['the "Not Found" answer while classic protection off lists enforced checks', 'unknown (fail closed)', NOT_FOUND, { ...CLASSIC_ON, enabled: false }, null],
+  ['the "Not Found" answer while classic protection off is enforced with no checks', 'unknown (fail closed)', NOT_FOUND,
+    { enabled: false, required_status_checks: { enforcement_level: 'everyone', contexts: [], checks: [] } }, null],
+  ['a "Branch not protected" answer while classic protection off is enforced with no checks', 'unknown (fail closed)', NOT_PROTECTED,
+    { enabled: false, required_status_checks: { enforcement_level: 'non_admins', contexts: [], checks: [] } }, null],
+  ['a "Branch not protected" answer while classic protection off lists checks it does not enforce', 'unknown (fail closed)', NOT_PROTECTED,
+    { enabled: false, required_status_checks: { enforcement_level: 'off', contexts: ['build'], checks: [{ context: 'build', app_id: null }] } }, null],
+  ['the "Not Found" answer while classic protection off has no required checks object', 'unknown (fail closed)', NOT_FOUND, { enabled: false }, null],
+  ['a "Branch not protected" answer while classic protection off has no required checks object', 'unknown (fail closed)', NOT_PROTECTED, { enabled: false }, null],
+  ['the "Not Found" answer while the branch read has no protection', 'unknown (fail closed)', NOT_FOUND, undefined, null],
+  ['the "Not Found" answer while `enabled` is not a boolean', 'unknown (fail closed)', NOT_FOUND, { ...CLASSIC_ON, enabled: 'true' }, null],
+  ['the "Not Found" answer with no required checks object', 'unknown (fail closed)', NOT_FOUND, { enabled: true }, null],
+  ['the "Not Found" answer with null required checks', 'unknown (fail closed)', NOT_FOUND, withRequired(null), null],
+  ['the "Not Found" answer with an unknown enforcement level', 'unknown (fail closed)', NOT_FOUND,
+    withRequired({ ...CLASSIC_ON.required_status_checks, enforcement_level: 'admins' }), null],
+  ['the "Not Found" answer listing checks that are not enforced', 'unknown (fail closed)', NOT_FOUND,
+    withRequired({ ...CLASSIC_ON.required_status_checks, enforcement_level: 'off' }), null],
+  ['the "Not Found" answer with no `checks`', 'unknown (fail closed)', NOT_FOUND, withRequired({ enforcement_level: 'non_admins', contexts: ['build'] }), null],
+  ['the "Not Found" answer with no `contexts`', 'unknown (fail closed)', NOT_FOUND,
+    withRequired({ enforcement_level: 'non_admins', checks: [{ context: 'build', app_id: null }] }), null],
+  ['the "Not Found" answer whose `checks` and `contexts` disagree', 'unknown (fail closed)', NOT_FOUND,
+    withRequired({ enforcement_level: 'non_admins', contexts: ['build'], checks: [{ context: 'lint', app_id: null }] }), null],
+  ['the "Not Found" answer with a check that has no `app_id`', 'unknown (fail closed)', NOT_FOUND,
+    withRequired({ enforcement_level: 'non_admins', contexts: ['build'], checks: [{ context: 'build' }] }), null],
+  // Not observed: the shape a token without the Administration permission may get (see guarded-merge.md).
+  ['a 403 answer', 'unknown (fail closed)', ghExit('gh: Resource not accessible by personal access token (HTTP 403)',
+    `{"message":"Resource not accessible by personal access token","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_ON, null],
+  // gh 2.102.0's answer with admin rights for a missing branch (codeabovelab/codeboost, 2026-10-20); without admin
+  // rights a missing branch answers "Not Found", but the branch read has then already succeeded.
+  ['a 404 with another message', 'unknown (fail closed)', ghExit('gh: Branch not found (HTTP 404)',
+    `{"message":"Branch not found","documentation_url":"${PROTECTION_DOCS}","status":"404"}`), CLASSIC_OFF, null],
+  ['a "Not Found" body without a 404 status', 'unknown (fail closed)', ghExit('gh: Not Found (HTTP 404)',
+    `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_ON, null],
   ['a "Branch not protected" body without a 404 status', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)',
-    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_OFF, false],
-  ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), CLASSIC_OFF, false],
+    `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"403"}`), CLASSIC_OFF, null],
+  ['a 404 whose body is not JSON', 'unknown (fail closed)', ghExit('gh: Branch not protected (HTTP 404)', ''), CLASSIC_OFF, null],
   // Not a gh exit, though it carries GitHub's body: only gh's own answer confirms the absence.
   ['a 404 message that gh did not answer', 'unknown (fail closed)', Object.assign(new Error('HTTP 404: Branch not protected'),
-    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), CLASSIC_OFF, false],
-] as const)('for %s, reads a protected branch\'s classic protection as %s', async (_case, _reads, answer, protection, known) => {
+    { stdout: `{"message":"Branch not protected","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), CLASSIC_OFF, null],
+  ['a "Not Found" message that gh did not answer', 'unknown (fail closed)', Object.assign(new Error('HTTP 404: Not Found'),
+    { stdout: `{"message":"Not Found","documentation_url":"${PROTECTION_DOCS}","status":"404"}` }), CLASSIC_ON, null],
+] as const)('for %s, reads a protected branch\'s classic protection as %s', async (_case, _reads, answer, protection, required) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
@@ -1858,8 +1912,25 @@ it.each([
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
-  expect(state.rulesKnown).toBe(known);
-  if (known) expect(state.requiredChecks).toEqual([{ context: 'test', appId: null, state: 'missing' }]);
+  expect(state.rulesKnown).toBe(required !== null);
+  if (required) expect(state.requiredChecks).toEqual(required);
+});
+
+// A `strict` in the branch read was not observed; GitHub leaves it out there. It must not give the guard if it appears.
+it.each([[false, false, false], [true, false, true], [false, true, false]])('never takes the base guard from the branch read; only a strict ruleset gives it (ruleset strict=%s, branch read strict=%s, atomicBaseGuard=%s)', async (rulesetStrict, branchStrict, guard) => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: rulesetStrict, required_status_checks: [{ context: 'test' }] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ name: 'main', protected: true,
+      protection: branchStrict ? withRequired({ ...CLASSIC_ON.required_status_checks, strict: true }) : CLASSIC_ON });
+    // Classic protection read this way never supplies the guard itself.
+    if (joined.endsWith('/protection')) throw NOT_FOUND;
+    { const fixed = alreadyFixedReads(args); if (fixed !== null) return fixed; }
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: guard, requiredChecks: WITH_BUILD });
 });
 
 it.each([
