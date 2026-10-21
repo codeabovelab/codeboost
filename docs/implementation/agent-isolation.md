@@ -113,8 +113,7 @@ Use only these entry points to run an agent:
        `prepareDraft` and `prepareSuggestions` already limit the prompt and the schema text to 32 KiB each, so this
        check refuses nothing they produce. It is a backstop for a caller that skips them. A test checks a draft at the
        prompt limit with today's schema; no test fails if the 32 KiB schema bound in `core/planning-author.ts` is
-       removed. It does not count Claude
-       Code's own system prompt and tool definitions, or the tokens of the answer.
+       removed. It does not count Claude Code's own system prompt and tool definitions, or the tokens of the answer.
      - *The run.* The command passes `--max-turns 50` (`PLANNING_MAX_TURNS`). If each turn sends at most one context
        window, a turn limit bounds the tokens a run can use with no tokenizer. That is assumed: calls the CLI makes for
        itself, such as compaction, may not count as turns, and the bound is loose (about 50 context windows; the CLI
