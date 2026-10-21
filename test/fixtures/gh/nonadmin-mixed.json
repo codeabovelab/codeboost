@@ -2,7 +2,7 @@
   "gh": "gh version 2.102.0 (2026-09-30)",
   "repository": "sveltejs/svelte",
   "pullRequest": 19050,
-  "recordedAt": "2026-10-20T20:50:33.643Z",
+  "recordedAt": "2026-10-21T00:45:50.695Z",
   "calls": [
     {
       "args": [
@@ -13,6 +13,23 @@
       ],
       "exitCode": 0,
       "stdout": "[[{\"type\":\"creation\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"update\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"deletion\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155284},{\"type\":\"deletion\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"non_fast_forward\",\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"pull_request\",\"parameters\":{\"required_approving_review_count\":1,\"dismiss_stale_reviews_on_push\":false,\"required_reviewers\":[],\"require_code_owner_review\":false,\"dismissal_restriction\":{\"enabled\":false,\"allowed_actors\":[]},\"require_last_push_approval\":false,\"required_review_thread_resolution\":false,\"require_extra_approval_for_unattributed_changes\":true,\"allowed_merge_methods\":[\"merge\",\"squash\",\"rebase\"]},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"do_not_enforce_on_create\":false,\"required_status_checks\":[{\"context\":\"vite-ecosystem-ci\",\"integration_id\":2935623}]},\"ruleset_source_type\":\"Repository\",\"ruleset_source\":\"sveltejs/svelte\",\"ruleset_id\":20155282}]]",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "api",
+        "graphql",
+        "-f",
+        "query=query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){__typename ... on Commit{oid checkSuites(first:100,after:$after){totalCount pageInfo{hasNextPage endCursor} nodes{app{databaseId} checkRuns(first:100,filterBy:{checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}}}}}",
+        "-f",
+        "owner=sveltejs",
+        "-f",
+        "name=svelte",
+        "-f",
+        "oid=111cc6411c9c647f691a159862da2b74212791e3"
+      ],
+      "exitCode": 0,
+      "stdout": "{\"data\":{\"repository\":{\"object\":{\"__typename\":\"Commit\",\"oid\":\"111cc6411c9c647f691a159862da2b74212791e3\",\"checkSuites\":{\"totalCount\":4,\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":\"Y3Vyc29yOnYyOpHPAAAAGN-eVHo=\"},\"nodes\":[{\"app\":{\"databaseId\":15368},\"checkRuns\":{\"totalCount\":0,\"nodes\":[]}},{\"app\":null,\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"vite-ecosystem-ci\",\"status\":\"COMPLETED\",\"conclusion\":\"SKIPPED\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"completedAt\":\"2026-10-20T12:41:24Z\"}]}},{\"app\":{\"databaseId\":4226557},\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"Vercel Internal Security Review\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"startedAt\":\"2026-10-20T12:41:25Z\",\"completedAt\":\"2026-10-20T12:41:49Z\"}]}},{\"app\":{\"databaseId\":8329},\"checkRuns\":{\"totalCount\":1,\"nodes\":[{\"name\":\"Vercel Agent Review\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\",\"startedAt\":\"2026-10-20T12:41:26Z\",\"completedAt\":\"2026-10-20T12:42:40Z\"}]}}]}}}}}",
       "stderr": ""
     },
     {
@@ -44,7 +61,7 @@
         "number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url"
       ],
       "exitCode": 0,
-      "stdout": "{\"baseRefName\":\"main\",\"baseRefOid\":\"40bb08482f4857d91221638dec544a532bc35389\",\"headRefName\":\"fix/print-keep-nbsp\",\"headRefOid\":\"111cc6411c9c647f691a159862da2b74212791e3\",\"isDraft\":false,\"mergeable\":\"UNKNOWN\",\"number\":19050,\"state\":\"OPEN\",\"statusCheckRollup\":[{\"__typename\":\"StatusContext\",\"context\":\"svelte.dev / preview deployments\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"state\":\"PENDING\",\"targetUrl\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:24Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/sveltejs\",\"name\":\"vite-ecosystem-ci\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:42:40Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com/github\",\"name\":\"Vercel Agent Review\",\"startedAt\":\"2026-10-20T12:41:26Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:49Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com\",\"name\":\"Vercel Internal Security Review\",\"startedAt\":\"2026-10-20T12:41:25Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"}],\"url\":\"https://github.com/sveltejs/svelte/pull/19050\"}\n",
+      "stdout": "{\"baseRefName\":\"main\",\"baseRefOid\":\"40bb08482f4857d91221638dec544a532bc35389\",\"headRefName\":\"fix/print-keep-nbsp\",\"headRefOid\":\"111cc6411c9c647f691a159862da2b74212791e3\",\"isDraft\":false,\"mergeable\":\"MERGEABLE\",\"number\":19050,\"state\":\"OPEN\",\"statusCheckRollup\":[{\"__typename\":\"StatusContext\",\"context\":\"svelte.dev / preview deployments\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"state\":\"PENDING\",\"targetUrl\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:24Z\",\"conclusion\":\"SKIPPED\",\"detailsUrl\":\"https://github.com/sveltejs\",\"name\":\"vite-ecosystem-ci\",\"startedAt\":\"2026-10-20T12:41:24Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:42:40Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com/github\",\"name\":\"Vercel Agent Review\",\"startedAt\":\"2026-10-20T12:41:26Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"},{\"__typename\":\"CheckRun\",\"completedAt\":\"2026-10-20T12:41:49Z\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":\"https://vercel.com\",\"name\":\"Vercel Internal Security Review\",\"startedAt\":\"2026-10-20T12:41:25Z\",\"status\":\"COMPLETED\",\"workflowName\":\"\"}],\"url\":\"https://github.com/sveltejs/svelte/pull/19050\"}\n",
       "stderr": ""
     }
   ]

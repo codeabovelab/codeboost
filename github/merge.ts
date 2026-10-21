@@ -215,6 +215,9 @@ function classicFromBranch(required: unknown): { enforced: boolean; strict: fals
   if (!enforced && (value.contexts.length || value.checks.length)) return null;
   return { enforced, strict: false, contexts: value.contexts, checks: value.checks };
 }
+/** Every value GitHub's GraphQL API documents for a check run's `status` and `conclusion` (CheckStatusState, CheckConclusionState). */
+const CHECK_RUN_STATUSES = ['REQUESTED','QUEUED','IN_PROGRESS','COMPLETED','WAITING','PENDING'];
+const CHECK_RUN_CONCLUSIONS = ['ACTION_REQUIRED','CANCELLED','FAILURE','NEUTRAL','SKIPPED','STALE','STARTUP_FAILURE','SUCCESS','TIMED_OUT'];
 /** Among runs with the same start, the one that passes least counts, so a tie never reads as passing. */
 const checkStateRank = { failure: 0, pending: 1, success: 2 } as const;
 
@@ -320,7 +323,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const alreadyFixed = this.#alreadyFixed(target, pr.baseRefName, base, deadlineAt, reads)
       .catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
     const [ruleRead, listRead] = await Promise.allSettled([
-      this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
+      this.#rules(pr.baseRefName, head, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
       published ? this.#branchOpen(target.headBranch!, reads).catch(stopOthers) : undefined,
     ]);
     const fixed = await alreadyFixed;
@@ -358,8 +361,65 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     });
   }
 
-  /** The effective branch rules and the state of each required check on the PR. */
-  async #rules(baseRefName: string, observed: Array<Record<string, unknown>>, signal?: AbortSignal): Promise<BranchRules> {
+  /**
+   * Every check run on commit `head`, with the ID of the app that reported it, in the shape of gh's statusCheckRollup
+   * entries plus `appId` (null for a suite GitHub names no app for). gh's statusCheckRollup does not ask for a run's app
+   * (#176), so a required check that a rule pins to an app is matched from this read. Only the fields the gateway reads
+   * are asked for, which keeps the answer small: a run's output text, which the REST API returns, is not. Each suite's
+   * latest run of each name is read, as GitHub counts for required checks. The read fails closed: on a gh failure (its error is kept), on errors or a
+   * malformed field in GitHub's answer, on a suite with more than 100 runs, on more than 1,000 suites, and when the
+   * suites change between pages.
+   */
+  async #checkRuns(head: string, signal?: AbortSignal): Promise<Array<Record<string, unknown> & { appId: number | null }>> {
+    const [owner, name] = this.config.repository.split('/') as [string, string];
+    const query = 'query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){__typename ... on Commit{oid checkSuites(first:100,after:$after){totalCount pageInfo{hasNextPage endCursor} nodes{app{databaseId} checkRuns(first:100,filterBy:{checkType:LATEST}){totalCount nodes{name status conclusion startedAt completedAt}}}}}}}}';
+    const runs: Array<Record<string, unknown> & { appId: number | null }> = [];
+    let cursor: string | null = null, suites = 0, total: number | null = null;
+    for (let page = 1; ; page++) {
+      const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-f',`oid=${head}`];
+      if (cursor !== null) args.push('-f', `after=${cursor}`);
+      const response = await this.#json(args, signal) as { data?: { repository?: { object?: Record<string, unknown> | null } | null }; errors?: unknown } | null;
+      signal?.throwIfAborted();
+      if (!response || typeof response !== 'object' || (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)))
+        throw new Error('GitHub returned check runs with errors.');
+      const commit = response.data?.repository?.object;
+      if (!commit || commit.__typename !== 'Commit' || commit.oid !== head) throw new Error('GitHub returned no check runs for the pull request head.');
+      const connection = commit.checkSuites as { totalCount?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null; nodes?: unknown } | null | undefined;
+      if (!connection || typeof connection !== 'object' || !Number.isSafeInteger(connection.totalCount) || (connection.totalCount as number) < 0 || !Array.isArray(connection.nodes)
+          || !connection.pageInfo || typeof connection.pageInfo.hasNextPage !== 'boolean' || (connection.pageInfo.endCursor !== null && typeof connection.pageInfo.endCursor !== 'string'))
+        throw new Error('GitHub returned incomplete check runs.');
+      if (total !== null && connection.totalCount !== total) throw new Error('The check suites on the pull request head changed while they were read.');
+      total = connection.totalCount as number;
+      for (const suite of connection.nodes) {
+        const value = suite as { app?: { databaseId?: unknown } | null; checkRuns?: { totalCount?: unknown; nodes?: unknown } | null } | null;
+        if (!value || typeof value !== 'object' || !Object.hasOwn(value, 'app') || (value.app !== null && (typeof value.app !== 'object' || !validNumber(value.app.databaseId))))
+          throw new Error('GitHub returned incomplete check runs.');
+        const appId = value.app === null ? null : value.app!.databaseId as number;
+        const checkRuns = value.checkRuns;
+        if (!checkRuns || typeof checkRuns !== 'object' || !Number.isSafeInteger(checkRuns.totalCount) || !Array.isArray(checkRuns.nodes)) throw new Error('GitHub returned incomplete check runs.');
+        // One page of runs per suite is read: a suite with more runs than its page holds could hide the required one.
+        if (checkRuns.nodes.length !== checkRuns.totalCount) throw new Error('A check suite on the pull request head has more check runs than codeboost can read.');
+        for (const run of checkRuns.nodes) {
+          const check = run as Record<string, unknown> | null;
+          if (!check || typeof check !== 'object' || typeof check.name !== 'string' || !CHECK_RUN_STATUSES.includes(check.status as string)
+              || (check.conclusion !== null && !CHECK_RUN_CONCLUSIONS.includes(check.conclusion as string))
+              || (check.startedAt !== null && typeof check.startedAt !== 'string') || (check.completedAt !== null && typeof check.completedAt !== 'string'))
+            throw new Error('GitHub returned a malformed check run.');
+          runs.push({ name: check.name, status: check.status, conclusion: check.conclusion, startedAt: check.startedAt, completedAt: check.completedAt, appId });
+        }
+      }
+      suites += connection.nodes.length;
+      if (!connection.pageInfo.hasNextPage) break;
+      if (page === 10 || typeof connection.pageInfo.endCursor !== 'string' || !connection.pageInfo.endCursor)
+        throw new Error('The pull request head has more check suites than codeboost can read.');
+      cursor = connection.pageInfo.endCursor;
+    }
+    if (suites !== total) throw new Error('The check suites on the pull request head changed while they were read.');
+    return runs;
+  }
+
+  /** The effective branch rules and the state of each required check on the PR, whose head is `head`. */
+  async #rules(baseRefName: string, head: string, observed: Array<Record<string, unknown>>, signal?: AbortSignal): Promise<BranchRules> {
     const branch = encodeURIComponent(baseRefName);
     let rulesKnown = true;
     let rules: unknown[] = [];
@@ -445,12 +505,14 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         }
       }
     }
+    // A check any app may report is matched from gh's rollup, check runs and commit statuses alike. One pinned to an app
+    // is matched only from the check runs that app reported on the head (#176): the rollup names no app, and a commit
+    // status has none, so a status never meets a pinned check. A failed read fails the inspection with its error.
+    const pinned = [...requirements.values()].some(required => required.appId !== null) ? await this.#checkRuns(head, signal) : [];
     const requiredChecks = [...requirements.values()].map(required => {
-      const matches = observed.filter(check => {
-        const context = typeof check.name === 'string' ? check.name : check.context;
-        const app = check.app && typeof check.app === 'object' ? (check.app as { databaseId?: unknown }).databaseId : null;
-        return context === required.context && (required.appId === null || app === required.appId);
-      });
+      const matches = required.appId === null
+        ? observed.filter(check => (typeof check.name === 'string' ? check.name : check.context) === required.context)
+        : pinned.filter(run => run.name === required.context && run.appId === required.appId);
       if (!matches.length) return { ...required, state: 'missing' as const };
       // A re-run adds a newer run (or status) with the same name; GitHub counts the latest one, so an older failure
       // does not outrank a newer pending or passing run. A check run and a commit status with the same name are not

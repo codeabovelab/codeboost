@@ -27,7 +27,7 @@ it('reads pending and passing at one pull request head, and no app in any record
   expect([pending.gh, passing.gh, zero.gh]).toEqual(Array(3).fill('gh version 2.102.0 (2026-09-30)'));
   expect(pullOf(passing)).toMatchObject({ number: 183, baseRefOid: pullOf(pending).baseRefOid, headRefOid: pullOf(pending).headRefOid });
   // gh's statusCheckRollup never carries a check's app (#176), in any recording.
-  for (const recording of [zero, pending, passing]) {
+  for (const recording of [zero, pending, passing, ...Object.values(nonAdmin)]) {
     const rollup = (JSON.parse(recording.calls.find(call => call.args[0] === 'pr')!.stdout) as { statusCheckRollup: object[] }).statusCheckRollup;
     for (const check of rollup) expect(check).not.toHaveProperty('app');
   }
@@ -54,6 +54,8 @@ it('reads the ruleset\'s required checks as pending, then as passing at the same
 
 // The same reads by a token without admin rights, recorded 2026-10-20 with gh 2.102.0 from public repositories this
 // token may only read. Each classic protection read answers 404 "Not Found", so classic checks come from the branch read.
+// nonadmin-ruleset and nonadmin-mixed were recorded again at the same heads on 2026-10-21 (UTC), when the inspection
+// began to read the head's check runs with their apps for checks pinned to an app (#176); their other answers did not change.
 // - nonadmin-ruleset: vitejs/vite PR 23837 into main, which only a ruleset covers (`protection.enabled` false);
 // - nonadmin-classic: cli/cli PR 14716 into trunk, with classic required checks and no ruleset checks;
 // - nonadmin-mixed: sveltejs/svelte PR 19050 into main, where a ruleset and classic protection both require one check.
@@ -81,12 +83,14 @@ it('records the 404 a token without admin rights gets, and the branch read\'s cl
 it('reads a ruleset-only branch\'s required checks with a token without admin rights', async () => {
   const run = replayGh(nonAdmin.ruleset), state = await gatewayFor(nonAdmin.ruleset, run).inspect({ fresh: true });
   expect(run.unrecorded).toEqual([]);
-  // The ruleset binds each check to GitHub Actions (app 15368). gh's rollup names no app (#176), so app-bound checks
-  // read as missing, though runs of these names passed: fail closed until #176.
+  // The ruleset binds each check to GitHub Actions (app 15368). gh's rollup names no app (#176), so they are matched from
+  // the head's check runs, where GitHub Actions reported a passing run of each (one of two runs of `Build & Test Passed
+  // or Skipped` was skipped, which passes).
+  expect(run.calls.filter(args => args[1] === 'graphql')).toHaveLength(1);
   expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, mergeQueue: false, requiredChecks: [
-    { context: 'Semantic Pull Request', appId: 15368, state: 'missing' },
-    { context: 'Build & Test Passed or Skipped', appId: 15368, state: 'missing' },
-    { context: 'Lint: node-24, ubuntu-latest', appId: 15368, state: 'missing' }] });
+    { context: 'Semantic Pull Request', appId: 15368, state: 'success' },
+    { context: 'Build & Test Passed or Skipped', appId: 15368, state: 'success' },
+    { context: 'Lint: node-24, ubuntu-latest', appId: 15368, state: 'success' }] });
 });
 
 it('reads a classic-protected branch\'s required checks with a token without admin rights', async () => {
@@ -103,6 +107,13 @@ it('reads a classic-protected branch\'s required checks with a token without adm
 it('reads a check both a ruleset and classic protection require once, with a token without admin rights', async () => {
   const run = replayGh(nonAdmin.mixed), state = await gatewayFor(nonAdmin.mixed, run).inspect({ fresh: true });
   expect(run.unrecorded).toEqual([]);
+  // The head has a skipped `vite-ecosystem-ci` run, but GitHub names no app for its check suite to this reader, so the
+  // run cannot be shown to come from app 2935623, and the pinned check reads as missing: it fails closed.
+  const suites = (JSON.parse(nonAdmin.mixed.calls.find(call => call.args[1] === 'graphql')!.stdout) as
+    { data: { repository: { object: { checkSuites: { nodes: { app: { databaseId: number } | null; checkRuns: { nodes: { name: string; conclusion: string }[] } }[] } } } } })
+    .data.repository.object.checkSuites.nodes;
+  expect(suites.filter(suite => suite.checkRuns.nodes.some(check => check.name === 'vite-ecosystem-ci')))
+    .toEqual([{ app: null, checkRuns: { totalCount: 1, nodes: [expect.objectContaining({ name: 'vite-ecosystem-ci', conclusion: 'SKIPPED' })] } }]);
   expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [{ context: 'vite-ecosystem-ci', appId: 2935623, state: 'missing' }] });
 });
 
