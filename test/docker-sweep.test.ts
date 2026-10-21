@@ -23,7 +23,7 @@ afterEach(() => {
 
 // The fake answers as no real daemon does for `network ls`: a line that is not JSON, a JSON null and one network
 // without a name. To every other call it answers nothing and exit 0, as Docker 27.4 does for `ls` with no match.
-it('skips output that is not a network, reports what is not JSON, and never throws', () => {
+it('skips and reports output that is not a network, and never throws', () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls');
   writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
@@ -31,7 +31,9 @@ it('skips output that is not a network, reports what is not JSON, and never thro
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   expect(() => removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'))).not.toThrow();
-  expect(warn.mock.calls.map(call => String(call[0]))).toContain('test: listing networks: docker printed a line that is not JSON:');
+  expect(warn.mock.calls).toEqual([['test: listing networks: docker printed a line that is not JSON:', 'not json'],
+    ['test: listing networks: docker printed a line that is not a network:', 'null'],
+    ['test: listing networks: docker printed a line that is not a network:', '{"ID":"abc"}']]);
   // Nothing it could not read is removed or looked up as a holder.
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|rm|network rm|volume rm|container rm|container inspect) /.test(line))).toEqual([]);
 });
@@ -97,13 +99,13 @@ it('removes by name only an object of exactly that name, and reports failures ot
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm /.test(line)))
     .toEqual([`rm --force ${id}`, `network rm ${other}`, 'volume rm --force busy', `network rm ${raced}`]);
   expect(warn.mock.calls).toEqual([
-    ['test: removing container busy: docker rm failed:',
+    [`test: removing container busy: docker rm --force ${id} failed:`,
       `Error response from daemon: removal of container ${id} is already in progress`],
-    ['test: removing network busy: docker network rm failed:',
+    [`test: removing network busy: docker network rm ${other} failed:`,
       `Error response from daemon: error while removing network: network busy id ${other} has active endpoints`],
-    ['test: removing volume busy: docker volume rm failed:', `Error response from daemon: remove busy: volume is in use - [${id}]`],
-    ['test: removing container killed: docker container inspect failed:', 'killed by SIGKILL'],
-    ['test: removing container lost: docker container inspect failed:',
+    ['test: removing volume busy: docker volume rm --force busy failed:', `Error response from daemon: remove busy: volume is in use - [${id}]`],
+    ['test: removing container killed: docker container inspect --format {{json .Id}} {{json .Name}} killed failed:', 'killed by SIGKILL'],
+    ['test: removing container lost: docker container inspect --format {{json .Id}} {{json .Name}} lost failed:',
       'Failed to initialize: unable to resolve docker endpoint: context "x": context not found: open /x/meta.json: no such file or directory'],
     ['test: removing container junk: docker printed what is not JSON:', 'not json\n'],
     ['test: removing container odd: docker printed no ID and name:', '1 2\n'],
@@ -250,4 +252,21 @@ it('finds the real docker once, at load, uses it by default, and refuses a shim 
   vi.resetModules();
   const missing = await import('./fixtures/docker-sweep.ts') as typeof Sweep;
   expect(() => missing.requireRealDocker()).toThrow('No docker on PATH when the test files loaded.');
+});
+
+it('reports a holder line that is not an ID and networks, and removes no holder from it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls'), net = 'd'.repeat(64);
+  // One swept network with one candidate holder, whose inspect line parses but is not an ID and networks, which Docker
+  // 27.4 is not known to print. Every other call gets no output and exit 0, as for `ls` with no match. The network line
+  // holds only the fields the sweep reads.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    `if [ "$1 $2" = "network ls" ]; then printf '%s\\n' '{"ID":"${net}","Name":"swept"}'; exit 0; fi`,
+    `if [ "$1" = ps ]; then printf '%s\\n' ${'a'.repeat(64)}; exit 0; fi`,
+    `if [ "$1 $2" = "container inspect" ]; then printf '%s\\n' '123 null'; exit 0; fi`, 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '123 null']);
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
 });

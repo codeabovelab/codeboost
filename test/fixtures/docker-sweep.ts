@@ -49,14 +49,15 @@ export const TEST_FILE_LABEL = 'io.codeboost.test-file';
  */
 export function removeByName(kind: 'container' | 'network' | 'volume', name: string, when: string, docker = REAL_DOCKER): void {
   const options = { encoding: 'utf8' as const, timeout: 30_000, killSignal: 'SIGKILL' as const, env: dockerEnv() };
-  const failed = (result: SpawnSyncReturns<string>, what: string) => console.warn(`${when}: removing ${kind} ${name}: docker ${what} failed:`,
+  const failed = (result: SpawnSyncReturns<string>, args: string[]) => console.warn(`${when}: removing ${kind} ${name}: docker ${args.join(' ')} failed:`,
     result.error?.message ?? (result.signal ? `killed by ${result.signal}` : result.stderr.trim()));
   // As JSON: a network's name may hold spaces. Only a container's name comes with a leading slash.
-  const found = spawnSync(docker, [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name], options);
+  const inspect = [kind, 'inspect', '--format', kind === 'volume' ? '{{json .Name}}' : '{{json .Id}} {{json .Name}}', name];
+  const found = spawnSync(docker, inspect, options);
   // Docker 27.4's answers for a missing object, each naming it, so a failure before the daemon (an unknown context's
   // "context not found: … no such file or directory") is still reported.
   const missing = { container: `No such container: ${name}`, network: `network ${name} not found`, volume: `get ${name}: no such volume` }[kind];
-  if (found.error || found.status !== 0) { if (found.status === null || !found.stderr.includes(missing)) failed(found, `${kind} inspect`); return; }
+  if (found.error || found.status !== 0) { if (found.status === null || !found.stderr.includes(missing)) failed(found, inspect); return; }
   let id: unknown, actual: unknown;
   try {
     const at = found.stdout.indexOf(' ');
@@ -66,11 +67,12 @@ export function removeByName(kind: 'container' | 'network' | 'volume', name: str
     console.warn(`${when}: removing ${kind} ${name}: docker printed no ID and name:`, found.stdout); return;
   }
   if ((kind === 'container' ? actual.replace(/^\//, '') : actual) !== name) return;
-  const removed = spawnSync(docker, kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id], options);
+  const remove = kind === 'container' ? ['rm', '--force', id] : [kind, 'rm', ...(kind === 'volume' ? ['--force'] : []), id];
+  const removed = spawnSync(docker, remove, options);
   // A network gone since the inspect is gone: Docker 27.4 answers "network <ID> not found" (rm --force of a missing
   // container or volume exits 0).
   const raced = kind === 'network' && removed.status === 1 && removed.stderr.includes(`network ${id} not found`);
-  if ((removed.error || removed.status !== 0) && !raced) failed(removed, kind === 'container' ? 'rm' : `${kind} rm`);
+  if ((removed.error || removed.status !== 0) && !raced) failed(removed, remove);
 }
 
 /**
@@ -120,7 +122,10 @@ export function removeLabelledObjects(label: string, value: string, when: string
       ? ['--no-trunc', '--format', '{{json .}}'] : kind === 'container' ? ['--quiet', '--no-trunc'] : ['--quiet']),
       '--filter', `label=${label}=${value}`])
       .flatMap(line => kind === 'network' ? parsed<{ ID?: unknown; Name?: unknown } | null>('listing networks', line)
-        .filter((object): object is { ID: string; Name: string } => typeof object?.ID === 'string' && typeof object.Name === 'string')
+        .filter((object): object is { ID: string; Name: string } => {
+          if (typeof object?.ID === 'string' && typeof object.Name === 'string') return true;
+          console.warn(`${when}: listing networks: docker printed a line that is not a network:`, line); return false;
+        })
         : [{ ID: line, Name: line }]);
     const ids = listed.map(object => object.ID), names = listed.map(object => object.Name);
     if (!ids.length) continue;
@@ -135,7 +140,10 @@ export function removeLabelledObjects(label: string, value: string, when: string
         '{{json .Id}} {{json .NetworkSettings.Networks}}', ...candidates]).flatMap(line => {
         const at = line.indexOf(' '), id = parsed<string>('reading holders', line.slice(0, at)),
           on = parsed<Record<string, unknown>>('reading holders', line.slice(at + 1));
-        return typeof id[0] === 'string' && typeof on[0] === 'object' ? [{ id: id[0], on: Object.keys(on[0] ?? {}) }] : [];
+        if (typeof id[0] === 'string' && typeof on[0] === 'object' && on[0] !== null) return [{ id: id[0], on: Object.keys(on[0]) }];
+        // A line already reported as not JSON is not reported again.
+        if (id.length && on.length) console.warn(`${when}: reading holders: docker printed a line that is not an ID and networks:`, line);
+        return [];
       }).filter(holder => holder.on.some(name => names.includes(name))).map(holder => holder.id);
       if (holders.length) {
         console.warn(`${when} removes the containers that hold them: ${holders.join(' ')}`);
