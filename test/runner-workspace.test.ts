@@ -235,7 +235,7 @@ describe('task storage path identity (#162)', () => {
       expect(probe.volume).toMatch(/^[0-9a-f]{64}$/);
       expect(docker('volume', 'inspect', '--format', '{{json .Options}}', probe.volume)).toContain('size=1048576,nr_inodes=64,');
     } finally { if (probe) docker('rm', '--force', '--volumes', probe.name); }
-    expect(() => docker('volume', 'inspect', probe.volume)).toThrow();
+    expect(() => docker('volume', 'inspect', probe.volume)).toThrow(/no such volume/i);
   }, 120_000);
   it('removes a probe a killed runner left, with its volume, in the next startup\'s recovery, and no other runner\'s (#181)', async () => {
     // Tokens of their own: recovery removes every agent container of its runner, and this file's may have some.

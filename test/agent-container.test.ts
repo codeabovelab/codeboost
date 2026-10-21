@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { CLIENT_LIMIT, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
+import { CLIENT_LIMIT, objectExists, removeByName, removeLabelledObjects, removeRunnerObjects, requireRealDocker, TEST_FILE_LABEL, TEST_RUN_LABEL } from './fixtures/docker-sweep.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
@@ -850,7 +850,7 @@ describe('real Docker agent isolation', () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
       try {
         for (const [kind, name] of byName) removeByName(kind, name, 'test');
-        expect(byName.filter(([kind, name]) => spawnSync('docker', [kind, 'inspect', name], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0)).toEqual([]);
+        expect(byName.filter(([kind, name]) => objectExists(kind, name))).toEqual([]);
         for (const [kind, name] of byName) removeByName(kind, name, 'test');
         expect(warn).not.toHaveBeenCalled();
       } finally { warn.mockRestore(); }
@@ -860,7 +860,7 @@ describe('real Docker agent isolation', () => {
       removeByName('network', lookalike.slice(0, 12), 'test');
       expect(docker('container', 'inspect', '--format', '{{.Id}}', bystanders[0]!.slice(0, 12))).toBe(bystanders[0]);
       removeByName('container', bystanders[0]!.slice(0, 12), 'test');
-      const exists = (kind: string, ref: string) => spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore', ...CLIENT_LIMIT }).status === 0;
+      const exists = objectExists;
       for (const holder of holders) expect(exists('container', holder)).toBe(false);
       expect([exists('network', network), exists('network', prefixNamed), exists('volume', volume)]).toEqual([false, false, false]);
       expect(exists('container', labelled)).toBe(false);
@@ -897,7 +897,7 @@ describe('real Docker agent isolation', () => {
     // First, so afterAll does not refuse a keeper this test finds left: its file-label sweep removes that keeper, then
     // its runner sweep the volumes.
     taskFilesystems.splice(taskFilesystems.indexOf(left), 1);
-    expect(spawnSync('docker', ['container', 'inspect', left.keeper], { stdio: 'ignore', ...CLIENT_LIMIT }).status).not.toBe(0);
+    expect(objectExists('container', left.keeper)).toBe(false);
     // Its volumes carry the runner label, so ordinary cleanup can remove them now that no keeper holds them.
     removeTaskFilesystems(left);
     expect(byAllocation(allocationId)).toEqual([]);
@@ -2568,7 +2568,7 @@ describe('real Docker agent isolation', () => {
     removeTaskFilesystems(handle);
     expect(isRecoveredTaskStorage(handle)).toBe(false);
     for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
-      expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore', ...CLIENT_LIMIT }).status).not.toBe(0);
+      expect(objectExists(kind, ref)).toBe(false);
   }, 180_000);
 
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
@@ -2596,7 +2596,7 @@ describe('real Docker agent isolation', () => {
       // 5.5 minutes, which the test's budget allows for.
       let released: unknown;
       try { removeTaskFilesystems(filesystems); } catch (error) { released = error; console.warn('cleanup: removing the storage failed:', error); }
-      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'test');
+      removeLabelledObjects('io.codeboost.allocation', owner.allocationId, 'finally');
       const keeperFailure = keeperRemoved.status === 0 ? undefined : `docker rm --force ${filesystems.keeper} failed: `
         + (keeperRemoved.error?.message ?? (keeperRemoved.signal ? `killed by ${keeperRemoved.signal}` : keeperRemoved.stderr?.trim()));
       if (keeperFailure && !passed) console.warn('cleanup:', keeperFailure);

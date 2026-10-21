@@ -65,7 +65,7 @@ afterAll(async () => {
     // `unlabelled`. It may not run before a hook timeout. The hook's 13 minutes leave two over the worst case of these
     // two sweeps (eleven calls of 30 s each), for the cleanup before them.
     // The records were read above; removed first, so a hook timeout during the sweeps does not leave them.
-    if (records) rmSync(records, { recursive: true, force: true });
+    try { if (records) rmSync(records, { recursive: true, force: true }); } catch (error) { console.warn('afterAll: removing the records failed:', error); }
     removeLabelledObjects(TEST_FILE_LABEL, TEST_FILE_RUN, 'afterAll');
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }

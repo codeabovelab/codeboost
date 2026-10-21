@@ -54,7 +54,8 @@ it('reads nothing from a docker call that was killed, whose output may be cut sh
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => /^(ps|network rm) /.test(line))).toEqual([]);
-  expect(warn.mock.calls).toContainEqual(['test: listing networks: docker network ls failed:', 'killed by SIGKILL']);
+  expect(warn.mock.calls).toContainEqual([`test: listing networks: docker network ls --no-trunc --format {{json .}} --filter label=${TEST_RUN_LABEL}=x failed:`,
+    'killed by SIGKILL']);
 });
 
 it('removes by name only an object of exactly that name, and reports failures other than no such object', () => {
@@ -195,12 +196,12 @@ it('says nothing of a network gone since the listing, and reports any other fail
   expect(failures()).toEqual([]);
   writeFileSync(answer, 'Error response from daemon: permission denied\n');
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
-  expect(failures()).toEqual([['test: removing networks: docker network rm failed:', 'Error response from daemon: permission denied']]);
+  expect(failures()).toEqual([[`test: removing networks: docker network rm ${net} failed:`, 'Error response from daemon: permission denied']]);
 });
 
 it.each([
   ['says nothing of a holder gone since the listing', 'Error response from daemon: No such container: b', []],
-  ['reports any other failure to read the holders', 'permission denied', [['test: reading holders: docker container inspect failed:', 'permission denied']]],
+  ['reports any other failure to read the holders', 'permission denied', [['test: reading holders: docker container inspect --format {{json .Id}} {{json .NetworkSettings.Networks}} HOLDERS failed:', 'permission denied']]],
 ])('%s, and still removes the holders it read', (_label, stderr, warnings) => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
   const calls = join(root, 'calls'), net = 'n'.repeat(64), a = 'a'.repeat(64), b = 'b'.repeat(64);
@@ -219,7 +220,8 @@ it.each([
   { mode: 0o755 });
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
-  expect(warn.mock.calls.filter(call => String(call[0]).endsWith('failed:'))).toEqual(warnings);
+  expect(warn.mock.calls.filter(call => String(call[0]).endsWith('failed:')))
+    .toEqual(warnings.map(([line, cause]) => [line!.replace('HOLDERS', `${a} ${b}`), cause]));
   expect(readFileSync(calls, 'utf8').split('\n')).toContain(`rm --force ${a}`);
 });
 
@@ -269,4 +271,20 @@ it('reports a holder line that is not an ID and networks, and removes no holder 
   removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
   expect(warn.mock.calls).toContainEqual(['test: reading holders: docker printed a line that is not an ID and networks:', '123 null']);
   expect(readFileSync(calls, 'utf8').split('\n').filter(line => line.startsWith('rm '))).toEqual([]);
+});
+
+it('reports and skips listed lines that are not a container ID or a volume name, so none becomes an option', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-sweep-')); roots.push(root);
+  const calls = join(root, 'calls');
+  // Lines Docker 27.4 is not known to print for these listings; every other call gets no output and exit 0, as for
+  // `ls` with no match.
+  writeFileSync(join(root, 'docker'), ['#!/bin/sh', `printf '%s\\n' "$*" >> '${calls}'`,
+    `if [ "$1 $2" = "container ls" ]; then printf '%s\\n' '--all'; exit 0; fi`,
+    `if [ "$1 $2" = "volume ls" ]; then printf '%s\\n' '-v'; exit 0; fi`, 'exit 0'].join('\n'),
+  { mode: 0o755 });
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  removeLabelledObjects(TEST_RUN_LABEL, 'x', 'test', join(root, 'docker'));
+  expect(warn.mock.calls).toEqual([['test: listing containers: docker printed a line that is not a container ID:', '--all'],
+    ['test: listing volumes: docker printed a line that is not a volume name:', '-v']]);
+  expect(readFileSync(calls, 'utf8').split('\n').filter(line => / rm |^rm |^ps /.test(line))).toEqual([]);
 });
