@@ -828,8 +828,10 @@ describe('real Docker agent isolation', () => {
       const shim = mkdtempSync(join(tmpdir(), 'codeboost-sweep-docker-')); roots.push(shim);
       mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
       const realDocker = requireRealDocker();
+      // It leaves a marker, so the test knows the sweep's holder read went through it.
+      const marker = join(shim, 'gone-added');
       writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
-        `if [ "$1 $2" = "container inspect" ]; then exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
+        `if [ "$1 $2" = "container inspect" ]; then : > '${marker}'; exec '${realDocker}' "$@" codeboost-gone-${randomUUID()}; fi`,
         `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
       // And it says nothing of that gone holder: Docker's own answer is not a failure.
       const sweepWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -839,6 +841,7 @@ describe('real Docker agent isolation', () => {
         removeLabelledObjects(TEST_RUN_LABEL, run, 'test', join(shim, 'docker'));
         sweepCalls = [...sweepWarn.mock.calls];
       } finally { sweepWarn.mockRestore(); }
+      expect(existsSync(marker), 'the sweep read its holders through the shim').toBe(true);
       expect(sweepCalls.filter(call => String(call[0]).endsWith('failed:'))).toEqual([]);
       expect(sweepCalls.length).toBeGreaterThan(0);
       // afterAll removes tracked names with removeByName, as here: an object of exactly that name goes, and a name that

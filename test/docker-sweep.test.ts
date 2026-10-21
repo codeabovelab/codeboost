@@ -8,8 +8,8 @@ import type * as Sweep from './fixtures/docker-sweep.ts';
 
 // The test sweep's and `removeByName`'s handling of answers they cannot use (#189), each test with its own fake
 // `docker`, described beside it. The sweep reads only stdout, the exit status, whether a signal killed the call and
-// whether it could start, and stderr to report a failure, and, for its read of holders, to tell one gone since the
-// listing ("No such container") from a failure. `removeByName` reads the same, and also an inspect's stdout (the ID and
+// whether it could start, and stderr to report a failure, and, for its read of holders and its removal of networks,
+// to tell one gone since the listing ("No such container", "network <ID> not found") from a failure. `removeByName` reads the same, and also an inspect's stdout (the ID and
 // name) and its stderr, to tell a missing object from a failure, and a network removal's stderr, to tell a network
 // gone since its inspect. Against the daemon, agent-container's holder test covers the sweep and removeByName's
 // removal, its silence on a missing name, and its refusal of an object found by an ID prefix.
