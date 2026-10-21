@@ -190,6 +190,7 @@ type Inspect = {
     CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
+    LogConfig?: DaemonLogConfig;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean;
       TmpfsOptions?: { SizeBytes?: number; Mode?: number; Options?: unknown };
@@ -199,6 +200,16 @@ type Inspect = {
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
   NetworkSettings: { Networks: Record<string, unknown>; Ports: Record<string, unknown> };
 };
+
+type DaemonLogConfig = { Type?: string; Config?: Record<string, string> | null } | null | undefined;
+/**
+ * Whether an inspected `HostConfig.LogConfig` keeps no daemon log (#165): driver `none`, and only options whose key
+ * starts with `cache-`. A daemon copies its own `cache-*` log options into every container, whatever its driver (moby
+ * v27.4.0, `logcache.MergeDefaultLogConfig`), and with `none` no logger or cache starts, so they do nothing. The CLI
+ * refuses any option with `none`, but the API stores whatever it is given.
+ */
+export const keepsNoDaemonLog = (config: DaemonLogConfig): boolean => config?.Type === 'none'
+  && Object.keys(config.Config ?? {}).every(key => key.startsWith('cache-'));
 
 /** Validate daemon-resolved configuration before starting an agent. */
 export async function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000,
@@ -244,7 +255,8 @@ export async function validateContainer(container: string, profile: ContainerPro
     || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
     || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== ''
     || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
-    || host.Runtime !== 'runc')
+    || host.Runtime !== 'runc'
+    || !keepsNoDaemonLog(host.LogConfig))
     throw new Error('Container daemon configuration is missing required lockdown.');
   if (JSON.stringify(host.Dns) !== JSON.stringify(['127.0.0.1']))
     throw new Error('Container DNS configuration changed.');
