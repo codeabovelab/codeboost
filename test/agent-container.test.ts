@@ -137,13 +137,18 @@ afterEach(async () => {
 afterAll(async () => {
   try {
     for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
-    for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
+    // Each one, even when an earlier one fails: storage left here is found by the sweep below only by its label.
+    const failures: unknown[] = [];
+    for (const filesystems of taskFilesystems.reverse()) {
+      try { removeTaskFilesystems(filesystems); } catch (error) { failures.push(error); }
+    }
     for (const profile of profiles) await disposeContainerProfile(profile);
     for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
     for (const root of roots.reverse()) {
       chmodSync(join(root, 'input'), 0o700);
       rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
+    if (failures.length) throw new AggregateError(failures, 'Task storage cleanup did not settle.');
   } finally {
     // The runner owner is this run's own, so nothing else would find what this run leaves behind. Objects a test
     // makes under another owner or without the runner label are not found here, unless they hold one of this run's
@@ -883,8 +888,8 @@ describe('real Docker agent isolation', () => {
     const created = await withDockerShim(['network', 'create'], foreign, () =>
       createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
     // Listed in the finally too: the network carries another runner's label, so no sweep of this run finds it (#189).
-    const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`],
-      { encoding: 'utf8' }).stdout.trim();
+    const listed = () => spawnSync('docker', ['network', 'ls', '--quiet', '--no-trunc', '--filter',
+      `label=io.codeboost.allocation=${allocationId}`], { encoding: 'utf8' }).stdout?.trim() ?? '';
     let left = '';
     try {
       left = listed();
@@ -2495,9 +2500,11 @@ describe('real Docker agent isolation', () => {
     const foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
       metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
     { runnerOwner: 'f'.repeat(32), attemptId: 'other-runner', allocationId: randomUUID() });
-    taskFilesystems.push(foreign);
-    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
-      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
+    // Removed here: it carries another runner's label, so no sweep of this run finds it (#189).
+    try {
+      await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
+        inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
+    } finally { removeTaskFilesystems(foreign); }
   }, 60_000);
 
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {

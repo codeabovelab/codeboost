@@ -37,9 +37,10 @@ afterAll(() => {
   } finally {
     // Then remove the task storage this run still owns, even when a test failed or the cleanup above threw. The path
     // identity probe carries no owner labels, so it is not found here. It may not run before a hook timeout.
+    // The hook's budget is a minute over this sweep's worst case (eleven calls of 30 s), for the cleanup before it.
     removeRunnerObjects(RUNNER_OWNER);
   }
-}, 6 * 60_000);
+}, 7 * 60_000);
 const docker = (...args: string[]) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 async function setup(agent: Record<string, string>) {

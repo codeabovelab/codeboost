@@ -40,9 +40,10 @@ afterAll(async () => {
     // Then remove whatever this run still owns, even when a test failed or the removal above threw. Objects a test
     // makes without the runner label are found here only while they hold one of this run's networks or volumes; those
     // tests remove their own. It may not run before a hook timeout.
+    // The hook's budget is a minute over this sweep's worst case (eleven calls of 30 s), for the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 6 * 60_000);
+}, 7 * 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', async () => {

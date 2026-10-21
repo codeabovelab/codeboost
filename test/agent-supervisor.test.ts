@@ -79,9 +79,10 @@ afterAll(async () => {
   } finally {
     // Then remove whatever this run still owns, even when a test failed or the cleanup above threw: an agent that
     // ignores SIGTERM, or storage whose removal did not settle. It may not run before a hook timeout.
+    // The hook's budget is a minute over this sweep's worst case (eleven calls of 30 s), for the cleanup before it.
     removeRunnerObjects(TEST_RUNNER_OWNER);
   }
-}, 6 * 60_000);
+}, 7 * 60_000);
 
 describe('container invocation supervisor', () => {
   it('preserves the first cancellation reason while retained setup cleanup settles', async () => {
