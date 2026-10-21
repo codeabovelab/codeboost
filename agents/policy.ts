@@ -135,10 +135,11 @@ export function createRunnerCommand(policy: PhasePolicy, commands: string): Agen
 
 /** Refuse a planning request whose prompt and schema together exceed the model budget. Returns the schema unchanged. */
 export function assertPlanningInput(prompt: string, schema: string): string {
-  const bytes = Buffer.byteLength(prompt, 'utf8') + Buffer.byteLength(schema, 'utf8');
-  if (bytes > MAX_PLANNING_INPUT_BYTES)
-    throw new Error(`Planning request is ${bytes} bytes of prompt and schema, over the ${MAX_PLANNING_INPUT_BYTES}-byte `
-      + 'model budget. Narrow the issue and comments, the selected paths or the lessons, then retry.');
+  const promptBytes = Buffer.byteLength(prompt, 'utf8'), schemaBytes = Buffer.byteLength(schema, 'utf8');
+  if (promptBytes + schemaBytes > MAX_PLANNING_INPUT_BYTES)
+    throw new Error(`Planning request is ${promptBytes + schemaBytes} bytes (prompt ${promptBytes}, schema ${schemaBytes}), `
+      + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. Narrow the issue and comments, the selected paths or the `
+      + 'lessons, then retry.');
   return schema;
 }
 

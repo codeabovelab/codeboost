@@ -107,8 +107,8 @@ Use only these entry points to run an agent:
      runner's host clone and task storage already exist by then, and the runner removes them. The budget has two parts:
      - *Input, before the start.* The prompt and the schema together must be at most `MAX_PLANNING_INPUT_BYTES`
        (64 KiB) of UTF-8: the 32 KiB prompt plus 32 KiB of schema text. A larger request is refused with an error
-       that gives its size and asks the person to narrow the issue, the paths or the lessons. Bytes stand in for
-       tokens because Claude's tokenizer is not available offline. A count of bytes is an upper bound on the tokens
+       that gives its size, split into prompt and schema, and asks the person to narrow the issue, the paths or the
+       lessons. Bytes stand in for tokens because Claude's tokenizer is not available offline. A count of bytes is an upper bound on the tokens
        if every token covers at least one byte; this is assumed, not verified against Claude's tokenizer.
        `prepareDraft` and `prepareSuggestions` already limit the prompt and the schema text to 32 KiB each, so this
        check refuses nothing they produce (`planning-author` checks a draft at the prompt limit with today's schema):

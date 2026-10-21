@@ -112,7 +112,8 @@ describe('agent phase policy', () => {
       'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input', '--', exact]);
     expect(PLANNING_MAX_TURNS).toBe(50);
     expect(() => createClaudeCommand(planning(), fill(MAX_PLANNING_INPUT_BYTES + 1), SCHEMA))
-      .toThrow(`Planning request is ${64 * 1024 + 1} bytes of prompt and schema, over the 65536-byte model budget.`);
+      .toThrow(`Planning request is ${64 * 1024 + 1} bytes (prompt ${64 * 1024 + 1 - Buffer.byteLength(SCHEMA)}, schema `
+        + `${Buffer.byteLength(SCHEMA)}), over the 65536-byte model budget.`);
     // Only planning has the budget: the other Claude phases carry no turn limit.
     for (const phase of ['questions', 'review', 'execute', 'fix'] as const)
       expect(createClaudeCommand(createPhasePolicy(request(phase)), 'Work.').argv).not.toContain('--max-turns');
