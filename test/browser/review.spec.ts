@@ -1007,9 +1007,17 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
   await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
  }
  else await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
+ const heldAnswered=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
  const released=Date.now();release();
  // The next poll comes 2 s after the held one, not after its backed-off delay of 16 s or more.
  if(answer==='ended'){
+  // The held poll answers the job's older running record: Cancel stays unavailable until the outcome shows.
+  await heldAnswered;
+  await page.waitForTimeout(300);
+  // The next poll comes 2 s after the held one, so the outcome is not shown yet.
+  await expect(page.locator('#merge')).not.toHaveText('Merged');
+  await expect(page.locator('#merge-cancel')).toHaveAttribute('aria-disabled','true');
+  await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
   await expect(page.locator('#merge')).toHaveText('Merged',{timeout:6_000});
   expect(Date.now()-released).toBeLessThan(5_000);
  } else {

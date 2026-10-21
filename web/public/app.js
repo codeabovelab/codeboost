@@ -294,7 +294,8 @@ async function pollMergeQueue(generation) {
     const update = await api("/api/merge");
     current = settle();
     if (!current) return;
-    mergeCancelAwaitingPoll = null;
+    // A poll that read the job before it ended still reports it running: Cancel stays unavailable until a poll does not.
+    if (!(update.job?.id === mergeCancelAwaitingPoll && update.job.state === "running")) mergeCancelAwaitingPoll = null;
     if (data.merge.job?.state === "running") {
       // A full review response read before this observation must not restore an older record of this job.
       mergeObservationGeneration++;
