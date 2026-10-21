@@ -197,8 +197,8 @@ export class PlanningCheck {
     return check;
   }
   /**
-   * Resolve once the check for the vendor chosen now has passed, or at once when no vendor is chosen; reject with a `GuardRefusal` naming why when it
-   * failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
+   * Resolve once the check for the vendor chosen now has passed, or at once when no vendor is chosen; reject with a
+   * `GuardRefusal` naming why when it failed, or when no check passed within `waitMs`. `signal` stops only this wait, never the check, which other
    * requests may share: an aborted wait rejects with `signal.reason`, and a vendor that cannot be read (a Store error)
    * with that error; the caller maps both.
    *

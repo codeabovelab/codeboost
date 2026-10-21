@@ -10,7 +10,7 @@ import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { PLANNING_BUDGET_MS, PLANNING_LEFTOVERS, planningCredential } from '../runner/planning-provider.ts';
+import { CODEX_PLANNING_REFUSED, PLANNING_BUDGET_MS, PLANNING_LEFTOVERS, planningCredential } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PLANNING_UNAVAILABLE, PlanningCheck } from '../runner/planning.ts';
@@ -384,7 +384,10 @@ describe('the planning check (#164)', () => {
   });
 
   it('checks nothing while no agent is chosen, then checks the vendor chosen before its first request', async () => {
-    const { deps, service, probe, issueAccess } = checked(async () => undefined, null);
+    // As PlanningAgent.probe answers: Claude's check passes here, and Codex's always fails (planningCredential).
+    const { deps, service, probe, issueAccess } = checked(async vendor => {
+      if (vendor === 'codex') throw new Error(CODEX_PLANNING_REFUSED);
+    }, null);
     expect(probe).not.toHaveBeenCalled();
     // No vendor: the request goes on, and fails later with NO_PLANNING_AGENT, as before.
     await deps.describe(signal());
@@ -393,9 +396,9 @@ describe('the planning check (#164)', () => {
     await deps.describe(signal());
     // Settings refuse Codex now, but a database from before #75 may still hold it.
     vi.spyOn(service.store, 'questionProvider').mockReturnValue('codex');
-    await deps.describe(signal());
+    await expect(deps.describe(signal())).rejects.toThrow(CODEX_PLANNING_REFUSED);
     expect(probe.mock.calls.map(call => call[0])).toEqual(['claude', 'codex']);
-    expect(issueAccess).toHaveBeenCalledTimes(3);
+    expect(issueAccess).toHaveBeenCalledTimes(2);
   });
 
   it('checks the vendor chosen while a request waited, before it admits the request', async () => {
@@ -443,14 +446,16 @@ describe('the planning check (#164)', () => {
   it('cancels a running check that a check for another vendor replaced', async () => {
     let vendor: 'claude' | 'codex' = 'claude';
     const signals: AbortSignal[] = [];
-    const check = new PlanningCheck((_vendor, probeSignal) => { signals.push(probeSignal); return new Promise<void>(() => undefined); },
-      () => vendor, { waitMs: 10 });
+    // Claude's check runs until cancelled; Codex's fails at once, as PlanningAgent.probe's does.
+    const check = new PlanningCheck((probed, probeSignal) => {
+      signals.push(probeSignal);
+      return probed === 'codex' ? Promise.reject(new Error(CODEX_PLANNING_REFUSED)) : new Promise<void>(() => undefined);
+    }, () => vendor, { waitMs: 10 });
     check.start();
     vendor = 'codex';
-    await expect(check.admit(signal())).rejects.toThrow('still checking');
+    await expect(check.admit(signal())).rejects.toThrow('choose another agent in Settings');
     expect(signals.map(probeSignal => probeSignal.aborted)).toEqual([true, false]);
     await check.close(10);
-    expect(signals[1]!.aborted).toBe(true);
   });
 
   it('keeps a multi-line reason whole, at the end of the refusal', async () => {
