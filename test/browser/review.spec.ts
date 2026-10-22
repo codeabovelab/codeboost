@@ -665,8 +665,8 @@ const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
 };
 /** Arms a watch on the merge header's Cancel button and returns a wait for its next `count` renders. Every render of the
- * merge control (renderMerge) rewrites Cancel's label and title, changed or not, so a render proves the page handled the
- * answer before it, even one that leaves Cancel as it was. Arm it before the event; await the returned wait after it. */
+ * merge control (renderMerge) while the step bar is shown rewrites Cancel's label and title, changed or not, so a render
+ * proves the page handled the answer before it, even one that leaves Cancel as it was. Arm it before the event; await the returned wait after it. */
 async function armCancelRenders(page:import('@playwright/test').Page,count:number){
  await page.evaluate(n=>{(window as unknown as {cancelRenders:Promise<void>}).cancelRenders=new Promise<void>(resolve=>{let seen=0;
   const observer=new MutationObserver(()=>{if(++seen>=n){observer.disconnect();resolve();}});
@@ -850,9 +850,12 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
   const review=await clickReview(route),running=mergeJobRecord({id,state:'running',step:'preparing',steps:mergeSteps([])});
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:running,blockers:[...review.merge.blockers,...jobResolvedBlockers]}),job:running})});});
  // The poll shows the rebase running until the cancel was asked. The first poll after it answers the older record (read
- // before the cancel was saved), which must not undo the adopted answer; then the job is cancelling, then cancelled.
- let afterCancel=0;
+ // before the cancel was saved), which must not undo the adopted answer; then the job is cancelling, then cancelled. The poll
+ // after the older record is sent only once that record's answer was rendered, and is held until the page was read.
+ let afterCancel=0,releaseNext!:()=>void,sawNext!:()=>void;
+ const nextHeld=new Promise<void>(resolve=>releaseNext=resolve),next=new Promise<void>(resolve=>sawNext=resolve);
  await page.route('**/api/merge',async route=>{const job=!cancelAsked?rebasing:[rebasing,cancelling][afterCancel++]??cancelled;
+  if(cancelAsked&&afterCancel===2){sawNext();await nextHeld;}
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
   body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null,blockers:[...body.merge.blockers,...jobResolvedBlockers]});await route.fulfill({response,json:body});});
@@ -866,7 +869,8 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(steps.getByRole('listitem').nth(2)).toHaveText('○ Push Waiting');
  // The 1 s timer rewrites only the times: the list items themselves stay, so a screen reader keeps its place.
  const first=await steps.getByRole('listitem').first().elementHandle();
- await page.waitForTimeout(1_300);
+ const running=steps.getByRole('listitem').nth(1),before=await running.textContent();
+ await expect(running).not.toHaveText(before!);
  expect(await first!.evaluate(node=>node.isConnected)).toBe(true);
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
@@ -879,11 +883,13 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(page.getByRole('button',{name:'Cancel requested',exact:true})).toHaveAttribute('aria-disabled','true');
  await expect(page.locator('#merge')).toHaveText('Cancelling…');
  await expect(page.locator('#banner')).toHaveText('Cancelling the merge. The task and its pull request stay open.');
- // The older record the next poll answers changes nothing on screen.
+ // The older record the next poll answers changes nothing on screen. Read once, after it was rendered.
  expect((await (await stalePoll).json()).job.revision).toBe(3);
- await page.waitForTimeout(200);
- await expect(page.locator('#merge')).toHaveText('Cancelling…');
- await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
+ await next;
+ expect(await page.evaluate(()=>({merge:document.getElementById('merge')!.textContent,cancel:document.getElementById('merge-cancel')!.textContent,
+  unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled')})))
+  .toEqual({merge:'Cancelling…',cancel:'Cancel requested',unavailable:'true'});
+ releaseNext();
  // The job ends: the list stays with the stopped step until Refresh, and Cancel goes away.
  await expect(page.locator('#merge')).toHaveText('Merge cancelled',{timeout:15_000});
  await expect(page.locator('#banner')).toContainText('Merge cancelled. You cancelled the merge; the task and its pull request stay open.');
@@ -1016,13 +1022,13 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
   await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
  }
  else await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
- const heldAnswered=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
+ // The held poll's answer is rendered (it renders the merge control even when it changes nothing shown).
+ const rendered=await armCancelRenders(page,1);
  const released=Date.now();release();
  // The next poll comes 2 s after the held one, not after its backed-off delay of 16 s or more.
  if(answer==='ended'){
   // The held poll answers the job's older running record: Cancel stays unavailable until the outcome shows.
-  await heldAnswered;
-  await page.waitForTimeout(300);
+  await rendered();
   // The next poll comes 2 s after the held one, so the outcome is not shown yet. Read once, not retried: the later
   // Merged state also marks Cancel unavailable.
   expect(await page.evaluate(()=>{const cancel=document.getElementById('merge-cancel')!,merge=document.getElementById('merge')!;
@@ -1033,10 +1039,11 @@ for (const answer of ['ended','newer'] as const) test(`polls again within second
  } else {
   // The held poll, read before the newer job, now answers the older job's running record: it must be discarded.
   const pollsAtRelease=polls.length;
+  await rendered();
+  expect(await page.evaluate(()=>({step:document.querySelector('#merge-steps li')!.textContent,banner:document.getElementById('banner')!.textContent})))
+   .toEqual({step:expect.stringMatching(/^● Fetch Running/),banner:'Preparing the merge: refresh, rebase, push and command checks.'});
   await expect.poll(()=>polls.length,{timeout:6_000}).toBeGreaterThan(pollsAtRelease);
-  await page.waitForTimeout(200);
-  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
-  await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
+  expect(Date.now()-released).toBeLessThan(5_000);
  }
 });
 test('keeps focus on Merge status while the poll follows a running job with no blockers (D16)',async({page})=>{
@@ -1052,9 +1059,9 @@ test('keeps focus on Merge status while the poll follows a running job with no b
  await page.goto(app.url);
  await expect(page.locator('#merge-details')).toBeVisible({timeout:10_000});
  await page.locator('#merge-details').focus();
+ // A second poll is sent only once the first poll's answer was rendered.
  await expect.poll(()=>polls,{timeout:15_000}).toBeGreaterThanOrEqual(2);
- await page.waitForTimeout(200);
- await expect(page.locator('#merge-details')).toBeFocused();
+ expect(await page.evaluate(()=>document.activeElement?.id)).toBe('merge-details');
 });
 for (const runner of [true,false] as const) test(`moves focus off the blockers button to Merge PR when a reload clears the last blocker, ${runner?'with':'without'} a runner (D16)`,async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
@@ -1193,20 +1200,22 @@ for (const refusal of ['ended','older','newer'] as const) test(`keeps what the p
  await expect(page.locator('#merge')).toHaveText('Merged',{timeout:15_000});
  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
  const pollsBefore=polls.length;
- const refused=page.waitForResponse(response=>response.url().endsWith('/api/action'));
- release();await refused;
- await page.waitForTimeout(300);
+ // Read once the page rendered the refusal's answer; the ended job is shown, so no poll renders meanwhile.
+ const rendered=await armCancelRenders(page,1);
+ release();await rendered();
+ const shown=()=>page.evaluate(()=>({merge:document.getElementById('merge')!.textContent,banner:document.getElementById('banner')!.textContent,
+  first:document.querySelector('#merge-steps li')!.textContent,last:document.querySelector('#merge-steps li:last-child')!.textContent}));
  if(refusal==='newer'){
   // The newer job is followed: its step list and step show, also after the next poll (which answers it).
-  await page.waitForTimeout(2_500);
-  await expect(page.locator('#merge')).toHaveText('Preparing…');
-  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
-  await expect(page.locator('#banner')).toHaveText('Preparing the merge: refresh, rebase, push and command checks.');
+  const followed={merge:'Preparing…',banner:'Preparing the merge: refresh, rebase, push and command checks.',first:expect.stringMatching(/^● Fetch Running/),last:expect.anything()};
+  expect(await shown()).toEqual(followed);
+  const polled=await armCancelRenders(page,1);await polled();
+  expect(await shown()).toEqual(followed);
  } else {
-  // The outcome, its banner and the step list stay; the refusal is not shown, and no poll is forced.
-  await expect(page.locator('#merge')).toHaveText('Merged');
-  await expect(page.locator('#banner')).toHaveText('Merged. Refresh to see the result.');
-  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').last()).toHaveText('✓ Merge Done, 1 s');
+  // The outcome, its banner and the step list stay; the refusal is not shown.
+  expect(await shown()).toEqual({merge:'Merged',banner:'Merged. Refresh to see the result.',first:expect.anything(),last:'✓ Merge Done, 1 s'});
+  // No poll is forced: a forced poll is sent at once, so a short wait is enough to see one; none may come.
+  await page.waitForTimeout(300);
   expect(polls.length).toBe(pollsBefore);
  }
 });
@@ -1237,8 +1246,7 @@ test('shows the refusal in the banner when an enabled Cancel is refused because 
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.');
  await expect(page.locator('#merge')).toHaveText('Merging…');
  // The next poll answers the same record: the refusal stays, as the only explanation of the enabled Cancel.
- const polled=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
- await polled;await page.waitForTimeout(200);
+ const polled=await armCancelRenders(page,1);await polled();
  await expect(page.locator('#banner')).toHaveText('Could not cancel the merge. GitHub has been asked to merge; wait for its outcome.');
  // One poll fails and rewrites the banner; the next poll, answering the same record, shows the refusal again.
  failNext=true;
@@ -1279,10 +1287,12 @@ test('keeps an adopted cancel when a poll on its way answers the older record of
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
  await expect(page.locator('#merge-cancel')).toBeVisible({timeout:10_000});
  hold=true;await inFlight;
- await page.locator('#merge-cancel').click();
+ // Two renders: the click's own (pending), then the answer's. The held poll is in flight, so no other poll renders.
+ const answered=await armCancelRenders(page,2);
+ await page.locator('#merge-cancel').click();await answered();
  await expect(page.locator('#merge-cancel')).toHaveText('Cancel requested');
- const heldAnswered=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
- release();await heldAnswered;await page.waitForTimeout(300);
+ const heldRendered=await armCancelRenders(page,1);
+ release();await heldRendered();
  // Read once: the older record must not undo the adopted cancel.
  expect(await page.evaluate(()=>({cancel:document.getElementById('merge-cancel')!.textContent,unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled'),
   merge:document.getElementById('merge')!.textContent,banner:document.getElementById('banner')!.textContent})))
@@ -1448,8 +1458,10 @@ test('keeps Cancel unavailable for an ended newer job when an older job\'s cance
  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/,{timeout:15_000});
  await expect(cancel).toHaveText('Cancel merge');
  // B's cancel is answered first, with B ended: Cancel stays unavailable until the page shows B's outcome.
- phase='hold';
- // Two renders: the click's own (pending), then the answer's.
+ // Polls are held from here: once one is held, no poll renders Cancel, because the next poll is sent only once the last
+ // answer was rendered. Then two renders: the click's own (pending), then the answer's.
+ const polled=page.waitForRequest(request=>request.url().endsWith('/api/merge'));
+ phase='hold';await polled;
  const renderedB=await armCancelRenders(page,2);
  await cancel.click();await renderedB();
  await expect(cancel).toHaveText('Cancel requested');
