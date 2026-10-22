@@ -1965,7 +1965,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     expect(await view(served.app)).toMatchObject({ startable: false, resumable: false });
     for (const action of ['start', 'resume']) {
       const id = randomUUID(), refused = await act(served.app, action, id);
-      expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+      expect(refused).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end, or cancel the merge or the task.' } });
       // Saved like other refusals: the same action ID replays it.
       expect(await act(served.app, action, id)).toMatchObject({ status: 409, body: { error: refused.body.error } });
     }
@@ -2014,7 +2014,7 @@ describe('the one-click merge job (F6b of #22)', () => {
     await acceptAndApprove(served.app.service);
     const calls = [...w.github.calls], attempts = served.store.recentAttempts(served.identity, 50).length;
     expect(await view(served.app)).toMatchObject({ startable: false });
-    expect(await act(served.app, 'start')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end or cancel the task.' } });
+    expect(await act(served.app, 'start')).toMatchObject({ status: 409, body: { error: 'A merge is running for this task; wait for it to end, or cancel the merge or the task.' } });
     expect(served.store.getTask(served.identity).status).toBe('in review');
     expect(served.store.recentAttempts(served.identity, 50)).toHaveLength(attempts);
     release();

@@ -222,7 +222,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
     // A merge job prepares, waits for checks and merges the PR's head. A run would move that head, and its end publishes
     // (pushes the head, refreshes the PR) under the job. Before owed work too: settling it ends in the same publish.
-    if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; wait for it to end or cancel the task.');
+    if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; wait for it to end, or cancel the merge or the task.');
     // Recovery owns this claim for Resume even when owed work will settle instead of admitting an item. Start must not
     // consume it and strand the task behind the resulting human gate.
     if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
