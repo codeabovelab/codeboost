@@ -1605,7 +1605,11 @@ test('marks Cancel unavailable once the merge job asked GitHub to merge (D16)',a
  await expect(cancel).toHaveAccessibleDescription('GitHub has been asked to merge; wait for its outcome.');
  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').nth(1)).toHaveText('– Rebase Skipped');
  await cancel.click({force:true});
+ // Nothing is sent: a check that nothing is sent can only be made over a window, so it waits longer than the shortest
+ // delay after which the page would send it (a cancel is sent at once; the page's shortest poll delay is 2 s).
+ await page.waitForTimeout(2_500);
  expect(cancels).toBe(0);
+ await expect(page.locator('#banner')).not.toHaveText(/^Could not cancel the merge\./);
 });
 test('keeps a draft typed while a merge-job click is in flight (F6b)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
