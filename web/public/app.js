@@ -300,7 +300,9 @@ async function pollMergeQueue(generation) {
     // of an older job than the one shown (a newer job the cancel's answer carried).
     const stale = shownJob?.state === "running" && !!job
       && (job.id === shownJob.id ? job.revision < shownJob.revision : !laterMergeJob(job, shownJob));
-    if (shownJob?.state === "running") {
+    // A later job is followed also once the shown job ended: a cancel's answer that carried it asks this poll at once.
+    const laterJob = !!shownJob && !!job && job.id !== shownJob.id && laterMergeJob(job, shownJob);
+    if (shownJob?.state === "running" || laterJob) {
       // A full review response read before this observation must not restore an older record of this job.
       mergeObservationGeneration++;
       // A merge job (F6b): follow its step. Once it ends, update only the merge control, as the merge-queue poll does:
@@ -462,12 +464,13 @@ $("merge-cancel").onclick = async () => {
       return;
     }
     // A newer job another tab started: followed as the poll follows a job, whatever this page last saw of the older one.
+    // A newer job that ended is presented by the poll (with its queue attempt), also when the shown job ended first.
     if (!laterMergeJob(answered, shownJob)) return;
     if (answered.state === "running") {
       mergeObservationGeneration++;
       data = withMergeJobObservation(data, answered);
       $("banner").textContent = mergeJobText(answered);
-    } else if (shownJob.state === "running") { pollNow = true; ended = answered; }
+    } else { pollNow = true; ended = answered; }
   };
   try { adopt((await api("/api/action", { action: "cancel-merge", jobId: job.id })).job); }
   catch (error) {
