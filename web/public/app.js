@@ -921,6 +921,7 @@ $("merge").onclick = async () => {
   try {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token, jobBefore: data.merge.job?.id ?? null };
+    const mergeObservationOwner = mergeObservationGeneration;
     const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
     mergeClickPending = false;
     // The composer stayed editable while the request was in flight: keep what the person typed meanwhile.
@@ -932,9 +933,19 @@ $("merge").onclick = async () => {
       // this click's ended job while a later one (another tab's retry) runs: the reloaded review then carries that later
       // job, and the page follows the later record (by sequence, or revision within one job).
       const job = !updated.mergeRefreshRequired && updated.merge?.job && laterMergeJob(updated.merge.job, updated.job) ? updated.merge.job : updated.job;
-      data = updated.mergeRefreshRequired
+      const answered = updated.mergeRefreshRequired
         ? { ...data, merge: { ...data.merge, ready: false, action: null, job } }
         : { ...updated, merge: { ...updated.merge, job } };
+      // A cancel's answer or a poll may have shown a later record (of this job, or a newer job) while the click was on
+      // its way: it is kept over the click's answer, with only its own queue attempt, as a full review response keeps it.
+      const newer = newerMergeObservations(answered, mergeObservationOwner);
+      if (newer.job) {
+        data = withNewerMergeObservations(answered, newer);
+        render();
+        showNewerMergeObservations(newer);
+        return;
+      }
+      data = answered;
       if (job.state !== "running") {
         // The job had already ended when the click was answered: say how to see its result, as the job poll does when a
         // job ends. A job that ended `queued` is shown with its own attempt, as the poll shows it: another client's poll
