@@ -54,6 +54,8 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 A race regression must assert that the interleaving it names actually happened (for example which abort stopped which stage, or that a deadline fired before a release) before it uses the outcome as evidence. Otherwise machine load can turn it into a test of a different order that still passes.
 
+A check that an event changed nothing (a late answer, a stale poll, a reload read earlier) must first prove the page handled that event, then read the state once: wait for a render or a state the event causes, or for a request the page sends only after handling it, and hold any later answer that could repair the state before the read. A fixed wait, the network response alone, or a retrying assertion on a state that already held before the event is not that proof: a page that handles the event late, or wrongly, then passes.
+
 ## Review readiness
 
 - Before requesting or re-requesting an automated Copilot review, self-review the full current diff, fix every issue found, and repeat the self-review and fix cycle until a complete pass finds no new issues. Re-run the relevant validation after fixes, then complete the mandatory independent-agent review loop below before requesting Copilot review.
