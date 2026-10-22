@@ -664,6 +664,15 @@ const mergeJobRecord=(fields:Partial<MergeJobView>={}):MergeJobView=>{
  const revision=state==='running'?(step==='checks'?((fields.checks??[]).length?3:2):({preparing:1,merging:4} as Record<string,number>)[step??'']??1):5;
  return {id:'0f6b0000-0000-4000-8000-000000000000',mergeActionId,reason:null,checks:[],url:null,sequence:1,revision,startedAt:'2026-10-11T00:00:00Z',updatedAt:'2026-10-11T00:00:00Z',...fields,state,step};
 };
+/** Arms a watch on the merge header's Cancel button and returns a wait for its next `count` renders. Every render of the
+ * merge control (renderMerge) rewrites Cancel's label and title, changed or not, so a render proves the page handled the
+ * answer before it, even one that leaves Cancel as it was. Arm it before the event; await the returned wait after it. */
+async function armCancelRenders(page:import('@playwright/test').Page,count:number){
+ await page.evaluate(n=>{(window as unknown as {cancelRenders:Promise<void>}).cancelRenders=new Promise<void>(resolve=>{let seen=0;
+  const observer=new MutationObserver(()=>{if(++seen>=n){observer.disconnect();resolve();}});
+  observer.observe(document.getElementById('merge-cancel')!,{childList:true,attributes:true,characterData:true,subtree:true});});},count);
+ return ()=>page.evaluate(()=>(window as unknown as {cancelRenders:Promise<void>}).cancelRenders);
+}
 /** A blocked job's reason as production saves it: one failing required check (runner/merge-job.ts classify), then the
  * next step that blocking appends (FIX_THEN_RETRY in runner/store.ts). */
 const CHECK_FAILED_BLOCK='Required check failed: ci. Fix it, then Retry merge.';
@@ -1320,8 +1329,8 @@ test('keeps the pending cancel to its own job when another tab starts a newer on
  let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  const a=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e3',state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
  const b=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e4',state:'running',step:'preparing',sequence:2,revision:2,steps:mergeSteps(['running'])});
- let releaseA!:()=>void,releaseB!:()=>void,newer=false;const cancels:string[]=[];
- const heldA=new Promise<void>(resolve=>releaseA=resolve),heldB=new Promise<void>(resolve=>releaseB=resolve);
+ let releaseA!:()=>void,releaseB!:()=>void,releasePolls!:()=>void,newer=false,holdPolls=false;const cancels:string[]=[];
+ const heldA=new Promise<void>(resolve=>releaseA=resolve),heldB=new Promise<void>(resolve=>releaseB=resolve),heldPolls=new Promise<void>(resolve=>releasePolls=resolve);
  await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();
   if(body.action==='cancel-merge'){cancels.push(body.jobId);
    // A's cancel is answered only after another tab ended A and started B; B's is held until the end.
@@ -1330,7 +1339,7 @@ test('keeps the pending cancel to its own job when another tab starts a newer on
   if(body.action!=='merge'){await route.continue();return;}
   const review=await clickReview(route);
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:a}),job:a})});});
- await page.route('**/api/merge',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:newer?b:a})}));
+ await page.route('**/api/merge',async route=>{if(holdPolls)await heldPolls;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:newer?b:a})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
  await page.getByRole('button',{name:'Merge PR',exact:true}).click();
@@ -1344,15 +1353,19 @@ test('keeps the pending cancel to its own job when another tab starts a newer on
  // B was never cancelled: its Cancel is offered.
  await expect(cancel).toHaveText('Cancel merge');
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
+ // Polls are held from here, so no poll renders Cancel while A's answer is checked: the next poll is sent only once the
+ // last answer was rendered.
+ const polled=page.waitForRequest(request=>request.url().endsWith('/api/merge'));
+ holdPolls=true;await polled;
  await cancel.click();
  await expect(cancel).toHaveText('Cancel requested');
  // A's answer arrives: it must not clear B's own pending cancel.
- const answeredA=page.waitForResponse(response=>response.url().endsWith('/api/action')&&response.request().postDataJSON().jobId===a.id);
- releaseA();await answeredA;await page.waitForTimeout(300);
+ const renderedA=await armCancelRenders(page,1);
+ releaseA();await renderedA();
  expect(await page.evaluate(()=>({label:document.getElementById('merge-cancel')!.textContent,unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled')})))
   .toEqual({label:'Cancel requested',unavailable:'true'});
  expect(cancels).toEqual([a.id,b.id]);
- releaseB();
+ releaseB();releasePolls();
 });
 test('keeps Cancel unavailable for an ended newer job when a poll read before it answers for the older job (D16)',async({page})=>{
  test.setTimeout(120_000);
@@ -1389,8 +1402,9 @@ test('keeps Cancel unavailable for an ended newer job when a poll read before it
  await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
  await expect(cancel).toHaveText('Cancel merge');
  // B's cancel is answered with B ended: Cancel stays unavailable until the page shows B's outcome.
- const answeredB=page.waitForResponse(response=>response.url().endsWith('/api/action')&&response.request().postDataJSON().jobId===b.id);
- await cancel.click();await answeredB;
+ // Two renders: the click's own (pending), then the answer's.
+ const renderedB=await armCancelRenders(page,2);
+ await cancel.click();await renderedB();
  await expect(cancel).toHaveText('Cancel requested');
  await expect(cancel).toHaveAttribute('aria-disabled','true');
  // The poll read before then answers for A: it says nothing about B, so Cancel stays unavailable.
@@ -1435,15 +1449,15 @@ test('keeps Cancel unavailable for an ended newer job when an older job\'s cance
  await expect(cancel).toHaveText('Cancel merge');
  // B's cancel is answered first, with B ended: Cancel stays unavailable until the page shows B's outcome.
  phase='hold';
- const answeredB=page.waitForResponse(response=>response.url().endsWith('/api/action')&&response.request().postDataJSON().jobId===b.id);
- await cancel.click();await answeredB;
+ // Two renders: the click's own (pending), then the answer's.
+ const renderedB=await armCancelRenders(page,2);
+ await cancel.click();await renderedB();
  await expect(cancel).toHaveText('Cancel requested');
  await expect(cancel).toHaveAttribute('aria-disabled','true');
  // A's late answer carries the same ended B: B is still shown running, so its Cancel stays unavailable.
- const answeredA=page.waitForResponse(response=>response.url().endsWith('/api/action')&&response.request().postDataJSON().jobId===a.id);
- // Its answer changes nothing the page shows, so the check waits briefly after the response: the page handles it in
- // the turns that read the response's small JSON body.
- releaseA();await answeredA;await page.waitForTimeout(100);
+ // Cancel is read once the page rendered that answer.
+ const renderedA=await armCancelRenders(page,1);
+ releaseA();await renderedA();
  expect(await page.evaluate(()=>({label:document.getElementById('merge-cancel')!.textContent,unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled')})))
   .toEqual({label:'Cancel requested',unavailable:'true'});
  // The held poll presents B's outcome.
