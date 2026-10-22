@@ -884,7 +884,8 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(cancel).toHaveAccessibleDescription('Stop this merge. The task and its pull request stay open.');
  const stalePoll=page.waitForResponse(response=>response.url().endsWith('/api/merge')&&cancelAsked);
  await cancel.click();
- expect(cancels).toEqual([{action:'cancel-merge',jobId:id}]);
+ // The route records the cancel when its request reaches it, which the click does not wait for.
+ await expect.poll(()=>cancels).toEqual([{action:'cancel-merge',jobId:id}]);
  await expect(page.getByRole('button',{name:'Cancel requested',exact:true})).toHaveAttribute('aria-disabled','true');
  await expect(page.locator('#merge')).toHaveText('Cancelling…');
  await expect(page.locator('#banner')).toHaveText('Cancelling the merge. The task and its pull request stay open.');
