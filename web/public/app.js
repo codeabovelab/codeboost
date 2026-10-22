@@ -376,7 +376,7 @@ const mergeStepStates = { pending: ["○", "Waiting"], running: ["●", "Running
   failed: ["✕", "Failed"], stopped: ["!", "Stopped"], unknown: ["!", "Unknown"] };
 /** The ID of the job a cancel request is on its way for, or null. */
 let mergeCancelPending = null;
-/** The ID of a job whose cancel was answered as ended, until the poll that presents the outcome answers, or null. */
+/** The ID of the job shown when a cancel's answer said it ended, until a poll does not report that job running, or null. */
 let mergeCancelAwaitingPoll = null;
 /** A cancel's refusal and the `id:revision` of the job record it was given for, or null. */
 let mergeCancelRefusal = null;
@@ -444,7 +444,8 @@ $("merge-cancel").onclick = async () => {
   if (!job || job.state !== "running" || $("merge-cancel").getAttribute("aria-disabled") === "true") return;
   mergeCancelPending = job.id;
   renderMergeSteps();
-  let pollNow = false;
+  // The job shown when an answer said it ended: Cancel stays unavailable until a poll does not report that job running.
+  let pollNow = false, awaitedJob = null;
   const adopt = answered => {
     const shownJob = data?.merge?.job;
     if (!answered || !shownJob) return;
@@ -453,7 +454,7 @@ $("merge-cancel").onclick = async () => {
       if (!(answered.revision > shownJob.revision)) return;
       // The job ended: the poll presents the outcome, follows a queued attempt and keeps the step list, so it is asked
       // at once. A later running record is adopted.
-      if (answered.state !== "running") { pollNow = true; return; }
+      if (answered.state !== "running") { pollNow = true; awaitedJob = shownJob.id; return; }
       mergeObservationGeneration++;
       data = { ...data, merge: { ...data.merge, job: answered } };
       $("banner").textContent = mergeJobText(answered);
@@ -465,7 +466,7 @@ $("merge-cancel").onclick = async () => {
       mergeObservationGeneration++;
       data = withMergeJobObservation(data, answered);
       $("banner").textContent = mergeJobText(answered);
-    } else if (shownJob.state === "running") pollNow = true;
+    } else if (shownJob.state === "running") { pollNow = true; awaitedJob = shownJob.id; }
   };
   try { adopt((await api("/api/action", { action: "cancel-merge", jobId: job.id })).job); }
   catch (error) {
@@ -479,8 +480,9 @@ $("merge-cancel").onclick = async () => {
   } finally {
     // Only this cancel's own pending state: a later cancel of a newer job keeps its own.
     if (mergeCancelPending === job.id) mergeCancelPending = null;
-    // Answered as ended: Cancel stays unavailable until the poll presents the outcome.
-    if (pollNow) mergeCancelAwaitingPoll = job.id;
+    // Answered as ended: Cancel stays unavailable until the poll presents the outcome. The wait is for the job shown
+    // then, not the one this cancel was for: a late answer to an older job's cancel must not end a newer job's wait.
+    if (pollNow) mergeCancelAwaitingPoll = awaitedJob;
     renderMerge();
     if (pollNow) {
       if (mergePollInFlight?.generation === mergeGeneration) {
