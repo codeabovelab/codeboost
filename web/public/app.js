@@ -261,7 +261,10 @@ function scheduleMergePoll() {
   // A new step of the list, or a cancel, polls quickly again, as a new job step does: a cancel usually ends the job at once.
   const state = job?.state === "running"
     ? `job:${job.step}:${job.steps?.find(step => step.state === "running")?.name ?? ""}:${job.cancelRequested ? "cancel" : ""}` : queue?.state;
-  if (job?.state === "running" || (queue?.kind === "queue" && ["submitting", "queued"].includes(state))) {
+  // A cancel's answer carried an ended job later than the one shown: polls continue until the page shows it, also when a
+  // poll already on its way showed the shown job end.
+  const unshownEnd = !!job && !!mergeCancelEnded && laterMergeJob(mergeCancelEnded, job);
+  if (job?.state === "running" || unshownEnd || (queue?.kind === "queue" && ["submitting", "queued"].includes(state))) {
     if (state !== mergePollState) {
       mergePollState = state;
       mergePollDelay = 2000;
@@ -300,8 +303,11 @@ async function pollMergeQueue(generation) {
     // of an older job than the one shown (a newer job the cancel's answer carried).
     const stale = shownJob?.state === "running" && !!job
       && (job.id === shownJob.id ? job.revision < shownJob.revision : !laterMergeJob(job, shownJob));
-    // A later job is followed also once the shown job ended: a cancel's answer that carried it asks this poll at once.
+    // A later job is followed also once the shown job ended (a cancel's answer that carried it asks this poll, or the
+    // queue poll after a job that ended `queued` reads it). The shown job's queue attempt is not the later job's: it is
+    // dropped, and only the later job's own attempt is kept (by its merge action ID).
     const laterJob = !!shownJob && !!job && job.id !== shownJob.id && laterMergeJob(job, shownJob);
+    if (laterJob) data = { ...data, merge: { ...data.merge, queue: null } };
     if (shownJob?.state === "running" || laterJob) {
       // A full review response read before this observation must not restore an older record of this job.
       mergeObservationGeneration++;
@@ -316,7 +322,8 @@ async function pollMergeQueue(generation) {
         // Any saved change (a step, the waiting checks, a cancel) is a later revision of the record.
         const changed = job.revision !== data.merge.job.revision || job.step !== data.merge.job.step
           || JSON.stringify(job.checks) !== JSON.stringify(data.merge.job.checks);
-        data = { ...data, merge: { ...data.merge, job } };
+        // A later job is followed as a newer job is (withMergeJobObservation), without the ended job's blocker.
+        data = laterJob ? withMergeJobObservation(data, job) : { ...data, merge: { ...data.merge, job } };
         // A cancel's refusal stays in the banner until the job's record changes: it is the only explanation of a Cancel
         // that stayed enabled.
         // Written again on every poll, so a reload or a failed poll that rewrote the banner meanwhile is corrected.
@@ -468,7 +475,8 @@ $("merge-cancel").onclick = async () => {
     if (!laterMergeJob(answered, shownJob)) return;
     if (answered.state === "running") {
       mergeObservationGeneration++;
-      data = withMergeJobObservation(data, answered);
+      // The older job's queue attempt is not the newer job's.
+      data = withMergeJobObservation({ ...data, merge: { ...data.merge, queue: null } }, answered);
       $("banner").textContent = mergeJobText(answered);
     } else { pollNow = true; ended = answered; }
   };
