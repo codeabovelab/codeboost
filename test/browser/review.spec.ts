@@ -852,9 +852,9 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  // The poll shows the rebase running until the cancel was asked. The first poll after it answers the older record (read
  // before the cancel was saved), which must not undo the adopted answer; then the job is cancelling, then cancelled. The poll
  // after the older record is sent only once that record's answer was rendered, and is held until the page was read.
- let afterCancel=0,releaseNext!:()=>void,sawNext!:()=>void;
- const nextHeld=new Promise<void>(resolve=>releaseNext=resolve),next=new Promise<void>(resolve=>sawNext=resolve);
- await page.route('**/api/merge',async route=>{const job=!cancelAsked?rebasing:[rebasing,cancelling][afterCancel++]??cancelled;
+ let afterCancel=0,releaseNext!:()=>void,sawNext!:()=>void,holdTick=false,releaseTick!:()=>void;
+ const nextHeld=new Promise<void>(resolve=>releaseNext=resolve),next=new Promise<void>(resolve=>sawNext=resolve),tickHeld=new Promise<void>(resolve=>releaseTick=resolve);
+ await page.route('**/api/merge',async route=>{if(holdTick)await tickHeld;const job=!cancelAsked?rebasing:[rebasing,cancelling][afterCancel++]??cancelled;
   if(cancelAsked&&afterCancel===2){sawNext();await nextHeld;}
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job})});});
  await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
@@ -867,11 +867,16 @@ test('shows the merge step list while a job runs, and cancels the merge alone fr
  await expect(steps.getByRole('listitem').first()).toHaveText('✓ Fetch Done, 1 s',{timeout:10_000});
  await expect(steps.getByRole('listitem').nth(1)).toHaveText(/^● Rebase Running, \d+ (s|min \d\d s)$/);
  await expect(steps.getByRole('listitem').nth(2)).toHaveText('○ Push Waiting');
- // The 1 s timer rewrites only the times: the list items themselves stay, so a screen reader keeps its place.
+ // The 1 s timer rewrites only the times: the list items themselves stay, so a screen reader keeps its place. Polls are
+ // held first (once one is held, no poll renders, since the next is sent only after the last answer was rendered), so
+ // only the timer can change the running step's time; it changes twice, a second apart.
+ const polledBeforeTick=page.waitForRequest(request=>request.url().endsWith('/api/merge'));
+ holdTick=true;await polledBeforeTick;
  const first=await steps.getByRole('listitem').first().elementHandle();
- const running=steps.getByRole('listitem').nth(1),before=await running.textContent();
- await expect(running).not.toHaveText(before!);
+ const running=steps.getByRole('listitem').nth(1);
+ for(let tick=0;tick<2;tick++){const before=await running.textContent();await expect(running).not.toHaveText(before!,{timeout:3_000});}
  expect(await first!.evaluate(node=>node.isConnected)).toBe(true);
+ holdTick=false;releaseTick();
  const cancel=page.getByRole('button',{name:'Cancel merge',exact:true});
  await expect(cancel).toBeVisible();
  await expect(cancel).not.toHaveAttribute('aria-disabled','true');
@@ -1059,8 +1064,9 @@ test('keeps focus on Merge status while the poll follows a running job with no b
  await page.goto(app.url);
  await expect(page.locator('#merge-details')).toBeVisible({timeout:10_000});
  await page.locator('#merge-details').focus();
- // A second poll is sent only once the first poll's answer was rendered.
- await expect.poll(()=>polls,{timeout:15_000}).toBeGreaterThanOrEqual(2);
+ // A poll is sent only once the last answer was rendered: two more polls after the focus prove one render after it.
+ const polledAtFocus=polls;
+ await expect.poll(()=>polls,{timeout:15_000}).toBeGreaterThanOrEqual(polledAtFocus+2);
  expect(await page.evaluate(()=>document.activeElement?.id)).toBe('merge-details');
 });
 for (const runner of [true,false] as const) test(`moves focus off the blockers button to Merge PR when a reload clears the last blocker, ${runner?'with':'without'} a runner (D16)`,async({page})=>{
@@ -1214,8 +1220,9 @@ for (const refusal of ['ended','older','newer'] as const) test(`keeps what the p
  } else {
   // The outcome, its banner and the step list stay; the refusal is not shown.
   expect(await shown()).toEqual({merge:'Merged',banner:'Merged. Refresh to see the result.',first:expect.anything(),last:'✓ Merge Done, 1 s'});
-  // No poll is forced: a forced poll is sent at once, so a short wait is enough to see one; none may come.
-  await page.waitForTimeout(300);
+  // No poll is forced, and none follows: a check that nothing is sent can only be made over a window, so it waits longer
+  // than the shortest delay after which the page sends a poll (2 s).
+  await page.waitForTimeout(2_500);
   expect(polls.length).toBe(pollsBefore);
  }
 });
