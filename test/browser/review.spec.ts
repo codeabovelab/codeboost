@@ -1443,6 +1443,51 @@ test('keeps Cancel unavailable for an ended newer job when an older job\'s cance
  releasePoll();
  await expect(cancel).toBeHidden({timeout:15_000});
 });
+test('keeps Cancel unavailable when a poll read before a newer job ended answers its running record (D16)',async({page})=>{
+ test.setTimeout(120_000);
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const a=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e9',state:'running',step:'checks',revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','running'])});
+ const b=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000ea',state:'running',step:'preparing',sequence:2,revision:2,steps:mergeSteps(['running'])});
+ const bEnded=mergeJobRecord({...b,state:'merged',step:null,revision:3,steps:mergeSteps(['done','skipped','skipped','skipped','done','done','done'])});
+ const c=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000eb',state:'running',step:'preparing',sequence:3,revision:2,steps:mergeSteps(['running'])});
+ let phase:'a'|'hold'|'b'|'c'='a',release!:()=>void,sawHeld!:()=>void;
+ const held=new Promise<void>(resolve=>release=resolve),seen=new Promise<void>(resolve=>sawHeld=resolve);
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();
+  // A's cancel is refused with the latest job, as the route answers: B, another tab's job, which has just ended.
+  if(body.action==='cancel-merge'){await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'This merge has already ended.',job:bEnded})});return;}
+  if(body.action!=='merge'){await route.continue();return;}
+  const review=await clickReview(route);
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:a}),job:a})});});
+ await page.route('**/api/merge',async route=>{
+  // The held poll read B while B still ran; it answers only after A's cancel was answered with B ended. Later polls
+  // answer as the test's phase says.
+  if(phase==='hold'){phase='b';sawHeld();await held;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:b})});return;}
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:null,job:phase==='a'?a:phase==='b'?b:c})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();body.merge=runnerMerge(body.merge,{ready:true,action:'merge',job:null});await route.fulfill({response,json:body});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ const cancel=page.locator('#merge-cancel');
+ await expect(cancel).toHaveText('Cancel merge',{timeout:10_000});
+ phase='hold';await seen;
+ // A, still shown running, is answered with B ended: Cancel stays unavailable until the page shows B's outcome.
+ const answeredA=page.waitForResponse(response=>response.url().endsWith('/api/action')&&response.request().postDataJSON().action==='cancel-merge');
+ await cancel.click();await answeredA;await page.waitForTimeout(100);
+ expect(await page.evaluate(()=>({label:document.getElementById('merge-cancel')!.textContent,unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled')})))
+  .toEqual({label:'Cancel requested',unavailable:'true'});
+ // The poll answers B's running record, read before B ended: the page follows B, and its Cancel stays unavailable.
+ const answered=page.waitForResponse(response=>response.url().endsWith('/api/merge'));
+ release();await answered;await page.waitForTimeout(100);
+ expect(await page.evaluate(()=>({first:document.querySelector('#merge-steps li')!.textContent,label:document.getElementById('merge-cancel')!.textContent,unavailable:document.getElementById('merge-cancel')!.getAttribute('aria-disabled'),hidden:document.getElementById('merge-cancel')!.hidden})))
+  .toEqual({first:expect.stringMatching(/^● Fetch Running/),label:'Cancel requested',unavailable:'true',hidden:false});
+ // A newer job C that another tab starts afterwards offers Cancel.
+ phase='c';
+ await expect(page.getByRole('list',{name:'Merge steps'}).getByRole('listitem').first()).toHaveText(/^● Fetch Running/);
+ await expect(cancel).toHaveText('Cancel merge',{timeout:15_000});
+ await expect(cancel).not.toHaveAttribute('aria-disabled','true');
+});
 test('marks Cancel unavailable once the merge job asked GitHub to merge (D16)',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
