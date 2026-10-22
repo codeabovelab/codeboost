@@ -481,8 +481,10 @@ $("merge-cancel").onclick = async () => {
   } finally {
     // Only this cancel's own pending state: a later cancel of a newer job keeps its own.
     if (mergeCancelPending === job.id) mergeCancelPending = null;
-    // Answered as ended: Cancel stays unavailable for every record older than the ended one, until the page shows it.
-    if (pollNow) mergeCancelEnded = ended;
+    // Answered as ended: Cancel stays unavailable for every record older than the ended one, until the page shows it. An
+    // answer is newer than the record shown, not always than the one held (a late answer for an older job), so the later
+    // ended record is kept.
+    if (pollNow && (!mergeCancelEnded || laterMergeJob(ended, mergeCancelEnded))) mergeCancelEnded = ended;
     renderMerge();
     if (pollNow) {
       if (mergePollInFlight?.generation === mergeGeneration) {
