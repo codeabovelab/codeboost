@@ -1286,7 +1286,11 @@ function newerMergeObservations(updated, observationOwner) {
 /** The full response `view` with the newer observations kept, as the poll presented them. */
 function withNewerMergeObservations(view, { queue, job, jobQueue }) {
   const kept = queue ? withMergeQueue(view, queue) : view;
-  return job ? withMergeJobObservation(kept, job, jobQueue) : kept;
+  if (!job) return kept;
+  // A kept job other than the response's: the response's queue attempt is the older job's (the response was read before
+  // the kept job), so it is dropped. A kept job's own attempt the page followed is `jobQueue`.
+  const sameJob = job.id === kept.merge.job?.id;
+  return withMergeJobObservation(sameJob ? kept : { ...kept, merge: { ...kept.merge, queue: null } }, job, jobQueue);
 }
 /** The banner for the newer observations kept, as the poll showed them; call after render. */
 function showNewerMergeObservations({ queue, job, jobQueue }) {
