@@ -36,10 +36,12 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
 | `changes` | For each plan item, the paths its commits changed. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
-| `earlierProblems` | The problems earlier rounds filed, so the agent can say whether each fix worked. |
+| `earlierProblems` | The problems the previous round filed and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. |
 
 The template is `prompts/review.md`. Every input goes into an escaped JSON data block, filled in one pass, so inserted
-text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB.
+text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB. Every round's prompt must also
+leave room for the next round's earlier problems (`MAX_ROUND_PROBLEM_BYTES`, 12 KiB, plus that section's own text), so a
+valid answer can never make the next round's prompt too large. A prompt without that room is refused at once.
 
 ### The answer
 
@@ -47,18 +49,21 @@ The answer schema is `prompts/review-answer.schema.json`. Lane D mounts it as th
 text to Claude as `--json-schema` ([agent isolation](agent-isolation.md), "Review answers"). The answer is one object:
 
 - `round`: the round number from the request;
-- `problems`: at most 50, each with `items` (the plan item IDs whose code must change), `summary`, `detail`, and `check`
-  (the exact text of the `check:` entry it fails, or null).
+- `problems`: at most 20, each with `items` (the plan item IDs whose code must change), `summary` (300 characters),
+  `detail` (1,500 characters), and `check` (the exact text of the `check:` entry it fails, or null).
 
 `validate` refuses an answer that:
 
 - is not strict JSON (a repeated key, an inexact integer), using the plan parser's rules;
 - does not match the schema;
 - is for another round;
-- names an item that is not in the plan.
+- names an item that is not in the plan;
+- holds text with NUL or an unpaired surrogate (the data blocks of later prompts refuse it);
+- splits into problems that take more than 12 KiB as the next round's data block.
 
 A valid answer becomes a list of `ReviewProblem`s, one per named item, in plan order. An item named twice in one problem
-gets one copy. An empty list means the round found nothing.
+gets one copy. A copy keeps the `check` text only when it is exactly one of that item's own `check:` entries; otherwise
+it is null. An empty list means the round found nothing.
 
 ### The invocation
 
@@ -87,12 +92,13 @@ Read each file in `test/fixtures/review/recorded/` before committing it. `test/r
 - each output must pass `validate`, and must file a problem against P2.
 
 `test/agent-review.test.ts` runs a review in a real container with an invalid token: only a request that reached the
-vendor comes back with its 401, so the command and its schema got through the container profile.
+vendor comes back with its 401. The unit tests (`test/agent-policy.test.ts`, `test/agent-adapter.test.ts`,
+`test/review-prompt.test.ts`) check that the review command carries the schema.
 
 ## Part 2 decisions (approved 2026-10-23)
 
 - **Where problems are stored.** Schema v20 adds `review_rounds` (round, revision, head, state) and `review_problems`
-  (round, plan item, source `agent` or `cmd`, text, state `open`, `fixed` or `accepted`, the fix attempt). A round's agent
+  (round, plan item, source `agent` or `check`, summary, detail, state `open`, `fixed` or `accepted`, the fix attempt). A round's agent
   problems are written in the terminal write that completes its review attempt; `cmd:` failures in the check attempt's
   terminal write. So a crash never loses a round or repeats one.
 - **One review attempt per round** covers every plan item. `cmd:` failures are filed against each item that lists the

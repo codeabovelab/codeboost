@@ -7,6 +7,12 @@ import { dataJSON, MAX_PROMPT_BYTES } from './planning-author.ts';
 
 /** The largest round number a review answer can carry; the round limit (#201) is at most this. */
 export const MAX_REVIEW_ROUNDS = 10;
+/**
+ * The most one round's problems may take, in UTF-8 bytes of their JSON data block, split per item and in the shape the
+ * next round reads them back (`EarlierProblem`). Every round's prompt keeps this much room, so a valid answer never
+ * makes the next round's prompt too large (the schema's per-field limits count characters, not bytes).
+ */
+export const MAX_ROUND_PROBLEM_BYTES = 12 * 1024;
 const template = readFileSync(new URL('../prompts/review.md', import.meta.url), 'utf8').replace(/^<!--[\s\S]*?-->\s*/u, '');
 /** The exact bytes lane D mounts and passes to Claude as `--json-schema`. */
 export const REVIEW_SCHEMA_TEXT = readFileSync(new URL('../prompts/review-answer.schema.json', import.meta.url), 'utf8');
@@ -26,6 +32,7 @@ export interface ReviewInput {
   changes: Readonly<Record<string, readonly string[]>>;
   issue: { number: number; title: string; body: string; comments: readonly string[] };
   approvedLessons: readonly string[];
+  /** The problems the previous round found and a fix ran for; empty in round 1. */
   earlierProblems: readonly EarlierProblem[];
 }
 export interface ReviewRequest {
@@ -55,29 +62,35 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   identityKey(input.identity);
   if (!Number.isSafeInteger(input.round) || input.round < 1 || input.round > MAX_REVIEW_ROUNDS)
     throw new Error(`Review round must be an integer from 1 to ${MAX_REVIEW_ROUNDS}.`);
-  if (typeof input.attemptId !== 'string' || !input.attemptId) throw new Error('Attempt ID is required.');
+  if (typeof input.attemptId !== 'string' || !/^[0-9a-f-]{1,64}$/u.test(input.attemptId)) throw new Error('Attempt ID is required.');
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.head)) throw new Error('Review head must be a full commit ID.');
+  if (!Number.isSafeInteger(input.plan.revision) || input.plan.revision < 1) throw new Error('Plan revision must be a positive integer.');
   if (input.issue.number !== input.plan.issue) throw new Error('Selected issue mismatch.');
   const plan = structuredClone(input.plan), ids = new Set(plan.items.map(item => item.id));
-  for (const id of Object.keys(input.changes)) if (!ids.has(id)) throw new Error(`Changes name ${id}, which is not a plan item.`);
+  for (const [id, paths] of Object.entries(input.changes))
+    if (!ids.has(id) || !Array.isArray(paths) || paths.some(path => typeof path !== 'string')) throw new Error(`Changes name ${id}, which is not a plan item with a list of paths.`);
   for (const problem of input.earlierProblems)
-    if (!ids.has(problem.item) || problem.round >= input.round) throw new Error('Earlier problems must name plan items from earlier rounds.');
+    if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
   const items = plan.items.map(item => ({ ...item, changed_files: [...(input.changes[item.id] ?? [])] }));
   const slots: Record<string, string> = {
     round: String(input.round),
     plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items }, 'Plan data'),
     issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: input.issue.body, comments: input.issue.comments }, 'Issue data'),
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
-    earlier_problems_json: dataJSON(input.earlierProblems.map(problem => ({ ...problem })), 'Earlier problems'),
+    earlier_problems_json: earlierData(input.earlierProblems),
   };
-  const conditional = template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu,
-    (_, block: string) => input.earlierProblems.length ? block : '');
-  // One pass over the trusted template only: inserted data is never interpreted again.
-  const prompt = conditional.replace(/\{\{([a-z_]+)\}\}/gu, (_, key: string) => {
-    if (!(key in slots)) throw new Error(`Unknown template slot ${key}.`);
-    return slots[key]!;
-  });
+  const fill = (withEarlier: boolean) => template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu,
+    (_, block: string) => withEarlier ? block : '')
+    // One pass over the trusted template only: inserted data is never interpreted again.
+    .replace(/\{\{([a-z_]+)\}\}/gu, (_, key: string) => {
+      if (!(key in slots)) throw new Error(`Unknown template slot ${key}.`);
+      return slots[key]!;
+    });
+  const prompt = fill(input.earlierProblems.length > 0);
   if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('Review prompt exceeds 32 KiB.');
+  // Room for the next round's earlier problems: the block's own text plus the largest problem list an answer may give.
+  if (Buffer.byteLength(fill(false), 'utf8') + EARLIER_BLOCK_BYTES + MAX_ROUND_PROBLEM_BYTES > MAX_PROMPT_BYTES)
+    throw new Error('Review prompt leaves no room for the next round\'s problems: narrow the issue, the plan or the lessons.');
   const { repositoryId, taskId, planId } = input.identity;
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,
@@ -95,10 +108,27 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     for (const problem of reply.problems) {
       const unknown = problem.items.filter(id => !ids.has(id));
       if (unknown.length) throw new Error(`The review answer names ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is not a plan item' : 'are not plan items'}.`);
-      // Split per item (design, "Review rounds" step 3), in plan order; a repeated ID files one copy.
-      for (const item of plan.items) if (problem.items.includes(item.id))
-        problems.push({ item: item.id, summary: problem.summary, detail: problem.detail, check: problem.check });
+      // Later prompts carry this text in data blocks, which refuse NUL and unpaired surrogates: refuse it here instead.
+      if ([problem.summary, problem.detail, problem.check ?? ''].some(text => text.includes('\0') || !text.isWellFormed()))
+        throw new Error('The review answer contains text with NUL or an unpaired surrogate.');
+      // Split per item (design, "Review rounds" step 3), in plan order; a repeated ID files one copy. An item keeps the
+      // check text only when it is one of that item's own `check:` entries.
+      for (const item of plan.items) if (problem.items.includes(item.id)) {
+        const check = problem.check !== null && item.acceptance.some(entry => entry.type === 'check' && entry.text === problem.check) ? problem.check : null;
+        problems.push({ item: item.id, summary: problem.summary, detail: problem.detail, check });
+      }
     }
+    // Measured as the next round's data block encodes it (JSON, with <, > and & as six-byte escapes), without its
+    // 32 KiB refusal, so an oversized answer gets this message.
+    const bytes = Buffer.byteLength(JSON.stringify(problems.map(({ item, summary, detail, check }) => ({ round: request.round, item, summary, detail, check })))
+      .replace(/[<>&]/gu, '\\u0000'), 'utf8');
+    if (bytes > MAX_ROUND_PROBLEM_BYTES)
+      throw new Error(`The review answer's problems take ${bytes} bytes, over the ${MAX_ROUND_PROBLEM_BYTES}-byte limit for one round.`);
     return problems;
   } });
 }
+/** The earlier-problems data block's contents, exactly as a prompt carries them. */
+const earlierData = (problems: readonly EarlierProblem[]) =>
+  dataJSON(problems.map(({ round, item, summary, detail, check }) => ({ round, item, summary, detail, check })), 'Earlier problems');
+/** The earlier-problems section's own text, without its data. */
+const EARLIER_BLOCK_BYTES = Buffer.byteLength(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/u.exec(template)![1]!.replace('{{earlier_problems_json}}', ''), 'utf8');

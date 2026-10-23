@@ -105,7 +105,7 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?
   if (STRUCTURED_PHASES.has(policy.phase) !== (schema !== undefined))
     throw new Error('Only the Claude planning and review commands carry an answer schema, and they must.');
   const planningArguments = schema === undefined ? [] : ['--json-schema',
-    assertPlanningInput(prompt, assertPlanningSchema(schema), policy.phase), '--max-turns', String(PLANNING_MAX_TURNS)];
+    assertPlanningInput(prompt, assertPlanningSchema(schema, policy.phase), policy.phase), '--max-turns', String(PLANNING_MAX_TURNS)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
@@ -151,17 +151,18 @@ export function assertPlanningInput(prompt: string, schema: string, phase: Phase
 }
 
 /**
- * A planning schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one command
- * argument. Returns the schema unchanged.
+ * A planning or review schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one
+ * command argument. Returns the schema unchanged.
  */
-export function assertPlanningSchema(schema: string): string {
+export function assertPlanningSchema(schema: string, phase: Phase = 'planning'): string {
+  const name = phase === 'review' ? 'Review schema' : 'Planning schema';
   if (schema.includes('\0') || Buffer.byteLength(schema, 'utf8') > MAX_COMMAND_SCHEMA_BYTES)
-    throw new Error('Planning schema must contain no NUL and fit the command schema limit.');
+    throw new Error(`${name} must contain no NUL and fit the command schema limit.`);
   let parsed: unknown;
-  try { parsed = JSON.parse(schema); } catch { throw new Error('Planning schema must be JSON.'); }
+  try { parsed = JSON.parse(schema); } catch { throw new Error(`${name} must be JSON.`); }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)
     || (parsed as { type?: unknown }).type !== 'object')
-    throw new Error('Planning schema must be a JSON object schema with "type": "object".');
+    throw new Error(`${name} must be a JSON object schema with "type": "object".`);
   return schema;
 }
 

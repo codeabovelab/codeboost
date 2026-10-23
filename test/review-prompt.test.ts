@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type InvocationResult } from '../agents/contract.ts';
 import { assertCommandSchema, createClaudeCommand, createPhasePolicy } from '../agents/policy.ts';
-import { MAX_REVIEW_ROUNDS, prepareReview, REVIEW_SCHEMA_TEXT } from '../core/review-prompt.ts';
-import { CODEX_REVIEW_REFUSED, REVIEW_FEATURE, reviewOutput, reviewRun } from '../runner/review-agent.ts';
+import { MAX_REVIEW_ROUNDS, MAX_ROUND_PROBLEM_BYTES, prepareReview, REVIEW_SCHEMA_TEXT } from '../core/review-prompt.ts';
+import { CODEX_REVIEW_REFUSED, removeReviewRoot, REVIEW_FEATURE, reviewOutput, reviewRun } from '../runner/review-agent.ts';
 import { reviewRecordingInput } from './fixtures/review/recording-inputs.ts';
 
 const HEAD = 'a'.repeat(40);
@@ -19,11 +22,11 @@ describe('review prompt (#201)', () => {
     expect(first.prompt).toContain('This is review round 1.');
     expect(first.prompt).toContain('"changed_files":["src/example.ts"]');
     expect(first.prompt).toContain(`"head":"${HEAD}"`);
-    expect(first.prompt).not.toContain('Problems found in earlier rounds');
+    expect(first.prompt).not.toContain('Problems the previous round found');
     expect(first.prompt).not.toMatch(/\{\{|\}\}/u);
     const second = prepareReview(reviewRecordingInput('claude-review-round2', HEAD, randomUUID())).request;
     expect(second.prompt).toContain('This is review round 2.');
-    expect(second.prompt).toContain('Problems found in earlier rounds');
+    expect(second.prompt).toContain('Problems the previous round found');
     expect(second.prompt).toContain('<earlier_problems_data>');
     // The builders' comment is removed before sending.
     expect(second.prompt).not.toContain('This comment is for builders');
@@ -47,18 +50,53 @@ describe('review prompt (#201)', () => {
     expect(() => prepareReview(input({ head: 'HEAD' }))).toThrow('full commit ID');
     expect(() => prepareReview(input({ changes: { P9: ['x'] } }))).toThrow('P9');
     expect(() => prepareReview(input({ earlierProblems: [{ round: 1, item: 'P1', summary: 's', detail: 'd', check: null }] })))
-      .toThrow('earlier rounds');
+      .toThrow('previous round');
+    // Only the previous round's problems: round 3 is not told round 1's again.
+    expect(() => prepareReview(input({ round: 3, earlierProblems: [{ round: 1, item: 'P1', summary: 's', detail: 'd', check: null }] })))
+      .toThrow('previous round');
+    expect(() => prepareReview(input({ earlierProblems: [{ round: 1, item: 'P9', summary: 's', detail: 'd', check: null }], round: 2 })))
+      .toThrow('previous round');
+    expect(() => prepareReview(input({ attemptId: '' }))).toThrow('Attempt ID');
+    expect(() => prepareReview(input({ attemptId: 'a\0b' }))).toThrow('Attempt ID');
+    expect(() => prepareReview(input({ plan: { ...reviewRecordingInput('claude-review-round1', HEAD, 'x').plan, revision: 0 } }))).toThrow('revision');
+    expect(() => prepareReview(input({ changes: { P1: 'src/example.ts' as unknown as string[] } }))).toThrow('list of paths');
     expect(() => prepareReview(input({ issue: { number: 413, title: '', body: '', comments: [] } }))).toThrow('issue mismatch');
     expect(() => prepareReview(input({ issue: { number: 412, title: '', body: 'x'.repeat(33 * 1024), comments: [] } }))).toThrow('32 KiB');
+    // Each block fits on its own, but the prompt as a whole does not.
+    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: 'x'.repeat(16 * 1024), comments: [] },
+      approvedLessons: ['y'.repeat(17 * 1024)] }))).toThrow('Review prompt exceeds 32 KiB.');
+  });
+
+  it('keeps room in every prompt for the largest list of problems a round may give the next one', () => {
+    // A prompt that fits today but would not fit with a full round of earlier problems is refused now, not next round.
+    const body = (bytes: number) => 'x'.repeat(bytes);
+    const base = Buffer.byteLength(prepareReview(input({ issue: { number: 412, title: '', body: '', comments: [] } })).request.prompt);
+    const room = 32 * 1024 - base - MAX_ROUND_PROBLEM_BYTES;
+    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }))).not.toThrow();
+    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: body(room), comments: [] } }))).toThrow('no room for the next round');
+    // The largest valid answer then fits in the next round's prompt.
+    const { validate } = prepareReview(input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }));
+    const detail = 'd'.repeat(1500), summary = 's'.repeat(300);
+    const most: ReturnType<typeof validate> = [];
+    for (let count = 1; count <= 20; count++) {
+      try { most.splice(0, most.length, ...validate(answer(Array.from({ length: count }, () => ({ items: ['P1'], summary, detail, check: null }))))); }
+      catch { break; }
+    }
+    expect(most.length).toBeGreaterThan(0);
+    expect(() => prepareReview({ ...input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }), round: 2,
+      earlierProblems: most.map(problem => ({ round: 1, ...problem })) })).not.toThrow();
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {
     const { validate } = prepareReview(input());
     expect(validate(answer([]))).toEqual([]);
-    expect(validate(answer([problem(['P2', 'P1', 'P2'], 'Spans both.', 'label() keeps no state between calls.'), problem(['P2'])]))).toEqual([
+    // P1's check stays on P1 only: P2 has no such entry. A check text that is no entry of the item (here a cmd) is dropped.
+    expect(validate(answer([problem(['P2', 'P1', 'P2'], 'Spans both.', 'label() keeps no state between calls.'), problem(['P2'], 'Wrong.', 'npm test'),
+      problem(['P2'], 'Untested.', 'The new test calls label(3) twice and asserts both results are equal.')]))).toEqual([
       { item: 'P1', summary: 'Spans both.', detail: 'src/example.ts:2 is wrong.', check: 'label() keeps no state between calls.' },
-      { item: 'P2', summary: 'Spans both.', detail: 'src/example.ts:2 is wrong.', check: 'label() keeps no state between calls.' },
+      { item: 'P2', summary: 'Spans both.', detail: 'src/example.ts:2 is wrong.', check: null },
       { item: 'P2', summary: 'Wrong.', detail: 'src/example.ts:2 is wrong.', check: null },
+      { item: 'P2', summary: 'Untested.', detail: 'src/example.ts:2 is wrong.', check: 'The new test calls label(3) twice and asserts both results are equal.' },
     ]);
     // Bytes are accepted too, as D may return them.
     expect(validate(Buffer.from(answer([])))).toEqual([]);
@@ -68,15 +106,25 @@ describe('review prompt (#201)', () => {
     const { validate } = prepareReview(input());
     expect(() => validate(answer([problem(['P3'])]))).toThrow('P3, which is not a plan item');
     expect(() => validate(answer([], 2))).toThrow('round 2, not round 1');
-    expect(() => validate('{"round":1,"problems":[],"round":1}')).toThrow();
+    expect(() => validate('{"round":1,"problems":[],"round":1}')).toThrow('Duplicate');
+    expect(() => validate('{"round":1.0000000000000001,"problems":[]}')).toThrow('not exactly representable');
     expect(() => validate('not json')).toThrow();
+    expect(() => validate(answer([problem(['P1'], 'a\u0000b')]))).toThrow('NUL or an unpaired surrogate');
+    expect(() => validate(answer([{ ...problem(['P1']), detail: '\ud800' }]))).toThrow('NUL or an unpaired surrogate');
+    // Within every field limit, but more than one round may hand the next: refused rather than truncated.
+    const long = { summary: '\u00e9'.repeat(300), detail: '\u00e9'.repeat(1500), check: null };
+    expect(() => validate(answer(Array.from({ length: 20 }, () => ({ items: ['P1', 'P2'], ...long }))))).toThrow(`${MAX_ROUND_PROBLEM_BYTES}-byte limit`);
     expect(() => validate(JSON.stringify({ round: 1, problems: [], extra: true }))).toThrow('schema');
     expect(() => validate(answer([{ ...problem(['P1']), extra: 1 }]))).toThrow('schema');
     expect(() => validate(answer([{ items: ['P1'], summary: 'Wrong.', detail: 'd' }]))).toThrow('schema');
     expect(() => validate(answer([problem([])]))).toThrow('schema');
     expect(() => validate(answer([problem(['p1'])]))).toThrow('schema');
     expect(() => validate(answer([problem(['P1'], '')]))).toThrow('schema');
-    expect(() => validate(answer(Array.from({ length: 51 }, () => problem(['P1']))))).toThrow('schema');
+    expect(() => validate(answer(Array.from({ length: 21 }, () => problem(['P1']))))).toThrow('schema');
+  });
+
+  it('allows the same rounds in the schema as in the request builder', () => {
+    expect(JSON.parse(REVIEW_SCHEMA_TEXT).properties.round).toMatchObject({ minimum: 1, maximum: MAX_REVIEW_ROUNDS });
   });
 
   it('mounts the exact schema bytes lane D passes to the Claude review command, within the model budget', () => {
@@ -113,5 +161,12 @@ describe('review agent output (#201)', () => {
       head: HEAD, attemptId: request.attemptId, prompt: request.prompt, schemaText: REVIEW_SCHEMA_TEXT,
       context: { planRevision: 1, referencedCodeHash: HEAD } });
     expect(REVIEW_FEATURE.phase).toBe('review');
+    // It deletes only its own roots: a planning root, or anything outside the temporary directory, is refused.
+    expect(REVIEW_FEATURE.removeRoot).toBe(removeReviewRoot);
+    expect(() => removeReviewRoot('/etc')).toThrow('it is not a review root');
+    expect(() => removeReviewRoot(join(tmpdir(), 'codeboost-planning-x'))).toThrow('it is not a review root');
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-review-'));
+    removeReviewRoot(root);
+    expect(existsSync(root)).toBe(false);
   });
 });

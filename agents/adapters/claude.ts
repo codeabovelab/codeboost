@@ -84,11 +84,11 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
 }
 
 /**
- * Read the planning schema for `--json-schema` with the profile's bounded no-follow reader. The profile captures the
- * mounted file again and refuses a command whose schema differs.
+ * Read the planning or review schema for `--json-schema` with the profile's bounded no-follow reader. The profile
+ * captures the mounted file again and refuses a command whose schema differs.
  */
-export function readPlanningSchema(inputDirectory: string): string {
-  const { content } = readCapturedFile(join(inputDirectory, 'schema.json'), 'Planning schema', MAX_COMMAND_SCHEMA_BYTES);
+export function readPlanningSchema(inputDirectory: string, label = 'Planning schema'): string {
+  const { content } = readCapturedFile(join(inputDirectory, 'schema.json'), label, MAX_COMMAND_SCHEMA_BYTES);
   return new TextDecoder('utf-8', { fatal: true }).decode(content);
 }
 
@@ -102,7 +102,7 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   const structured = STRUCTURED_PHASES.has(policy.phase);
   // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
   const command = createClaudeCommand(policy, request.prompt,
-    structured ? readPlanningSchema(request.inputDirectory) : undefined);
+    structured ? readPlanningSchema(request.inputDirectory, policy.phase === 'review' ? 'Review schema' : 'Planning schema') : undefined);
   assertAdapterRequest(request);
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command, claudeToken: oauthToken }),

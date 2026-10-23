@@ -1,11 +1,8 @@
 import type { InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import { PLANNING_MAX_TURNS } from '../agents/policy.ts';
 import type { ReviewRequest } from '../core/review-prompt.ts';
-import { chmodSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
-import { PLANNING_STORAGE } from './planning-provider.ts';
-import { exceedsStorage, sameContext, type Provider, type ReadOnlyFeature, type ReadOnlyRun, type RepositorySize } from './question-container.ts';
+import { PLANNING_STORAGE, rootRemover, structuredOutput } from './planning-provider.ts';
+import { exceedsStorage, type Provider, type ReadOnlyFeature, type ReadOnlyRun, type RepositorySize } from './question-container.ts';
 
 /**
  * The review agent (#201): one read-only Claude invocation per review round, in lane D's "review" phase (read, list
@@ -19,20 +16,9 @@ const stopMessages: Record<StopReason, string> = {
 };
 /** Accept only this exact invocation's output, and only after a clean exit. The text is still unvalidated. */
 export function reviewOutput(result: InvocationResult, invocation: InvocationInput): string {
-  if (result.attemptId !== invocation.attemptId || !result.context || !sameContext(result.context, invocation.context))
-    throw new Error('The review agent returned a result for a different attempt.');
-  if (result.stopReason) throw new Error(stopMessages[result.stopReason]);
-  if (result.exitCode === null || result.signal !== null)
-    throw new Error(`Claude stopped unexpectedly${result.signal ? ` (${result.signal})` : ''}.`);
-  if (result.exitCode !== 0) {
-    const detail = result.stdout.replace(/\s+/g, ' ').trim().slice(0, 300);
-    // Claude Code's own text when `--max-turns` stops the run (#163); a review shares planning's turn limit.
-    const advice = detail.includes('Reached maximum number of turns')
-      ? `The review stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered.`
-      : 'Check its sign-in and usage limits.';
-    throw new Error(`Claude could not review the plan items. ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
-  }
-  return result.stdout;
+  // A review shares planning's turn limit (#163).
+  return structuredOutput(result, invocation, { agent: 'review agent', stops: stopMessages, failed: 'Claude could not review the plan items.',
+    turnLimit: `The review stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered.` });
 }
 
 /** Codex reads files only through its shell, and the review phase runs none (#93). */
@@ -41,13 +27,7 @@ export const CODEX_REVIEW_REFUSED = 'Codex cannot review plan items yet: it can 
 const text = (error: unknown) => error instanceof Error ? error.message : String(error);
 const ROOT_PREFIX = 'codeboost-review-';
 /** Delete a review root: a direct child of the temporary directory named with the review's prefix, and nothing else. */
-export function removeReviewRoot(root: string): void {
-  if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
-    throw new Error(`A copy of the reviewed code could not be deleted (${root}): it is not a review root.`);
-  try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
-  try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
-  catch (error) { throw new Error(`A copy of the reviewed code could not be deleted (${root}).`, { cause: error }); }
-}
+export const removeReviewRoot = rootRemover(ROOT_PREFIX, 'reviewed', 'review');
 /**
  * A review as a read-only run outside the runner, for the recording script and the Docker probe. The review reads the
  * code and writes nothing, so it has planning's storage ceilings.

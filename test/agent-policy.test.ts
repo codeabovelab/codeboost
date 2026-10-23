@@ -134,6 +134,8 @@ describe('agent phase policy', () => {
     for (const schema of ['', 'not json', '[]', 'null', '"string"', '{"type":"object"}\0', '{"type":"array"}',
       '{"type":"string"}', '{"properties":{}}'])
       expect(() => createClaudeCommand(planning(), 'Plan.', schema)).toThrow('Planning schema');
+    // A review's schema is checked the same way, and named as the review's.
+    expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', '{"type":"array"}')).toThrow('Review schema must be a JSON object schema');
     const oversized = `{"description":"${'x'.repeat(MAX_COMMAND_SCHEMA_BYTES)}"}`;
     expect(() => createClaudeCommand(planning(), 'Plan.', oversized)).toThrow('limit');
   });

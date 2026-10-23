@@ -15,7 +15,7 @@
     "problems": {
       "description": "Every problem this round found. An empty list means the round found nothing.",
       "type": "array",
-      "maxItems": 50,
+      "maxItems": 20,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -25,7 +25,7 @@
             "description": "The plan items whose code must change to fix this problem. codeboost files one copy of the problem against each.",
             "type": "array",
             "minItems": 1,
-            "maxItems": 50,
+            "maxItems": 20,
             "items": { "type": "string", "pattern": "^P[1-9][0-9]{0,2}$" }
           },
           "summary": {
@@ -38,12 +38,12 @@
             "description": "Where it is (file and line) and why it is wrong, so that a fix needs no other context.",
             "type": "string",
             "minLength": 1,
-            "maxLength": 4000
+            "maxLength": 1500
           },
           "check": {
             "description": "The text of the check entry this problem fails, copied exactly, or null when it fails the item's intent only.",
             "type": ["string", "null"],
-            "maxLength": 1000
+            "maxLength": 400
           }
         }
       }

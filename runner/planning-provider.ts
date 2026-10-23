@@ -52,12 +52,19 @@ const ROOT_PREFIX = 'codeboost-planning-';
  * Delete a planning root: a direct child of the temporary directory named with planning's prefix, and nothing else.
  * Its input directory is made writable first, since the request left it read-only.
  */
-export function removePlanningRoot(root: string): void {
-  if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
-    throw new Error(`A copy of the planned code could not be deleted (${root}): it is not a planning root.`);
-  try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
-  try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
-  catch (error) { throw new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }); }
+export function removePlanningRoot(root: string): void { rootRemover(ROOT_PREFIX, 'planned', 'planning')(root); }
+/**
+ * The removal of one read-only feature's host roots (planning's, the review's): a direct child of the temporary
+ * directory named with `prefix`, and nothing else. `code` and `feature` name them in errors.
+ */
+export function rootRemover(prefix: string, code: string, feature: string): (root: string) => void {
+  return root => {
+    if (dirname(root) !== tmpdir() || !basename(root).startsWith(prefix))
+      throw new Error(`A copy of the ${code} code could not be deleted (${root}): it is not a ${feature} root.`);
+    try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
+    try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+    catch (error) { throw new Error(`A copy of the ${code} code could not be deleted (${root}).`, { cause: error }); }
+  };
 }
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.
@@ -88,9 +95,16 @@ const stopMessages: Record<StopReason, string> = {
 };
 /** Accept only this exact invocation's output, and only after a clean exit. The text is still unvalidated. */
 export function planningOutput(result: InvocationResult, invocation: InvocationInput): string {
+  return structuredOutput(result, invocation, { agent: 'planning agent', stops: stopMessages, failed: 'Claude could not write the plan.',
+    turnLimit: `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.` });
+}
+/** What a structured-answer feature (planning, the review) says about an invocation that gave no answer. */
+export interface OutputWords { agent: string; stops: Record<StopReason, string>; failed: string; turnLimit: string }
+/** Accept only this exact invocation's output, and only after a clean exit, for planning or the review. Still unvalidated. */
+export function structuredOutput(result: InvocationResult, invocation: InvocationInput, words: OutputWords): string {
   if (result.attemptId !== invocation.attemptId || !result.context || !sameContext(result.context, invocation.context))
-    throw new Error('The planning agent returned a result for a different attempt.');
-  if (result.stopReason) throw new Error(stopMessages[result.stopReason]);
+    throw new Error(`The ${words.agent} returned a result for a different attempt.`);
+  if (result.stopReason) throw new Error(words.stops[result.stopReason]);
   if (result.exitCode === null || result.signal !== null)
     throw new Error(`Claude stopped unexpectedly${result.signal ? ` (${result.signal})` : ''}.`);
   if (result.exitCode !== 0) {
@@ -98,10 +112,8 @@ export function planningOutput(result: InvocationResult, invocation: InvocationI
     // Claude Code's own text when `--max-turns` stops the run (#163). The decoder keeps no subtype, so this matches the
     // text: a stop without it gets the general advice, and other output that contains it (Claude's own `result` text
     // can) gets the turn-limit advice. Only the advice can be wrong; the text is still quoted.
-    const advice = detail.includes('Reached maximum number of turns')
-      ? `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.`
-      : 'Check its sign-in and usage limits.';
-    throw new Error(`Claude could not write the plan. ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
+    const advice = detail.includes('Reached maximum number of turns') ? words.turnLimit : 'Check its sign-in and usage limits.';
+    throw new Error(`${words.failed} ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
   }
   return result.stdout;
 }
