@@ -1084,7 +1084,7 @@ test('offers Close pull requests for a cancelled task whose close is owed, and s
   await expect(page.locator('#runner-note')).toHaveText('✕ Demos never publish pull requests.');
 });
 
-test('names an expired time budget in the needs-human banner, before an older failure', async ({ page }) => {
+test('adds a spent time budget to the needs-human banner after the failure it names', async ({ page }) => {
   await serve();
   let needsHuman = false;
   // After P1 failed, a spent budget moved the idle task to needs human without a new attempt (runner/store.ts
@@ -1095,7 +1095,9 @@ test('names an expired time budget in the needs-human banner, before an older fa
   await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
   needsHuman = true;
   await refreshReview(page);
-  await expect(page.locator('#task-banner-text')).toHaveText("! This task needs a person. The task's time budget ran out.");
+  // The attempt's own reason is not the budget, so its failure is named, and the spent budget is added.
+  const diagnostic = app.service.store.recentAttempts(app.service.config.identity, 1)[0]!.diagnostic!;
+  await expect(page.locator('#task-banner-text')).toHaveText(`! This task needs a person. ${diagnostic.slice(0, 300)} Its time budget has also run out.`);
 });
 
 test('names a failed attempt\'s diagnostic in the needs-human banner', async ({ page }) => {
@@ -1145,16 +1147,20 @@ test('shows a stop whose reason is not saved yet', async ({ page }) => {
   fail();
 });
 
-test('hides Cancel task while a merge is being submitted', async ({ page }) => {
+test('names a publish message as the needs-human cause while the budget is unspent, and names a time-limit stop as the budget', async ({ page }) => {
   await serve();
-  // The review's merge status while GitHub is asked to merge (runner/merge.ts): the page reads only `queue.state` here.
-  await page.route('**/api/review', async route => {
-    const response = await fetch(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
-    const review = await response.json() as Record<string, any>;
-    review.merge = { ...(review.merge ?? {}), available: false, queue: { state: 'submitting' } };
-    await route.fulfill({ status: response.status, json: review });
+  let state: 'publish' | 'time-limit' = 'publish';
+  await viewWith(page, view => {
+    view.startable = false; view.task.status = 'needs human'; view.task.budgetDeadline = Date.now() + 3_600_000;
+    view.publish = { ...view.publish, last: { outcome: 'opened', draft: true, message: 'Pull request #7 is open as a draft; the task is needs human.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z', number: 7 } };
+    // A stopped attempt whose first reason is the time limit (runner/lifecycle.ts FIRST_REASONS); the page reads only
+    // these fields of it.
+    if (state === 'time-limit') { view.task.currentAttemptId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
+      view.attempts = [{ id: view.task.currentAttemptId, kind: 'execute', item: 'P1', state: 'cancelled', firstReason: 'time-limit', diagnostic: null }]; }
   });
   await openReview(page, app.url);
-  await expect(status(page)).toHaveText('○ In review');
-  await expect(page.locator('#cancel-task')).toBeHidden();
+  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs a person. Pull request #7 is open as a draft; the task is needs human.');
+  state = 'time-limit';
+  await refreshReview(page);
+  await expect(page.locator('#task-banner-text')).toHaveText("! This task needs a person. The task's time budget ran out.");
 });

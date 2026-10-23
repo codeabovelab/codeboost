@@ -2380,12 +2380,14 @@ function taskBannerText(view) {
   }
   if (task.status === "needs amendment") return "! This task needs a plan change before it can continue.";
   if (task.status === "needs human") {
-    // A budget that ran out moves an idle task here without a new attempt (runner/store.ts startAttempt), so the current
-    // attempt may be an older failure; the budget comes first.
-    const budgetSpent = (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) || attempt?.firstReason === "time-limit";
-    const detail = budgetSpent ? "The task's time budget ran out."
+    // An attempt the time limit stopped names the budget as the cause. Otherwise the cause is the failed attempt or the
+    // publish; a budget past its deadline is added, since it may be why (an idle task is moved here when it runs out,
+    // runner/store.ts startAttempt) or only true by now.
+    const detail = attempt?.firstReason === "time-limit" ? "The task's time budget ran out."
       : (attempt?.state === "failed" ? attempt.diagnostic : null) ?? view.publish.last?.message;
-    return `! This task needs a person.${detail ? ` ${String(detail).slice(0, 300)}` : ""}`;
+    const budget = attempt?.firstReason !== "time-limit" && task.budgetDeadline !== null && task.budgetDeadline <= Date.now()
+      ? " Its time budget has also run out." : "";
+    return `! This task needs a person.${detail ? ` ${String(detail).slice(0, 300)}` : ""}${budget}`;
   }
   if (task.status === "possibly already fixed")
     return `! ${view.publish.last?.message ?? "The issue may already be fixed, so no pull request was opened."}`;
@@ -2458,10 +2460,9 @@ function renderRunner() {
     const run = runAction(view);
     shown["run-action"] = !!run;
     if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
-    // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles. Not
-    // while a merge is being submitted or sits in GitHub's queue: the server refuses a cancel then (runner/store.ts).
-    const mergeSubmitted = ["submitting", "queued"].includes(data?.merge?.queue?.state);
-    shown["cancel-task"] = !closed && !mergeSubmitted && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
+    // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles. While
+    // a merge is being submitted or sits in GitHub's queue, the server refuses it and the note says why.
+    shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
     $("task-banner-text").textContent = text;
