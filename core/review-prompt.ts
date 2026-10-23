@@ -93,14 +93,16 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     const what = [description ? 'description' : '', comments ? `${comments} comment${comments === 1 ? '' : 's'}` : ''].filter(Boolean);
     return what.length ? `\n\nThe issue's ${what.join(' and ')} did not fit here, so ${what.length > 1 || comments > 1 ? 'they are' : 'it is'} left out.` : '';
   };
+  // With none listed, the note is the section, under its own heading.
   const earlierNote = (listed: number, left: number) => left
-    ? `\n\n${listed ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '';
+    ? `\n\n${listed ? `${left} more problem${left === 1 ? '' : 's'}` : `## Problems the previous round found\n\nThe ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '';
   const changesNote = '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.';
   const lessonsNote = '\n\nThe approved lessons did not fit here, so they are left out.';
   /**
-   * `reserve`: the parts that change from round to round at their longest, for the room the prompt keeps: the round
-   * number, and the earlier-problems note for the most problems a round can give. The other notes are the same in every
-   * round of the same plan, issue and lessons.
+   * `reserve`: what can differ from round to round at its longest, for the room the prompt keeps: the round number, the
+   * earlier-problems note for the most problems a round can give, and the description's and lessons' notes even where
+   * there is no description or lesson yet (one written or approved between rounds then still fits). The change texts'
+   * note is the same in every round of one plan.
    */
   const render = (parts: Parts, reserve = false): string | null => {
     const left = total - parts.earlier, comments = input.issue.comments.length;
@@ -111,9 +113,9 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       plan_left_out: !parts.changes && changeTexts ? changesNote : '',
       issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: parts.description ? input.issue.body : '',
         comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
-      issue_left_out: issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments),
+      issue_left_out: issueNote(reserve || (!parts.description && !!input.issue.body), parts.comments ? 0 : comments),
       lessons_data_json: dataJSON(parts.lessons ? input.approvedLessons : [], 'Lessons'),
-      lessons_left_out: !parts.lessons && input.approvedLessons.length ? lessonsNote : '',
+      lessons_left_out: reserve || (!parts.lessons && input.approvedLessons.length) ? lessonsNote : '',
       earlier_problems_json: dataJSON(input.earlierProblems.slice(0, parts.earlier).map(({ round, item, summary, detail, check }) =>
         ({ round, item, summary, detail, check })), 'Earlier problems'),
       earlier_left_out: reserve ? earlierNote(0, Math.max(total, MAX_NOTE_COUNT)) : earlierNote(parts.earlier, left),
@@ -130,8 +132,8 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   const sized = (parts: Parts, reserve = false) => { try { return render(parts, reserve); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
   // The smallest prompt: the plan without its change texts, the issue's number and title, the prompt's own text and the
   // note for each part left out, with the round number and the earlier-problems note at their longest. The next round
-  // of the same plan, issue and lessons therefore fits whenever this one does (an issue whose title or comment count
-  // changed may not). Every later prompt is at most this size until a part goes in.
+  // of the same plan therefore fits whenever this one does, unless the issue's title or its number of comments changed
+  // in between. Every later prompt is at most this size until a part goes in.
   let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
   if (sized(parts, true) === null)
     throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);

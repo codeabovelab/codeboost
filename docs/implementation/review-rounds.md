@@ -55,10 +55,12 @@ tried):
 
 codeboost's own note in the prompt names whatever was left out: the smallest prompt the budget must hold includes every
 note, with the earlier-problems note for the most problems a round can give. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
-Because that room and the longest round number are kept from round 1 on, and the other notes are the same in every
-round, every later round of the same plan, issue and lessons fits whenever round 1 did. (An issue whose title or number of comments changed between rounds may not.) So an answer is never refused for its size: any valid answer can be the next round's earlier
-problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
-would fit. Part 2 starts a new plan revision again at round 1, with no earlier problems.
+Room is kept from round 1 on for the longest round number, the earlier-problems note, and the notes of the issue's
+description and of the lessons. So every later round of the same plan fits whenever round 1 did, even if a description
+was written or lessons were approved in between. (An issue whose title or number of comments changed between rounds may
+not fit.) So an answer is never refused for its size: any valid answer can be the next round's earlier problems. Text
+that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it would fit. Part 2
+starts a new plan revision again at round 1, with no earlier problems.
 
 **Known limit.** A plan too large to fit even without its change texts (with the issue's number and title, the
 prompt's own text and the room for the notes) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400

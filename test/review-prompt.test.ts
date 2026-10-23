@@ -7,6 +7,7 @@ import { captureInvocation, type InvocationInput, type InvocationResult } from '
 import { assertCommandSchema, createClaudeCommand, createPhasePolicy, MAX_PLANNING_INPUT_BYTES } from '../agents/policy.ts';
 import { MAX_REVIEW_PROMPT_BYTES, MAX_REVIEW_ROUNDS, prepareReview, REVIEW_SCHEMA_TEXT, validateReviewAnswer } from '../core/review-prompt.ts';
 import { CODEX_REVIEW_REFUSED, removeReviewRoot, REVIEW_FEATURE, reviewOutput, reviewRun } from '../runner/review-agent.ts';
+import type { Plan } from '../core/plan.ts';
 import { reviewRecordingInput } from './fixtures/review/recording-inputs.ts';
 
 const HEAD = 'a'.repeat(40);
@@ -14,6 +15,45 @@ const input = (overrides: Partial<ReturnType<typeof reviewRecordingInput>> = {})
   ({ ...reviewRecordingInput('claude-review-round1', HEAD, randomUUID()), ...overrides });
 const answer = (problems: unknown[], round = 1) => JSON.stringify({ round, problems });
 const problem = (items: string[], summary = 'Wrong.', check: string | null = null) => ({ items, summary, detail: 'src/example.ts:2 is wrong.', check });
+
+// Plans as the plan schema allows them (schema/plan.schema.json): at most 30 items, 40 files and 10 checks each, with
+// 600-character intents, 1,200-character change texts, 400-character checks and 300-character paths. These add `bytes`
+// characters to a plan in fields of those sizes, so a test can size a prompt without a plan production could not make.
+const MAX = { items: 30, files: 40, checks: 10, change: 1200, check: 400 };
+/** `bytes` more characters of `check:` text, in the fixture's items and then in more items like them. */
+function checksPadded(base: Plan, bytes: number): Plan {
+  const items = structuredClone(base.items);
+  let left = bytes, next = items.length + 1;
+  for (let index = 0; left > 0; index++) {
+    if (index >= items.length) {
+      if (items.length >= MAX.items) throw new Error('The padding does not fit a schema-valid plan.');
+      items.push({ ...structuredClone(base.items[0]!), id: `P${next++}`, depends_on: [], acceptance: [] });
+    }
+    const item = items[index]!;
+    while (left > 0 && item.acceptance.length < MAX.checks) {
+      const length = Math.min(MAX.check, left);
+      item.acceptance.push({ type: 'check', text: 'k'.repeat(length) });
+      left -= length;
+    }
+  }
+  return { ...base, items };
+}
+/**
+ * `bytes` more characters of file change text in the first item, which gets all 40 files first, so each character adds
+ * exactly one byte to the prompt.
+ */
+function changesPadded(base: Plan, bytes: number): Plan {
+  const items = structuredClone(base.items), first = items[0]!;
+  for (let file = first.files.length; file < MAX.files; file++) first.files.push({ path: `src/pad-${file}.ts`, kind: 'edit', renamed_from: null, change: '' });
+  let left = bytes;
+  for (let file = 0; left > 0 && file < MAX.files; file++) {
+    const length = Math.min(MAX.change - first.files[file]!.change.length, left);
+    first.files[file] = { ...first.files[file]!, change: first.files[file]!.change + 'y'.repeat(length) };
+    left -= length;
+  }
+  if (left > 0) throw new Error('The padding does not fit a schema-valid plan.');
+  return { ...base, items };
+}
 
 describe('review prompt (#201)', () => {
   it('carries the round, the plan and its head, and the earlier problems only when there are some', () => {
@@ -90,8 +130,7 @@ describe('review prompt (#201)', () => {
     const tiny = [1, 2, 3].map(index => ({ round: 1, item: 'P1', summary: `s${index}`, detail: 'd'.repeat(200), check: null }));
     const plan = input().plan;
     const at = (pad: number) => prepareReview(input({ round: 2, earlierProblems: tiny, issue: { number: 412, title: '', body: '', comments: [] },
-      plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item
-        : { ...item, files: item.files.map(file => ({ ...file, change: 'y'.repeat(pad) })) }) } })).request;
+      plan: changesPadded(checksPadded(plan, 20_000), pad) })).request;
     const base = at(1000), room = MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(base.prompt);
     expect(base.earlierListed).toBe(3);
     const exact = at(1000 + room);
@@ -111,7 +150,7 @@ describe('review prompt (#201)', () => {
     expect(none.prompt).toContain('The 3 problems the previous round found did not fit here. Check every plan item again.');
   });
 
-  it('accepts an answer of the largest problems the schema allows, and the next round still builds its prompt from it', () => {
+  it('accepts an answer of the longest problems the schema allows, and the next round still builds its prompt from it', () => {
     const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
     const largest = Array.from({ length: 10 }, (_, index) => ({ items: ['P1', 'P2'], summary: `${String(index).padStart(2, "0")}${text(298)}`, detail: text(1500), check: text(400) }));
     const problems = validateReviewAnswer(input().plan, 1, answer(largest));
@@ -155,9 +194,7 @@ describe('review prompt (#201)', () => {
     expect(changes.prompt).toContain('b'.repeat(5000));
     expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
     // Only a plan too large without its change texts is refused.
-    const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
-      acceptance: Array.from({ length: 10 }, (_, check) => ({ type: 'check' as const, text: `${check}${'a'.repeat(399)}` })),
-      files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
+    const huge = checksPadded(big, 70_000);
     expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // The earlier problems go in before the issue's description: with room for only one of them, the problems win.
     const some = Array.from({ length: 19 }, (_, index) => ({ round: 1, item: 'P1', summary: `p${index}`, detail: 'd'.repeat(1500), check: null }));
@@ -176,8 +213,8 @@ describe('review prompt (#201)', () => {
     const plan = input().plan;
     const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => prepareReview(input({ round, earlierProblems,
       issue: { number: 412, title: '', body: 'b'.repeat(500), comments: ['c'] }, approvedLessons: ['l'],
-      plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item : { ...item, intent: 'y'.repeat(pad) }) } })).request;
-    let low = 0, high = 32_000;
+      plan: checksPadded(plan, pad) })).request;
+    let low = 0, high = 70_000;
     const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
     while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
     expect(() => at(low + 1)).toThrow('The plan is too large to review in one prompt');
@@ -263,7 +300,9 @@ describe('review agent output (#201)', () => {
     expect(() => reviewOutput(result({ attemptId: 'a2' }), invocation)).toThrow('different attempt');
     expect(() => reviewOutput(result({ stopReason: 'timeout' }), invocation)).toThrow('timed out');
     expect(() => reviewOutput(result({ exitCode: null, signal: 'SIGKILL' }), invocation)).toThrow('SIGKILL');
-    expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Reached maximum number of turns (50)' }), invocation)).toThrow('50-turn limit');
+    expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Reached maximum number of turns (50)' }), invocation))
+      .toThrow('Claude could not review the plan items. The review stopped at its 50-turn limit before Claude answered.');
+    expect(() => reviewOutput(result({ stopReason: 'output-limit' }), invocation)).toThrow('Review agent output exceeded its limit.');
     expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Invalid API key' }), invocation)).toThrow('Claude could not review the plan items. Check its sign-in');
   });
 
