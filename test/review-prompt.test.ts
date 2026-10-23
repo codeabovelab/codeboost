@@ -85,12 +85,13 @@ describe('review prompt (#201)', () => {
   });
 
   it('lists every earlier problem when they all fit exactly, and as many as fit with the note otherwise', () => {
-    // Only the earlier problems can give way here: the padding is in the plan, which always goes in.
+    // Only the earlier problems can give way here: the padding is in a file change text, which goes in before them.
     // Each problem takes more than the note does, so leaving one out makes room for the note.
     const tiny = [1, 2, 3].map(index => ({ round: 1, item: 'P1', summary: `s${index}`, detail: 'd'.repeat(200), check: null }));
     const plan = input().plan;
     const at = (pad: number) => prepareReview(input({ round: 2, earlierProblems: tiny, issue: { number: 412, title: '', body: '', comments: [] },
-      plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item : { ...item, intent: 'y'.repeat(pad) }) } })).request;
+      plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item
+        : { ...item, files: item.files.map(file => ({ ...file, change: 'y'.repeat(pad) })) }) } })).request;
     const base = at(1000), room = MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(base.prompt);
     expect(base.earlierListed).toBe(3);
     const exact = at(1000 + room);
@@ -110,7 +111,7 @@ describe('review prompt (#201)', () => {
     expect(none.prompt).toContain('The 3 problems the previous round found did not fit here. Check every plan item again.');
   });
 
-  it('accepts every schema-valid answer whatever its size, and the next round still builds its prompt from it', () => {
+  it('accepts the largest schema-valid answer, and the next round still builds its prompt from it', () => {
     const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
     const largest = Array.from({ length: 10 }, (_, index) => ({ items: ['P1', 'P2'], summary: `${String(index).padStart(2, "0")}${text(298)}`, detail: text(1500), check: text(400) }));
     const problems = validateReviewAnswer(input().plan, 1, answer(largest));
@@ -153,43 +154,36 @@ describe('review prompt (#201)', () => {
     expect(changes.prompt).toContain('"path":"f39.ts"');
     expect(changes.prompt).toContain('b'.repeat(5000));
     expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
-    // A note that fits is kept even where not every note would: 18 bytes from the budget, with the change texts in, the
-    // description's note is there, though it and the change texts' note together would not have fitted the plan alone.
-    const tight = { ...big, items: big.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: 'x' })) })) };
-    const fit = (pad: number) => prepareReview(input({ plan: { ...tight, summary: 's'.repeat(30_000), items: tight.items.map((item, index) =>
-      index ? item : { ...item, intent: 'i'.repeat(pad) }) }, issue: issue(33 * 1024, 0) })).request;
-    const roomy = fit(0);
-    expect(roomy.prompt).toContain('The issue\'s description did not fit here, so it is left out.');
-    const near = fit(MAX_REVIEW_PROMPT_BYTES - 18 - Buffer.byteLength(roomy.prompt));
-    expect(Buffer.byteLength(near.prompt)).toBe(MAX_REVIEW_PROMPT_BYTES - 18);
-    expect(near.leftOut).toEqual(['issue description']);
-    expect(near.prompt).toContain('The issue\'s description did not fit here, so it is left out.');
     // Only a plan too large without its change texts is refused.
     const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
       acceptance: Array.from({ length: 10 }, (_, check) => ({ type: 'check' as const, text: `${check}${'a'.repeat(399)}` })),
       files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's text and the lessons, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's text, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
     expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
     expect(() => build({ round: 2, earlierProblems: [{ round: 1, item: 'P1', summary: '\ud800', detail: 'd', check: null }] })).toThrow('Earlier problems must be valid text');
   });
 
-  it('builds the next round from the largest plan the first round accepted, keeping the notes that fit', () => {
-    // Round 1 at exactly the budget, with nothing left out; round 2 adds one problem, which needs at least a note.
+  it('builds every later round of the largest plan the first round accepted, with its notes', () => {
+    // Round 1 at the largest plan it accepts; rounds 2 and 10, with the most problems a round can give, still fit.
     const plan = input().plan;
     const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => prepareReview(input({ round, earlierProblems,
-      issue: { number: 412, title: '', body: '', comments: [] },
+      issue: { number: 412, title: '', body: 'b'.repeat(500), comments: ['c'] }, approvedLessons: ['l'],
       plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item : { ...item, intent: 'y'.repeat(pad) }) } })).request;
-    const pad = 1000 + MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(at(1000).prompt);
-    const first = at(pad);
-    expect([Buffer.byteLength(first.prompt), first.leftOut]).toEqual([MAX_REVIEW_PROMPT_BYTES, []]);
-    const second = at(pad, 2, [{ round: 1, item: 'P2', summary: 'Still wrong.', detail: 'd', check: null }]);
-    expect(Buffer.byteLength(second.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
-    // The plan's change texts and the problem do not both fit: the problem's note goes in first, then as much as fits.
-    expect(second.earlierListed).toBe(0);
-    expect(second.prompt).toContain('The 1 problem the previous round found did not fit here.');
-    expect(second.leftOut).toEqual(['file change texts']);
+    let low = 0, high = 32_000;
+    const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
+    while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
+    expect(() => at(low + 1)).toThrow('The plan is too large to review in one prompt');
+    const most = Array.from({ length: 100 }, (_, index) => ({ round: 1, item: index % 2 ? 'P2' : 'P1', summary: `s${index}`, detail: 'd', check: null }));
+    for (const round of [2, 10]) {
+      const next = at(low, round, most.map(problem => ({ ...problem, round: round - 1 })));
+      expect(Buffer.byteLength(next.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
+      // What did not fit is named, whatever it is.
+      for (const part of next.leftOut) expect(next.prompt).toContain({ 'file change texts': 'The text of each file change did not fit here',
+        'issue description': 'The issue\'s description', lessons: 'The approved lessons did not fit here', 'issue comments': '1 comment' }[part]);
+      if (next.earlierListed < 100) expect(next.prompt).toContain(`problems the previous round found did not fit here.`);
+    }
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {
@@ -266,7 +260,7 @@ describe('review agent output (#201)', () => {
     expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Invalid API key' }), invocation)).toThrow('Claude could not review the plan items. Check its sign-in');
   });
 
-  it('refuses Codex and a missing token before any work, and runs the request\'s head read-only', () => {
+  it('refuses Codex and a missing token for credentials, and runs the request\'s head read-only', () => {
     expect(() => REVIEW_FEATURE.credential('codex', {})).toThrow(CODEX_REVIEW_REFUSED);
     expect(() => REVIEW_FEATURE.credential('claude', {})).toThrow('CLAUDE_CODE_OAUTH_TOKEN');
     expect(REVIEW_FEATURE.credential('claude', { CLAUDE_CODE_OAUTH_TOKEN: 't' })).toBe('t');

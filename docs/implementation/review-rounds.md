@@ -35,7 +35,7 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `plan` | The approved plan revision that ran. |
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
-| `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. Failed `cmd:` checks are not among them: the agent cannot run commands, and the next round runs the checks again. |
+| `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. `prepareReview` refuses them in round 1, and any from another round. Part 2 passes only the agent's problems: failed `cmd:` checks are left out, because the agent cannot run commands and the next round runs the checks again. |
 
 The template is `prompts/review.md`. Every input goes into an escaped JSON data block, filled in one pass, so inserted
 text is never read as a placeholder or as a closing tag. The prompt is at most `MAX_REVIEW_PROMPT_BYTES`: the review's
@@ -53,14 +53,15 @@ tried):
 4. the approved lessons;
 5. the issue's comments.
 
-codeboost's own note in the prompt names whatever was left out. `request.leftOut` lists the parts left out, and
-`request.earlierListed` counts the earlier problems listed. A note is left out only when the plan leaves no room even
-for it. So an answer is never refused for its size: any valid answer can be the next round's earlier
+codeboost's own note in the prompt names whatever was left out: the prompt always keeps room for every note, in its
+longest form. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
+Because that room and the longest round number are kept from round 1 on, every later round of the same plan, issue and
+lessons fits whenever round 1 did. So an answer is never refused for its size: any valid answer can be the next round's earlier
 problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
-would fit. A new plan revision starts again at round 1, with no earlier problems.
+would fit. Part 2 starts a new plan revision again at round 1, with no earlier problems.
 
-**Known limit.** A plan too large to fit even without its change texts (with the issue's number and title and the
-prompt's own text) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
+**Known limit.** A plan too large to fit even without its change texts (with the issue's number and title, the
+prompt's own text and the room for the notes) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
 characters). Part 2 then moves the task to needs human. Reviewing such a plan in batches of items is a follow-up.
 
 The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB

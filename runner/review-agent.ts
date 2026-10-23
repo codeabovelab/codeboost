@@ -18,7 +18,7 @@ const stopMessages: Record<StopReason, string> = {
 export function reviewOutput(result: InvocationResult, invocation: InvocationInput): string {
   // A review shares planning's turn limit (#163).
   return structuredOutput(result, invocation, { agent: 'review agent', stops: stopMessages, failed: 'Claude could not review the plan items.',
-    turnLimit: `The review stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Split the plan into smaller items, or review the task yourself.` });
+    turnLimit: `The review stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Run the round again, or review the task yourself.` });
 }
 
 /** Codex reads files only through its shell, and the review phase runs none (#93). */

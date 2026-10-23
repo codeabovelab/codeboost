@@ -312,7 +312,7 @@ Key rules for this flow, from the product design and the runner contract:
 - If a plan item needs another file, the task pauses in **needs amendment** until you approve a new plan revision.
 - Changes to package manifests or scripts the runner will run pause in **needs approval**.
 - Before opening a pull request, the already-fixed check runs. A match, or a check that cannot finish, opens nothing and moves the task to **possibly already fixed**. A task in needs human gets a draft pull request listing its open problems.
-- Review rounds (a read-only review agent, then fixes, at most 3 rounds) are designed but not yet run by the runner (#201). Part 1 built the review agent's prompt (`prompts/review.md`), its answer schema and validation (`core/review-prompt.ts`), and lane D's review command with that schema; see [review rounds](implementation/review-rounds.md).
+- Review rounds (a read-only review agent, then fixes, 3 rounds by default) are designed but not yet run by the runner (#201). Part 1 built the review agent's prompt (`prompts/review.md`), its answer schema and validation (`core/review-prompt.ts`), and lane D's review command with that schema; see [review rounds](implementation/review-rounds.md).
 
 ## State and lifecycles
 
