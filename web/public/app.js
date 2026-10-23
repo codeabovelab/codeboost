@@ -1003,11 +1003,12 @@ $("merge").onclick = async () => {
       return;
     }
     // The page follows a running job: a click needs `ready`, which excludes one, so a cancel's answer or a poll showed it
-    // while the click was on its way. It keeps following it, unless the refusal carries a later record of it that ended.
+    // while the click was on its way. It keeps following it, unless the refusal carries a later record that ended.
     const shown = data.merge?.job;
     if (shown?.state === "running") {
-      // A later record that ended (the job ended meanwhile) is presented, as the click's answer presents an ended job. One
-      // that ended `queued` or `submitted` is left to the poll, which follows its attempt: the refusal carries none.
+      // A later ended record (of that job, or of a newer job) is presented, as the click's answer presents an ended job;
+      // an older one is not. One that ended `queued` or `submitted` is left to the poll, which follows its attempt: the
+      // refusal carries none.
       if (error.job && error.job.state !== "running" && laterMergeJob(error.job, shown) && !followsOwnAttempt(error.job)) {
         const queue = data.merge.queue;
         data = withMergeJobObservation(data, error.job, queue);

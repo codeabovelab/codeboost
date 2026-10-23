@@ -2140,7 +2140,7 @@ for (const read of ['running','ended','own-attempt','blocked-own'] as const) tes
  if(read==='blocked-own')await expect(page.locator('#banner')).toHaveText(/Fix it, then Retry merge\./);
  else if(read!=='own-attempt')await expect(page.locator('#banner')).toHaveText(/^Merge stopped\./);
 });
-for (const carried of ['running','none','ended'] as const) test(`keeps following the running job a cancel answer showed when a merge click on its way is refused ${{running:'with it',none:'with no job',ended:'with a later record of it that ended, presented'}[carried]} (D16)`,async({page})=>{
+for (const carried of ['running','none','ended','older'] as const) test(`keeps following the running job a cancel answer showed when a merge click on its way is refused ${{running:'with it',none:'with no job',ended:'with a later record of it that ended, presented',older:'with an older job\'s ended record'}[carried]} (D16)`,async({page})=>{
  test.setTimeout(120_000);
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -2151,7 +2151,7 @@ for (const carried of ['running','none','ended'] as const) test(`keeps following
  // B: another tab's job, started while this page's click was on its way.
  const b=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e5',sequence:2,state:'running',step:'preparing',revision:2,steps:mergeSteps(['running'])});
  const bMerged=mergeJobRecord({id:b.id,sequence:2,state:'merged',step:null,revision:6,url:'https://github.com/owner/repo/pull/7',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','done'])});
- // Refused because B runs (with B's record), or for a reason that carries no job (the review changed).
+ // Refused because B runs (with B's record), or for a reason that carries no job or an older job (the review changed).
  const refusal=carried==='running'?'A merge is running for this task; wait for it to end, or cancel the merge or the task.':'The review changed after Merge PR was clicked. Refresh to see the change.';
  let clicks=0,stage:'a'|'a-ended'|'b'='a',holdPolls=false,releaseA!:()=>void,sawCancelA!:()=>void,releaseClickB!:()=>void,sawClickB!:()=>void,releasePolls!:()=>void;
  const heldA=new Promise<void>(resolve=>releaseA=resolve),cancelASent=new Promise<void>(resolve=>sawCancelA=resolve);
@@ -2162,7 +2162,8 @@ for (const carried of ['running','none','ended'] as const) test(`keeps following
   if(body.action!=='merge'){await route.continue();return;}
   const first=++clicks===1;if(!first)sawClickB();
   // The second click is refused, with B's record (the same one A's answer carried) or with no job.
-  if(!first){await heldClickB;await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify(carried==='none'?{error:refusal}:{error:refusal,job:carried==='ended'?bMerged:b})});return;}
+  // (Older: refused while A was still the task's latest job, so it carries A cancelled.)
+  if(!first){await heldClickB;await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify(carried==='none'?{error:refusal}:{error:refusal,job:carried==='ended'?bMerged:carried==='older'?aCancelled:b})});return;}
   const review=await clickReview(route);
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:a}),job:a})});});
  await page.route('**/api/merge',async route=>{if(holdPolls)await heldPolls;
