@@ -189,6 +189,9 @@ async function refresh() {
 function mergeFocusFallback() {
   return !$("merge").hidden && !$("merge").disabled ? $("merge") : $("reload");
 }
+// The merge state the runner header last saw, so a change (a merge submitted, queued, merged or failed, a merge job that
+// ended) reads the runner view again: a merge closes or blocks the task, and nothing else would show it (#200).
+let runnerMergeSeen = null;
 function renderMerge() {
   // Read before rendering: hiding the focused control itself blurs it at once (hiding its parent does so at the next
   // frame). A render that hides the focused merge control, its blockers button or Cancel moves focus to the fallback once
@@ -197,6 +200,9 @@ function renderMerge() {
   renderMergeControls();
   renderMergeSteps(focused);
   if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) mergeFocusFallback().focus();
+  const merge = data?.merge, seen = merge ? JSON.stringify([merge.queue?.state ?? null, merge.queue?.actionId ?? null, merge.job?.id ?? null, merge.job?.state ?? null]) : null;
+  if (runnerMergeSeen !== null && seen !== null && seen !== runnerMergeSeen) loadRunner();
+  runnerMergeSeen = seen;
 }
 function renderMergeControls() {
   const merge = data?.merge;

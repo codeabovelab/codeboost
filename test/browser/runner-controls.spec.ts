@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Request, type Route } from '@playwright/test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDemo } from '../../scripts/demo.ts';
@@ -8,6 +8,8 @@ import type { ReviewService } from '../../runner/review.ts';
 import type { RunnerDeps } from '../../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../../runner/execution.ts';
 import { approveItem } from '../../core/approvals.ts';
+import type { MergeGateway } from '../../github/merge.ts';
+import { fixtureGit } from '../fixtures/git.ts';
 import { openReview, refreshReview } from './review-page.ts';
 
 // Runner controls (#200) against a real server and runner. The runner's preparation always fails, so an admitted item
@@ -23,9 +25,13 @@ async function approvePlan(service: ReviewService) {
     view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
 }
 /** `prepare` decides when the item's preparation fails, so a test can hold an attempt in progress. */
-async function serve(options: { approve?: boolean; prepare?: () => Promise<never> } = {}) {
+async function serve(options: { approve?: boolean; prepare?: () => Promise<never>; mergeGateway?: MergeGateway } = {}) {
   root = mkdtempSync(join(tmpdir(), 'codeboost-runner-ui-'));
-  app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+  const demo = createDemo(join(root, 'demo'));
+  // A merge needs a review that is not a demo, with the demo's out-of-scope change undone (as review.spec.ts does).
+  const config = options.mergeGateway ? { ...demo, demo: false } : demo;
+  if (options.mergeGateway) { chmodSync(join(config.repository, 'run.sh'), 0o644); fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope'); }
+  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, undefined, undefined, undefined, async service => {
     if (options.approve !== false) await approvePlan(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: options.prepare ?? (async () => { throw new Error('no agent here'); }),
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
@@ -1177,4 +1183,27 @@ test('offers Cancel task during a merge submission and shows the server\'s refus
   await cancel.click(); await cancel.click();
   await expect(page.locator('#runner-note')).toContainText('✕ A merge is in progress. Cancel the task after it finishes or fails.');
   expect(app.service.store.getTask(app.service.config.identity).status).not.toBe('cancelled');
+});
+
+test('reads the runner state again after a merge, so the header shows the task merged', async ({ page }) => {
+  // GitHub as review.spec.ts's direct-merge tests answer it: an open, mergeable PR with an atomic base guard.
+  const gateway: MergeGateway = {
+    inspect: async () => { const snapshot = (await app.service.load()).snapshot; return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN',
+      mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false }; },
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+  };
+  await serve({ mergeGateway: gateway });
+  let view = await app.service.load();
+  for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous')) view = await app.service.act({ action: 'accept', key: segment.key, token: view.token });
+  for (const item of view.items) if (item.state !== 'approved') view = await app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review');
+  await expect(page.locator('#cancel-task')).toBeVisible();
+  page.on('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeVisible();
+  // Without a Refresh, the header follows the task to merged and offers no Cancel task.
+  await expect(status(page)).toHaveText('✓ Merged');
+  await expect(page.locator('#cancel-task')).toBeHidden();
+  expect(app.service.store.getTask(app.service.config.identity).status).toBe('merged');
 });
