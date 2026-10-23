@@ -617,6 +617,30 @@ footer button {
   font-size: 12px;
   min-height: 24px;
 }
+#task-status {
+  white-space: nowrap;
+}
+#cancel-task[data-confirm="true"] {
+  color: var(--error);
+  border-color: var(--error);
+}
+.task-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.task-banner p {
+  margin: 0;
+  margin-right: auto;
+  color: var(--warning);
+}
+#runner-note:not(:empty) {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
 #banner:not(:empty) {
   padding: 12px 16px;
   background: var(--surface);

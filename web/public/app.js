@@ -122,6 +122,7 @@ function showFailure(message, planStatusOwner) {
   $("merge-details").hidden = true;
   $("merge-steps-bar").hidden = true;
   if (mergeStepTimer) { clearInterval(mergeStepTimer); mergeStepTimer = null; }
+  renderRunner();
   $("message").disabled = true;
   $("save-note").disabled = true;
   $("previous").disabled = true;
@@ -163,6 +164,7 @@ async function refresh() {
     render();
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+    loadRunner();
   } catch (error) {
     if (generation !== reviewGeneration) return;
     rememberDraft();
@@ -633,6 +635,7 @@ async function act(command) {
     data = withNewerMergeObservations(updated, newer);
     render();
     showNewerMergeObservations(newer);
+    loadRunner();
     return true;
   } catch (error) {
     if (generation !== reviewGeneration) return false;
@@ -676,6 +679,7 @@ function render() {
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
   renderMerge();
+  renderRunner();
   $("banner").textContent = data.demo
     ? "Demo repository · real Git changes and local SQLite storage. No tests or AI review have been run for this demo."
     : "";
@@ -2222,6 +2226,7 @@ $("plans-refresh").onclick = async () => {
     render();
     showNewerMergeObservations(newer);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+    loadRunner();
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
     setPlanStatus(statusOwner, "bad", `✕ Could not refresh the current plan. ${error.message}`);
@@ -2246,6 +2251,271 @@ $("issues-refresh").onclick = () => loadIssues();
 $("issues-list").onclick = (event) => {
   const button = event.target.closest("button.issue-trust");
   if (button) changeIssueTrust(button);
+};
+// Runner controls (#200). The server decides every action: `GET /api/runner` says which ones it would admit now
+// (`startable`, `resumable`, `retryable`, `publish`, `continuation`), and the page offers only those.
+let runnerView = null,
+  // Every load, poll and action answer takes a generation; only the latest is applied (AGENTS.md).
+  runnerGeneration = 0,
+  runnerPollTimer = null,
+  runnerPollDelay = 2000,
+  // The action in flight, by kind; repeat activation is ignored while it is set.
+  runnerPending = null,
+  // Kept until a definite answer, so a resend after a 503, a lost response or an unknown outcome replays the same
+  // action instead of running it twice. Reused only for the identical request: the server hashes it under its action ID.
+  runnerKey = null,
+  // Whether the last applied view had work in progress, so the end of a run can be named once.
+  runnerWasActive = false,
+  cancelConfirmTimer = null;
+const runnerPollMaximumDelay = 30000;
+const runnerStatusMarks = {
+  queued: ["○", "Queued", "neutral"],
+  running: ["○", "Running", "neutral"],
+  "needs human": ["!", "Needs human", "warn"],
+  "needs amendment": ["!", "Needs amendment", "warn"],
+  "needs approval": ["!", "Needs approval", "warn"],
+  "possibly already fixed": ["!", "Possibly already fixed", "warn"],
+  "in review": ["○", "In review", "neutral"],
+  "approved but merge blocked": ["✕", "Merge blocked", "bad"],
+  merged: ["✓", "Merged", "good"],
+  cancelled: ["–", "Cancelled", "neutral"],
+};
+const runnerControlIds = ["attempt-stop", "attempt-retry", "run-action", "cancel-task", "task-banner-plans", "task-banner-approve"];
+/** The attempt the task is on while it has not settled; the only one Stop can name. */
+function liveAttempt(view) {
+  const attempt = view.attempts.find((entry) => entry.id === view.task.currentAttemptId);
+  return attempt && (attempt.state === "pending" || attempt.state === "running") ? attempt : null;
+}
+/** Work that is still moving on its own, so the page polls until it settles. */
+function runnerBusy(view) {
+  return !!view?.available && (!!liveAttempt(view) || view.publish.active || view.preMerge.active
+    || view.stopRequested !== null || view.unresolved !== null || view.task.cancelRequested !== null);
+}
+/** The header's one run action, in the order a person would take them; null when the server would admit none. */
+function runAction(view) {
+  if (view.resumable) return { action: "resume", label: "Resume" };
+  if (view.startable) return { action: "start", label: "Start" };
+  if (view.publish.publishable) return { action: "publish", label: view.publish.draft ? "Publish draft PR" : "Publish PR" };
+  if (view.publish.closable) return { action: "close-pull-requests", label: "Close pull requests" };
+  return null;
+}
+/** The continuation a person can approve now: a checkpoint whose revised plan validates and is not yet approved. */
+function approvableContinuation(view) {
+  const continuation = view.continuation;
+  return continuation && !continuation.approved && !continuation.reason
+    && ["needs amendment", "queued", "running"].includes(view.task.status) ? continuation : null;
+}
+function taskBannerText(view) {
+  const task = view.task, attempt = view.attempts.find((entry) => entry.id === task.currentAttemptId);
+  if (task.status === "needs amendment") {
+    const continuation = view.continuation;
+    if (!continuation) return "This task needs a plan change before it can continue.";
+    const paths = continuation.outOfScopePaths.join(", ");
+    const head = `${continuation.item} changed ${paths ? `files the plan did not declare: ${paths}` : "files the plan did not declare"}.`;
+    if (continuation.reason) return `${head} ${continuation.reason}`;
+    return continuation.approved ? `${head} The continuation is approved; resume the task.` : `${head} Revise the plan to declare them, then approve the continuation.`;
+  }
+  if (task.status === "needs human") {
+    const detail = attempt?.safetyFinding ?? (attempt?.state === "failed" ? attempt.diagnostic : null) ?? view.publish.last?.message;
+    return `This task needs a person.${detail ? ` ${String(detail).slice(0, 300)}` : ""}`;
+  }
+  if (task.status === "possibly already fixed")
+    return view.publish.last?.message ?? "The issue may already be fixed, so no pull request was opened.";
+  if (task.status === "needs approval") return "This task needs your approval before it continues.";
+  return "";
+}
+function setRunnerNote(text) {
+  $("runner-note").textContent = text;
+  $("runner-note").className = text ? statusClass(text) : "";
+}
+function disarmCancel() {
+  if (cancelConfirmTimer) clearTimeout(cancelConfirmTimer);
+  cancelConfirmTimer = null;
+  $("cancel-task").textContent = "Cancel task";
+  $("cancel-task").removeAttribute("data-confirm");
+}
+/**
+ * Shows the runner controls from the last applied view. Each control's visibility is decided once, and focus on a
+ * control this hides moves to Refresh after every control has its final state (AGENTS.md).
+ */
+function renderRunner() {
+  const focused = document.activeElement;
+  const view = runnerView?.available && data ? runnerView : null;
+  const shown = {};
+  for (const id of runnerControlIds) shown[id] = false;
+  if (view) {
+    const task = view.task, closed = task.status === "merged" || task.status === "cancelled";
+    const [mark, word, tone] = runnerStatusMarks[task.status] ?? ["○", task.status, "neutral"];
+    const live = liveAttempt(view);
+    const suffix = task.cancelRequested !== null ? " · Cancelling…"
+      : view.stopRequested !== null ? " · Stopping…"
+        : view.publish.active ? " · Publishing…"
+          : live ? ` · ${live.item ?? live.kind}` : "";
+    $("task-status").textContent = `${mark} ${word}${suffix}`;
+    $("task-status").className = tone;
+    $("task-status").setAttribute("aria-label", `Task: ${word}${suffix.replace(" · ", ", ")}`);
+    shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
+    if (live) $("attempt-stop").textContent = live.item ? `Stop ${live.item}` : "Stop attempt";
+    shown["attempt-retry"] = view.retryable;
+    const run = runAction(view);
+    shown["run-action"] = !!run;
+    if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
+    shown["cancel-task"] = !closed && task.cancelRequested === null;
+    if (!shown["cancel-task"]) disarmCancel();
+    const text = taskBannerText(view);
+    $("task-banner-text").textContent = text;
+    $("task-banner").hidden = !text;
+    shown["task-banner-plans"] = task.status === "needs amendment";
+    shown["task-banner-approve"] = !!approvableContinuation(view);
+  } else {
+    $("task-banner").hidden = true;
+    disarmCancel();
+  }
+  $("task-status").hidden = !view;
+  for (const id of runnerControlIds) {
+    $(id).hidden = !shown[id];
+    // Marked, never disabled, while an action is in flight, so the focused control keeps focus (AGENTS.md).
+    if (runnerPending) $(id).setAttribute("aria-disabled", "true");
+    else $(id).removeAttribute("aria-disabled");
+  }
+  if (runnerControlIds.includes(focused?.id) && focused.hidden) $("reload").focus();
+}
+function scheduleRunnerPoll() {
+  if (runnerPollTimer) clearTimeout(runnerPollTimer);
+  runnerPollTimer = null;
+  if (!runnerBusy(runnerView) || runnerPending) return;
+  const generation = runnerGeneration;
+  runnerPollTimer = setTimeout(() => loadRunner({ generation, poll: true }), runnerPollDelay);
+}
+/** Applies a view the server sent: from a load, a poll or an action's answer. */
+function applyRunnerView(view) {
+  const wasActive = runnerWasActive;
+  runnerView = view;
+  runnerWasActive = runnerBusy(view);
+  // A run that ended changed the task's code; the review shows it only after a reload, which would erase the person's
+  // selection and input if the page did it on its own.
+  if (wasActive && !runnerWasActive && view.available) {
+    const last = view.attempts.find((attempt) => attempt.id === view.task.currentAttemptId);
+    const ended = last ? `${last.item ?? last.kind} ${last.state}. ` : "";
+    setRunnerNote(`${last?.state === "failed" ? "✕ " : ""}${ended}The task is now ${view.task.status}. Refresh to review its latest changes.`);
+  }
+  renderRunner();
+}
+async function loadRunner({ poll = false, generation = poll ? runnerGeneration : undefined } = {}) {
+  // An action in flight answers with the view after it; a read now could be answered before it commits and, being
+  // newer, would drop that answer and leave the page on the state before the action.
+  if (runnerPending || (poll && generation !== runnerGeneration)) return;
+  generation ??= ++runnerGeneration;
+  runnerPollTimer = null;
+  try {
+    const view = await api("/api/runner");
+    if (generation !== runnerGeneration) return;
+    const before = JSON.stringify(runnerView);
+    applyRunnerView(view);
+    // Unchanged work in progress backs off; any change polls quickly again.
+    runnerPollDelay = poll && before === JSON.stringify(view) ? Math.min(runnerPollDelay * 2, runnerPollMaximumDelay) : 2000;
+  } catch (error) {
+    if (generation !== runnerGeneration) return;
+    setRunnerNote(`✕ Could not read the runner state. ${error.message}`);
+    runnerPollDelay = Math.min(runnerPollDelay * 2, runnerPollMaximumDelay);
+  }
+  scheduleRunnerPoll();
+}
+function runnerOutcomeText(action, result) {
+  switch (action) {
+    case "start":
+    case "resume":
+      return result.outcome === "started" ? `✓ Running ${result.item}.` : "✓ The task's owed work has settled; nothing new started.";
+    case "approve-continuation":
+      return `✓ Continuation approved.${result.next ? ` Resume the task to run ${result.next}.` : ""}`;
+    case "cancel-task":
+      return result.outcome === "stopping" ? "Cancelling: the running work is stopping." : "✓ Task cancelled.";
+    case "publish":
+      return result.draft ? "Publishing a draft pull request…" : "Publishing the pull request…";
+    case "close-pull-requests":
+      return "Closing the task's pull requests…";
+    case "cancel-attempt":
+      return "Stopping the item…";
+    case "retry":
+      return "✓ Retrying the attempt.";
+    default:
+      return "";
+  }
+}
+/**
+ * Sends one runner action with the versions the person saw: the task's from the runner view, the review's from the
+ * review on screen. A definite answer (applied, refused, or an upstream failure the server saved) ends its key.
+ */
+async function sendRunnerAction(action, attemptId = null) {
+  if (runnerPending || !runnerView?.available || !data) return;
+  const request = { action, expectedStateVersion: runnerView.stateVersion,
+    ...(["start", "resume", "approve-continuation"].includes(action) ? { expectedReviewVersion: data.expected.reviewVersion } : {}),
+    ...(attemptId ? { attemptId } : {}) };
+  const same = runnerKey && JSON.stringify(runnerKey.request) === JSON.stringify(request);
+  if (!same) runnerKey = { request, actionId: crypto.randomUUID() };
+  const key = runnerKey;
+  runnerPending = { action };
+  const generation = ++runnerGeneration;
+  if (runnerPollTimer) clearTimeout(runnerPollTimer);
+  runnerPollTimer = null;
+  disarmCancel();
+  setRunnerNote("");
+  renderRunner();
+  try {
+    const answer = await api("/api/runner", { ...key.request, actionId: key.actionId });
+    if (runnerKey === key) runnerKey = null;
+    runnerPending = null;
+    runnerPollDelay = 2000;
+    if (generation === runnerGeneration) applyRunnerView(answer.runner);
+    setRunnerNote(runnerOutcomeText(action, answer.result));
+  } catch (error) {
+    // No status (the response was lost), a 503 or an unknown outcome decided nothing the page can see: keep the key.
+    const definite = error.status !== undefined && error.status !== 503 && !error.outcomeUnknown;
+    if (definite && runnerKey === key) runnerKey = null;
+    runnerPending = null;
+    setRunnerNote(`✕ ${error.message}${definite ? "" : " Try again to resend the same request."}`);
+    // A refusal often means the view was stale; read the current one.
+    if (generation === runnerGeneration) {
+      renderRunner();
+      await loadRunner();
+      return;
+    }
+  }
+  renderRunner();
+  scheduleRunnerPoll();
+}
+$("run-action").onclick = () => {
+  if (runnerPending || !runnerView) return;
+  const run = runAction(runnerView);
+  if (run) sendRunnerAction(run.action);
+};
+$("attempt-stop").onclick = () => {
+  if (runnerPending || !runnerView) return;
+  const live = liveAttempt(runnerView);
+  if (live) sendRunnerAction("cancel-attempt", live.id);
+};
+$("attempt-retry").onclick = () => {
+  if (runnerPending || !runnerView?.retryable) return;
+  sendRunnerAction("retry", runnerView.task.currentAttemptId);
+};
+$("task-banner-approve").onclick = () => {
+  if (runnerPending || !runnerView || !approvableContinuation(runnerView)) return;
+  sendRunnerAction("approve-continuation");
+};
+$("task-banner-plans").onclick = () => showView("plans");
+// Cancel closes the task and its pull requests and cannot be undone: the first press asks, a second within 5 s sends.
+$("cancel-task").onclick = () => {
+  if (runnerPending || !runnerView) return;
+  if ($("cancel-task").dataset.confirm !== "true") {
+    $("cancel-task").dataset.confirm = "true";
+    $("cancel-task").textContent = "Confirm cancel";
+    const ask = "! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.";
+    setRunnerNote(ask);
+    // Clears only its own question: a later note (a poll's run end, an answer) stays.
+    cancelConfirmTimer = setTimeout(() => { disarmCancel(); if ($("runner-note").textContent === ask) setRunnerNote(""); }, 5000);
+    return;
+  }
+  sendRunnerAction("cancel-task");
 };
 const initialView = new URLSearchParams(location.search).get("view");
 showView(["issues", "plans"].includes(initialView) ? initialView : "review");
