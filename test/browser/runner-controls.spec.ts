@@ -15,6 +15,8 @@ import { openReview, refreshReview } from './review-page.ts';
 type App = Awaited<ReturnType<typeof startServer>>;
 let root: string, app: App;
 const OWNER = 'd'.repeat(32);
+// What the server stores in `task.cancelRequested`: the cancel's action ID (runner/store.ts cancelTask).
+const CANCEL_ACTION = '3f2b6c1d-4e5a-4b7c-9d8e-0f1a2b3c4d5e';
 async function approvePlan(service: ReviewService) {
   const view = await service.load();
   service.store.saveReview(service.config.identity, view.expected,
@@ -265,15 +267,21 @@ test('offers Publish draft PR when the server would publish, and shows the serve
 test('offers Retry for a retryable attempt and sends its attempt ID', async ({ page }) => {
   await serve();
   const posts = runnerPosts(page);
-  const attemptId = '0b6e2f0a-3c4d-4e5f-8a9b-0c1d2e3f4a5b';
-  await viewWith(page, view => { view.retryable = true; view.task.currentAttemptId = attemptId; });
+  // A running task whose current attempt failed. The server offers a retry only for a non-execute attempt, which this
+  // runner never makes, so `retryable` is set here; every other field is the real view after P1 failed.
+  let offerRetry = false;
+  await viewWith(page, view => { if (offerRetry) { view.retryable = true; view.resumable = false; } });
   await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  offerRetry = true;
+  await refreshReview(page);
   await page.getByRole('button', { name: 'Retry', exact: true }).click();
-  await expect.poll(() => posts.length).toBe(1);
-  expect(posts[0]).toMatchObject({ action: 'retry', attemptId });
-  await expect(page.locator('#runner-note')).toContainText('✕');
+  await expect.poll(() => posts.length).toBe(2);
+  expect(posts[1]).toMatchObject({ action: 'retry', attemptId: app.service.store.getTask(app.service.config.identity).currentAttemptId });
+  // The real server refuses: a plan item runs again by resuming.
+  await expect(page.locator('#runner-note')).toContainText('A plan item is run again by resuming the task');
 });
-
 test('shows the needs-amendment banner, approves the continuation, and opens the Plans screen', async ({ page }) => {
   await serve();
   const posts = runnerPosts(page);
@@ -365,7 +373,8 @@ test('the review strip fits its runner controls at the 1280px minimum width', as
   await page.setViewportSize({ width: 1280, height: 800 });
   // The most controls the strip shows at once: status, Retry, a run action and Cancel task (Stop and Retry are never
   // offered together: the server offers a retry only when no attempt is active).
-  await viewWith(page, view => { view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true }; });
+  // Shapes only: the page reads `retryable` and the publish flags to choose what to show, nothing else from them here.
+  await viewWith(page, view => { view.task.status = 'running'; view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true }; });
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
   // This server has no merge gateway, so the merge controls a production task also shows are unhidden here with their
@@ -455,7 +464,7 @@ test('a task being cancelled offers no continuation approval', async ({ page }) 
   await viewWith(page, view => {
     view.startable = false;
     view.task.status = 'needs amendment';
-    view.task.cancelRequested = 'cancelled';
+    view.task.cancelRequested = CANCEL_ACTION;
     view.continuation = { checkpointId: 'c1', item: 'P2', completedItems: ['P1'], outOfScopePaths: ['src/config.ts'], next: 'P2', approved: false };
   });
   await openReview(page, app.url);
@@ -511,7 +520,7 @@ test('shows a runner that needs a restart, and does not poll for it', async ({ p
   await page.clock.install();
   let gets = 0;
   page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
-  await viewWith(page, view => { view.startable = false; view.unresolved = { attemptId: 'a1', reason: 'storage-not-removed' }; });
+  await viewWith(page, view => { view.startable = false; view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'storage-not-removed' }; });
   await openReview(page, app.url);
   await expect(status(page)).toHaveText("○ In review · Needs restart: an attempt's task storage could not be removed");
   await expect(status(page)).toHaveClass('bad');
@@ -648,7 +657,7 @@ test('offers Cancel task again for a cancel held by an unread push, and bounds i
   // again settles it.
   await viewWith(page, view => {
     view.startable = false;
-    view.task.cancelRequested = 'cancelled';
+    view.task.cancelRequested = CANCEL_ACTION;
     view.task.pushInProgress = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', branch: 'codeboost/3-retries', from: 'a'.repeat(40),
       to: 'b'.repeat(40), snapshotId: 's1', startedAt: 1_760_000_000_000 };
   });
@@ -682,7 +691,7 @@ test('offers Cancel task again for a cancel held by an unread push, and bounds i
 test('a cancel that an unresolved marker holds offers no Cancel task', async ({ page }) => {
   await serve();
   // The attempt row stays pending under the marker, so the server refuses a second cancel (runner/store.ts cancelTask).
-  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = 'cancelled';
+  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = CANCEL_ACTION;
     view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'result-not-saved' }; });
   await openReview(page, app.url);
   await expect(status(page)).toContainText('Needs restart');
@@ -990,13 +999,13 @@ test('a resent cancel held by a push says the push is being checked', async ({ p
   await serve();
   const marker = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', branch: 'codeboost/3-retries', from: 'a'.repeat(40),
     to: 'b'.repeat(40), snapshotId: 's1', startedAt: 1_760_000_000_000 };
-  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = 'cancelled'; view.task.pushInProgress = marker; });
+  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = CANCEL_ACTION; view.task.pushInProgress = marker; });
   // The server's answer to that cancel (web/server.ts cancel-task with a push marker): `stopping`, and its runner view
   // with the marker still set while the branch is read again.
   await page.route('**/api/runner', async route => {
     if (route.request().method() !== 'POST') { await route.fallback(); return; }
     const view = await serverRunnerView(route);
-    view.startable = false; view.task.cancelRequested = 'cancelled'; view.task.pushInProgress = marker;
+    view.startable = false; view.task.cancelRequested = CANCEL_ACTION; view.task.pushInProgress = marker;
     await route.fulfill({ status: 200, json: { result: { outcome: 'stopping' }, runner: view } });
   });
   await openReview(page, app.url);
@@ -1056,4 +1065,96 @@ test('a replayed publish answer that carries the settled record names it once', 
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Publish PR', exact: true }).click();
   await expect(page.locator('#runner-note')).toHaveText('✕ The task belongs to another repository.');
+});
+
+test('offers Close pull requests for a cancelled task whose close is owed, and sends it', async ({ page }) => {
+  await serve();
+  const posts = runnerPosts(page);
+  // A cancelled task whose pull requests did not close (runner/publishing.ts mode() answers `close`).
+  await viewWith(page, view => { view.startable = false; view.task.status = 'cancelled';
+    view.publish = { ...view.publish, available: true, closable: true,
+      last: { outcome: 'failed', draft: false, action: 'close', message: 'GitHub refused to close pull request #7.', stateVersion: 1, at: '2026-10-23T12:05:00.000Z' } }; });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('– Cancelled');
+  await page.getByRole('button', { name: 'Close pull requests', exact: true }).click();
+  await expect.poll(() => posts.length).toBe(1);
+  expect(posts[0]).toMatchObject({ action: 'close-pull-requests' });
+  expect(posts[0]).not.toHaveProperty('expectedReviewVersion');
+  // This demo server has no publisher, so it refuses.
+  await expect(page.locator('#runner-note')).toHaveText('✕ Demos never publish pull requests.');
+});
+
+test('names an expired time budget in the needs-human banner, before an older failure', async ({ page }) => {
+  await serve();
+  let needsHuman = false;
+  // After P1 failed, a spent budget moved the idle task to needs human without a new attempt (runner/store.ts
+  // startAttempt): the current attempt is still P1's failed one.
+  await viewWith(page, view => { if (needsHuman) { view.task.status = 'needs human'; view.task.budgetDeadline = Date.now() - 1_000; view.resumable = false; } });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  needsHuman = true;
+  await refreshReview(page);
+  await expect(page.locator('#task-banner-text')).toHaveText("! This task needs a person. The task's time budget ran out.");
+});
+
+test('names a failed attempt\'s diagnostic in the needs-human banner', async ({ page }) => {
+  await serve();
+  let needsHuman = false;
+  await viewWith(page, view => { if (needsHuman) { view.task.status = 'needs human'; view.resumable = false; } });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const diagnostic = app.service.store.recentAttempts(app.service.config.identity, 1)[0]!.diagnostic;
+  expect(diagnostic).toBeTruthy();
+  needsHuman = true;
+  await refreshReview(page);
+  await expect(page.locator('#task-banner-text')).toHaveText(`! This task needs a person. ${diagnostic!.slice(0, 300)}`);
+});
+
+test('shows the needs-approval banner and an approved continuation\'s text', async ({ page }) => {
+  await serve();
+  let state: 'needs approval' | 'approved' = 'needs approval';
+  await viewWith(page, view => {
+    view.startable = false;
+    if (state === 'needs approval') view.task.status = 'needs approval';
+    else { view.task.status = 'needs amendment';
+      view.continuation = { checkpointId: 'c1', item: 'P2', completedItems: ['P1'], outOfScopePaths: ['src/config.ts'], next: 'P2', approved: true }; }
+  });
+  await openReview(page, app.url);
+  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs your approval before it continues.');
+  state = 'approved';
+  await refreshReview(page);
+  await expect(page.locator('#task-banner-text')).toHaveText('! P2 changed files the plan did not declare: src/config.ts. The continuation is approved; resume the task.');
+  await expect(page.locator('#task-banner-approve')).toBeHidden();
+});
+
+test('shows a stop whose reason is not saved yet', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  let stopping = false;
+  // The coordinator's status while the stop's reason write has not succeeded (runner/coordinator.ts status()).
+  await viewWith(page, view => { if (stopping) view.stopRequested = { attemptId: view.task.currentAttemptId, reason: 'cancelled', saved: false }; });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  stopping = true;
+  await refreshReview(page);
+  await expect(status(page)).toHaveText('● Running · Stopping (not saved yet)');
+  await expect(page.locator('#attempt-stop')).toBeHidden();
+  fail();
+});
+
+test('hides Cancel task while a merge is being submitted', async ({ page }) => {
+  await serve();
+  // The review's merge status while GitHub is asked to merge (runner/merge.ts): the page reads only `queue.state` here.
+  await page.route('**/api/review', async route => {
+    const response = await fetch(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const review = await response.json() as Record<string, any>;
+    review.merge = { ...(review.merge ?? {}), available: false, queue: { state: 'submitting' } };
+    await route.fulfill({ status: response.status, json: review });
+  });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review');
+  await expect(page.locator('#cancel-task')).toBeHidden();
 });

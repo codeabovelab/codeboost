@@ -2260,8 +2260,10 @@ $("issues-list").onclick = (event) => {
   const button = event.target.closest("button.issue-trust");
   if (button) changeIssueTrust(button);
 };
-// Runner controls (#200). The server decides every action: `GET /api/runner` says which ones it would admit now
-// (`startable`, `resumable`, `retryable`, `publish`, `continuation`), and the page offers only those.
+// Runner controls (#200). The server decides every action. The run actions, Retry and Approve continuation follow the
+// flags `GET /api/runner` sets when it would admit them (`startable`, `resumable`, `retryable`, `publish`,
+// `continuation`). Stop and Cancel task have no flag: the page offers them from the task's state, and the server may
+// still refuse them.
 let runnerView = null,
   // Every load, poll and action answer takes a generation; only the latest is applied (AGENTS.md).
   runnerGeneration = 0,
@@ -2378,7 +2380,10 @@ function taskBannerText(view) {
   }
   if (task.status === "needs amendment") return "! This task needs a plan change before it can continue.";
   if (task.status === "needs human") {
-    const detail = attempt?.firstReason === "time-limit" ? "The task's time budget ran out."
+    // A budget that ran out moves an idle task here without a new attempt (runner/store.ts startAttempt), so the current
+    // attempt may be an older failure; the budget comes first.
+    const budgetSpent = (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) || attempt?.firstReason === "time-limit";
+    const detail = budgetSpent ? "The task's time budget ran out."
       : (attempt?.state === "failed" ? attempt.diagnostic : null) ?? view.publish.last?.message;
     return `! This task needs a person.${detail ? ` ${String(detail).slice(0, 300)}` : ""}`;
   }
@@ -2453,8 +2458,10 @@ function renderRunner() {
     const run = runAction(view);
     shown["run-action"] = !!run;
     if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
-    // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles.
-    shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
+    // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles. Not
+    // while a merge is being submitted or sits in GitHub's queue: the server refuses a cancel then (runner/store.ts).
+    const mergeSubmitted = ["submitting", "queued"].includes(data?.merge?.queue?.state);
+    shown["cancel-task"] = !closed && !mergeSubmitted && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
     $("task-banner-text").textContent = text;
