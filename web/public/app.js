@@ -570,11 +570,11 @@ function withEndedJobQueue(view, job, queue) {
   }
   return ["submitting", "queued"].includes(queue.state) ? { ...view, merge: { ...view.merge, queue } } : withMergeQueue(view, queue);
 }
-/** Whether `queue` is the merge attempt a job that ended `queued` left in GitHub's queue (its action ID is the job's `mergeActionId`). */
 /** Whether an ended job follows its own merge attempt: it left the attempt with GitHub (queued, or an unknown outcome). */
 function followsOwnAttempt(job) {
   return job?.state === "queued" || job?.state === "submitted";
 }
+/** Whether `queue` is the merge attempt a job that ended `queued` or `submitted` left with GitHub (its action ID is the job's `mergeActionId`). */
 function isEndedJobQueue(job, queue) {
   return followsOwnAttempt(job) && Boolean(queue?.actionId) && queue.actionId === job.mergeActionId;
 }
@@ -1003,11 +1003,12 @@ $("merge").onclick = async () => {
       return;
     }
     // The page follows a running job: a click needs `ready`, which excludes one, so a cancel's answer or a poll showed it
-    // while the click was on its way. It keeps following it, whatever job (if any) the refusal carries.
+    // while the click was on its way. It keeps following it, unless the refusal carries a later record of it that ended.
     const shown = data.merge?.job;
     if (shown?.state === "running") {
-      // A later record that ended (the job ended meanwhile) is presented, as the click's answer presents an ended job.
-      if (error.job && error.job.state !== "running" && laterMergeJob(error.job, shown)) {
+      // A later record that ended (the job ended meanwhile) is presented, as the click's answer presents an ended job. One
+      // that ended `queued` or `submitted` is left to the poll, which follows its attempt: the refusal carries none.
+      if (error.job && error.job.state !== "running" && laterMergeJob(error.job, shown) && !followsOwnAttempt(error.job)) {
         const queue = data.merge.queue;
         data = withMergeJobObservation(data, error.job, queue);
         render();
