@@ -13,9 +13,9 @@
       "maximum": 10
     },
     "problems": {
-      "description": "Every problem this round found. An empty list means the round found nothing.",
+      "description": "Every problem this round found, at most 10: the most important first. An empty list means the round found nothing.",
       "type": "array",
-      "maxItems": 20,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -25,7 +25,7 @@
             "description": "The plan items whose code must change to fix this problem. codeboost files one copy of the problem against each.",
             "type": "array",
             "minItems": 1,
-            "maxItems": 30,
+            "maxItems": 10,
             "items": { "type": "string", "pattern": "^P[1-9][0-9]{0,2}$" }
           },
           "summary": {

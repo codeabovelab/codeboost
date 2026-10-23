@@ -3,7 +3,7 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import { identityKey, type PlanIdentity } from './identity.ts';
 import { parseV1 } from './parse-v1.ts';
 import type { Plan } from './plan.ts';
-import { dataJSON } from './planning-author.ts';
+import { DataTooLarge, dataJSON } from './planning-author.ts';
 
 /** The largest round number a review answer can carry; the round limit (#201) is at most this. */
 export const MAX_REVIEW_ROUNDS = 10;
@@ -51,8 +51,8 @@ export interface ReviewRequest {
   /** What else did not fit and was left out, with a note in the prompt saying so. */
   readonly leftOut: readonly ReviewLeftOut[];
 }
-/** The parts of a review prompt that are left out, in this order, when it would not fit its budget. */
-export type ReviewLeftOut = 'issue comments' | 'issue description' | 'lessons' | 'file change texts';
+/** The parts of a review prompt that can be left out when it would not fit its budget (see prepareReview). */
+export type ReviewLeftOut = 'file change texts' | 'issue description' | 'lessons' | 'issue comments';
 /** One problem filed against one plan item. A problem the agent named several items for becomes one per item. */
 export interface ReviewProblem { item: string; summary: string; detail: string; check: string | null }
 export interface PreparedReview {
@@ -77,61 +77,67 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   if (input.round === 1 && input.earlierProblems.length) throw new Error('Round 1 has no earlier problems.');
   for (const problem of input.earlierProblems)
     if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
-  // What the prompt gives up, in this order, when it does not fit its budget: earlier problems first (they are a hint;
-  // the agent checks every item anyway), then the issue's comments, its description, the lessons, and the plan's file
-  // change texts. The plan's items, intents, files and checks always go in: without them there is nothing to review.
-  // codeboost's own note says what was left out. Only a plan too large without its change texts is refused.
-  const issueData = (comments: boolean, body: boolean) => dataJSON({ number: input.issue.number, title: input.issue.title,
-    body: body ? input.issue.body : '', comments: comments ? input.issue.comments : [] }, 'Issue data');
-  const planData = (changes: boolean) => dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head,
-    items: changes ? plan.items : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) },
-  'Plan data', MAX_REVIEW_PROMPT_BYTES);
-  const tiers: { leftOut: ReviewLeftOut[]; slots: () => Record<string, string> }[] = [
-    { leftOut: [], slots: () => ({ plan_data_json: planData(true), issue_data_json: issueData(true, true), lessons_data_json: dataJSON(input.approvedLessons, 'Lessons') }) },
-    { leftOut: ['issue comments'], slots: () => ({ plan_data_json: planData(true), issue_data_json: issueData(false, true), lessons_data_json: dataJSON(input.approvedLessons, 'Lessons') }) },
-    { leftOut: ['issue comments', 'issue description'], slots: () => ({ plan_data_json: planData(true), issue_data_json: issueData(false, false), lessons_data_json: dataJSON(input.approvedLessons, 'Lessons') }) },
-    { leftOut: ['issue comments', 'issue description', 'lessons'], slots: () => ({ plan_data_json: planData(true), issue_data_json: issueData(false, false), lessons_data_json: dataJSON([], 'Lessons') }) },
-    { leftOut: ['issue comments', 'issue description', 'lessons', 'file change texts'], slots: () => ({ plan_data_json: planData(false), issue_data_json: issueData(false, false), lessons_data_json: dataJSON([], 'Lessons') }) },
-  ];
-  const notes = (leftOut: readonly ReviewLeftOut[]) => ({
-    issue_left_out: leftOut.includes('issue description') ? `\n\nThe issue's description${input.issue.comments.length ? ' and comments' : ''} did not fit here, so ${input.issue.comments.length ? 'they are' : 'it is'} left out. The plan says what the issue asks.`
-      : leftOut.includes('issue comments') && input.issue.comments.length ? `\n\nThe issue's ${input.issue.comments.length} comment${input.issue.comments.length === 1 ? '' : 's'} did not fit here, so ${input.issue.comments.length === 1 ? 'it is' : 'they are'} left out.` : '',
-    lessons_left_out: leftOut.includes('lessons') && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
-    plan_left_out: leftOut.includes('file change texts') ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
-  });
+  // The plan's items, intents, files and checks always go in: without them there is nothing to review. The rest goes in
+  // while it fits, in this order: the file change texts, the earlier problems (as many as fit, in order: a hint, as the
+  // agent checks every item anyway), the issue's description, the lessons, the issue's comments. What is left out is
+  // named in codeboost's own note.
   const total = input.earlierProblems.length;
-  const fill = (values: Record<string, string>, listed: number, note: boolean) => {
-    const earlier = input.earlierProblems.slice(0, listed).map(({ round, item, summary, detail, check }) => ({ round, item, summary, detail, check }));
-    const left = total - listed;
-    const all: Record<string, string> = { ...values, round: String(input.round), earlier_problems_json: dataJSON(earlier, 'Earlier problems'),
-      earlier_left_out: note && left ? `\n\n${listed ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '' };
-    return template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => listed ? block : '')
+  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean };
+  const changeTexts = plan.items.some(item => item.files.some(file => file.change));
+  const issueNote = (description: boolean, comments: number) => {
+    const what = [description ? 'description' : '', comments ? `${comments} comment${comments === 1 ? '' : 's'}` : ''].filter(Boolean);
+    return what.length ? `\n\nThe issue's ${what.join(' and ')} did not fit here, so ${what.length > 1 || comments > 1 ? 'they are' : 'it is'} left out.` : '';
+  };
+  const render = (parts: Parts): string | null => {
+    const left = total - parts.earlier, comments = input.issue.comments.length;
+    const values: Record<string, string> = {
+      round: String(input.round),
+      plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
+        : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
+      plan_left_out: !parts.changes && changeTexts ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
+      issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: parts.description ? input.issue.body : '',
+        comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
+      issue_left_out: issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments),
+      lessons_data_json: dataJSON(parts.lessons ? input.approvedLessons : [], 'Lessons'),
+      lessons_left_out: !parts.lessons && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
+      earlier_problems_json: dataJSON(input.earlierProblems.slice(0, parts.earlier).map(({ round, item, summary, detail, check }) =>
+        ({ round, item, summary, detail, check })), 'Earlier problems'),
+      earlier_left_out: left ? `\n\n${parts.earlier ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '',
+    };
+    const prompt = template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => parts.earlier ? block : '')
       // One pass over the trusted template only: inserted data is never interpreted again.
       .replace(/\{\{([a-z_]+)\}\}/gu, (_, key: string) => {
-        if (!(key in all)) throw new Error(`Unknown template slot ${key}.`);
-        return all[key]!;
+        if (!(key in values)) throw new Error(`Unknown template slot ${key}.`);
+        return values[key]!;
       });
+    return Buffer.byteLength(prompt, 'utf8') <= MAX_REVIEW_PROMPT_BYTES ? prompt : null;
   };
-  const fits = (prompt: string) => Buffer.byteLength(prompt, 'utf8') <= MAX_REVIEW_PROMPT_BYTES;
-  let chosen: { prompt: string; listed: number; leftOut: ReviewLeftOut[] } | undefined, refusal: unknown;
-  for (const tier of tiers) {
-    let values: Record<string, string>;
-    try { values = { ...tier.slots(), ...notes(tier.leftOut) }; } catch (error) { refusal = error; continue; } // a block over its limit
-    const attempt = (listed: number, note: boolean) => { try { const prompt = fill(values, listed, note); return fits(prompt) ? prompt : null; } catch { return null; } };
-    // Every earlier problem, or as many as fit with the note (one more always adds more than the note's count shrinks),
-    // or none with the note, or none at all.
-    let prompt = total ? attempt(total, false) : null, listed = total;
-    if (prompt === null && total) {
+  // Only a size refusal means "does not fit"; any other refusal (text a data block cannot hold) is the input's fault.
+  const sized = (parts: Parts) => { try { return render(parts); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
+  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
+  if (sized(parts) === null)
+    throw new Error(`The plan is too large to review in one prompt: its items, intents, files and checks alone take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+  const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
+  keep({ ...parts, changes: true });
+  if (total) {
+    if (sized({ ...parts, earlier: total }) !== null) parts = { ...parts, earlier: total };
+    else {
+      // With the note, each more problem listed adds more than the note's count shrinks, so this is monotonic.
       let low = 0, high = total - 1;
-      while (low < high) { const mid = Math.ceil((low + high) / 2); if (attempt(mid, true) !== null) low = mid; else high = mid - 1; }
-      prompt = attempt(low, true); listed = low;
+      while (low < high) { const mid = Math.ceil((low + high) / 2); if (sized({ ...parts, earlier: mid }) !== null) low = mid; else high = mid - 1; }
+      parts = { ...parts, earlier: low };
     }
-    if (prompt === null) { prompt = attempt(0, false); listed = 0; }
-    if (prompt !== null) { chosen = { prompt, listed, leftOut: tier.leftOut }; break; }
-    refusal = new Error(`The review prompt exceeds ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   }
-  if (!chosen) throw new Error(`${refusal instanceof Error ? refusal.message : String(refusal)} The plan is too large to review even without its file change texts, the issue and the lessons.`);
-  const { prompt, listed: low, leftOut } = chosen;
+  keep({ ...parts, description: true });
+  keep({ ...parts, lessons: true });
+  keep({ ...parts, comments: true });
+  const prompt = sized(parts)!, low = parts.earlier;
+  const leftOut: ReviewLeftOut[] = [
+    ...(!parts.changes && changeTexts ? ['file change texts' as const] : []),
+    ...(!parts.description && input.issue.body ? ['issue description' as const] : []),
+    ...(!parts.lessons && input.approvedLessons.length ? ['lessons' as const] : []),
+    ...(!parts.comments && input.issue.comments.length ? ['issue comments' as const] : []),
+  ];
   const { repositoryId, taskId, planId } = input.identity;
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,

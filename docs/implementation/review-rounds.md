@@ -42,19 +42,26 @@ text is never read as a placeholder or as a closing tag. The prompt is at most `
 64 KiB model budget less its schema. The plan block may use all of it; the issue, lessons and earlier-problems blocks are
 at most 32 KiB each.
 
-When the prompt would not fit, it leaves things out, in this order, and codeboost's own note in the prompt says what:
+The plan's items, intents, files and checks always go in: without them there is nothing to review. The rest goes in
+while it fits, in this order:
 
-1. earlier problems, from the last (the prompt lists as many as fit, in order: `request.earlierListed`; they are a
-   hint, and the agent checks every item anyway);
-2. the issue's comments;
+1. the text of each file change in the plan;
+2. the previous round's problems, as many as fit, in order (`request.earlierListed`): they are a hint, and the agent
+   checks every item anyway;
 3. the issue's description;
 4. the approved lessons;
-5. the text of each file change in the plan (paths, kinds, intents and checks stay).
+5. the issue's comments.
 
-The plan's items, intents, files and checks always go in: without them there is nothing to review. Only a plan too large
-even without its change texts is refused. So an answer is never refused for its size: any valid answer can be the next
-round's earlier problems. `request.leftOut` lists what else was left out. A new plan revision starts again at round 1,
-with no earlier problems.
+codeboost's own note in the prompt names whatever was left out, and `request.leftOut` lists it. So an answer is never
+refused for its size: any valid answer can be the next round's earlier problems. A new plan revision starts again at
+round 1, with no earlier problems.
+
+**Known limit.** A plan whose items, intents, files and checks alone take more than the budget cannot be reviewed in one
+prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
+characters). Part 2 then moves the task to needs human. Reviewing such a plan in batches of items is a follow-up.
+
+The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB
+limit for one argument.
 
 ### The answer
 
@@ -62,9 +69,10 @@ The answer schema is `prompts/review-answer.schema.json`. Lane D mounts it as th
 text to Claude as `--json-schema` ([agent isolation](agent-isolation.md), "Review answers"). The answer is one object:
 
 - `round`: the round number from the request;
-- `problems`: at most 20, each with `items` (the plan item IDs whose code must change, at most 30, as a plan has),
-  `summary` (300 characters), `detail` (1,500 characters), and `check` (the exact text of the `check:` entry it fails,
-  or null).
+- `problems`: at most 10 (the prompt asks for the 10 that matter most), each with `items` (at most 10 plan item IDs
+  whose code must change), `summary` (300 characters), `detail` (1,500 characters), and `check` (the exact text of the
+  `check:` entry it fails, or null). So one round files at most 100 problems, one per item named; part 2 runs one fix
+  for each, within the task's time limit.
 
 `validate` refuses an answer that:
 

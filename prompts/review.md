@@ -53,5 +53,6 @@ The block below lists the problems the previous round found in the code. codeboo
 3. **Give evidence.** In `detail`, name the file and line, and say why it is wrong, so that someone can fix it without asking you.
 4. **Name the items to fix.** In `items`, list every plan item whose declared files must change to fix the problem. Use only the item IDs in the plan. If a fix needs a file no item declares, name the item whose intent it belongs to and say so in `detail`.
 5. **Name the check.** If the problem fails a `check` entry, copy that entry's text exactly into `check`. Otherwise set `check` to null.
-6. **Nothing found is an answer.** If every item does what it says, return an empty `problems` list.
-7. **Plain words.** Short sentences. No marketing language.
+6. **At most 10 problems.** If you find more, report the 10 that matter most; the next round reviews the code again.
+7. **Nothing found is an answer.** If every item does what it says, return an empty `problems` list.
+8. **Plain words.** Short sentences. No marketing language.

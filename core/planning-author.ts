@@ -46,10 +46,12 @@ export interface PreparedAuthor<T> {
 function integer(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive safe integer.`);
 }
+/** A data block or one of its strings is over its size limit; any other refusal is a plain Error. */
+export class DataTooLarge extends Error {}
 function boundedText(value: string, label: string, limit = MAX_PROMPT_BYTES): string {
   if (typeof value !== 'string' || value.includes('\0') || !value.isWellFormed())
     throw new Error(`${label} must be valid text without NUL.`);
-  if (Buffer.byteLength(value, 'utf8') > limit) throw new Error(`${label} exceeds ${limit === MAX_PROMPT_BYTES ? '32 KiB' : `${limit} bytes`}.`);
+  if (Buffer.byteLength(value, 'utf8') > limit) throw new DataTooLarge(`${label} exceeds ${limit === MAX_PROMPT_BYTES ? '32 KiB' : `${limit} bytes`}.`);
   return value;
 }
 /** Bound each field and the aggregate before serialization; never truncate source data.
@@ -57,7 +59,7 @@ function boundedText(value: string, label: string, limit = MAX_PROMPT_BYTES): st
  * 32 KiB; the whole block at most `limit` bytes (32 KiB unless a prompt with a larger budget asks for more). */
 export function dataJSON(value: unknown, label: string, limit = MAX_PROMPT_BYTES): string {
   let bytes = 0;
-  const over = () => new Error(`${label} exceeds ${limit === MAX_PROMPT_BYTES ? '32 KiB' : `${limit} bytes`}.`);
+  const over = () => new DataTooLarge(`${label} exceeds ${limit === MAX_PROMPT_BYTES ? '32 KiB' : `${limit} bytes`}.`);
   function check(item: unknown, depth: number): void {
     if (depth > 50) throw new Error(`${label} is too deep.`);
     if (typeof item === 'string') bytes += Buffer.byteLength(boundedText(item, label));
