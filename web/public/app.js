@@ -340,6 +340,13 @@ async function pollMergeQueue(generation) {
       return;
     }
     const queue = update.queue;
+    // An ended job the page shows keeps its outcome against a poll that read it, or an older job, before it ended (one
+    // already on its way when a click's answer showed it end): only its own queue attempt (a job that ended `queued`) is
+    // followed.
+    if (shownJob && shownJob.state !== "running" && !isEndedJobQueue(shownJob, queue)) {
+      renderMerge();
+      return;
+    }
     mergeObservationGeneration++;
     data = withMergeQueue(data, queue);
     showMergeQueueStatus(queue);
@@ -980,6 +987,14 @@ $("merge").onclick = async () => {
       data = withMergeJobObservation(data, error.job);
       render();
       $("banner").textContent = `${error.message} ${mergeJobText(error.job)}`;
+      return;
+    }
+    // The page already follows that running job, or a later one (a cancel's answer or a poll showed it while the click
+    // was on its way): it keeps following it.
+    const shown = data.merge?.job;
+    if (error.job?.state === "running" && shown?.state === "running" && !laterMergeJob(error.job, shown)) {
+      render();
+      $("banner").textContent = `${error.message} ${mergeJobText(shown)}`;
       return;
     }
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
