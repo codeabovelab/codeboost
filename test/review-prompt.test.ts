@@ -195,7 +195,8 @@ describe('review prompt (#201)', () => {
     expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
     // Only a plan too large without its change texts is refused.
     const huge = checksPadded(big, 70_000);
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, and with room kept for the notes a later round may need, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge, round: 2 })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // The earlier problems go in before the issue's description: with room for only one of them, the problems win.
     const some = Array.from({ length: 19 }, (_, index) => ({ round: 1, item: 'P1', summary: `p${index}`, detail: 'd'.repeat(1500), check: null }));
     const first = build({ round: 2, earlierProblems: some, issue: issue(31 * 1024, 0) });
@@ -225,7 +226,7 @@ describe('review prompt (#201)', () => {
     let low = 0, high = 70_000;
     const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
     while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
-    expect(() => at(low + 1)).toThrow('The plan is too large to review in one prompt');
+    expect(() => at(low + 1)).toThrow('and with room kept for the notes a later round may need, the prompt takes more than');
     const most = Array.from({ length: 100 }, (_, index) => ({ round: 1, item: index % 2 ? 'P2' : 'P1', summary: `s${index}`, detail: 'd', check: null }));
     for (const round of [2, 10]) {
       const next = at(low, round, most.map(problem => ({ ...problem, round: round - 1 })));

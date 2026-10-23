@@ -136,7 +136,8 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // the reserve is room kept for it, not a reason to refuse it. Every prompt is at most this size until a part goes in.
   let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
   if (sized(parts, input.round === 1) === null)
-    throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems${
+      input.round === 1 ? ', and with room kept for the notes a later round may need,' : ','} the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
   keep({ ...parts, changes: true });
   if (total) {
