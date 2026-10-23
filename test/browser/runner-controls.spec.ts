@@ -129,7 +129,7 @@ test('resends the same action ID after a 503 or a lost response, and uses a new 
   for (let click = 0; click < 3; click++) {
     await start.click();
     await expect.poll(() => keys.length).toBe(click + 1);
-    await expect(page.locator('#runner-note')).toContainText('resend the same request');
+    await expect(page.locator('#runner-note')).toContainText('resend the same request, unless the task has changed meanwhile');
   }
   await start.click();
   await expect.poll(() => keys.length).toBe(4);
@@ -749,5 +749,46 @@ test('clears the quiet note when a later read shows a change', async ({ page }) 
   offerNothing = false;
   await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
   await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await expect(note).toHaveText('');
+});
+
+test('a background note that arrives while the cancel question is shown waits behind it until the question goes', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  let failRead = false;
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() === 'GET' && failRead) { failRead = false; await route.fulfill({ status: 500, json: { error: 'Storage failed.' } }); return; }
+    await route.continue();
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  const note = page.locator('#runner-note'), cancel = page.locator('#cancel-task');
+  await cancel.click();
+  await expect(note).toContainText('Press Confirm cancel');
+  // The next poll (2 s after Start's answer) fails while the question is shown.
+  failRead = true;
+  const reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  // The question and its button stay; the read error waits behind it and shows when the confirmation lapses.
+  expect(await note.textContent()).toContain('Press Confirm cancel');
+  await expect(cancel).toHaveText('Confirm cancel');
+  await page.clock.runFor(3_100);
+  await expect(cancel).toHaveText('Cancel task');
+  await expect(note).toHaveText('✕ Could not read the runner state. Storage failed.');
+  fail();
+});
+
+test('the Plans screen refresh clears a note that asked for Refresh', async ({ page }) => {
+  await serve();
+  await viewWith(page, view => { view.reviewVersion += 1; });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  const note = page.locator('#runner-note');
+  await expect(note).toHaveText('! The review changed since this page loaded it. Press Refresh, check the review, then try again.');
+  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
+  await expect(page.locator('#plans-status')).toContainText('is current');
   await expect(note).toHaveText('');
 });

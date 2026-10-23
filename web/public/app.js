@@ -2228,6 +2228,8 @@ $("plans-refresh").onclick = async () => {
     render();
     showNewerMergeObservations(newer);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+    // As Refresh: the review now shows what ended work changed, and is current.
+    clearRunnerNotes(["work-ended", "needs-refresh", "quiet"]);
     loadRunner();
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
@@ -2380,6 +2382,18 @@ function setRunnerNote(text, kind = null) {
   $("runner-note").textContent = text;
   $("runner-note").className = text ? statusClass(text) : "";
 }
+/**
+ * Shows a note from background work (a read, a poll, a run that ended). While the cancel confirmation's question is
+ * shown, the note becomes the one the question puts back when it goes, so the question stays and the note is not lost.
+ */
+function postRunnerNote(text, kind) {
+  if (runnerNoteKind === "cancel-ask") cancelEarlierNote = text ? { text, kind } : null;
+  else setRunnerNote(text, kind);
+}
+/** The note shown, or the one the cancel confirmation's question holds while it is shown. */
+function currentRunnerNote() {
+  return runnerNoteKind === "cancel-ask" ? cancelEarlierNote : $("runner-note").textContent ? { text: $("runner-note").textContent, kind: runnerNoteKind } : null;
+}
 /** Clears a note of one of `kinds`, also the one the cancel confirmation's question is holding to put back. */
 function clearRunnerNotes(kinds) {
   if (kinds.includes(runnerNoteKind)) setRunnerNote("");
@@ -2456,7 +2470,8 @@ function scheduleRunnerPoll() {
       ? "! Nothing has changed for a minute. Press Cancel task again to retry the cancel, or Refresh to check again."
       : "! Nothing has changed for a minute. Press Refresh to check again.";
     // Kept after a note about work that ended, which names what to review.
-    setRunnerNote(runnerNoteKind === "work-ended" ? `${$("runner-note").textContent} ${quiet}` : quiet, "quiet");
+    const shown = currentRunnerNote();
+    postRunnerNote(shown?.kind === "work-ended" ? `${shown.text} ${quiet}` : quiet, "quiet");
     return;
   }
   const generation = runnerGeneration;
@@ -2484,7 +2499,7 @@ function applyRunnerView(view) {
   const before = runnerView?.available ? runnerView : null;
   runnerView = view;
   const ended = view.available ? endedWorkNote(before, view) : "";
-  if (ended) setRunnerNote(ended, "work-ended");
+  if (ended) postRunnerNote(ended, "work-ended");
   else clearRunnerNotes(runnerWorking(view) || JSON.stringify(before) !== JSON.stringify(view) ? ["read-error", "quiet"] : ["read-error"]);
   renderRunner();
 }
@@ -2506,7 +2521,7 @@ async function loadRunner({ poll = false, generation = poll ? runnerGeneration :
     runnerPollDelay = poll && before === JSON.stringify(view) ? Math.min(runnerPollDelay * 2, runnerPollMaximumDelay) : 2000;
   } catch (error) {
     if (generation !== runnerGeneration) return;
-    setRunnerNote(`✕ Could not read the runner state. ${error.message}`, "read-error");
+    postRunnerNote(`✕ Could not read the runner state. ${error.message}`, "read-error");
     runnerPollDelay = Math.min(runnerPollDelay * 2, runnerPollMaximumDelay);
   } finally {
     // Counts every settled read, applied or dropped, so a check can prove the page handled one (AGENTS.md).
@@ -2578,7 +2593,7 @@ async function sendRunnerAction(action, attemptId = null) {
     // The server's stale-state refusals say "Reload before writing."; on this screen that is Refresh.
     const stale = error.message.includes("Reload before writing.");
     const message = error.message.replace("Reload before writing.", "Press Refresh to load the latest state.");
-    setRunnerNote(`✕ ${message}${definite ? "" : " Try again to resend the same request."}`, stale ? "needs-refresh" : null);
+    setRunnerNote(`✕ ${message}${definite ? "" : " Press it again to resend the same request, unless the task has changed meanwhile."}`, stale ? "needs-refresh" : null);
     // A refusal often means the view was stale; read the current one.
     if (generation === runnerGeneration) {
       renderRunner();
