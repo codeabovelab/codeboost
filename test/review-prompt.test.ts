@@ -208,12 +208,20 @@ describe('review prompt (#201)', () => {
     expect(() => build({ issue: { number: 412, title: '', body: undefined as unknown as string, comments: [] } })).toThrow('Issue data is not JSON data.');
   });
 
-  it('builds every later round of the largest plan the first round accepted, with its notes', () => {
+  it.each([
+    ['a description, a lesson and a comment', { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }, { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }],
+    // Round 1 keeps room for a description written and a lesson approved before a later round.
+    ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(40_000), comments: [], lessons: ['l'.repeat(40_000)] }],
+    // A later round is not refused for the reserve: comments added before it change only the note's count.
+    ['none, and later ten comments', { body: '', comments: [], lessons: [] }, { body: '', comments: Array.from({ length: 10 }, () => 'c'.repeat(4000)), lessons: [] }],
+  ])('builds every later round of the largest plan the first round accepted, with its notes (round 1 with %s)', (_, first, later) => {
     // Round 1 at the largest plan it accepts; rounds 2 and 10, with the most problems a round can give, still fit.
     const plan = input().plan;
-    const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => prepareReview(input({ round, earlierProblems,
-      issue: { number: 412, title: '', body: 'b'.repeat(500), comments: ['c'] }, approvedLessons: ['l'],
-      plan: checksPadded(plan, pad) })).request;
+    const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => {
+      const { body, comments, lessons } = round === 1 ? first : later;
+      return prepareReview(input({ round, earlierProblems, issue: { number: 412, title: '', body, comments }, approvedLessons: lessons,
+        plan: checksPadded(plan, pad) })).request;
+    };
     let low = 0, high = 70_000;
     const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
     while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
@@ -224,7 +232,7 @@ describe('review prompt (#201)', () => {
       expect(Buffer.byteLength(next.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
       // What did not fit is named, whatever it is.
       for (const part of next.leftOut) expect(next.prompt).toContain({ 'file change texts': 'The text of each file change did not fit here',
-        'issue description': 'The issue\'s description', lessons: 'The approved lessons did not fit here', 'issue comments': '1 comment' }[part]);
+        'issue description': 'The issue\'s description', lessons: 'The approved lessons did not fit here', 'issue comments': `${later.comments.length} comment` }[part]);
       if (next.earlierListed < 100) expect(next.prompt).toContain(`problems the previous round found did not fit here.`);
     }
   });

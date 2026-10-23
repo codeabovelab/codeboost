@@ -131,11 +131,11 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // Only a size refusal means "does not fit"; any other refusal (data that is not JSON text, a template slot) is a bug.
   const sized = (parts: Parts, reserve = false) => { try { return render(parts, reserve); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
   // The smallest prompt: the plan without its change texts, the issue's number and title, the prompt's own text and the
-  // note for each part left out, with the round number and the earlier-problems note at their longest. The next round
-  // of the same plan therefore fits whenever this one does, unless the issue's title or its number of comments changed
-  // in between. Every later prompt is at most this size until a part goes in.
+  // note for each part left out. Round 1 checks it with the reserve, so every later round of the same plan fits unless
+  // the issue's title or its number of comments changed in between. A later round checks only its own smallest prompt:
+  // the reserve is room kept for it, not a reason to refuse it. Every prompt is at most this size until a part goes in.
   let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
-  if (sized(parts, true) === null)
+  if (sized(parts, input.round === 1) === null)
     throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
   keep({ ...parts, changes: true });
