@@ -30,7 +30,7 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); seen.decode = undefined; });
 const envelope = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"prose","structured_output":{"round":1,"problems":[]}}');
 
-it.each([['planning', '{"round":1,"problems":[]}'], ['review', '{"round":1,"problems":[]}'], ['questions', 'prose'], ['execute', 'prose']] as const)(
+it.each([['planning', '{"round":1,"problems":[]}'], ['review', '{"round":1,"problems":[]}'], ['questions', 'prose'], ['execute', 'prose'], ['fix', 'prose']] as const)(
   'the %s start call decodes its answer from the right member', async (phase: Phase, text) => {
     const input = mkdtempSync(join(tmpdir(), 'codeboost-decode-')); dirs.push(input);
     writeFileSync(join(input, 'schema.json'), '{"type":"object"}');

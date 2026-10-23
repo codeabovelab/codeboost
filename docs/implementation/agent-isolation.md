@@ -95,8 +95,8 @@ Use only these entry points to run an agent:
      the start call reads `schema.json` (the review answer schema, `prompts/review-answer.schema.json`), passes it as
      `--json-schema`, and returns `structured_output` as JSON text. The command refuses a Claude review without a
      schema or with approved argv (Claude has no tool that runs them), and a questions, execute or fix command with a
-     schema. A review has planning's model budget below: the same 64 KiB input check (its error names the review) and
-     `--max-turns 50`. The review keeps planning's read-only tools
+     schema. A review has planning's model budget below: the same 64 KiB input check (its error names the review and
+     says to build the request with `prepareReview`, which keeps it within the budget) and `--max-turns 50`. The review keeps planning's read-only tools
      (`Read,Glob,Grep`) and `plan` permission mode. Command checks still run in the review phase with the `runner`
      vendor and no schema flag.
    - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory

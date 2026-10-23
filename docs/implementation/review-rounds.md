@@ -53,10 +53,10 @@ tried):
 4. the approved lessons;
 5. the issue's comments.
 
-codeboost's own note in the prompt names whatever was left out: the prompt always keeps room for every note, in its
-longest form. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
-Because that room and the longest round number are kept from round 1 on, every later round of the same plan, issue and
-lessons fits whenever round 1 did. (An issue whose title or number of comments changed between rounds may not.) So an answer is never refused for its size: any valid answer can be the next round's earlier
+codeboost's own note in the prompt names whatever was left out: the smallest prompt the budget must hold includes every
+note, with the earlier-problems note for the most problems a round can give. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
+Because that room and the longest round number are kept from round 1 on, and the other notes are the same in every
+round, every later round of the same plan, issue and lessons fits whenever round 1 did. (An issue whose title or number of comments changed between rounds may not.) So an answer is never refused for its size: any valid answer can be the next round's earlier
 problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
 would fit. Part 2 starts a new plan revision again at round 1, with no earlier problems.
 

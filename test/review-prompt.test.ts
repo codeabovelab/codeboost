@@ -167,6 +167,8 @@ describe('review prompt (#201)', () => {
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
     expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
     expect(() => build({ round: 2, earlierProblems: [{ round: 1, item: 'P1', summary: '\ud800', detail: 'd', check: null }] })).toThrow('Earlier problems must be valid text');
+    // Nor is a runner bug: data that is not JSON text is refused, not left out.
+    expect(() => build({ issue: { number: 412, title: '', body: undefined as unknown as string, comments: [] } })).toThrow('Issue data is not JSON data.');
   });
 
   it('builds every later round of the largest plan the first round accepted, with its notes', () => {
