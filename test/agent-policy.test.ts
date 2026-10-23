@@ -31,7 +31,8 @@ describe('agent phase policy', () => {
   });
 
   it('review dispatches only one exact approved argv without granting a shell tool', () => {
-    const captured = request('review', 'claude', [['npm', 'test']]), policy = createPhasePolicy(captured), execute = vi.fn(argv => argv.join(' '));
+    // Command checks are the review phase's only commands, run with the runner vendor (#201).
+    const captured = request('review', 'runner'), policy = createPhasePolicy(captured), execute = vi.fn(argv => argv.join(' '));
     expect(policy.tools).toEqual(['read', 'list', 'search', 'runner-command']);
     expect(dispatchApprovedCommand(policy, ['npm', 'test'], execute)).toBe('npm test');
     expect(execute).toHaveBeenCalledWith(['npm', 'test']);
@@ -142,6 +143,9 @@ describe('agent phase policy', () => {
       expect(() => createClaudeCommand(planning(), 'Plan.', schema)).toThrow('Planning schema');
     // A review's schema is checked the same way, and named as the review's.
     expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', '{"type":"array"}')).toThrow('Review schema must be a JSON object schema');
+    // The execute launcher's plain-text schema is refused for a review too.
+    expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n'))
+      .toThrow('Review schema must be a JSON object schema');
     const oversized = `{"description":"${'x'.repeat(MAX_COMMAND_SCHEMA_BYTES)}"}`;
     expect(() => createClaudeCommand(planning(), 'Plan.', oversized)).toThrow('limit');
   });

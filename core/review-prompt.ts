@@ -85,7 +85,8 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // agent checks every item anyway), the issue's description, the lessons, the issue's comments. What is left out is
   // named in codeboost's own note.
   const total = input.earlierProblems.length;
-  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean; notes: boolean };
+  type Note = 'earlier' | 'changes' | 'issue' | 'lessons';
+  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean; notes: ReadonlySet<Note> };
   const changeTexts = plan.items.some(item => item.files.some(file => file.change));
   const issueNote = (description: boolean, comments: number) => {
     const what = [description ? 'description' : '', comments ? `${comments} comment${comments === 1 ? '' : 's'}` : ''].filter(Boolean);
@@ -97,15 +98,15 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       round: String(input.round),
       plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
         : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
-      plan_left_out: parts.notes && !parts.changes && changeTexts ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
+      plan_left_out: parts.notes.has('changes') && !parts.changes && changeTexts ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
       issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: parts.description ? input.issue.body : '',
         comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
-      issue_left_out: parts.notes ? issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments) : '',
+      issue_left_out: parts.notes.has('issue') ? issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments) : '',
       lessons_data_json: dataJSON(parts.lessons ? input.approvedLessons : [], 'Lessons'),
-      lessons_left_out: parts.notes && !parts.lessons && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
+      lessons_left_out: parts.notes.has('lessons') && !parts.lessons && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
       earlier_problems_json: dataJSON(input.earlierProblems.slice(0, parts.earlier).map(({ round, item, summary, detail, check }) =>
         ({ round, item, summary, detail, check })), 'Earlier problems'),
-      earlier_left_out: parts.notes && left ? `\n\n${parts.earlier ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '',
+      earlier_left_out: parts.notes.has('earlier') && left ? `\n\n${parts.earlier ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '',
     };
     const prompt = template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => parts.earlier ? block : '')
       // One pass over the trusted template only: inserted data is never interpreted again.
@@ -117,13 +118,17 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   };
   // Only a size refusal means "does not fit"; any other refusal (text a data block cannot hold) is the input's fault.
   const sized = (parts: Parts) => { try { return render(parts); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
-  // The smallest prompt: the plan's items, intents, files and checks and the prompt's own text. Then codeboost's notes
-  // about what is left out, which go in unless the plan alone leaves no room even for them.
-  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false, notes: false };
+  // The smallest prompt: the plan without its change texts, the issue's number and title, and the prompt's own text.
+  // Then codeboost's notes about what may be left out: all of them, or, if the plan leaves no room for all, each that
+  // fits, earlier problems' first. A part that goes in later drops its note's text; nothing goes out unannounced
+  // unless its note found no room here.
+  const allNotes: readonly Note[] = ['earlier', 'changes', 'issue', 'lessons'];
+  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false, notes: new Set() };
   if (sized(parts) === null)
-    throw new Error(`The plan is too large to review in one prompt: its items, intents, files and checks, with the prompt's own text, take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's text and the lessons, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
-  keep({ ...parts, notes: true });
+  if (sized({ ...parts, notes: new Set(allNotes) }) !== null) parts = { ...parts, notes: new Set(allNotes) };
+  else for (const note of allNotes) keep({ ...parts, notes: new Set([...parts.notes, note]) });
   keep({ ...parts, changes: true });
   if (total) {
     if (sized({ ...parts, earlier: total }) !== null) parts = { ...parts, earlier: total };
@@ -137,6 +142,8 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   keep({ ...parts, description: true });
   keep({ ...parts, lessons: true });
   keep({ ...parts, comments: true });
+  // A part that went in may have made room for a note that did not fit before.
+  for (const note of allNotes) if (!parts.notes.has(note)) keep({ ...parts, notes: new Set([...parts.notes, note]) });
   const prompt = sized(parts)!, listed = parts.earlier;
   const leftOut: ReviewLeftOut[] = [
     ...(!parts.changes && changeTexts ? ['file change texts' as const] : []),

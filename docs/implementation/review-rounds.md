@@ -54,13 +54,13 @@ tried):
 5. the issue's comments.
 
 codeboost's own note in the prompt names whatever was left out. `request.leftOut` lists the parts left out, and
-`request.earlierListed` counts the earlier problems listed. Only when the plan alone leaves no room even for those notes
-are they left out too. So an answer is never refused for its size: any valid answer can be the next round's earlier
+`request.earlierListed` counts the earlier problems listed. A note is left out only when the plan leaves no room even
+for it. So an answer is never refused for its size: any valid answer can be the next round's earlier
 problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
 would fit. A new plan revision starts again at round 1, with no earlier problems.
 
-**Known limit.** A plan whose items, intents, files and checks alone take more than the budget cannot be reviewed in one
-prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
+**Known limit.** A plan too large to fit even without its change texts (with the issue's number and title and the
+prompt's own text) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
 characters). Part 2 then moves the task to needs human. Reviewing such a plan in batches of items is a follow-up.
 
 The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB
@@ -108,8 +108,9 @@ launcher must mount the review answer schema: the execute launcher's plain-text 
 
 ### Recorded output
 
-`scripts/record-review.ts` records two real Claude answers on a fixed finished task (`test/fixtures/review/recording-inputs.ts`):
-round 1, and round 2 with round 1's problem listed as earlier. The task's second plan item has a planted defect (its
+`scripts/record-review.ts` records two real Claude answers on a fixed finished task
+(`test/fixtures/review/recording-inputs.ts`): round 1, and round 2 with a hand-written earlier problem
+(`REVIEW_RECORDING_EARLIER`) like the one round 1 should find. The task's second plan item has a planted defect (its
 test calls `label(3)` once). To record, run this with your own token and Docker:
 
 ```bash

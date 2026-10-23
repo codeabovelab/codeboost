@@ -153,18 +153,29 @@ describe('review prompt (#201)', () => {
     expect(changes.prompt).toContain('"path":"f39.ts"');
     expect(changes.prompt).toContain('b'.repeat(5000));
     expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
+    // A note that fits is kept even where not every note would: 18 bytes from the budget, with the change texts in, the
+    // description's note is there, though it and the change texts' note together would not have fitted the plan alone.
+    const tight = { ...big, items: big.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: 'x' })) })) };
+    const fit = (pad: number) => prepareReview(input({ plan: { ...tight, summary: 's'.repeat(30_000), items: tight.items.map((item, index) =>
+      index ? item : { ...item, intent: 'i'.repeat(pad) }) }, issue: issue(33 * 1024, 0) })).request;
+    const roomy = fit(0);
+    expect(roomy.prompt).toContain('The issue\'s description did not fit here, so it is left out.');
+    const near = fit(MAX_REVIEW_PROMPT_BYTES - 18 - Buffer.byteLength(roomy.prompt));
+    expect(Buffer.byteLength(near.prompt)).toBe(MAX_REVIEW_PROMPT_BYTES - 18);
+    expect(near.leftOut).toEqual(['issue description']);
+    expect(near.prompt).toContain('The issue\'s description did not fit here, so it is left out.');
     // Only a plan too large without its change texts is refused.
     const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
       acceptance: Array.from({ length: 10 }, (_, check) => ({ type: 'check' as const, text: `${check}${'a'.repeat(399)}` })),
       files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: its items, intents, files and checks, with the prompt's own text, take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's text and the lessons, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
     expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
     expect(() => build({ round: 2, earlierProblems: [{ round: 1, item: 'P1', summary: '\ud800', detail: 'd', check: null }] })).toThrow('Earlier problems must be valid text');
   });
 
-  it('builds the next round from the largest plan the first round accepted, dropping its notes only if nothing else fits', () => {
+  it('builds the next round from the largest plan the first round accepted, keeping the notes that fit', () => {
     // Round 1 at exactly the budget, with nothing left out; round 2 adds one problem, which needs at least a note.
     const plan = input().plan;
     const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => prepareReview(input({ round, earlierProblems,
@@ -174,10 +185,11 @@ describe('review prompt (#201)', () => {
     const first = at(pad);
     expect([Buffer.byteLength(first.prompt), first.leftOut]).toEqual([MAX_REVIEW_PROMPT_BYTES, []]);
     const second = at(pad, 2, [{ round: 1, item: 'P2', summary: 'Still wrong.', detail: 'd', check: null }]);
-    expect(second.earlierListed).toBe(0);
     expect(Buffer.byteLength(second.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
-    // There was room for neither the problem nor its note: the rest of the plan's text gave way first (none was left).
-    expect(second.prompt).not.toContain('did not fit here');
+    // The plan's change texts and the problem do not both fit: the problem's note goes in first, then as much as fits.
+    expect(second.earlierListed).toBe(0);
+    expect(second.prompt).toContain('The 1 problem the previous round found did not fit here.');
+    expect(second.leftOut).toEqual(['file change texts']);
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {

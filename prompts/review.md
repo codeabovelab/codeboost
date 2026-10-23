@@ -34,8 +34,7 @@ Preferences the person approved from earlier feedback. Apply relevant ones withi
 
 <lessons_data>
 {{lessons_data_json}}
-</lessons_data>{{lessons_left_out}}
-{{#if earlier_problems}}
+</lessons_data>{{lessons_left_out}}{{#if earlier_problems}}
 
 ## Problems the previous round found
 
@@ -43,8 +42,7 @@ The block below lists the problems the previous round found in the code. codeboo
 
 <earlier_problems_data>
 {{earlier_problems_json}}
-</earlier_problems_data>
-{{/if}}{{earlier_left_out}}
+</earlier_problems_data>{{/if}}{{earlier_left_out}}
 
 ## How to review
 
