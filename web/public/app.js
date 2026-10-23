@@ -341,11 +341,16 @@ async function pollMergeQueue(generation) {
     }
     const queue = update.queue;
     // An ended job the page shows keeps its outcome against a poll that read it, or an older job, before it ended (one
-    // already on its way when a click's answer showed it end): only its own queue attempt (a job that ended `queued`) is
-    // followed.
-    if (shownJob && shownJob.state !== "running" && !isEndedJobQueue(shownJob, queue)) {
-      renderMerge();
-      return;
+    // already on its way when a click's answer showed it end), and against an answer that is not about its own merge
+    // attempt. Its own attempt (by its merge action ID: a job that ended `queued` or `submitted`) is still followed.
+    if (shownJob && shownJob.state !== "running") {
+      const readEarlier = !!job && laterMergeJob(shownJob, job);
+      const ownAttempt = !!queue?.actionId && queue.actionId === shownJob.mergeActionId;
+      if (readEarlier || !ownAttempt) {
+        backOffMergePoll();
+        renderMerge();
+        return;
+      }
     }
     mergeObservationGeneration++;
     data = withMergeQueue(data, queue);
@@ -989,10 +994,10 @@ $("merge").onclick = async () => {
       $("banner").textContent = `${error.message} ${mergeJobText(error.job)}`;
       return;
     }
-    // The page already follows that running job, or a later one (a cancel's answer or a poll showed it while the click
-    // was on its way): it keeps following it.
+    // The page follows a running job: a click needs `ready`, which excludes one, so a cancel's answer or a poll showed it
+    // while the click was on its way. It keeps following it, whatever job (if any) the refusal carries.
     const shown = data.merge?.job;
-    if (error.job?.state === "running" && shown?.state === "running" && !laterMergeJob(error.job, shown)) {
+    if (shown?.state === "running") {
       render();
       $("banner").textContent = `${error.message} ${mergeJobText(shown)}`;
       return;
