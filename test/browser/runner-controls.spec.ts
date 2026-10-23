@@ -1004,3 +1004,54 @@ test('a resent cancel held by a push says the push is being checked', async ({ p
   await cancel.click(); await cancel.click();
   await expect(page.locator('#runner-note')).toHaveText("Cancelling: checking the outcome of the task's last push.");
 });
+
+test('a Publish press after a lost answer and a settled publish is a new action, and its outcome shows once', async ({ page }) => {
+  await serve();
+  const posts = runnerPosts(page);
+  let settled = false, lost = true;
+  const failed = { outcome: 'failed', draft: false, message: 'The task belongs to another repository.', stateVersion: 1, at: '2026-10-23T12:05:00.000Z' };
+  // The publish offered; once the lost request's job has settled `failed`, it is offered again (a failure leaves the
+  // publish owed, runner/publishing.ts) with the same task state version.
+  await viewWith(page, view => {
+    view.startable = false;
+    view.publish = { ...view.publish, available: true, publishable: true, draft: false, last: settled ? failed
+      : { outcome: 'not published', draft: false, message: 'This task reached its status before publishing existed.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } };
+  });
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST' || !lost) { await route.fallback(); return; }
+    lost = false; settled = true;
+    await route.abort('failed');
+  });
+  await openReview(page, app.url);
+  const publish = page.getByRole('button', { name: 'Publish PR', exact: true }), note = page.locator('#runner-note');
+  await publish.click();
+  // The lost answer's follow-up read shows the job settled.
+  await expect(note).toContainText('✕ The task belongs to another repository.');
+  await publish.click();
+  await expect.poll(() => posts.length).toBe(2);
+  expect(posts[1]!.actionId).not.toBe(posts[0]!.actionId);
+  // The demo server refuses the new publish; the failure from the first job shows once.
+  await expect(note).toHaveText('✕ The task belongs to another repository. ✕ Demos never publish pull requests.');
+});
+
+test('a replayed publish answer that carries the settled record names it once', async ({ page }) => {
+  await serve();
+  const failed = { outcome: 'failed', draft: false, message: 'The task belongs to another repository.', stateVersion: 1, at: '2026-10-23T12:05:00.000Z' };
+  await viewWith(page, view => {
+    view.startable = false;
+    view.publish = { ...view.publish, available: true, publishable: true, draft: false,
+      last: { outcome: 'not published', draft: false, message: 'This task reached its status before publishing existed.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } };
+  });
+  // A replay of a publish whose job has settled: the server answers with the saved response, which recordPublish
+  // replaced with the settled record (web/server.ts publish), and the view now names that record.
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.fallback(); return; }
+    const view = await serverRunnerView(route);
+    view.startable = false;
+    view.publish = { ...view.publish, available: true, publishable: true, draft: false, last: failed };
+    await route.fulfill({ status: 200, json: { result: failed, runner: view } });
+  });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Publish PR', exact: true }).click();
+  await expect(page.locator('#runner-note')).toHaveText('✕ The task belongs to another repository.');
+});

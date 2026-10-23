@@ -2516,6 +2516,9 @@ function applyRunnerView(view) {
   runnerView = view;
   const ended = view.available ? endedWorkNotes(before, view) : {};
   for (const [kind, text] of Object.entries(ended)) setRunnerReviewNote(kind, text);
+  // A kept publish or close key (its answer was lost) belongs to a job that has now settled: a press after this asks for
+  // a new job, which the same key would only replay.
+  if (ended.publish && ["publish", "close-pull-requests"].includes(runnerKey?.request.action)) runnerKey = null;
   // Work that ended makes the answer that started it ("Running P1.", "Publishing…") out of date.
   if (Object.keys(ended).length) setRunnerStatus("");
   else if (runnerNotes.statusKind === "read-error"
@@ -2607,7 +2610,9 @@ async function sendRunnerAction(action, attemptId = null) {
     runnerPollDelay = 2000;
     runnerQuietPolls = 0;
     if (generation === runnerGeneration) applyRunnerView(answer.runner);
-    setRunnerStatus(runnerOutcomeText(action, answer.result, answer.runner));
+    const outcome = runnerOutcomeText(action, answer.result, answer.runner);
+    // A replayed publish answers with its settled record, which the review part may already name.
+    setRunnerStatus(outcome === runnerNotes.review.get("publish")?.text ? "" : outcome);
   } catch (error) {
     // No status (the response was lost), a 503 or an unknown outcome decided nothing the page can see: keep the key.
     const definite = error.status !== undefined && error.status !== 503 && !error.outcomeUnknown;
