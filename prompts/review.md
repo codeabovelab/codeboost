@@ -42,7 +42,7 @@ The block below lists the problems the previous round found in the code. codeboo
 
 <earlier_problems_data>
 {{earlier_problems_json}}
-</earlier_problems_data>
+</earlier_problems_data>{{earlier_omitted}}
 {{/if}}
 
 ## How to review

@@ -1,7 +1,7 @@
 import type { InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import { PLANNING_MAX_TURNS } from '../agents/policy.ts';
 import type { ReviewRequest } from '../core/review-prompt.ts';
-import { PLANNING_STORAGE, removeFeatureRoot, structuredOutput } from './planning-provider.ts';
+import { cleanupFailure, PLANNING_STORAGE, removeFeatureRoot, structuredOutput } from './planning-provider.ts';
 import { exceedsStorage, type Provider, type ReadOnlyFeature, type ReadOnlyRun, type RepositorySize } from './question-container.ts';
 
 /**
@@ -24,7 +24,6 @@ export function reviewOutput(result: InvocationResult, invocation: InvocationInp
 /** Codex reads files only through its shell, and the review phase runs none (#93). */
 export const CODEX_REVIEW_REFUSED = 'Codex cannot review plan items yet: it can read the code only by running commands, '
   + 'and the review runs none. Choose Claude Code in Settings, then retry.';
-const text = (error: unknown) => error instanceof Error ? error.message : String(error);
 const ROOT_PREFIX = 'codeboost-review-agent-';
 /** Delete a review root: a direct child of the temporary directory named with the review's prefix, and nothing else. */
 export function removeReviewRoot(root: string): void { removeFeatureRoot(root, ROOT_PREFIX, 'reviewed', 'review'); }
@@ -45,9 +44,7 @@ export const REVIEW_FEATURE: ReadOnlyFeature = Object.freeze({
     if (exceedsStorage(size, PLANNING_STORAGE)) throw new Error('The repository is too large for the review.');
   },
   output: (_vendor: Provider, result: InvocationResult, invocation: InvocationInput) => reviewOutput(result, invocation),
-  cleanupFailed: (failures: readonly unknown[], failure?: { error: unknown }) => failure
-    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
-    : new AggregateError(failures, 'Review container cleanup did not settle.'),
+  cleanupFailed: cleanupFailure('Review'),
 });
 
 /** One review request as a read-only run of `repository` at the request's head, without its owner. */

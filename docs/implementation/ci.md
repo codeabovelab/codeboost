@@ -89,6 +89,8 @@ them. They do not call a vendor or GitHub.
 
 - Recorded Claude planning output: `test/fixtures/planning/recorded/`, replayed
   by `test/planning-recorded.test.ts`.
+- Recorded Claude review-agent output (#201): `test/fixtures/review/recorded/`,
+  replayed by `test/review-recorded.test.ts`.
 - Recorded GitHub (`gh`) answers to the merge inspection's reads:
   `test/fixtures/gh/`, replayed by `test/merge-recorded.test.ts` (T12).
   Hand-written `gh` responses: fixtures inside `test/merge.test.ts` and the
@@ -198,6 +200,20 @@ Read each file in `test/fixtures/planning/recorded/` before you commit it. No
 workflow records fixtures. [Planning acceptance](planning-acceptance.md#recorded-vendor-output)
 describes the recordings.
 
+## Record the review-agent fixtures again
+
+`test/review-recorded.test.ts` fails when a recording no longer matches
+today's request, as for planning: the review prompt, its answer schema, the
+recorded task's files, the Claude review command, the image tag or the CLI
+version. To record again, run this on a machine with Docker:
+
+```sh
+CODEBOOST_RUN_AUTH_PROBES=1 CLAUDE_CODE_OAUTH_TOKEN=... node scripts/record-review.ts
+```
+
+Read each file in `test/fixtures/review/recorded/` before you commit it.
+[Review rounds](review-rounds.md#recorded-output) describes the recordings.
+
 ## Record the gh merge fixtures again
 
 `scripts/record-merge-gh.ts` runs one fresh merge inspection of a pull request
@@ -267,3 +283,5 @@ To keep T9 green:
   record the fixtures again by hand (see
   [Record the planning fixtures again](#record-the-planning-fixtures-again)).
   No workflow records them.
+- The same holds for `test/review-recorded.test.ts` (see
+  [Record the review-agent fixtures again](#record-the-review-agent-fixtures-again)).

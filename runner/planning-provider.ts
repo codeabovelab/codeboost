@@ -127,10 +127,14 @@ export const PLANNING_FEATURE: ReadOnlyFeature = Object.freeze({
   output: (_vendor: Provider, result: InvocationResult, invocation: InvocationInput) => planningOutput(result, invocation),
   // What cleanup left is retained, and the next request names it. A successful request is refused rather than
   // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
-  cleanupFailed: (failures: readonly unknown[], failure?: { error: unknown }) => failure
-    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
-    : new AggregateError(failures, 'Planning container cleanup did not settle.'),
+  cleanupFailed: cleanupFailure('Planning'),
 });
+/** A read-only feature's `cleanupFailed`: the run's own error first, when it had one, then what cleanup did not settle. */
+export function cleanupFailure(feature: string): ReadOnlyFeature['cleanupFailed'] {
+  return (failures, failure) => failure
+    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
+    : new AggregateError(failures, `${feature} container cleanup did not settle.`);
+}
 
 /** Where a planning request reads the code: the review's repository at the snapshot's head. */
 export interface PlanningSource {

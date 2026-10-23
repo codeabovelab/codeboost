@@ -36,15 +36,14 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
 | `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. Failed `cmd:` checks are not among them: the agent cannot run commands, and the next round runs the checks again. |
-| `final` | The last round the limit allows. Its prompt keeps no room for a next round. |
 
 The template is `prompts/review.md`. Every input goes into an escaped JSON data block, filled in one pass, so inserted
-text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB. Every round's prompt except the
-last one's must also leave room for the next round's earlier problems (`MAX_ROUND_PROBLEM_BYTES`, 12 KiB, plus that
-section's own text). The next round of the same plan revision has the same prompt but for its round number, which is
-counted as long as the largest. So a valid answer never makes the next round's prompt too large, unless the issue or the
-lessons grew in between. A prompt without that room is refused at once. A new plan revision starts again at round 1,
-with no earlier problems.
+text is never read as a placeholder or as a closing tag. Each data block is at most 32 KiB, and the prompt is at most
+`MAX_REVIEW_PROMPT_BYTES`: the review's 64 KiB model budget less its schema. A prompt over either limit is refused.
+
+The earlier problems are a hint: the agent checks every item anyway. So the prompt lists as many of them as fit, in
+order, and says how many more it left out (`request.earlierListed`). An answer is therefore never refused for its size:
+any valid answer can be the next round's earlier problems. A new plan revision starts again at round 1, with none.
 
 ### The answer
 
@@ -63,8 +62,10 @@ text to Claude as `--json-schema` ([agent isolation](agent-isolation.md), "Revie
 - is for another round;
 - names an item that is not in the plan;
 - holds text with NUL or an unpaired surrogate (the data blocks of later prompts refuse it), or a summary or detail that
-  is only white space;
-- splits into problems that take more than 12 KiB as the next round's data block.
+  is only white space.
+
+`validateReviewAnswer(plan, round, source)` does the same check without the rest of the request, so an answer can be
+checked again without rebuilding its prompt.
 
 A valid answer becomes a list of `ReviewProblem`s: for each problem in the answer's order, one copy per named item, in
 plan order. An item named twice in one problem gets one copy. A copy keeps the `check` text only when it is exactly one of that item's own `check:` entries; otherwise
@@ -73,8 +74,8 @@ it is null. An empty list means the round found nothing.
 ### The invocation
 
 The review agent is Claude in lane D's read-only `review` phase: read, list and search tools, `plan` permission mode, and
-vendor-only egress. It runs no commands: the Claude command disallows Bash, and a review is captured with no approved
-argv, so the phase's command tool has nothing to run. It shares planning's model budget: 64 KiB of prompt and schema, and `--max-turns 50`.
+vendor-only egress. It runs no commands: the Claude command gives it only `Read,Glob,Grep` and disallows Bash. (The
+review phase's policy also lists the runner's command tool, for command checks; Claude is not given it.) It shares planning's model budget: 64 KiB of prompt and schema, and `--max-turns 50`.
 Codex is refused, as in every phase (#93). `reviewOutput` (`runner/review-agent.ts`) accepts only the invocation's own
 output after a clean exit.
 
