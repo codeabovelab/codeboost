@@ -139,7 +139,8 @@ test('resends the same action ID after a 503 or a lost response, and uses a new 
   // A refusal is a definite answer: the next press of the same action is a new action with a new key.
   await resume.click();
   await expect.poll(() => keys.length).toBe(5);
-  await expect(page.locator('#runner-note')).toHaveText('✕ Stale task state. Press Refresh to load the latest state.');
+  // A note about P1's end may stay beside the refusal, depending on whether the start's answer still showed P1 running.
+  await expect(page.locator('#runner-note')).toHaveText(/(^|\. )✕ Stale task state\. The page has read it again; try again\.$/);
   await resume.click();
   await expect.poll(() => keys.length).toBe(6);
   // The same request apart from its key: only the refusal made the second press a new action.
@@ -521,7 +522,7 @@ test('shows a runner that needs a restart, and does not poll for it', async ({ p
   expect(gets).toBe(seen);
 });
 
-test('clears a runner read error on the next read, and a work-ended note on Refresh', async ({ page }) => {
+test('a Refresh clears a runner read error and a work-ended note', async ({ page }) => {
   await serve();
   let failRead = true;
   await page.route('**/api/runner', async route => {
@@ -729,29 +730,6 @@ test('the cancel question goes when a read hides Cancel task', async ({ page }) 
   await expect(note).toHaveText('');
 });
 
-test('clears the quiet note when a later read shows a change', async ({ page }) => {
-  await serve();
-  let offerNothing = true;
-  await viewWith(page, view => { if (offerNothing) view.resumable = false; });
-  await page.clock.install();
-  await openReview(page, app.url);
-  await page.getByRole('button', { name: 'Start', exact: true }).click();
-  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
-  const note = page.locator('#runner-note'), asks = '! Nothing has changed for a minute. Press Refresh to check again.';
-  for (let step = 0; !(await note.textContent())!.endsWith(asks); step++) {
-    expect(step).toBeLessThan(10);
-    const reads = Number(await note.getAttribute('data-reads'));
-    await page.clock.runFor(30_000);
-    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent())!.endsWith(asks)).toBe(true);
-  }
-  // The runner now offers Resume. A runner read that is not a poll (the Plans screen's refresh reloads it) shows the
-  // change, and the quiet note goes.
-  offerNothing = false;
-  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
-  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
-  await expect(note).toHaveText('');
-});
-
 test('a background note that arrives while the cancel question is shown waits behind it until the question goes', async ({ page }) => {
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
@@ -869,4 +847,88 @@ test('a runner read after a review action clears the quiet note when it shows a 
   await expect(note).toHaveAttribute('data-reads', String(reads + 1));
   await expect(status(page)).toHaveText('○ In review');
   await expect(note).toHaveText('');
+});
+
+test('a Refresh whose review was read before an item ended keeps the note about that end', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  let holdReview = false, releaseReview!: () => void, reviewSent!: () => void;
+  const reviewGate = new Promise<void>(resolve => { releaseReview = resolve; }), sent = new Promise<void>(resolve => { reviewSent = resolve; });
+  await page.route('**/api/review', async route => {
+    if (!holdReview) { await route.continue(); return; }
+    holdReview = false;
+    // Read now, before P1 ends, and answered after.
+    const response = await fetch(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const body = await response.json();
+    reviewSent(); await reviewGate;
+    await route.fulfill({ status: response.status, json: body });
+  });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  holdReview = true;
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await sent;
+  fail();
+  const note = page.locator('#runner-note'), ended = '✕ P1 failed. The task is now running. Refresh to review its latest changes.';
+  await expect(note).toHaveText(ended);
+  const reads = Number(await note.getAttribute('data-reads'));
+  releaseReview();
+  // The reload applies (and reads the runner again); the note it could not have shown stays.
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  await expect(note).toHaveText(ended);
+});
+
+test('a later success replaces a stale task-state refusal', async ({ page }) => {
+  await serve();
+  let refused = false;
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() === 'POST' && !refused) { refused = true; await route.fulfill({ status: 409, json: { error: 'Stale task state. Reload before writing.' } }); return; }
+    await route.continue();
+  });
+  await openReview(page, app.url);
+  const cancel = page.locator('#cancel-task'), note = page.locator('#runner-note');
+  await cancel.click(); await cancel.click();
+  await expect(note).toHaveText('✕ Stale task state. The page has read it again; try again.');
+  await cancel.click(); await cancel.click();
+  await expect(note).toHaveText('✓ Task cancelled.');
+  await expect(note).toHaveClass('good');
+});
+
+test('a publish outcome survives a failed poll and the good poll after it', async ({ page }) => {
+  await serve();
+  let active = true, failRead = false;
+  // A running task between steps (polled), whose publish is in progress, then settles.
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    if (failRead) { failRead = false; await route.fulfill({ status: 500, json: { error: 'Storage failed.' } }); return; }
+    const view = await serverRunnerView(route);
+    view.startable = false;
+    view.task.status = 'running';
+    view.publish = { ...view.publish, available: true, active, last: active
+      ? { outcome: 'publishing', draft: false, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' }
+      : { outcome: 'opened', draft: false, message: 'Pull request #7 is open; the task is running.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z', number: 7 } };
+    await route.fulfill({ status: 200, json: view });
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  const note = page.locator('#runner-note');
+  const step = async () => {
+    const reads = Number(await note.getAttribute('data-reads'));
+    for (let second = 0; Number(await note.getAttribute('data-reads')) === reads; second++) {
+      expect(second).toBeLessThan(40);
+      await page.clock.runFor(1_000);
+      await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+    }
+  };
+  await expect(status(page)).toHaveText('● Running · Publishing…');
+  active = false;
+  await step();
+  const opened = '✓ Pull request #7 is open; the task is running.';
+  await expect(note).toHaveText(opened);
+  failRead = true;
+  await step();
+  await expect(note).toHaveText(`${opened} ✕ Could not read the runner state. Storage failed.`);
+  await step();
+  await expect(note).toHaveText(opened);
 });

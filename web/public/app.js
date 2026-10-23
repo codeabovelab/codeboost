@@ -132,6 +132,8 @@ function showFailure(message, planStatusOwner) {
 }
 async function refresh() {
   if (busy || planImportPending) return;
+  // Runner notes written from here on are newer than the review this reload reads.
+  const notesMark = runnerNoteSeq;
   supersedePlanRefresh();
   const planStatusOwner = planStatusGeneration;
   const busyOwner = beginBusy("read");
@@ -165,7 +167,7 @@ async function refresh() {
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     // The review now shows what the ended work changed.
-    clearRunnerNotesOnReviewLoad();
+    clearRunnerNotesOnReviewLoad(notesMark);
     loadRunner();
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -2199,6 +2201,8 @@ $("plans-link").onclick = (event) => {
 $("plans-refresh").onclick = async () => {
   if (planRefreshPending || planImportPending) return;
   if (busy) return;
+  // Runner notes written from here on are newer than the review this reload reads.
+  const notesMark = runnerNoteSeq;
   const generation = ++planOperationGeneration;
   let sharedGeneration = ++reviewGeneration;
   const mergeObservationOwner = mergeObservationGeneration;
@@ -2229,7 +2233,7 @@ $("plans-refresh").onclick = async () => {
     showNewerMergeObservations(newer);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     // As Refresh: the review now shows what ended work changed, and is current.
-    clearRunnerNotesOnReviewLoad();
+    clearRunnerNotesOnReviewLoad(notesMark);
     loadRunner();
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
@@ -2269,15 +2273,19 @@ let runnerView = null,
   // action instead of running it twice. Reused only for the identical request: the server hashes it under its action ID.
   runnerKey = null,
   cancelConfirmTimer = null;
-// The note under the banner, in three parts that are set and cleared independently and shown together, so no note
-// replaces another (#200):
-// - review: the review on screen is out of date (an attempt ended, a stale-review refusal). Only a review reload (Refresh,
-//   or the Plans screen's refresh) clears it.
-// - status: the latest action answer, read error or quiet note; the next one replaces it. A read error is cleared by the
-//   next good read, the quiet note by a read that shows work or a change; an ended attempt replaces it with what else
-//   ended (or nothing), and a review reload clears it.
+// The note under the banner, in parts that are set and cleared independently and shown together, so no note replaces
+// another (#200):
+// - review: what changed since the review on screen loaded: an attempt that ended, a publish or close that ended, a
+//   cancel that settled, or a stale-review refusal; one entry of each kind, the latest. Only a review reload (Refresh,
+//   or the Plans screen's refresh) clears an entry, and only one written before its review request was sent.
+// - status: the latest action answer, action refusal, read error or quiet note; the next one replaces it. A good read
+//   clears a read error, and a read that shows work or a change clears the quiet note. Work that ended makes it out of
+//   date and clears it; so does a review reload sent after it was written.
 // - ask: the cancel confirmation's question, while it is armed.
-const runnerNotes = { review: "", status: "", statusKind: null, ask: "" };
+const runnerReviewKinds = ["attempt", "publish", "cancel", "stale"];
+const runnerNotes = { review: new Map(), status: "", statusKind: null, statusSeq: 0, ask: "" };
+// Numbers every write of a review entry or the status, so a review reload can tell which were written before it.
+let runnerNoteSeq = 0;
 const runnerPollMaximumDelay = 30000;
 // Unchanged reads of a task between steps before polling stops: 2 + 4 + 8 + 16 + 30 s, about a minute.
 const runnerQuietPollLimit = 5;
@@ -2380,25 +2388,31 @@ function taskBannerText(view) {
   return "";
 }
 function renderRunnerNote() {
-  const { review, status, ask } = runnerNotes;
+  const review = runnerReviewKinds.map((kind) => runnerNotes.review.get(kind)?.text).filter(Boolean).join(" ");
+  const { status, ask } = runnerNotes;
   $("runner-note").textContent = [review, status, ask].filter(Boolean).join(" ");
   // Coloured by the part a person most needs to act on first.
   const lead = ask || status || review;
   $("runner-note").className = lead ? statusClass(lead) : "";
 }
-function setRunnerReviewNote(text) {
-  runnerNotes.review = text;
+function setRunnerReviewNote(kind, text) {
+  runnerNotes.review.set(kind, { text, seq: ++runnerNoteSeq });
   renderRunnerNote();
 }
 function setRunnerStatus(text, kind = null) {
   runnerNotes.status = text;
   runnerNotes.statusKind = text ? kind : null;
+  runnerNotes.statusSeq = ++runnerNoteSeq;
   renderRunnerNote();
 }
-/** A review reload shows what ended work changed and is current: the review and status parts go. */
-function clearRunnerNotesOnReviewLoad() {
-  runnerNotes.review = "";
-  setRunnerStatus("");
+/**
+ * A review reload shows what ended work changed and is current, as of when its request was sent (`mark`, from
+ * runnerNoteSeq then): it clears the review entries and the status written before that, and keeps any written since.
+ */
+function clearRunnerNotesOnReviewLoad(mark) {
+  for (const [kind, entry] of runnerNotes.review) if (entry.seq <= mark) runnerNotes.review.delete(kind);
+  if (runnerNotes.statusSeq <= mark) setRunnerStatus("");
+  else renderRunnerNote();
 }
 function publishNote(record) {
   const mark = record.outcome === "opened" || record.outcome === "closed" ? "✓" : publishNotices.has(record.outcome) ? "!" : "✕";
@@ -2481,25 +2495,25 @@ function scheduleRunnerPoll() {
  * it on its own.
  */
 function endedWorkNotes(before, after) {
-  const review = [], status = [];
+  const ended = {};
   const was = before && liveAttempt(before);
   // Only an attempt whose row settled: an unresolved marker hides a row that is still pending or running.
   const settled = was && after.attempts.find((attempt) => attempt.id === was.id);
   if (settled && ["completed", "failed", "cancelled", "stale"].includes(settled.state)) {
-    review.push(`${settled.state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`);
+    ended.attempt = `${settled.state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
   }
-  if (before?.publish.active && !after.publish.active && after.publish.last) status.push(publishNote(after.publish.last));
-  if (before && before.task.cancelRequested !== null && after.task.cancelRequested === null && after.task.status === "cancelled") status.push("✓ Task cancelled.");
-  return { review: review.join(" "), status: status.join(" ") };
+  if (before?.publish.active && !after.publish.active && after.publish.last) ended.publish = publishNote(after.publish.last);
+  if (before && before.task.cancelRequested !== null && after.task.cancelRequested === null && after.task.status === "cancelled") ended.cancel = "✓ Task cancelled.";
+  return ended;
 }
 /** Applies a view the server sent: from a load, a poll or an action's answer. */
 function applyRunnerView(view) {
   const before = runnerView?.available ? runnerView : null;
   runnerView = view;
-  const ended = view.available ? endedWorkNotes(before, view) : { review: "", status: "" };
-  if (ended.review) setRunnerReviewNote(ended.review);
-  // An ended attempt makes the answer that started it out of date.
-  if (ended.status || ended.review) setRunnerStatus(ended.status);
+  const ended = view.available ? endedWorkNotes(before, view) : {};
+  for (const [kind, text] of Object.entries(ended)) setRunnerReviewNote(kind, text);
+  // Work that ended makes the answer that started it ("Running P1.", "Publishing…") out of date.
+  if (Object.keys(ended).length) setRunnerStatus("");
   else if (runnerNotes.statusKind === "read-error"
     || (runnerNotes.statusKind === "quiet" && (runnerWorking(view) || JSON.stringify(before) !== JSON.stringify(view)))) setRunnerStatus("");
   renderRunner();
@@ -2562,7 +2576,7 @@ async function sendRunnerAction(action, attemptId = null) {
   const reviewed = ["start", "resume", "approve-continuation"].includes(action);
   // The server refuses a review version older than its own; the review on screen must be reloaded first.
   if (reviewed && runnerView.reviewVersion > data.expected.reviewVersion) {
-    setRunnerReviewNote("! The review changed since this page loaded it. Press Refresh, check the review, then try again.");
+    setRunnerReviewNote("stale", "! The review changed since this page loaded it. Press Refresh, check the review, then try again.");
     return;
   }
   const request = { action, expectedStateVersion: runnerView.stateVersion,
@@ -2592,10 +2606,11 @@ async function sendRunnerAction(action, attemptId = null) {
     if (definite && runnerKey === key) runnerKey = null;
     runnerPending = null;
     // The server's stale-state refusals say "Reload before writing."; on this screen that is Refresh.
-    const stale = error.message.includes("Reload before writing.");
-    const message = error.message.replace("Reload before writing.", "Press Refresh to load the latest state.");
+    // Only a stale review needs a review reload; a stale task state is current again after the runner read below.
+    const stale = error.message.startsWith("Stale review state.");
+    const message = error.message.replace("Reload before writing.", stale ? "Press Refresh to load the latest state." : "The page has read it again; try again.");
     const note = `✕ ${message}${definite ? "" : " Press it again to resend the same request, unless the task has changed meanwhile."}`;
-    if (stale) setRunnerReviewNote(note);
+    if (stale) setRunnerReviewNote("stale", note);
     else setRunnerStatus(note);
     // A refusal often means the view was stale; read the current one.
     if (generation === runnerGeneration) {
