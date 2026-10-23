@@ -34,7 +34,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | --- | --- |
 | Isolation holds: non-root, no capabilities, read-only root, no host paths or secrets, vendor-only egress | `agent-container`: read-only isolation, lockdown and mount validation; `agent-network`: egress and DNS |
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
-| Planning and questions cannot run a process; a Claude review runs none either | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases; the Claude review command gives Claude only `Read,Glob,Grep` and disallows Bash |
+| Planning and questions cannot run a process; a Claude review runs none either | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases; the Claude review command gives Claude only `Read,Glob,Grep`, disallows Bash, and is refused for a review captured with approved argv |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
 | A planning or review request over its model budget is refused before the start, and the planning and review commands pass `--max-turns 50` (see [planning model budget](#planning-model-budget) for what is and is not shown about the stop) | `agent-policy`: a prompt and schema of exactly 64 KiB build a planning or review command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget planning request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
 | A planning or review answer is checked against the mounted schema | `agent-policy`: only the Claude planning and review commands pass `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
@@ -94,8 +94,9 @@ Use only these entry points to run an agent:
    - **Review answers (#201).** A Claude invocation in the review phase answers in JSON too, exactly like planning:
      the start call reads `schema.json` (the review answer schema, `prompts/review-answer.schema.json`), passes it as
      `--json-schema`, and returns `structured_output` as JSON text. The command refuses a Claude review without a
-     schema, and one in questions, execute or fix with a schema. A review has planning's model budget below: the same
-     64 KiB input check (its error names the review) and `--max-turns 50`. The review keeps planning's read-only tools
+     schema or with approved argv (Claude has no tool that runs them), and a questions, execute or fix command with a
+     schema. A review has planning's model budget below: the same 64 KiB input check (its error names the review) and
+     `--max-turns 50`. The review keeps planning's read-only tools
      (`Read,Glob,Grep`) and `plan` permission mode. Command checks still run in the review phase with the `runner`
      vendor and no schema flag.
    - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory

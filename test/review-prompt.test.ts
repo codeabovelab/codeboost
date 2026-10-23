@@ -62,7 +62,6 @@ describe('review prompt (#201)', () => {
     // Round 1 is told nothing earlier, whatever round the problems claim.
     expect(() => prepareReview(input({ earlierProblems: [{ round: 0, item: 'P1', summary: 's', detail: 'd', check: null }] }))).toThrow('Round 1 has no earlier problems');
     expect(() => prepareReview(input({ issue: { number: 413, title: '', body: '', comments: [] } }))).toThrow('issue mismatch');
-    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: 'x'.repeat(33 * 1024), comments: [] } }))).toThrow('Issue data exceeds 32 KiB.');
   });
 
   it('lists as many earlier problems as fit, in order, and says how many it left out', () => {
@@ -73,7 +72,7 @@ describe('review prompt (#201)', () => {
     expect(request.earlierListed).toBeLessThan(all.length);
     expect(Buffer.byteLength(request.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
     const left = all.length - request.earlierListed;
-    expect(request.prompt).toContain(`${left} more problems from the previous round did not fit here. Check every plan item again.`);
+    expect(request.prompt).toContain(`${left} more problems the previous round found did not fit here. Check every plan item again.`);
     // In order, and as many as fit: one more would not.
     expect(request.prompt).toContain(`Problem ${request.earlierListed - 1}.`);
     expect(request.prompt).not.toContain(`Problem ${request.earlierListed}.`);
@@ -85,9 +84,26 @@ describe('review prompt (#201)', () => {
     expect(few.prompt).not.toContain('did not fit here');
   });
 
+  it('lists every earlier problem when they all fit exactly, even where listing fewer would need the longer note', () => {
+    const tiny = [1, 2].map(index => ({ round: 1, item: 'P1', summary: `s${index}`, detail: 'd', check: null }));
+    const at = (lessons: number) => prepareReview(input({ round: 2, earlierProblems: tiny,
+      issue: { number: 412, title: '', body: 'x'.repeat(30_000), comments: [] }, approvedLessons: ['y'.repeat(lessons)] })).request;
+    const base = at(1000);
+    expect(base.earlierListed).toBe(2);
+    const exact = at(1000 + MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(base.prompt));
+    expect(Buffer.byteLength(exact.prompt)).toBe(MAX_REVIEW_PROMPT_BYTES);
+    expect([exact.earlierListed, exact.leftOut]).toEqual([2, []]);
+    expect(exact.prompt).not.toContain('did not fit here');
+    // One byte more: listing one of them with the note is longer still, so the section goes, and the note says so.
+    const over = at(1001 + MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(base.prompt));
+    expect([over.earlierListed, over.leftOut]).toEqual([0, []]);
+    expect(over.prompt).toContain('The 2 problems the previous round found did not fit here. Check every plan item again.');
+    expect(over.prompt).not.toContain('<earlier_problems_data>');
+  });
+
   it('accepts every schema-valid answer whatever its size, and the next round still builds its prompt from it', () => {
     const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
-    const largest = Array.from({ length: 20 }, () => ({ items: ['P1', 'P2'], summary: text(300), detail: text(1500), check: text(400) }));
+    const largest = Array.from({ length: 20 }, (_, index) => ({ items: ['P1', 'P2'], summary: `${String(index).padStart(2, "0")}${text(298)}`, detail: text(1500), check: text(400) }));
     const problems = validateReviewAnswer(input().plan, 1, answer(largest));
     expect(problems).toHaveLength(40);
     const next = prepareReview(input({ round: 2, earlierProblems: problems.map(problem => ({ round: 1, ...problem })) })).request;
@@ -95,11 +111,37 @@ describe('review prompt (#201)', () => {
     expect(Buffer.byteLength(next.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
   });
 
-  it('keeps the prompt within the model budget lane D enforces', () => {
+  it('keeps the prompt within the model budget lane D enforces, leaving out what does not fit, in order, with a note', () => {
     expect(MAX_REVIEW_PROMPT_BYTES + Buffer.byteLength(REVIEW_SCHEMA_TEXT)).toBe(MAX_PLANNING_INPUT_BYTES);
-    // Each block fits on its own (under 32 KiB), but together they do not.
-    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: 'x'.repeat(31 * 1024), comments: [] },
-      approvedLessons: ['y'.repeat(31 * 1024)] }))).toThrow(`The review prompt exceeds ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    const issue = (body: number, comments: number) => ({ number: 412, title: 'T', body: 'b'.repeat(body), comments: comments ? ['c'.repeat(comments)] : [] });
+    const build = (over: Partial<ReturnType<typeof input>>) => prepareReview(input(over)).request;
+    expect(build({}).leftOut).toEqual([]);
+    // The issue's comments go first, then its description, then the lessons, then the plan's change texts.
+    const comments = build({ issue: issue(1000, 31 * 1024), approvedLessons: ['l'.repeat(31 * 1024)] });
+    expect(comments.leftOut).toEqual(['issue comments']);
+    expect(comments.prompt).toContain('The issue\'s 1 comment did not fit here, so it is left out.');
+    expect(comments.prompt).not.toContain('c'.repeat(100));
+    const description = build({ issue: issue(31 * 1024, 0), approvedLessons: ['l'.repeat(31 * 1024)] });
+    expect(description.leftOut).toEqual(['issue comments', 'issue description']);
+    expect(description.prompt).toContain('The issue\'s description did not fit here, so it is left out.');
+    expect(description.prompt).toContain('l'.repeat(1000));
+    // A single block over its own 32 KiB limit is left out the same way.
+    expect(build({ issue: issue(33 * 1024, 0) }).leftOut).toEqual(['issue comments', 'issue description']);
+    expect(build({ approvedLessons: ['l'.repeat(20 * 1024), 'm'.repeat(20 * 1024)] }).leftOut).toEqual(['issue comments', 'issue description', 'lessons']);
+    // A plan whose change texts alone are too large is reviewed without them.
+    const big = input().plan;
+    const wide = { ...big, items: big.items.map(item => ({ ...item, files: Array.from({ length: 40 }, (_, index) =>
+      ({ path: `f${index}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x'.repeat(1200) })) })) };
+    const changes = build({ plan: wide });
+    expect(changes.leftOut).toEqual(['issue comments', 'issue description', 'lessons', 'file change texts']);
+    expect(changes.prompt).toContain('The text of each file change did not fit here, so it is left out.');
+    expect(changes.prompt).toContain('"path":"f39.ts"');
+    expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
+    // Only a plan too large without its change texts is refused.
+    const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
+      acceptance: Array.from({ length: 10 }, (_, index) => ({ type: 'check' as const, text: `${index}${'a'.repeat(399)}` })),
+      files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
+    expect(() => build({ plan: huge })).toThrow('The plan is too large to review even without its file change texts, the issue and the lessons.');
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {
@@ -113,6 +155,10 @@ describe('review prompt (#201)', () => {
       { item: 'P2', summary: 'Wrong.', detail: 'src/example.ts:2 is wrong.', check: null },
       { item: 'P2', summary: 'Untested.', detail: 'src/example.ts:2 is wrong.', check: 'The new test calls label(3) twice and asserts both results are equal.' },
     ]);
+    // The same problem twice for one item is one problem (one fix).
+    expect(validate(answer([problem(['P1']), problem(['P1', 'P2']), problem(['P2'])]))).toEqual([
+      { item: 'P1', summary: 'Wrong.', detail: 'src/example.ts:2 is wrong.', check: null },
+      { item: 'P2', summary: 'Wrong.', detail: 'src/example.ts:2 is wrong.', check: null }]);
     // Bytes are accepted too, as D may return them.
     expect(validate(Buffer.from(answer([])))).toEqual([]);
   });

@@ -9,9 +9,11 @@ const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const SCHEMA = '{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}\n';
 
 let attempt = 0;
-const request = (phase: Phase, vendor: 'claude' | 'codex' | 'runner' = 'claude'): InvocationInput => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
+// A Claude review runs no commands (#201), so it is captured with none unless a test says otherwise.
+const request = (phase: Phase, vendor: 'claude' | 'codex' | 'runner' = 'claude',
+  approvedArgv: string[][] = ['planning', 'questions'].includes(phase) || (phase === 'review' && vendor === 'claude') ? [] : [['npm', 'test']]): InvocationInput => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tmp/task', head: 'a'.repeat(40) },
-  vendor, phase, approvedArgv: ['planning', 'questions'].includes(phase) ? [] : [['npm', 'test']],
+  vendor, phase, approvedArgv,
   deadline: 2000, attemptId: `attempt-${phase}-${++attempt}`,
   context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
 }, 1000);
@@ -29,7 +31,7 @@ describe('agent phase policy', () => {
   });
 
   it('review dispatches only one exact approved argv without granting a shell tool', () => {
-    const captured = request('review'), policy = createPhasePolicy(captured), execute = vi.fn(argv => argv.join(' '));
+    const captured = request('review', 'claude', [['npm', 'test']]), policy = createPhasePolicy(captured), execute = vi.fn(argv => argv.join(' '));
     expect(policy.tools).toEqual(['read', 'list', 'search', 'runner-command']);
     expect(dispatchApprovedCommand(policy, ['npm', 'test'], execute)).toBe('npm test');
     expect(execute).toHaveBeenCalledWith(['npm', 'test']);
@@ -86,6 +88,9 @@ describe('agent phase policy', () => {
       expect(argv[argv.indexOf('--disallowedTools') + 1]).toBe('Bash,WebFetch,WebSearch,NotebookEdit');
       expect(() => createClaudeCommand(createPhasePolicy(request(phase)), 'Answer.')).toThrow('must');
     }
+    // A Claude review has no command tool to run approved argv with, so one captured with any is refused (#201).
+    expect(() => createClaudeCommand(createPhasePolicy(request('review', 'claude', [['npm', 'test']])), 'Answer.', SCHEMA))
+      .toThrow('A Claude review runs no commands');
     for (const phase of ['questions', 'execute', 'fix'] as const) {
       const policy = createPhasePolicy(request(phase));
       expect(createClaudeCommand(policy, 'Work.').argv).not.toContain('--json-schema');

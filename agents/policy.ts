@@ -80,8 +80,9 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
  * Planning's model budget (#163), checked when the command is built, before the adapter creates a container. The input
  * is counted in UTF-8 bytes of the prompt and schema: Claude's tokenizer is not available offline, and a count of bytes
  * bounds the tokens if every token covers at least one byte (assumed, not verified against Claude's tokenizer). 64 KiB
- * is the 32 KiB prompt plus the 32 KiB of schema text that core/planning-author.ts allows, so this is a backstop for
- * callers that skip it; it does not count Claude Code's own system prompt and tools, or the answer. The run is bounded
+ * is the 32 KiB prompt plus the 32 KiB of schema text that core/planning-author.ts allows, so for planning this is a
+ * backstop for callers that skip it. A review's prompt may use all of it less its schema (`MAX_REVIEW_PROMPT_BYTES`,
+ * #201). It does not count Claude Code's own system prompt and tools, or the answer. The run is bounded
  * by turns: if each turn sends at most one context window (assumed; the CLI's own calls, such as compaction, are not
  * counted), `--max-turns` bounds the tokens a run can use (the CLI may make one call more than the limit). Claude stops
  * at the limit with an `error_max_turns` result and exit status 1 (seen in a run of Claude Code 2.1.281 on macOS,
@@ -104,6 +105,10 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
   if (STRUCTURED_PHASES.has(policy.phase) !== (schema !== undefined))
     throw new Error('Only the Claude planning and review commands carry an answer schema, and they must.');
+  // Claude has no tool here that runs approved argv (Bash is disallowed), so a review captured with any is a caller's
+  // mistake, refused rather than left to the tool lists (#201).
+  if (policy.phase === 'review' && assertPhasePolicy(policy).approvedArgv.length)
+    throw new Error('A Claude review runs no commands: capture it with no approved argv.');
   const planningArguments = schema === undefined ? [] : ['--json-schema',
     assertPlanningInput(prompt, assertPlanningSchema(schema, policy.phase), policy.phase), '--max-turns', String(PLANNING_MAX_TURNS)];
   const writable = policy.worktree === 'read-write';
