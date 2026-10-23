@@ -3,6 +3,7 @@ import { captureInvocation, type InvocationInput, type Phase } from '../agents/c
 import { assertAgentCommand, assertAgentTool, assertCommandSchema, codexBaseArguments, createClaudeCommand,
   createCodexCommand, createPhasePolicy, createRunnerCommand, dispatchApprovedCommand, MAX_COMMAND_SCHEMA_BYTES,
   MAX_PLANNING_INPUT_BYTES, PLANNING_MAX_TURNS } from '../agents/policy.ts';
+import { EXECUTE_SCHEMA } from '../runner/production.ts';
 import planSchema from '../schema/versions/1/plan.schema.json' with { type: 'json' };
 import editSchema from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -144,8 +145,7 @@ describe('agent phase policy', () => {
     // A review's schema is checked the same way, and named as the review's.
     expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', '{"type":"array"}')).toThrow('Review schema must be a JSON object schema');
     // The execute launcher's plain-text schema is refused for a review too.
-    expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n'))
-      .toThrow('Review schema must be a JSON object schema');
+    expect(() => createClaudeCommand(createPhasePolicy(request('review')), 'Review.', EXECUTE_SCHEMA)).toThrow('Review schema must be a JSON object schema');
     const oversized = `{"description":"${'x'.repeat(MAX_COMMAND_SCHEMA_BYTES)}"}`;
     expect(() => createClaudeCommand(planning(), 'Plan.', oversized)).toThrow('limit');
   });

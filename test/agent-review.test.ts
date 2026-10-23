@@ -38,8 +38,10 @@ describe('review in the agent container', () => {
       mkdirSync(dirname(join(repository, path)), { recursive: true });
       writeFileSync(join(repository, path), text);
     }
-    const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=t', '-c', 'user.email=t@t.invalid', ...args],
-      { cwd: repository, encoding: 'utf8' }).trim();
+    // The developer's own Git configuration (signing, hooks) is kept out, as the recording script does.
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repository, encoding: 'utf8',
+      env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
+        GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t.invalid' } }).trim();
     git('init', '--quiet', '--initial-branch=main'); git('add', '.'); git('commit', '--quiet', '-m', 'baseline');
     const head = git('rev-parse', 'HEAD'), owner = randomBytes(16).toString('hex'); owners.push(owner);
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'codeboost-invalid-test-token' };

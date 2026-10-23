@@ -56,13 +56,14 @@ tried):
 codeboost's own note in the prompt names whatever was left out: the prompt always keeps room for every note, in its
 longest form. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
 Because that room and the longest round number are kept from round 1 on, every later round of the same plan, issue and
-lessons fits whenever round 1 did. So an answer is never refused for its size: any valid answer can be the next round's earlier
+lessons fits whenever round 1 did. (An issue whose title or number of comments changed between rounds may not.) So an answer is never refused for its size: any valid answer can be the next round's earlier
 problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
 would fit. Part 2 starts a new plan revision again at round 1, with no earlier problems.
 
 **Known limit.** A plan too large to fit even without its change texts (with the issue's number and title, the
 prompt's own text and the room for the notes) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
-characters). Part 2 then moves the task to needs human. Reviewing such a plan in batches of items is a follow-up.
+characters). Part 2 then moves the task to needs human, after the plan's items have run. Reviewing such a plan in
+batches of items, or checking that it can be reviewed before its items run, is a follow-up.
 
 The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB
 limit for one argument.

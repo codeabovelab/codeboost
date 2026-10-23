@@ -111,7 +111,7 @@ describe('review prompt (#201)', () => {
     expect(none.prompt).toContain('The 3 problems the previous round found did not fit here. Check every plan item again.');
   });
 
-  it('accepts the largest schema-valid answer, and the next round still builds its prompt from it', () => {
+  it('accepts an answer of the largest problems the schema allows, and the next round still builds its prompt from it', () => {
     const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
     const largest = Array.from({ length: 10 }, (_, index) => ({ items: ['P1', 'P2'], summary: `${String(index).padStart(2, "0")}${text(298)}`, detail: text(1500), check: text(400) }));
     const problems = validateReviewAnswer(input().plan, 1, answer(largest));
@@ -158,7 +158,11 @@ describe('review prompt (#201)', () => {
     const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
       acceptance: Array.from({ length: 10 }, (_, check) => ({ type: 'check' as const, text: `${check}${'a'.repeat(399)}` })),
       files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's text, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    // The earlier problems go in before the issue's description: with room for only one of them, the problems win.
+    const some = Array.from({ length: 19 }, (_, index) => ({ round: 1, item: 'P1', summary: `p${index}`, detail: 'd'.repeat(1500), check: null }));
+    const first = build({ round: 2, earlierProblems: some, issue: issue(31 * 1024, 0) });
+    expect([first.earlierListed, first.leftOut]).toEqual([19, ['issue description']]);
     // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
     expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
@@ -214,6 +218,7 @@ describe('review prompt (#201)', () => {
     expect(() => validate('not json')).toThrow();
     expect(() => validate(answer([problem(['P1'], 'a\u0000b')]))).toThrow('NUL or an unpaired surrogate');
     expect(() => validate(answer([{ ...problem(['P1']), detail: '\ud800' }]))).toThrow('NUL or an unpaired surrogate');
+    expect(() => validate(answer([{ ...problem(['P1']), check: 'a\u0000b' }]))).toThrow('NUL or an unpaired surrogate');
 
     expect(() => validate(JSON.stringify({ round: 1, problems: [], extra: true }))).toThrow('schema');
     expect(() => validate(answer([{ ...problem(['P1']), extra: 1 }]))).toThrow('schema');
