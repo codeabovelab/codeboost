@@ -35,6 +35,10 @@ describe('production agent adapters', () => {
   });
 
   it('reads planning and review answers from structured_output, and every other phase\'s from its result (#201)', () => {
+    // Claude Code 2.1.281 wrote this shape for the planning recordings in test/fixtures/planning/recorded, which this
+    // decoder read from the real envelope: `subtype` "success", `is_error` false, and the schema-checked answer object in
+    // `structured_output`. Members the decoder does not read, such as usage and session_id, are left out. A run without
+    // `--json-schema` has no `structured_output`; one envelope with both members checks that those phases ignore it.
     const envelope = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"prose","structured_output":{"round":1,"problems":[]}}');
     for (const phase of ['planning', 'review'] as const) expect(decodeClaudeAnswer(phase, envelope)).toEqual({ text: '{"round":1,"problems":[]}', providerFailed: false });
     for (const phase of ['questions', 'execute', 'fix'] as const) expect(decodeClaudeAnswer(phase, envelope)).toEqual({ text: 'prose', providerFailed: false });

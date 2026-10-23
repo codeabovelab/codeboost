@@ -28,6 +28,10 @@ const { captureInvocation } = await import('../agents/contract.ts');
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); seen.decode = undefined; });
+// Claude Code 2.1.281 wrote this shape for the planning recordings in test/fixtures/planning/recorded, which this
+// decoder read from the real envelope: `subtype` "success", `is_error` false, and the schema-checked answer object in
+// `structured_output`. Members the decoder does not read, such as usage and session_id, are left out. A run without
+// `--json-schema` has no `structured_output`; one envelope with both members checks that those phases ignore it.
 const envelope = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"prose","structured_output":{"round":1,"problems":[]}}');
 
 it.each([['planning', '{"round":1,"problems":[]}'], ['review', '{"round":1,"problems":[]}'], ['questions', 'prose'], ['execute', 'prose'], ['fix', 'prose']] as const)(
