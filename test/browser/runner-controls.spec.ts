@@ -1,4 +1,4 @@
-import { test, expect, type Page, type Request } from '@playwright/test';
+import { test, expect, type Page, type Request, type Route } from '@playwright/test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -196,8 +196,8 @@ test('shows an item in progress with Stop, polls until it settles, and drops a p
   let heldView: Record<string, any> | undefined;
   await page.route('**/api/runner', async route => {
     if (route.request().method() === 'GET' && !heldOne) {
-      heldOne = true; const response = await route.fetch(); heldView = await response.json(); pollHeld(); await pollGate;
-      await route.fulfill({ response }); return;
+      heldOne = true; heldView = await serverRunnerView(route); pollHeld(); await pollGate;
+      await route.fulfill({ status: 200, json: heldView }); return;
     }
     // Later reads wait until the check below, so none can repair a state the held answer broke.
     if (route.request().method() === 'GET' && holdLater) await laterGate;
@@ -232,10 +232,20 @@ test('shows an item in progress with Stop, polls until it settles, and drops a p
 async function viewWith(page: Page, change: (view: Record<string, any>) => void) {
   await page.route('**/api/runner', async route => {
     if (route.request().method() !== 'GET') { await route.continue(); return; }
-    const response = await route.fetch(), view = await response.json();
+    const view = await serverRunnerView(route);
     change(view);
-    await route.fulfill({ response, json: view });
+    await route.fulfill({ status: 200, json: view });
   });
+}
+/**
+ * The real server's `GET /api/runner` answer for an intercepted read. A plain fetch, not `route.fetch`: Playwright's
+ * pooled connection can reach an earlier test's server on a reused port and fail with ECONNRESET (as clickReview in
+ * review.spec.ts notes for its reads).
+ */
+async function serverRunnerView(route: Route): Promise<Record<string, any>> {
+  const request = route.request(), response = await fetch(request.url(), { headers: { 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+  if (!response.ok) throw new Error(`The runner read answered ${response.status}.`);
+  return await response.json() as Record<string, any>;
 }
 
 test('offers Publish draft PR when the server would publish, and shows the server refusal', async ({ page }) => {
@@ -588,13 +598,13 @@ test('stops polling a running task that is offered nothing after a minute of unc
   // Each poll is scheduled when the read before it settles, and none waits more than 30 s: advance 30 s at a time,
   // waiting for a read to settle after each step, until polling stops. Short delays can let more than one poll run
   // within a step. Five unchanged reads stop it; the first read after Start may still change and restart the count.
-  const note = page.locator('#runner-note'), asks = '! No work is running and no action is offered yet. Press Refresh to check again.';
+  const note = page.locator('#runner-note'), asks = '! Nothing has changed for a minute. Press Refresh to check again.';
   const startReads = Number(await note.getAttribute('data-reads'));
-  for (let step = 0; (await note.textContent()) !== asks; step++) {
+  for (let step = 0; !(await note.textContent())!.endsWith(asks); step++) {
     expect(step).toBeLessThan(10);
     const reads = Number(await note.getAttribute('data-reads'));
     await page.clock.runFor(30_000);
-    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent()) === asks).toBe(true);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent())!.endsWith(asks)).toBe(true);
   }
   expect(Number(await note.getAttribute('data-reads')) - startReads).toBeGreaterThanOrEqual(5);
   // Nothing is sent in the next 120 s.
@@ -606,4 +616,73 @@ test('stops polling a running task that is offered nothing after a minute of unc
   await refreshReview(page);
   await expect(page.locator('#runner-note')).toHaveText('');
   expect(gets).toBeGreaterThan(sent);
+});
+
+test('does not poll a running task that is offered Publish PR', async ({ page }) => {
+  await serve();
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // A running task whose items have all run and whose publish was refused: the server offers Publish again
+  // (runner/publishing.ts mode()). The real view after P1 failed, with that offer.
+  await viewWith(page, view => { view.resumable = false; view.publish = { ...view.publish, available: true, publishable: true, draft: false }; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Publish PR', exact: true })).toBeVisible();
+  // Nothing is sent in 120 s, and no note says nothing is offered.
+  const sent = gets;
+  await page.clock.runFor(120_000);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+  expect(gets).toBe(sent);
+  expect(await page.locator('#runner-note').textContent()).not.toContain('Nothing has changed');
+});
+
+test('offers Cancel task again for a cancel with no work left, and bounds its polling', async ({ page }) => {
+  await serve();
+  const posts = runnerPosts(page);
+  // A cancel held by a push whose outcome could not be read (web/server.ts cancel-task): the task keeps
+  // `cancelRequested` with no work running, and sending the cancel again settles it.
+  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = 'cancelled'; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review · Cancelling…');
+  const note = page.locator('#runner-note'), asks = '! Nothing has changed for a minute. Press Refresh to check again.';
+  for (let step = 0; (await note.textContent()) !== asks; step++) {
+    expect(step).toBeLessThan(10);
+    const reads = Number(await note.getAttribute('data-reads'));
+    await page.clock.runFor(30_000);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent()) === asks).toBe(true);
+  }
+  // The confirmation's question replaces the note while it is armed and puts it back when it lapses.
+  const cancel = page.locator('#cancel-task');
+  await cancel.click();
+  await expect(note).toContainText('cannot be undone');
+  await page.clock.runFor(5_100);
+  await expect(note).toHaveText(asks);
+  await cancel.click();
+  await cancel.click();
+  await expect.poll(() => posts.map(post => post.action)).toEqual(['cancel-task']);
+});
+
+test('clears the quiet note when a later read shows a change', async ({ page }) => {
+  await serve();
+  let offerNothing = true;
+  await viewWith(page, view => { if (offerNothing) view.resumable = false; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const note = page.locator('#runner-note'), asks = '! Nothing has changed for a minute. Press Refresh to check again.';
+  for (let step = 0; !(await note.textContent())!.endsWith(asks); step++) {
+    expect(step).toBeLessThan(10);
+    const reads = Number(await note.getAttribute('data-reads'));
+    await page.clock.runFor(30_000);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent())!.endsWith(asks)).toBe(true);
+  }
+  // The runner now offers Resume. A runner read that is not a poll (the Plans screen's refresh reloads it) shows the
+  // change, and the quiet note goes.
+  offerNothing = false;
+  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await expect(note).toHaveText('');
 });

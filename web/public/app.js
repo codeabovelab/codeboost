@@ -165,7 +165,7 @@ async function refresh() {
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     // The review now shows what the ended work changed.
-    if (runnerNoteKind === "work-ended" || runnerNoteKind === "needs-refresh") setRunnerNote("");
+    if (["work-ended", "needs-refresh", "quiet"].includes(runnerNoteKind)) setRunnerNote("");
     loadRunner();
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -2267,8 +2267,8 @@ let runnerView = null,
   // action instead of running it twice. Reused only for the identical request: the server hashes it under its action ID.
   runnerKey = null,
   // What the note under the banner says, so a later event clears only its own kind: "read-error" (cleared by the next
-  // read), "work-ended" and "needs-refresh" (cleared by Refresh), "cancel-ask" (cleared when the confirmation lapses),
-  // or null.
+  // read), "work-ended" and "needs-refresh" (cleared by Refresh), "quiet" (cleared by Refresh or a read that shows work
+  // or a change), "cancel-ask" (replaced by the note before it when the confirmation lapses), or null.
   runnerNoteKind = null,
   cancelConfirmTimer = null;
 const runnerPollMaximumDelay = 30000;
@@ -2316,18 +2316,19 @@ function liveAttempt(view) {
  */
 function runnerWorking(view) {
   if (!view?.available || view.unresolved) return false;
-  return !!liveAttempt(view) || view.publish.active || view.preMerge.active
-    || view.stopRequested !== null || view.task.cancelRequested !== null;
+  return !!liveAttempt(view) || view.publish.active || view.preMerge.active || view.stopRequested !== null;
 }
 /**
- * A running or queued task the server offers no action for. It may be between steps of a run (an attempt's cleanup,
- * the next item, the publish after the last one), which the view does not name; or it may wait on a person in a way the
- * view does not name either (an expired time budget, unapproved items, an untrusted issue). So the page polls it only
- * for `runnerQuietPollLimit` unchanged reads, then stops and asks for Refresh.
+ * A task that may still change with no work the view names. Either it is running or queued and offered nothing: between
+ * steps of a run (an attempt's cleanup, the next item, the publish after the last one), or waiting on a person in a way
+ * the view does not name (an expired time budget, unapproved items, an untrusted issue). Or it is being cancelled with
+ * no work left, which settles on its own or waits for the cancel to be sent again (a push whose outcome could not be
+ * read). The page polls it only for `runnerQuietPollLimit` unchanged reads, then stops and asks for Refresh.
  */
 function runnerBetweenSteps(view) {
-  return !!view?.available && !view.unresolved && !runnerWorking(view) && ["running", "queued"].includes(view.task.status)
-    && !view.startable && !view.resumable && !view.retryable && !approvableContinuation(view);
+  if (!view?.available || view.unresolved || runnerWorking(view)) return false;
+  if (view.task.cancelRequested !== null) return true;
+  return ["running", "queued"].includes(view.task.status) && !runAction(view) && !view.retryable && !approvableContinuation(view);
 }
 function runnerBusy(view) {
   return runnerWorking(view) || runnerBetweenSteps(view);
@@ -2413,7 +2414,8 @@ function renderRunner() {
     const run = runAction(view);
     shown["run-action"] = !!run;
     if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
-    shown["cancel-task"] = !closed && task.cancelRequested === null;
+    // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles.
+    shown["cancel-task"] = !closed && (task.cancelRequested === null || !runnerWorking(view));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
     $("task-banner-text").textContent = text;
@@ -2438,7 +2440,9 @@ function scheduleRunnerPoll() {
   runnerPollTimer = null;
   if (!runnerBusy(runnerView) || runnerPending) return;
   if (!runnerWorking(runnerView) && runnerQuietPolls >= runnerQuietPollLimit) {
-    setRunnerNote("! No work is running and no action is offered yet. Press Refresh to check again.", "needs-refresh");
+    const quiet = "! Nothing has changed for a minute. Press Refresh to check again.";
+    // Kept after a note about work that ended, which names what to review.
+    setRunnerNote(runnerNoteKind === "work-ended" ? `${$("runner-note").textContent} ${quiet}` : quiet, "quiet");
     return;
   }
   const generation = runnerGeneration;
@@ -2468,6 +2472,7 @@ function applyRunnerView(view) {
   const ended = view.available ? endedWorkNote(before, view) : "";
   if (ended) setRunnerNote(ended, "work-ended");
   else if (runnerNoteKind === "read-error") setRunnerNote("");
+  else if (runnerNoteKind === "quiet" && (runnerWorking(view) || JSON.stringify(before) !== JSON.stringify(view))) setRunnerNote("");
   renderRunner();
 }
 async function loadRunner({ poll = false, generation = poll ? runnerGeneration : undefined } = {}) {
@@ -2596,9 +2601,10 @@ $("cancel-task").onclick = () => {
   if ($("cancel-task").dataset.confirm !== "true") {
     $("cancel-task").dataset.confirm = "true";
     $("cancel-task").textContent = "Confirm cancel";
+    const earlier = { text: $("runner-note").textContent, kind: runnerNoteKind };
     setRunnerNote("! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.", "cancel-ask");
-    // Clears only its own question: a later note (a poll's run end, an answer) stays.
-    cancelConfirmTimer = setTimeout(() => { disarmCancel(); if (runnerNoteKind === "cancel-ask") setRunnerNote(""); }, 5000);
+    // Puts back the note the question replaced; a later note (a poll's run end, an answer) stays.
+    cancelConfirmTimer = setTimeout(() => { disarmCancel(); if (runnerNoteKind === "cancel-ask") setRunnerNote(earlier.text, earlier.kind); }, 5000);
     return;
   }
   sendRunnerAction("cancel-task");
