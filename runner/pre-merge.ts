@@ -8,7 +8,7 @@ import { MAX_REBASE_TIMEOUT_MS, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOU
   RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService, ReviewView } from './review.ts';
 import { BranchPushRefused } from './branch-push.ts';
-import type { PreMergeReadiness, PushMarker, PushOutcome, RebaseMarker } from './store.ts';
+import { MERGE_CANCELLED, type MergeStepName, type PreMergeReadiness, type PushMarker, type PushOutcome, type RebaseMarker } from './store.ts';
 
 /** `branch` is the task PR's head branch, present when the runner published the PR. */
 export interface RemotePair { base: string; head: string; branch?: string }
@@ -41,6 +41,11 @@ export interface PreMergeResult {
   base: string; head: string; checked: readonly string[]; reason: string | null;
 }
 type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
+/**
+ * Told when a preparation step starts, finishes or is not needed, for the merge job's step list. Display only: the
+ * preparation never waits for it, and an error it throws is ignored.
+ */
+export type PreMergeProgress = (step: Extract<MergeStepName, 'fetch' | 'rebase' | 'push' | 'commands'>, state: 'running' | 'done' | 'skipped') => void;
 
 // D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
 // of that ownership settlement inside the preparation's one overall deadline.
@@ -109,7 +114,8 @@ export class PreMergeCoordinator {
     if (this.#closing) throw new GuardRefusal('The server is shutting down.');
     if (this.#active) throw new GuardRefusal('Pre-merge preparation is already running.');
   }
-  start(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; actionId?: string }): Promise<PreMergeResult> {
+  start(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; actionId?: string },
+    progress?: PreMergeProgress): Promise<PreMergeResult> {
     this.assertStartable();
     const controller = new AbortController(); this.#abort = controller;
     const deadline = performance.now() + this.operationTimeoutMs;
@@ -136,7 +142,7 @@ export class PreMergeCoordinator {
     };
     const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline,
       observation => { failurePair = observation.pair; failureBinding = observation.binding; },
-      checked => { failureChecked = Object.freeze([...checked]); })).then(remember, error => {
+      checked => { failureChecked = Object.freeze([...checked]); }, progress)).then(remember, error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
       const result: PreMergeResult = { state: 'failed', ...failurePair,
         checked: failureChecked, reason: error instanceof Error ? error.message : String(error) };
@@ -166,6 +172,11 @@ export class PreMergeCoordinator {
     this.#closing = true; this.#shutdown.abort(new Error('Server shutdown.')); this.#abort?.abort(new Error('Server shutdown.'));
     await this.#active;
   }
+  /**
+   * The person cancelled the merge job that owns the running preparation, not the task: stop it as a task cancel does
+   * (a rebase is cleaned up, a command check is stopped as cancelled), but leave the task as it is.
+   */
+  stopForMergeCancel(): void { this.#abort?.abort(Object.assign(new Error(MERGE_CANCELLED), { code: 'MERGE_CANCELLED' })); }
   /** Cancel the task and promptly stop whichever rebase, remote read or command check this preparation owns. */
   cancelTask(expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
     const identity = this.service.config.identity;
@@ -357,8 +368,9 @@ export class PreMergeCoordinator {
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
     deadline: number, onObserved: (value: { pair: RemotePair; binding: { stateVersion: number; reviewVersion: number;
-      snapshotId: string } }) => void, onChecked: (checked: readonly string[]) => void): Promise<PreparedResult> {
+      snapshotId: string } }) => void, onChecked: (checked: readonly string[]) => void, progress?: PreMergeProgress): Promise<PreparedResult> {
     const identity = this.service.config.identity;
+    const step: PreMergeProgress = (name, state) => { try { progress?.(name, state); } catch { /* Display only. */ } };
     const remaining = () => {
       const value = Math.ceil(deadline - performance.now());
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded.'), { code: 'ETIMEDOUT' });
@@ -456,6 +468,7 @@ export class PreMergeCoordinator {
         || this.service.store.getSnapshot(identity).id !== guard.snapshotId)
         throw new GuardRefusal('The task or review changed during preparation. Reload first.');
     };
+    step('fetch', 'running');
     let initial = await this.remote.inspect(signal); await this.remote.fetch(initial, signal); signal.throwIfAborted();
     assertCurrent(expected);
     // A rewrite is pushed only once its review is clear. Until then (a review stop, or a failed or refused push), a retry
@@ -468,7 +481,10 @@ export class PreMergeCoordinator {
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
     }
-    if (initial.base !== view.snapshot.base) {
+    step('fetch', 'done');
+    if (initial.base === view.snapshot.base) step('rebase', 'skipped');
+    else {
+      step('rebase', 'running');
       const repository = this.service.reviewRepository().path;
       const old = (await readHistoryInWorker(repository, view.snapshot.base, view.snapshot.head,
         { maxDurationMs: Math.min(30_000, reviewBudget()), signal })).commits.map(commit => commit.sha);
@@ -511,11 +527,14 @@ export class PreMergeCoordinator {
       const rebasedSnapshot = this.service.store.getSnapshot(identity);
       bindRebaseFailure(rebased, { base: rebasedSnapshot.base, head: rebasedSnapshot.head }, rebased.stateVersion);
       view = await reload(rebased);
+      step('rebase', 'done');
     }
     const blocker = this.#reviewBlocker(view);
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
       checked: [], reason: blocker };
-    if (initial.head !== view.snapshot.head) {
+    if (initial.head === view.snapshot.head) step('push', 'skipped');
+    else {
+      step('push', 'running');
       const { result: pushed, stateVersion: pushState } = await this.#pushRewrite(initial, view, signal, deadline, authorize,
         bindRebaseFailure);
       // Bind any later failure to the state the push (or refusal) left, so it is reported as current, not stale.
@@ -548,9 +567,12 @@ export class PreMergeCoordinator {
       assertCurrent(pushedBinding);
       initial = seen;
       view = await reload(pushedBinding);
+      step('push', 'done');
     }
     const checked: string[] = [];
-    for (const item of view.items.filter(candidate => candidate.acceptance.some(check => check.type === 'cmd'))) {
+    const commandItems = view.items.filter(candidate => candidate.acceptance.some(check => check.type === 'cmd'));
+    step('commands', commandItems.length ? 'running' : 'skipped');
+    for (const item of commandItems) {
       signal.throwIfAborted();
       task = this.service.store.getTask(identity);
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
@@ -602,6 +624,7 @@ export class PreMergeCoordinator {
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
+    if (commandItems.length) step('commands', 'done');
     const prepared = { base: view.snapshot.base, head: view.snapshot.head };
     const guarded = { stateVersion: this.service.store.getTask(identity).stateVersion,
       // Rebase and command attempts advance task/snapshot state, but this preparation never owns a review edit.

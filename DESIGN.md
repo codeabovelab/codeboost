@@ -144,9 +144,11 @@ components:
 | Token | Meaning | Icon and word |
 |---|---|---|
 | `success` | OK: passed, in scope, approved | ✓ plus a word such as "OK" or "Passed" |
-| `warning` | Attribution warning, stale | ! plus a word such as "Stale" or "Ambiguous" |
+| `warning` | Attribution warning, stale, or a step that did not finish normally | ! plus a word such as "Stale" or "Ambiguous" ("Stopped" for a cancelled merge step, "Unknown" when GitHub's merge outcome is not known) |
 | `error` | Scope or test failure, blocker, unplanned | ✕ plus a word such as "Fail" or "Unplanned" |
-| `neutral-status` | Not applicable | – plus "N/A" |
+| `neutral-status` | Not applicable | – plus "N/A" (or "Skipped" for a step that was not needed) |
+| `neutral-status` | Not started yet (a step that is waiting) | ○ plus "Waiting" |
+| `text` | In progress (a step that is running) | ● plus "Running" |
 
 - `success` is much lighter than `error`. This lets red-green color-blind users still tell them apart by brightness. Never rely on hue alone.
 - **Contrast (checked 2026-09-22):** every text and status color is at least 5.0:1 on every surface. Body text is 14.6:1 on `surface`.
@@ -174,7 +176,7 @@ components:
 | 1280–1439px | The conversation pane collapses to a tab. The plan list narrows to 208px |
 | Below 1280px | A notice asks for a wider window |
 
-**Frame:** a 44px app bar (the shared menu, design review D13), then a 48px review strip (issue, PR, revision, progress, blockers), then full-height panes. Panes can be resized and collapsed.
+**Frame:** a 44px app bar (the shared menu, design review D13), then a 48px review strip (issue, PR, revision, progress, blockers), then, while a merge job runs and until the review reloads, the merge step bar, then full-height panes. Panes can be resized and collapsed.
 
 **Rhythm:** a 4px base grid. Rows are 32px. Pane padding is 12px. Space between sections is 16px or 24px. Keep density tight inside lists and give the code pane the most room.
 
@@ -257,3 +259,7 @@ There are no shadows and no glows. Depth comes from the surface brightness steps
 | 2026-09-22 | The serif "second voice" for the user's own words was not adopted | The user chose variant B. Two faces are enough |
 | 2026-09-22 | Logo: terminal-prompt mark (`>_`) in a rounded square, in `text` color | Taken from the approved review-screen mockup. It was left out of the first HTML screen and restored at the user's request |
 | 2026-09-22 | Contrast-checked values kept instead of values extracted from the mockup image | The extracted values (for example error #DA1E28) failed contrast on dark surfaces |
+| 2026-10-21 | Two progress marks for the merge step list: ○ "Waiting" in `neutral-status` and ● "Running" in `text` | Steps that have not started or are under way are not outcomes, so they take no outcome color. Approved by the user (PR #194) |
+| 2026-10-21 | The not-applicable mark also reads "Skipped" for a merge step that was not needed | Same meaning as N/A, worded for a step. Part of the step list the user approved (PR #194) |
+| 2026-10-21 | The warning mark also reads "Stopped" (a cancelled merge step) and "Unknown" (GitHub's merge outcome not known) | Both mean "look at this, it did not finish normally". Approved by the user (PR #194) |
+| 2026-10-21 | While a merge job runs, and after it ends until the review reloads, a step bar sits between the review strip and the panes | It shows the merge step list and Cancel merge without replacing the review strip's merge control. Approved by the user (PR #194) |

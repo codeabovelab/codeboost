@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS, PreMergeCoordinator,
-  type PreMergeAuthorization, type PreMergeResult } from '../runner/pre-merge.ts';
+  type PreMergeAuthorization, type PreMergeProgress, type PreMergeResult } from '../runner/pre-merge.ts';
+import { MERGE_CANCELLED } from '../runner/store.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import { MergeJobCoordinator } from '../runner/merge-job.ts';
 import { MergeSubmissionError, type MergeGateway } from '../github/merge.ts';
@@ -89,6 +90,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   /** Runs while each review load the preparation starts is in flight. */
   duringLoad?: (service: ReviewService) => void;
   closeDuringCommand?: boolean;
+  /** The merge job cancels its merge (not the task) while the command check runs. */
+  mergeCancelDuringCommand?: boolean;
+  /** Told of each preparation step, as the merge job's step list is. */
+  progress?: PreMergeProgress;
   closeAfterCommandAdmission?: boolean;
   commandWaitsForDeadline?: boolean;
   commandWaitsForCancellation?: boolean;
@@ -237,10 +242,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   };
   const cancelReasons: string[] = [];
   const runner = new RunnerCoordinator(service.store, commandCheckDeps(service.store, workspace, input => {
-    if (options.closeDuringCommand) {
+    if (options.closeDuringCommand || options.mergeCancelDuringCommand) {
       let settle!: (result: InvocationResult) => void;
       const settled = new Promise<InvocationResult>(resolve => { settle = resolve; });
-      queueMicrotask(() => { void coordinator.close(); });
+      queueMicrotask(() => { if (options.mergeCancelDuringCommand) coordinator.stopForMergeCancel(); else void coordinator.close(); });
       return { attemptId: input.attemptId, settled, cancel(reason) {
         cancelReasons.push(reason);
         settle({ attemptId: input.attemptId, context: input.context, exitCode: null,
@@ -353,7 +358,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   if (options.actionId) service.store.userAction(identity, { actionId: options.actionId, kind: 'prepare-merge', request: actionRequest }, () => ({ outcome: 'preparing' }));
   const result = options.deferStart ? null as unknown as PreMergeResult : await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
-    ...(options.actionId ? { actionId: options.actionId } : {}) });
+    ...(options.actionId ? { actionId: options.actionId } : {}) }, options.progress);
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, actionRequest, pushes, remote: () => remotePair,
     branchReads: () => branchReads, fetchesAfterPush: () => fetchesAfterPush,
     /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
@@ -934,6 +939,44 @@ it('refuses to record a head moved before preparation when the task changes whil
   await coordinator.close();
 });
 
+it('reports Rebase and Push skipped when neither the base nor the head moved', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-unmoved-')); roots.push(root);
+  const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
+  fixtureGit(repository, 'config', 'user.name', 'Test'); fixtureGit(repository, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repository, 'a.txt'), 'base\n'); fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'base');
+  const base = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-qc', 'feature');
+  writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-am', 'feature', '-q');
+  const head = fixtureGit(repository, 'rev-parse', 'HEAD');
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const config = { database: join(root, 'review.sqlite'), repository, runnerRepository: repository, identity,
+    pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' as const } };
+  const service = new ReviewService(config); services.push(service);
+  const plan: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'One change', questions: [], items: [{ id: 'P1',
+    title: 'Change a', intent: 'Change a', files: [{ path: 'a.txt', kind: 'edit', renamed_from: null, change: 'Change it' }],
+    acceptance: [{ type: 'check', text: 'a changed' }], depends_on: [] }] };
+  const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands: [] };
+  service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
+  let view = await service.load();
+  service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
+  markRunnerOwned(service);
+  view = await service.load(); view = await service.act({ action: 'approve', item: 'P1', token: view.token });
+  // GitHub shows the reviewed pair: nothing to rebase and nothing to push.
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => ({ base, head }), fetch: async () => undefined, ...unusedPush });
+  const task = service.store.getTask(identity);
+  const events: string[] = [];
+  const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id,
+    base, head }, (step, state) => { events.push(`${step}:${state}`); });
+  expect(result).toMatchObject({ state: 'ready', base, head });
+  expect(events).toEqual(['fetch:running', 'fetch:done', 'rebase:skipped', 'push:skipped', 'commands:skipped']);
+  await coordinator.close();
+});
+
 it('refreshes the moved head against its prior base when the PR base and head advance together', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
@@ -958,10 +1001,14 @@ it('refreshes the moved head against its prior base when the PR base and head ad
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => moved, fetch: async () => undefined, ...unusedPush });
   const task = service.store.getTask(config.identity);
+  const events: string[] = [];
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head },
+  (step, state) => { events.push(`${step}:${state}`); });
   expect(result.reason).toMatch(/head moved/);
   expect(result).toMatchObject({ state: 'review-required', base: initial.base, head: moved.head, checked: [] });
+  // Fetch is still running when the moved head stops preparation, so the job's step list shows it Failed (D16).
+  expect(events).toEqual(['fetch:running']);
   const refreshed = await service.load();
   expect(refreshed.snapshot).toMatchObject({ base: initial.base, head: moved.head });
   expect(refreshed.segments.some(segment => segment.row === 'Unplanned')).toBe(true);
@@ -2092,4 +2139,66 @@ it('ends the job cancelled when the task is cancelled while a command check runs
   expect(f.merged).toEqual([]);
   await vi.waitFor(() => expect(f.service.store.getTask(identity).status).toBe('cancelled'));
   await f.close();
+});
+
+// The merge job's step list (D16) and the header's Cancel, which stops the merge but not the task.
+const progressLog = () => {
+  const events: string[] = [];
+  return { events, progress: ((step, state) => { events.push(`${step}:${state}`); }) as PreMergeProgress };
+};
+
+it('reports each preparation step as it starts and finishes: fetch, rebase, push, then command checks', async () => {
+  const log = progressLog();
+  const fixture = await rebaseFixture('feature\n', 0, { progress: log.progress });
+  expect(fixture.result).toMatchObject({ state: 'ready', checked: ['P1'] });
+  expect(log.events).toEqual(['fetch:running', 'fetch:done', 'rebase:running', 'rebase:done', 'push:running', 'push:done',
+    'commands:running', 'commands:done']);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports command checks skipped when no plan item has one, and stops reporting where preparation stops for review', async () => {
+  const skipped = progressLog();
+  const ready = await rebaseFixture('feature\n', undefined, { progress: skipped.progress });
+  expect(ready.result).toMatchObject({ state: 'ready', checked: [] });
+  expect(skipped.events).toEqual(['fetch:running', 'fetch:done', 'rebase:running', 'rebase:done', 'push:running', 'push:done', 'commands:skipped']);
+  await ready.coordinator.close(); await ready.runner.close();
+
+  const review = progressLog();
+  const stale = await rebaseFixture('changed by rebase\n', undefined, { progress: review.progress });
+  expect(stale.result.state).toBe('review-required');
+  expect(review.events).toEqual(['fetch:running', 'fetch:done', 'rebase:running', 'rebase:done']);
+  await stale.coordinator.close(); await stale.runner.close();
+});
+
+it('prepares as before when the progress callback throws: the step list is display only', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { progress: () => { throw new Error('display failed'); } });
+  expect(fixture.result).toMatchObject({ state: 'ready', checked: ['P1'] });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('stops a command check as cancelled when the merge is cancelled, and leaves the task as it was', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { mergeCancelDuringCommand: true });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: MERGE_CANCELLED });
+  expect(fixture.cancelReasons).toEqual(['cancelled']);
+  const store = fixture.service.store, id = fixture.service.config.identity;
+  expect(store.getAttempts(id).find(attempt => attempt.kind === 'check')).toMatchObject({ state: 'cancelled' });
+  expect(store.getTask(id)).toMatchObject({ status: 'in review', cancelRequested: null });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('aborts an owned rebase and cleans it up when the merge is cancelled, leaving the task in review', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringRebase(_service, coordinator) { coordinator.stopForMergeCancel(); } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: MERGE_CANCELLED });
+  const task = fixture.service.store.getTask(fixture.service.config.identity);
+  expect(task).toMatchObject({ status: 'in review', cancelRequested: null, rebaseInProgress: null });
+  expect(fixture.pushes).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('pushes nothing when the merge is cancelled while the push reads the remote, settles the push and keeps the task in review', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringPushRead(_service, coordinator) { coordinator.stopForMergeCancel(); } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: MERGE_CANCELLED });
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(fixture.service.store.getTask(fixture.service.config.identity)).toMatchObject({ status: 'in review', cancelRequested: null, pushInProgress: null });
+  await fixture.coordinator.close(); await fixture.runner.close();
 });

@@ -222,7 +222,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
     // A merge job prepares, waits for checks and merges the PR's head. A run would move that head, and its end publishes
     // (pushes the head, refreshes the PR) under the job. Before owed work too: settling it ends in the same publish.
-    if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; wait for it to end or cancel the task.');
+    if (mergeJobs?.active) throw new GuardRefusal('A merge is running for this task; wait for it to end, or cancel the merge or the task.');
     // Recovery owns this claim for Resume even when owed work will settle instead of admitting an item. Start must not
     // consume it and strand the task behind the resulting human gate.
     if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
@@ -717,6 +717,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(input.action==='retry-question') {
           const view=await service.load({signal:requestAbort.signal});if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
           questions.start(input.id,view);applied=true;json(200,await load(requestAbort.signal));return;
+        }
+        if(input.action==='cancel-merge') {
+          // The merge header's Cancel stops the running job only; the task and its pull request stay open. Cancelling
+          // the same job again answers it, so the request needs no key of its own.
+          if(!mergeJobs)throw new GuardRefusal('Merging does not run as a job for this review.');
+          if(!isUuidV4(input.jobId)) { json(400,{error:'A merge cancel needs the job\'s UUID v4 jobId.'}); return; }
+          try { json(200,{job:mergeJobs.cancelMerge(input.jobId)}); }
+          catch (error) { if(error instanceof GuardRefusal) { json(409,{error:error.message,job:mergeJobs.latest()}); return; } throw error; }
+          return;
         }
         if(input.action==='merge') {
           // Every merge click carries its idempotency key; a request without one would bypass replay.

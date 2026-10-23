@@ -32,6 +32,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Preserve completed historical results, but visibly mark them stale when their snapshot, plan revision, assignment, or referenced code no longer matches.
 - When polling updates one part of the screen, update only that state. Preserve scroll position unless the user was already following the bottom.
 - While a request is in flight, do not disable the control that has keyboard focus; disabling it drops focus to the page. Mark it `aria-disabled`, ignore repeat activation with an in-flight guard, and test that focus stays on the control after the response.
+- When a background update (a poll, a reload, an answer) hides or removes the control that has keyboard focus, move focus to a named fallback that is still shown and not `disabled` (an `aria-disabled` control qualifies) once the update has set every control's final state, and test that focus lands there for each way the control can be hidden. Decide a focusable control's visibility once per update: hiding it and showing it again blurs it.
 - When a row or control's visual selection determines the current content or input, expose the same state with the appropriate accessibility attribute, such as `aria-current` or `aria-selected`, and test it across navigation.
 
 ## Required race regressions
@@ -52,6 +53,8 @@ Before opening or updating a PR for asynchronous behavior, test every applicable
 Every reproduced race requires a failing-before and passing-after regression. Assert both the visible result and the durable state when they can diverge.
 
 A race regression must assert that the interleaving it names actually happened (for example which abort stopped which stage, or that a deadline fired before a release) before it uses the outcome as evidence. Otherwise machine load can turn it into a test of a different order that still passes.
+
+A check that an event changed nothing (a late answer, a stale poll, a reload read earlier) must first prove the page handled that event, then read the state once: wait for a render or a state the event causes, or for a request the page sends only after handling it, and hold any later answer that could repair the state before the read. A fixed wait, the network response alone, or a retrying assertion on a state that already held before the event is not that proof: a page that handles the event late, or wrongly, then passes. A check that nothing is sent after an event can only be made over a window: wait longer than the shortest delay after which the page would send it, and say so beside the check.
 
 ## Review readiness
 
