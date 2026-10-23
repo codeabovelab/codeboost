@@ -57,6 +57,7 @@ function beginBusy(kind) {
   return ++busyGeneration;
 }
 function endBusy(owner) {
+  runnerReadFollows = false;
   if (owner !== busyGeneration) return;
   busy = false;
   busyKind = null;
@@ -163,6 +164,7 @@ async function refresh() {
     const newer = newerMergeObservations(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
     snippetSelection = null;
+    runnerReadFollows = true;
     render();
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
@@ -189,9 +191,12 @@ async function refresh() {
 function mergeFocusFallback() {
   return !$("merge").hidden && !$("merge").disabled ? $("merge") : $("reload");
 }
-// The merge state the runner header last saw, so a change (a merge submitted, queued, merged or failed, a merge job that
-// ended) reads the runner view again: a merge closes or blocks the task, and nothing else would show it (#200).
-let runnerMergeSeen = null;
+// The merge state the runner header last saw (the merge attempt's state and action ID, the merge job's ID and state), so
+// a change read from a poll reads the runner view again: a merge closes or blocks the task, and nothing else would show
+// it (#200). Paths that read the runner view themselves (Refresh, a review action, the Plans refresh, a merge click) set
+// `runnerReadFollows` around their render so it is read once; loadRunner and endBusy clear it.
+let runnerMergeSeen = null,
+  runnerReadFollows = false;
 function renderMerge() {
   // Read before rendering: hiding the focused control itself blurs it at once (hiding its parent does so at the next
   // frame). A render that hides the focused merge control, its blockers button or Cancel moves focus to the fallback once
@@ -201,7 +206,7 @@ function renderMerge() {
   renderMergeSteps(focused);
   if ((focused === $("merge") || focused === $("merge-details")) && focused.hidden) mergeFocusFallback().focus();
   const merge = data?.merge, seen = merge ? JSON.stringify([merge.queue?.state ?? null, merge.queue?.actionId ?? null, merge.job?.id ?? null, merge.job?.state ?? null]) : null;
-  if (runnerMergeSeen !== null && seen !== null && seen !== runnerMergeSeen) loadRunner();
+  if (runnerMergeSeen !== null && seen !== null && seen !== runnerMergeSeen && !runnerReadFollows) loadRunner();
   runnerMergeSeen = seen;
 }
 function renderMergeControls() {
@@ -643,6 +648,7 @@ async function act(command) {
     rememberDraft();
     const newer = newerMergeObservations(updated, mergeObservationOwner);
     data = withNewerMergeObservations(updated, newer);
+    runnerReadFollows = true;
     render();
     showNewerMergeObservations(newer);
     loadRunner();
@@ -952,6 +958,9 @@ $("merge").onclick = async () => {
   else $("merge").disabled = true;
   mergeClickPending = true;
   $("merge").textContent = "Requesting merge…";
+  // The click reads the runner view once it settles (below), answered or not: a merge closes or blocks the task, also
+  // when the server could not reload the review and the merge state shown does not change.
+  runnerReadFollows = true;
   try {
     rememberDraft();
     mergeAction ??= { actionId: crypto.randomUUID(), token: data.token, jobBefore: data.merge.job?.id ?? null };
@@ -1039,6 +1048,7 @@ $("merge").onclick = async () => {
     $("banner").textContent = `Merge blocked. ${error.message}`;
   } finally {
     endBusy(busyOwner);
+    loadRunner();
   }
 };
 $("review-link").onclick = (event) => {
@@ -2235,6 +2245,7 @@ $("plans-refresh").onclick = async () => {
     rememberDraft();
     const newer = newerMergeObservations(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
+    runnerReadFollows = true;
     render();
     showNewerMergeObservations(newer);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
@@ -2540,6 +2551,7 @@ function applyRunnerView(view) {
   renderRunner();
 }
 async function loadRunner({ poll = false, generation = poll ? runnerGeneration : undefined } = {}) {
+  runnerReadFollows = false;
   // An action in flight answers with the view after it; a read now could be answered before it commits and, being
   // newer, would drop that answer and leave the page on the state before the action.
   if (runnerPending || (poll && generation !== runnerGeneration)) return;
