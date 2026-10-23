@@ -8,6 +8,7 @@ const dockerTests = [
   'test/agent-network.test.ts',
   'test/agent-planning.test.ts',
   'test/agent-question.test.ts',
+  'test/agent-review.test.ts',
   'test/agent-supervisor.test.ts',
   'test/runner-workspace.test.ts',
 ];

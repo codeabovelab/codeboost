@@ -91,6 +91,13 @@ Use only these entry points to run an agent:
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
+   - **Review answers (#201).** A Claude invocation in the review phase answers in JSON too, exactly like planning:
+     the start call reads `schema.json` (the review answer schema, `prompts/review-answer.schema.json`), passes it as
+     `--json-schema`, and returns `structured_output` as JSON text. The command refuses a Claude review without a
+     schema, and one in questions, execute or fix with a schema. A review has planning's model budget below: the same
+     64 KiB input check (its error names the review) and `--max-turns 50`. The review keeps planning's read-only tools
+     (`Read,Glob,Grep`) and `plan` permission mode. Command checks still run in the review phase with the `runner`
+     vendor and no schema flag.
    - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory
      and passes its exact text to Claude as `--json-schema`. The container profile refuses the command if that text
      differs from the file it mounts. The result's `stdout` is Claude's `structured_output` object as JSON text, with

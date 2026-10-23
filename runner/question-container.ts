@@ -208,7 +208,7 @@ export function answerFromResult(provider: Provider, result: InvocationResult, i
  * else is `runReadOnlyAgent`.
  */
 export interface ReadOnlyFeature {
-  readonly phase: 'questions' | 'planning';
+  readonly phase: 'questions' | 'planning' | 'review';
   /** Prefix of the host root, under tmpdir(), that holds the clone's staging and the input mount. */
   readonly rootPrefix: string;
   /** Deletes one of this feature's roots and refuses any other path. Throws while the root is still on disk. */

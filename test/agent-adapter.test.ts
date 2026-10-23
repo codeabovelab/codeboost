@@ -99,7 +99,7 @@ describe('production agent adapters', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('reads the planning schema before allocating anything, and only in planning', () => {
+  it('reads the answer schema before allocating anything, and only in planning and review', () => {
     const missing = { filesystems: {} as never, inputDirectory: '/nonexistent-codeboost-input',
       imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
     const planning = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
@@ -126,6 +126,10 @@ describe('production agent adapters', () => {
       expect(isInvocationActive(overBudget.attemptId)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
     expect(isInvocationActive(planning.attemptId)).toBe(false);
+    // A Claude review returns its problems as JSON, so it reads the schema too (#201).
+    const review = captureInvocation({ ...planning, phase: 'review', attemptId: 'claude-review-schema' });
+    expect(() => startClaudeInvocation({ ...missing, invocation: review }, 'token')).toThrow('ENOENT');
+    expect(isInvocationActive(review.attemptId)).toBe(false);
     // Questions carry no schema, so the same request gets past the schema read to the image check.
     const questions = captureInvocation({ ...planning, phase: 'questions', attemptId: 'claude-no-schema' });
     expect(() => startClaudeInvocation({ ...missing, invocation: questions }, 'token')).toThrow('Agent image');

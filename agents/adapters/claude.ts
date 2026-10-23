@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { InvocationHandle } from '../contract.ts';
 import { readCapturedFile } from '../container/profile.ts';
-import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES } from '../policy.ts';
+import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES, STRUCTURED_PHASES } from '../policy.ts';
 import { launchInvocation } from './supervisor.ts';
 import { setUpProfile } from './setup.ts';
 import { assertAdapterRequest, capAdapterInvocationBudget, createAdapterInvocationBudget,
@@ -99,7 +99,7 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   const remaining = options.invocationBudget
     ? capAdapterInvocationBudget(options.invocationBudget, options.timeoutMs)
     : createAdapterInvocationBudget(request.invocation, options.timeoutMs);
-  const structured = policy.phase === 'planning';
+  const structured = STRUCTURED_PHASES.has(policy.phase);
   // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
   const command = createClaudeCommand(policy, request.prompt,
     structured ? readPlanningSchema(request.inputDirectory) : undefined);

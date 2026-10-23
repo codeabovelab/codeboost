@@ -67,7 +67,7 @@ describe('agent phase policy', () => {
     expect(codexBaseArguments(codexPolicy)).toEqual(['codex', '--strict-config', '--config', 'web_search="disabled"',
       '--config', 'mcp_servers={}', '--config', 'features.shell_tool=false', '--ask-for-approval', 'never']);
     const reviewPolicy = createPhasePolicy(request('review'));
-    const claudeCommand = createClaudeCommand(reviewPolicy, 'Inspect the code.');
+    const claudeCommand = createClaudeCommand(reviewPolicy, 'Inspect the code.', SCHEMA);
     expect(() => assertAgentCommand({ argv: claudeCommand.argv }, reviewPolicy)).toThrow('not generated');
     expect(() => assertAgentCommand(claudeCommand, codexPolicy)).toThrow('not generated');
     expect(() => assertAgentCommand(claudeCommand, reviewPolicy, 'codex')).toThrow('vendor');
@@ -75,15 +75,20 @@ describe('agent phase policy', () => {
     expect(() => createCodexCommand(readonly, 'Wrong vendor.')).toThrow('Codex invocation');
   });
 
-  it('passes the planning answer schema to Claude as exact text, and only in planning', () => {
-    const argv = createClaudeCommand(createPhasePolicy(request('planning')), 'Plan.', SCHEMA).argv;
-    expect(argv[argv.indexOf('--json-schema') + 1]).toBe(SCHEMA);
-    expect(argv.indexOf('--json-schema')).toBeLessThan(argv.indexOf('--'));
-    expect(() => createClaudeCommand(createPhasePolicy(request('planning')), 'Plan.')).toThrow('must');
-    for (const phase of ['questions', 'review', 'execute', 'fix'] as const) {
+  it('passes the answer schema to Claude as exact text, and only in planning and review (#201)', () => {
+    for (const phase of ['planning', 'review'] as const) {
+      const argv = createClaudeCommand(createPhasePolicy(request(phase)), 'Answer.', SCHEMA).argv;
+      expect(argv[argv.indexOf('--json-schema') + 1]).toBe(SCHEMA);
+      expect(argv.indexOf('--json-schema')).toBeLessThan(argv.indexOf('--'));
+      // A review reads like planning: read-only tools and plan mode.
+      expect(argv[argv.indexOf('--tools') + 1]).toBe('Read,Glob,Grep');
+      expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('plan');
+      expect(() => createClaudeCommand(createPhasePolicy(request(phase)), 'Answer.')).toThrow('must');
+    }
+    for (const phase of ['questions', 'execute', 'fix'] as const) {
       const policy = createPhasePolicy(request(phase));
       expect(createClaudeCommand(policy, 'Work.').argv).not.toContain('--json-schema');
-      expect(() => createClaudeCommand(createPhasePolicy(request(phase)), 'Work.', SCHEMA)).toThrow('Only the Claude planning');
+      expect(() => createClaudeCommand(createPhasePolicy(request(phase)), 'Work.', SCHEMA)).toThrow('Only the Claude planning and review');
     }
   });
 
@@ -114,8 +119,13 @@ describe('agent phase policy', () => {
     expect(() => createClaudeCommand(planning(), fill(MAX_PLANNING_INPUT_BYTES + 1), SCHEMA))
       .toThrow(`Planning request is ${64 * 1024 + 1} bytes (prompt ${64 * 1024 + 1 - Buffer.byteLength(SCHEMA)}, schema `
         + `${Buffer.byteLength(SCHEMA)}), over the 65536-byte model budget.`);
-    // Only planning has the budget: the other Claude phases carry no turn limit.
-    for (const phase of ['questions', 'review', 'execute', 'fix'] as const)
+    // A review shares the budget and the turn limit, and names itself when refused (#201).
+    const review = () => createPhasePolicy(request('review'));
+    expect(createClaudeCommand(review(), exact, SCHEMA).argv.slice(4, 8)).toEqual(['--json-schema', SCHEMA, '--max-turns', '50']);
+    expect(() => createClaudeCommand(review(), fill(MAX_PLANNING_INPUT_BYTES + 1), SCHEMA))
+      .toThrow(`Review request is ${64 * 1024 + 1} bytes`);
+    // The other Claude phases carry no turn limit.
+    for (const phase of ['questions', 'execute', 'fix'] as const)
       expect(createClaudeCommand(createPhasePolicy(request(phase)), 'Work.').argv).not.toContain('--max-turns');
   });
 
@@ -133,9 +143,12 @@ describe('agent phase policy', () => {
     expect(() => assertCommandSchema(command, Buffer.from(SCHEMA))).not.toThrow();
     expect(() => assertCommandSchema(command, Buffer.from(SCHEMA.trim()))).toThrow('does not match');
     expect(() => assertCommandSchema(command, Buffer.from('{"type":"object"}\n'))).toThrow('does not match');
+    const review = createClaudeCommand(createPhasePolicy(request('review')), 'Review.', SCHEMA);
+    expect(() => assertCommandSchema(review, Buffer.from(SCHEMA))).not.toThrow();
+    expect(() => assertCommandSchema(review, Buffer.from('{"type":"object"}\n'))).toThrow('does not match');
     // A command without a schema reads nothing from the mount.
-    const review = createClaudeCommand(createPhasePolicy(request('review')), 'Review.');
-    expect(() => assertCommandSchema(review, Buffer.from('anything'))).not.toThrow();
+    const question = createClaudeCommand(createPhasePolicy(request('questions')), 'Answer.');
+    expect(() => assertCommandSchema(question, Buffer.from('anything'))).not.toThrow();
   });
 
   it('runs only complete approved argv arrays in the credential-free review profile', () => {
