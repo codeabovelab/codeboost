@@ -345,8 +345,7 @@ async function pollMergeQueue(generation) {
     // attempt. Its own attempt (by its merge action ID: a job that ended `queued` or `submitted`) is still followed.
     if (shownJob && shownJob.state !== "running") {
       const readEarlier = !!job && laterMergeJob(shownJob, job);
-      const ownAttempt = !!queue?.actionId && queue.actionId === shownJob.mergeActionId;
-      if (readEarlier || !ownAttempt) {
+      if (readEarlier || !isEndedJobQueue(shownJob, queue)) {
         backOffMergePoll();
         renderMerge();
         return;
@@ -563,12 +562,21 @@ function withMergeQueue(view, queue) {
  * banner read that, as they do for a queue merge. Any other job or attempt leaves the view unchanged.
  */
 function withEndedJobQueue(view, job, queue) {
-  if (!isEndedJobQueue(job, queue)) return view;
+  if (!isEndedJobQueue(job, queue)) {
+    // A job that ended otherwise (blocked, failed) is described by its outcome: a copy of its own attempt the page kept
+    // while it asked GitHub is dropped, so that copy does not keep polling or replace the outcome.
+    const keptOwn = !!view.merge.queue?.actionId && view.merge.queue.actionId === job?.mergeActionId;
+    return keptOwn && !followsOwnAttempt(job) ? { ...view, merge: { ...view.merge, queue: null } } : view;
+  }
   return ["submitting", "queued"].includes(queue.state) ? { ...view, merge: { ...view.merge, queue } } : withMergeQueue(view, queue);
 }
 /** Whether `queue` is the merge attempt a job that ended `queued` left in GitHub's queue (its action ID is the job's `mergeActionId`). */
+/** Whether an ended job follows its own merge attempt: it left the attempt with GitHub (queued, or an unknown outcome). */
+function followsOwnAttempt(job) {
+  return job?.state === "queued" || job?.state === "submitted";
+}
 function isEndedJobQueue(job, queue) {
-  return job?.state === "queued" && Boolean(queue?.actionId) && queue.actionId === job.mergeActionId;
+  return followsOwnAttempt(job) && Boolean(queue?.actionId) && queue.actionId === job.mergeActionId;
 }
 /** The banner text for a job the page saw end (`job` null: the poll no longer reports it). */
 function endedMergeJobText(job) {
@@ -998,6 +1006,14 @@ $("merge").onclick = async () => {
     // while the click was on its way. It keeps following it, whatever job (if any) the refusal carries.
     const shown = data.merge?.job;
     if (shown?.state === "running") {
+      // A later record that ended (the job ended meanwhile) is presented, as the click's answer presents an ended job.
+      if (error.job && error.job.state !== "running" && laterMergeJob(error.job, shown)) {
+        const queue = data.merge.queue;
+        data = withMergeJobObservation(data, error.job, queue);
+        render();
+        showEndedJobAndAttempt(error.job, queue);
+        return;
+      }
       render();
       $("banner").textContent = `${error.message} ${mergeJobText(shown)}`;
       return;

@@ -47,7 +47,7 @@ With merge jobs, the merge status words the blockers the job resolves as what me
 |---|---|---|
 | `merged` | merged | nothing |
 | `queued` | unchanged (in review, or approved, merge blocked on a retry) while GitHub's queue holds it | nothing |
-| `submitted` | unchanged | refresh; the merge attempt settles from GitHub |
+| `submitted` | unchanged | refresh; the merge attempt settles from GitHub, and while GitHub's queue holds it the page follows it, as for `queued` |
 | `blocked` | approved, merge blocked | what the reason's last sentence says. After the 30-minute wait ran out, nothing failed: "Wait for the checks to pass, then Retry merge." (or wait for GitHub to determine mergeability). After a failing check or GitHub's refusal: "Fix it, then Retry merge." ("Fix them" for several failing checks). After GitHub refused a merge, a retry whose preparation rebases makes a new snapshot, and that needs every item approved again (the replacement-snapshot rule of `merge-queue.md`): the items show stale, the retry ends `review-required`, and the merge status asks for every item to be approved again. To change the task's code, use the scope-amendment flow, as from review: it accepts a blocked task. |
 | `review-required` | unchanged | review the refreshed pull request, then merge again |
 | `failed` | unchanged | do what the reason asks first, if anything (for example, review the new head), then merge again. The reason never says "merge again": the page adds "Merge again when ready." once |

@@ -2137,7 +2137,7 @@ for (const read of ['running','ended','own-attempt'] as const) test(`keeps a job
   .toEqual({merge:outcome,details:false});
  if(read!=='own-attempt')await expect(page.locator('#banner')).toHaveText(/^Merge stopped\./);
 });
-for (const carried of ['running','none'] as const) test(`keeps following the running job a cancel answer showed when a merge click on its way is refused ${carried==='running'?'with it':'with no job'} (D16)`,async({page})=>{
+for (const carried of ['running','none','ended'] as const) test(`keeps following the running job a cancel answer showed when a merge click on its way is refused ${{running:'with it',none:'with no job',ended:'with a later record of it that ended, presented'}[carried]} (D16)`,async({page})=>{
  test.setTimeout(120_000);
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
  const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
@@ -2147,6 +2147,7 @@ for (const carried of ['running','none'] as const) test(`keeps following the run
  const aCancelled=mergeJobRecord({id:a.id,state:'cancelled',step:null,revision:5,cancelRequested:true,reason:'You cancelled the merge; the task and its pull request stay open.',steps:mergeSteps(['done','skipped','skipped','skipped','stopped'])});
  // B: another tab's job, started while this page's click was on its way.
  const b=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e5',sequence:2,state:'running',step:'preparing',revision:2,steps:mergeSteps(['running'])});
+ const bMerged=mergeJobRecord({id:b.id,sequence:2,state:'merged',step:null,revision:6,url:'https://github.com/owner/repo/pull/7',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','done'])});
  // Refused because B runs (with B's record), or for a reason that carries no job (the review changed).
  const refusal=carried==='running'?'A merge is running for this task; wait for it to end, or cancel the merge or the task.':'The review changed after Merge PR was clicked. Refresh to see the change.';
  let clicks=0,stage:'a'|'a-ended'|'b'='a',holdPolls=false,releaseA!:()=>void,sawCancelA!:()=>void,releaseClickB!:()=>void,sawClickB!:()=>void,releasePolls!:()=>void;
@@ -2158,7 +2159,7 @@ for (const carried of ['running','none'] as const) test(`keeps following the run
   if(body.action!=='merge'){await route.continue();return;}
   const first=++clicks===1;if(!first)sawClickB();
   // The second click is refused, with B's record (the same one A's answer carried) or with no job.
-  if(!first){await heldClickB;await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify(carried==='running'?{error:refusal,job:b}:{error:refusal})});return;}
+  if(!first){await heldClickB;await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify(carried==='none'?{error:refusal}:{error:refusal,job:carried==='ended'?bMerged:b})});return;}
   const review=await clickReview(route);
   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...review,merge:runnerMerge(review.merge,{ready:false,action:null,job:a}),job:a})});});
  await page.route('**/api/merge',async route=>{if(holdPolls)await heldPolls;
@@ -2187,7 +2188,10 @@ for (const carried of ['running','none'] as const) test(`keeps following the run
  releaseClickB();await answered();
  expect(await page.evaluate(()=>({merge:document.getElementById('merge')!.textContent,banner:document.getElementById('banner')!.textContent,
   label:document.getElementById('merge-cancel')!.textContent,steps:!document.getElementById('merge-steps-bar')!.hidden})))
-  .toEqual({merge:'Preparing…',banner:`${refusal} Preparing the merge: refresh, rebase, push and command checks.`,label:'Cancel merge',steps:true});
+  .toEqual(carried==='ended'
+   // B merged meanwhile: the refusal carried that later record, and the page shows B's outcome.
+   ?{merge:'Merged',banner:expect.stringMatching(/^Merged\. /),label:expect.anything(),steps:true}
+   :{merge:'Preparing…',banner:`${refusal} Preparing the merge: refresh, rebase, push and command checks.`,label:'Cancel merge',steps:true});
  releasePolls();
 });
 test('follows the merge attempt of a job that ended submitted, loaded from a full review (D16)',async({page})=>{
@@ -2208,6 +2212,53 @@ test('follows the merge attempt of a job that ended submitted, loaded from a ful
  await page.goto(app.url);
  await expect(page.locator('#merge')).toHaveText('Merge queued',{timeout:15_000});
  // GitHub merges the attempt: the page follows it without a Refresh.
+ merged=true;
+ await expect(page.locator('#merge')).toHaveText('Merged',{timeout:15_000});
+ await expect(page.locator('#banner')).toHaveText('GitHub confirmed the reviewed head was merged.');
+});
+test('keeps a blocked outcome when a reload during the Merge step left its own attempt submitting (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ // The review was read at the Merge step, with the job's own attempt submitting; GitHub then refused the merge.
+ const head=view.snapshot.head,mergeActionId='0f6b0000-0000-4000-8000-00000000ac01';
+ const merging=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e7',state:'running',step:'merging',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','running'])});
+ const blocked=mergeJobRecord({id:merging.id,mergeActionId,state:'blocked',step:null,reason:'GitHub refused the merge: nope. Fix it, then Retry merge.',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','failed'])});
+ expect(merging.mergeActionId).toBe(mergeActionId);
+ const queue=(state:string)=>({kind:'queue',state,reviewedHead:head,url:null,reason:state==='failed'?'nope':null,phase:null,position:null,occurredAt:null,actionId:mergeActionId,retryable:false});
+ let polls=0;
+ await page.route('**/api/merge',async route=>{polls++;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:queue('failed'),job:blocked})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge=runnerMerge(body.merge,{ready:false,action:null,queue:queue('submitting'),job:merging,blockers:[]});await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ await expect(page.locator('#merge')).toHaveText('Merge blocked',{timeout:15_000});
+ // The outcome stays, and polling stops: the attempt is the blocked job's own, read while it asked GitHub. A check that
+ // nothing is sent can only be made over a window: it waits longer than the shortest delay after which the page polls (2 s).
+ const pollsAtOutcome=polls;
+ await page.waitForTimeout(3_000);
+ expect(polls).toBe(pollsAtOutcome);
+ expect(await page.evaluate(()=>({merge:document.getElementById('merge')!.textContent,banner:document.getElementById('banner')!.textContent})))
+  .toEqual({merge:'Merge blocked',banner:expect.stringMatching(/Fix it, then Retry merge\./)});
+});
+test('follows the own attempt of a job a poll saw end submitted (D16)',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=(await app.service.load()).snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear',pullRequest:7,draft:false};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=await app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=await app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=await app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ // The job's merge outcome was unknown: it ended submitted, its own attempt in GitHub's queue, which then merges it.
+ const head=view.snapshot.head,mergeActionId='0f6b0000-0000-4000-8000-00000000ac01';
+ const running=mergeJobRecord({id:'0f6b0000-0000-4000-8000-0000000000e8',state:'running',step:'preparing',steps:mergeSteps(['running'])});
+ const submitted=mergeJobRecord({id:running.id,state:'submitted',step:null,reason:'GitHub\'s merge outcome is unknown; the merge attempt settles from GitHub.',steps:mergeSteps(['done','skipped','skipped','skipped','done','done','unknown'])});
+ expect(submitted.mergeActionId).toBe(mergeActionId);
+ const queue=(state:string)=>({kind:'queue',state,reviewedHead:head,url:null,reason:null,phase:null,position:state==='queued'?1:null,occurredAt:null,actionId:mergeActionId,retryable:false});
+ let merged=false;
+ await page.route('**/api/merge',async route=>{await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:queue(merged?'merged':'queued'),job:submitted})});});
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();
+  body.merge=runnerMerge(body.merge,{ready:false,action:null,queue:null,job:running,blockers:[]});await route.fulfill({response,json:body});});
+ await page.goto(app.url);
+ // The poll sees the job end submitted, with its own attempt queued: the page follows the attempt.
+ await expect(page.locator('#merge')).toHaveText('Merge queued',{timeout:15_000});
  merged=true;
  await expect(page.locator('#merge')).toHaveText('Merged',{timeout:15_000});
  await expect(page.locator('#banner')).toHaveText('GitHub confirmed the reviewed head was merged.');
