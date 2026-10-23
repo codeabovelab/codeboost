@@ -2502,7 +2502,11 @@ function endedWorkNotes(before, after) {
   if (settled && ["completed", "failed", "cancelled", "stale"].includes(settled.state)) {
     ended.attempt = `${settled.state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
   }
-  if (before?.publish.active && !after.publish.active && after.publish.last) ended.publish = publishNote(after.publish.last);
+  // A publish or close that settled since the earlier view: its record is new, or the earlier view saw it in progress.
+  // It may have started and ended between two reads (polls wait up to 30 s).
+  const last = after.publish.last;
+  if (before && last && !after.publish.active && !["publishing", "closing"].includes(last.outcome)
+    && (before.publish.active || JSON.stringify(before.publish.last) !== JSON.stringify(last))) ended.publish = publishNote(last);
   if (before && before.task.cancelRequested !== null && after.task.cancelRequested === null && after.task.status === "cancelled") ended.cancel = "✓ Task cancelled.";
   return ended;
 }
@@ -2523,6 +2527,8 @@ async function loadRunner({ poll = false, generation = poll ? runnerGeneration :
   // newer, would drop that answer and leave the page on the state before the action.
   if (runnerPending || (poll && generation !== runnerGeneration)) return;
   generation ??= ++runnerGeneration;
+  // A read a person or a review load asked for starts the quiet count again, whatever it answers.
+  if (!poll) runnerQuietPolls = 0;
   runnerPollTimer = null;
   try {
     const view = await api("/api/runner");
@@ -2544,7 +2550,7 @@ async function loadRunner({ poll = false, generation = poll ? runnerGeneration :
   }
   scheduleRunnerPoll();
 }
-function runnerOutcomeText(action, result) {
+function runnerOutcomeText(action, result, view) {
   switch (action) {
     case "start":
     case "resume":
@@ -2552,7 +2558,9 @@ function runnerOutcomeText(action, result) {
     case "approve-continuation":
       return `✓ Continuation approved.${result.next ? ` Resume the task to run ${result.next}.` : ""}`;
     case "cancel-task":
-      return result.outcome === "stopping" ? "Cancelling: the running work is stopping." : "✓ Task cancelled.";
+      if (result.outcome !== "stopping") return "✓ Task cancelled.";
+      // A cancel held by a push whose outcome is unknown: the server reads the branch again (web/server.ts cancel-task).
+      return view?.task.pushInProgress ? "Cancelling: checking the outcome of the task's last push." : "Cancelling: the running work is stopping.";
     case "publish":
     case "close-pull-requests":
       // A replay answers with the job's settled record once it has one (web/server.ts publish).
@@ -2599,7 +2607,7 @@ async function sendRunnerAction(action, attemptId = null) {
     runnerPollDelay = 2000;
     runnerQuietPolls = 0;
     if (generation === runnerGeneration) applyRunnerView(answer.runner);
-    setRunnerStatus(runnerOutcomeText(action, answer.result));
+    setRunnerStatus(runnerOutcomeText(action, answer.result, answer.runner));
   } catch (error) {
     // No status (the response was lost), a 503 or an unknown outcome decided nothing the page can see: keep the key.
     const definite = error.status !== undefined && error.status !== 503 && !error.outcomeUnknown;

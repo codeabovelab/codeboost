@@ -668,10 +668,10 @@ test('offers Cancel task again for a cancel held by an unread push, and bounds i
   await page.clock.runFor(120_000);
   await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
   expect(gets).toBe(sent);
-  // The confirmation's question replaces the note while it is armed and puts it back when it lapses.
+  // The confirmation's question shows after the note while it is armed, and goes when it lapses.
   const cancel = page.locator('#cancel-task');
   await cancel.click();
-  await expect(note).toContainText('cannot be undone');
+  await expect(note).toHaveText(`${asks} ! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.`);
   await page.clock.runFor(5_100);
   await expect(note).toHaveText(asks);
   await cancel.click();
@@ -689,8 +689,9 @@ test('a cancel that an unresolved marker holds offers no Cancel task', async ({ 
   await expect(page.locator('#cancel-task')).toBeHidden();
 });
 
-test('a lapsed cancel confirmation does not put back a note a read cleared meanwhile', async ({ page }) => {
-  await serve();
+test('a good poll clears a read error while the cancel question is armed, and the question stays', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
   let failRead = false;
   await page.route('**/api/runner', async route => {
     if (route.request().method() === 'GET' && failRead) { failRead = false; await route.fulfill({ status: 500, json: { error: 'Storage failed.' } }); return; }
@@ -698,20 +699,25 @@ test('a lapsed cancel confirmation does not put back a note a read cleared meanw
   });
   await page.clock.install();
   await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
   const note = page.locator('#runner-note');
-  // A later read fails (the Plans screen's refresh reads the runner again); the view loaded before stays.
+  // P1 runs, so the page polls (2 s, then backing off while nothing changes). The next poll fails.
   failRead = true;
-  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
+  let reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
   await expect(note).toHaveText('✕ Could not read the runner state. Storage failed.');
   await page.locator('#cancel-task').click();
-  await expect(note).toContainText('cannot be undone');
-  // A read succeeds while the question is armed (the Plans screen's refresh reads the runner again).
-  const reads = Number(await note.getAttribute('data-reads'));
-  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
+  const question = "! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.";
+  await expect(note).toHaveText(`✕ Could not read the runner state. Storage failed. ${question}`);
+  // The next poll (4 s after the failed one) succeeds within the 5 s confirmation: it clears the read error only.
+  reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(4_000);
   await expect(note).toHaveAttribute('data-reads', String(reads + 1));
-  await page.clock.runFor(5_100);
-  await expect(page.locator('#cancel-task')).toHaveText('Cancel task');
-  await expect(note).toHaveText('');
+  await expect(note).toHaveText(question);
+  await expect(page.locator('#cancel-task')).toHaveText('Confirm cancel');
+  fail();
 });
 
 test('the cancel question goes when a read hides Cancel task', async ({ page }) => {
@@ -931,4 +937,70 @@ test('a publish outcome survives a failed poll and the good poll after it', asyn
   await expect(note).toHaveText(`${opened} ✕ Could not read the runner state. Storage failed.`);
   await step();
   await expect(note).toHaveText(opened);
+});
+
+test('a failed read after the quiet note shows the read error, not the quiet note', async ({ page }) => {
+  await serve();
+  let failRead = false;
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    if (failRead) { failRead = false; await route.fulfill({ status: 500, json: { error: 'Storage failed.' } }); return; }
+    // A task the server reports running with nothing offered, unchanged.
+    const view = await serverRunnerView(route);
+    view.task.status = 'running'; view.startable = false;
+    await route.fulfill({ status: 200, json: view });
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  const note = page.locator('#runner-note'), quiet = '! Nothing has changed for a minute. Press Refresh to check again.';
+  for (let polls = 0; (await note.textContent()) !== quiet; polls++) {
+    expect(polls).toBeLessThan(10);
+    const reads = Number(await note.getAttribute('data-reads'));
+    await page.clock.runFor(30_000);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent()) === quiet).toBe(true);
+  }
+  // Refresh reloads the review; its runner read fails.
+  failRead = true;
+  await refreshReview(page);
+  await expect(note).toHaveText('✕ Could not read the runner state. Storage failed.');
+});
+
+test('names a publish that started and settled between two reads', async ({ page }) => {
+  await serve();
+  let settled = false;
+  // A running task between steps (polled). Its publish starts and ends between two reads, so no read sees it active.
+  await viewWith(page, view => {
+    view.startable = false; view.task.status = 'running';
+    view.publish = { ...view.publish, available: true, active: false, last: settled
+      ? { outcome: 'failed', draft: false, message: 'The task belongs to another repository.', stateVersion: 2, at: '2026-10-23T12:05:00.000Z' }
+      : { outcome: 'not published', draft: false, message: 'This task reached its status before publishing existed.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } };
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  const note = page.locator('#runner-note');
+  await expect(note).toHaveText('');
+  settled = true;
+  const reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  await expect(note).toHaveText('✕ The task belongs to another repository.');
+});
+
+test('a resent cancel held by a push says the push is being checked', async ({ page }) => {
+  await serve();
+  const marker = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', branch: 'codeboost/3-retries', from: 'a'.repeat(40),
+    to: 'b'.repeat(40), snapshotId: 's1', startedAt: 1_760_000_000_000 };
+  await viewWith(page, view => { view.startable = false; view.task.cancelRequested = 'cancelled'; view.task.pushInProgress = marker; });
+  // The server's answer to that cancel (web/server.ts cancel-task with a push marker): `stopping`, and its runner view
+  // with the marker still set while the branch is read again.
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.fallback(); return; }
+    const view = await serverRunnerView(route);
+    view.startable = false; view.task.cancelRequested = 'cancelled'; view.task.pushInProgress = marker;
+    await route.fulfill({ status: 200, json: { result: { outcome: 'stopping' }, runner: view } });
+  });
+  await openReview(page, app.url);
+  const cancel = page.locator('#cancel-task');
+  await cancel.click(); await cancel.click();
+  await expect(page.locator('#runner-note')).toHaveText("Cancelling: checking the outcome of the task's last push.");
 });
