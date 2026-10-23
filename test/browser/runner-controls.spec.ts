@@ -274,6 +274,9 @@ test('shows the needs-amendment banner, approves the continuation, and opens the
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('! Needs amendment');
   await expect(page.locator('#task-banner-text')).toHaveText('! P2 changed files the plan did not declare: src/config.ts. Revise the plan to declare them, then approve the continuation.');
+  // Review plan change is the banner's main action (the design's "Task states that wait on you").
+  await expect(page.locator('#task-banner-plans')).toHaveClass('primary');
+  await expect(page.locator('#task-banner-approve')).not.toHaveClass('primary');
   await page.getByRole('button', { name: 'Approve continuation', exact: true }).click();
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0]).toMatchObject({ action: 'approve-continuation', expectedReviewVersion: (await app.service.load()).expected.reviewVersion });
@@ -303,18 +306,20 @@ test('shows the needs-human and possibly-already-fixed banners with Cancel task 
   await viewWith(page, view => {
     view.startable = false;
     view.task.status = state;
-    view.publish = { ...view.publish, last: { outcome: state === 'needs human' ? 'opened' : 'possibly already fixed',
-      message: state === 'needs human' ? 'Opened draft pull request #7.' : 'The issue may already be fixed (#401 links to it), so no pull request was opened.' } };
+    // Messages in runner/publishing.ts's formats.
+    view.publish = { ...view.publish, last: state === 'needs human'
+      ? { outcome: 'opened', draft: true, message: 'Pull request #7 is open as a draft; the task is needs human.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z', number: 7 }
+      : { outcome: 'possibly already fixed', draft: false, message: 'The issue may already be fixed (pull request owner/repo#401), so no pull request was opened.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } };
   });
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('! Needs human');
-  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs a person. Opened draft pull request #7.');
+  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs a person. Pull request #7 is open as a draft; the task is needs human.');
   await expect(page.locator('#run-action')).toBeHidden();
   await expect(page.locator('#cancel-task')).toBeVisible();
   state = 'possibly already fixed';
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect(status(page)).toHaveText('! Possibly already fixed');
-  await expect(page.locator('#task-banner-text')).toHaveText('! The issue may already be fixed (#401 links to it), so no pull request was opened.');
+  await expect(page.locator('#task-banner-text')).toHaveText('! The issue may already be fixed (pull request owner/repo#401), so no pull request was opened.');
   await expect(page.locator('#cancel-task')).toBeVisible();
 });
 
@@ -347,7 +352,8 @@ test('a Refresh while an action is in flight does not replace its answer with a 
 test('the review strip fits its runner controls at the 1280px minimum width', async ({ page }) => {
   await serve();
   await page.setViewportSize({ width: 1280, height: 800 });
-  // Every control the strip can show at once while an item runs: status, Stop, Retry, a run action and Cancel task.
+  // The most controls the strip shows at once: status, Retry, a run action and Cancel task (Stop and Retry are never
+  // offered together: the server offers a retry only when no attempt is active).
   await viewWith(page, view => { view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true }; });
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
@@ -393,10 +399,12 @@ test('polls every 2 s while work is in progress, backs off while nothing changes
   let active = true;
   await viewWith(page, view => {
     view.startable = false;
-    view.publish = { ...view.publish, available: true, active, last: active ? { outcome: 'publishing', draft: false, message: 'Publishing.', stateVersion: 1, at: '' }
-      : { outcome: 'opened', draft: false, message: 'Opened pull request #7.', stateVersion: 1, at: '' } };
+    view.publish = { ...view.publish, available: true, active, last: active ? { outcome: 'publishing', draft: false, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' }
+      : { outcome: 'opened', draft: false, message: 'Pull request #7 is open; the task is in review.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z', number: 7 } };
   });
   await page.clock.install();
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('○ In review · Publishing…');
   const reads = async () => Number(await page.locator('#runner-note').getAttribute('data-reads'));
@@ -411,11 +419,12 @@ test('polls every 2 s while work is in progress, backs off while nothing changes
   // The publish settles; the next poll (16 s later) shows its outcome, and none follows.
   active = false;
   await page.clock.runFor(16_000); await settledReads(base + 4);
-  await expect(page.locator('#runner-note')).toHaveText('✓ Opened pull request #7.');
-  // Nothing more in 60 s, past the 30 s backoff cap. The read count shows any poll that ran.
+  await expect(page.locator('#runner-note')).toHaveText('✓ Pull request #7 is open; the task is in review.');
+  // Nothing is sent in 60 s, past the 30 s backoff cap: counted by requests sent, not reads that finished.
+  const sent = gets;
   await page.clock.runFor(60_000);
   await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
-  expect(await reads()).toBe(base + 4);
+  expect(gets).toBe(sent);
 });
 
 test('a running task with an approvable continuation shows the banner and Approve', async ({ page }) => {
@@ -448,15 +457,15 @@ test('names the outcome of a publish when it ends', async ({ page }) => {
   let active = true;
   await viewWith(page, view => {
     view.startable = false;
-    view.publish = active ? { ...view.publish, available: true, active: true, last: { outcome: 'publishing', draft: false, message: 'Publishing.', stateVersion: 1, at: '' } }
-      : { ...view.publish, available: true, active: false, last: { outcome: 'refused', draft: false, message: 'The branch holds a commit codeboost did not make.', stateVersion: 1, at: '' } };
+    view.publish = active ? { ...view.publish, available: true, active: true, last: { outcome: 'publishing', draft: false, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } }
+      : { ...view.publish, available: true, active: false, last: { outcome: 'failed', draft: false, message: 'The task belongs to another repository.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } };
   });
   await page.clock.install();
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('○ In review · Publishing…');
   active = false;
   await page.clock.runFor(2_000);
-  await expect(page.locator('#runner-note')).toHaveText('✕ The branch holds a commit codeboost did not make.');
+  await expect(page.locator('#runner-note')).toHaveText('✕ The task belongs to another repository.');
 });
 
 test('asks for Refresh instead of sending Start when the runner reports a newer review than the page shows', async ({ page }) => {
@@ -481,6 +490,9 @@ test('names Refresh when the server refuses a start for a stale review', async (
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await expect.poll(() => posts.length).toBe(1);
   await expect(page.locator('#runner-note')).toHaveText('✕ Stale review state. Press Refresh to load the latest state.');
+  // Refresh, as the note asks, clears it.
+  await refreshReview(page);
+  await expect(page.locator('#runner-note')).toHaveText('');
 });
 
 test('shows a runner that needs a restart, and does not poll for it', async ({ page }) => {
@@ -515,4 +527,46 @@ test('clears a runner read error on the next read, and a work-ended note on Refr
   await expect(page.locator('#runner-note')).toContainText('Refresh to review its latest changes');
   await refreshReview(page);
   await expect(page.locator('#runner-note')).toHaveText('');
+});
+
+test('keeps polling while a run is between steps, and shows Resume once the runner offers it', async ({ page }) => {
+  await serve();
+  // Between steps of a run (an attempt's cleanup, the next item, the publish) the server's view names no live attempt
+  // and offers nothing: `resumable` is false while the executor is busy (web/server.ts runChoice). This keeps the real
+  // view after P1 failed, with `resumable` false until the run "ends".
+  let busy = true;
+  await viewWith(page, view => { if (busy) view.resumable = false; });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  await expect(status(page)).toHaveText('● Running');
+  await expect(page.locator('#run-action')).toBeHidden();
+  // The page keeps polling: two more reads settle with nothing offered.
+  const reads = Number(await page.locator('#runner-note').getAttribute('data-reads'));
+  await expect(page.locator('#runner-note')).toHaveAttribute('data-reads', String(reads + 2), { timeout: 20_000 });
+  busy = false;
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible({ timeout: 30_000 });
+});
+
+test('an unresolved marker hides Stop for its attempt and stops polling', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  let unresolved = false, gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // The real view of a held item, with the marker a result that could not be saved leaves (its row stays pending).
+  await viewWith(page, view => { if (unresolved) view.unresolved = { attemptId: view.task.currentAttemptId, reason: 'result-not-saved' }; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  unresolved = true;
+  await page.clock.runFor(2_000);
+  await expect(status(page)).toHaveText("● Running · Needs restart: an attempt's result could not be saved");
+  await expect(page.locator('#attempt-stop')).toBeHidden();
+  // Nothing is sent in 60 s, past the 30 s backoff cap.
+  const sent = gets;
+  await page.clock.runFor(60_000);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+  expect(gets).toBe(sent);
+  fail();
 });

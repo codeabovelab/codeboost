@@ -165,7 +165,7 @@ async function refresh() {
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     // The review now shows what the ended work changed.
-    if (runnerNoteKind === "work-ended") setRunnerNote("");
+    if (runnerNoteKind === "work-ended" || runnerNoteKind === "needs-refresh") setRunnerNote("");
     loadRunner();
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -2267,7 +2267,8 @@ let runnerView = null,
   // action instead of running it twice. Reused only for the identical request: the server hashes it under its action ID.
   runnerKey = null,
   // What the note under the banner says, so a later event clears only its own kind: "read-error" (cleared by the next
-  // read), "work-ended" (cleared by Refresh), "cancel-ask" (cleared when the confirmation lapses), or null.
+  // read), "work-ended" and "needs-refresh" (cleared by Refresh), "cancel-ask" (cleared when the confirmation lapses),
+  // or null.
   runnerNoteKind = null,
   cancelConfirmTimer = null;
 const runnerPollMaximumDelay = 30000;
@@ -2296,18 +2297,28 @@ const publishNotices = new Set(["possibly already fixed", "draft skipped", "draf
 // Controls an action in flight marks `aria-disabled`; Review plan change only navigates, so it stays usable.
 const runnerActionIds = ["attempt-stop", "attempt-retry", "run-action", "cancel-task", "task-banner-approve"];
 const runnerControlIds = [...runnerActionIds, "task-banner-plans"];
-/** The attempt the task is on while it has not settled; the only one Stop can name. */
+/**
+ * The attempt the task is on while it has not settled; the only one Stop can name. None while an unresolved marker
+ * holds the task: its row can stay pending or running after its job ended (a result or start that was not saved), and
+ * only a restart settles it.
+ */
 function liveAttempt(view) {
+  if (view.unresolved) return null;
   const attempt = view.attempts.find((entry) => entry.id === view.task.currentAttemptId);
   return attempt && (attempt.state === "pending" || attempt.state === "running") ? attempt : null;
 }
 /**
- * Work that is still moving on its own, so the page polls until it settles. An unresolved marker is left out: only a
- * restart clears it, so polling for it would never end.
+ * Work that is still moving on its own, so the page polls until it settles. Nothing is while an unresolved marker holds
+ * the task: only a restart clears it, so polling for it would never end. A running or queued task the server offers no
+ * action for is between steps of a run (an attempt's cleanup, the next item, the publish after the last one), which
+ * the view does not name; it is polled too, at the backoff's pace.
  */
 function runnerBusy(view) {
-  return !!view?.available && (!!liveAttempt(view) || view.publish.active || view.preMerge.active
-    || view.stopRequested !== null || view.task.cancelRequested !== null);
+  if (!view?.available || view.unresolved) return false;
+  const betweenSteps = ["running", "queued"].includes(view.task.status) && !view.startable && !view.resumable
+    && !view.retryable && !approvableContinuation(view);
+  return !!liveAttempt(view) || view.publish.active || view.preMerge.active || betweenSteps
+    || view.stopRequested !== null || view.task.cancelRequested !== null;
 }
 /** The header's one run action, in the order a person would take them; null when the server would admit none. */
 function runAction(view) {
@@ -2324,6 +2335,7 @@ function runAction(view) {
 function approvableContinuation(view) {
   const continuation = view.continuation;
   return continuation && !continuation.approved && !continuation.reason && view.task.cancelRequested === null
+    && !liveAttempt(view) && !view.publish.active && view.stopRequested === null
     && ["needs amendment", "queued", "running"].includes(view.task.status) ? continuation : null;
 }
 function taskBannerText(view) {
@@ -2497,7 +2509,7 @@ async function sendRunnerAction(action, attemptId = null) {
   const reviewed = ["start", "resume", "approve-continuation"].includes(action);
   // The server refuses a review version older than its own; the review on screen must be reloaded first.
   if (reviewed && runnerView.reviewVersion > data.expected.reviewVersion) {
-    setRunnerNote("! The review changed since this page loaded it. Press Refresh, check the review, then try again.");
+    setRunnerNote("! The review changed since this page loaded it. Press Refresh, check the review, then try again.", "needs-refresh");
     return;
   }
   const request = { action, expectedStateVersion: runnerView.stateVersion,
@@ -2526,8 +2538,9 @@ async function sendRunnerAction(action, attemptId = null) {
     if (definite && runnerKey === key) runnerKey = null;
     runnerPending = null;
     // The server's stale-state refusals say "Reload before writing."; on this screen that is Refresh.
+    const stale = error.message.includes("Reload before writing.");
     const message = error.message.replace("Reload before writing.", "Press Refresh to load the latest state.");
-    setRunnerNote(`✕ ${message}${definite ? "" : " Try again to resend the same request."}`);
+    setRunnerNote(`✕ ${message}${definite ? "" : " Try again to resend the same request."}`, stale ? "needs-refresh" : null);
     // A refusal often means the view was stale; read the current one.
     if (generation === runnerGeneration) {
       renderRunner();
