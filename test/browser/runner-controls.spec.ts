@@ -1049,7 +1049,9 @@ test('a replayed publish answer that carries the settled record names it once', 
     const view = await serverRunnerView(route);
     view.startable = false;
     view.publish = { ...view.publish, available: true, publishable: true, draft: false, last: failed };
-    await route.fulfill({ status: 200, json: { result: failed, runner: view } });
+    // The saved answer is the record without its stateVersion and at (runner/store.ts publishActionResponse).
+    const { stateVersion: _version, at: _at, ...result } = failed;
+    await route.fulfill({ status: 200, json: { result, runner: view } });
   });
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Publish PR', exact: true }).click();
