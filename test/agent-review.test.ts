@@ -46,7 +46,7 @@ describe('review in the agent container', () => {
     const deps = { buildImage: buildAgentImage, createClone: createTaskClone, prepareFilesystems: prepareTaskFilesystems,
       removeFilesystems: removeTaskFilesystems, measureRepository: measureGitRepository,
       capture: captureInvocation, startClaude: startClaudeInvocation, env };
-    const before = readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-'));
+    const before = readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-agent-'));
     const { request } = prepareReviewRecording('claude-review-round2', head, randomUUID());
     const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, paths: paths => `Delete ${paths.join(', ')}.`,
       untracked: () => 'Setup or cleanup was not confirmed.', retained: count => `${count} allocation(s) were not removed.` });
@@ -58,6 +58,6 @@ describe('review in the agent container', () => {
     // Cleaned up: no Docker object carries the owner, nothing is retained, and the host root is gone.
     for (const kind of ['container', 'volume', 'network']) expect(labelled(kind, owner), kind).toEqual([]);
     expect([retained.size, retained.untracked, retained.paths()]).toEqual([0, 0, []]);
-    expect(readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-'))).toEqual(before);
+    expect(readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-agent-'))).toEqual(before);
   }, 11 * 60_000);
 });

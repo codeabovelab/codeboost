@@ -203,7 +203,7 @@ export function answerFromResult(provider: Provider, result: InvocationResult, i
 }
 
 /**
- * What differs between features that run one read-only agent in lane D's container (Ask, planning): the phase, the
+ * What differs between features that run one read-only agent in lane D's container (Ask, planning, the review): the phase, the
  * host root and its removal, limits, the credential rule, the output check, and the wording a person sees. Everything
  * else is `runReadOnlyAgent`.
  */
@@ -238,7 +238,7 @@ export interface ReadOnlyRun {
   readonly deadline: number;
   readonly context: InvocationContext;
   readonly prompt: string;
-  /** The only file in the input mount. Claude planning receives it as `--json-schema`. */
+  /** The only file in the input mount. Claude planning and the review receive it as `--json-schema`. */
   readonly schemaText: string;
 }
 

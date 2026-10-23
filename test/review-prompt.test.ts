@@ -16,11 +16,11 @@ const answer = (problems: unknown[], round = 1) => JSON.stringify({ round, probl
 const problem = (items: string[], summary = 'Wrong.', check: string | null = null) => ({ items, summary, detail: 'src/example.ts:2 is wrong.', check });
 
 describe('review prompt (#201)', () => {
-  it('carries the round, the plan with each item\'s changed files, and the earlier problems only when there are some', () => {
+  it('carries the round, the plan and its head, and the earlier problems only when there are some', () => {
     const first = prepareReview(input()).request;
     expect(first).toMatchObject({ phase: 'review', access: 'read-only', round: 1, revision: 1, head: HEAD, schemaText: REVIEW_SCHEMA_TEXT });
     expect(first.prompt).toContain('This is review round 1.');
-    expect(first.prompt).toContain('"changed_files":["src/example.ts"]');
+    expect(first.prompt).toContain('"id":"P2","title":"Test that label() is stable"');
     expect(first.prompt).toContain(`"head":"${HEAD}"`);
     expect(first.prompt).not.toContain('Problems the previous round found');
     expect(first.prompt).not.toMatch(/\{\{|\}\}/u);
@@ -48,8 +48,7 @@ describe('review prompt (#201)', () => {
     expect(() => prepareReview(input({ round: 0 }))).toThrow(`from 1 to ${MAX_REVIEW_ROUNDS}`);
     expect(() => prepareReview(input({ round: MAX_REVIEW_ROUNDS + 1 }))).toThrow('Review round');
     expect(() => prepareReview(input({ head: 'HEAD' }))).toThrow('full commit ID');
-    expect(() => prepareReview(input({ changes: { P9: ['x'] } }))).toThrow('P9');
-    expect(() => prepareReview(input({ earlierProblems: [{ round: 1, item: 'P1', summary: 's', detail: 'd', check: null }] })))
+    expect(() => prepareReview(input({ round: 2, earlierProblems: [{ round: 2, item: 'P1', summary: 's', detail: 'd', check: null }] })))
       .toThrow('previous round');
     // Only the previous round's problems: round 3 is not told round 1's again.
     expect(() => prepareReview(input({ round: 3, earlierProblems: [{ round: 1, item: 'P1', summary: 's', detail: 'd', check: null }] })))
@@ -59,7 +58,9 @@ describe('review prompt (#201)', () => {
     expect(() => prepareReview(input({ attemptId: '' }))).toThrow('Attempt ID');
     expect(() => prepareReview(input({ attemptId: 'a\0b' }))).toThrow('Attempt ID');
     expect(() => prepareReview(input({ plan: { ...reviewRecordingInput('claude-review-round1', HEAD, 'x').plan, revision: 0 } }))).toThrow('revision');
-    expect(() => prepareReview(input({ changes: { P1: 'src/example.ts' as unknown as string[] } }))).toThrow('list of paths');
+    expect(() => prepareReview(input({ attemptId: 'ABC' }))).toThrow('lowercase hex');
+    // Round 1 is told nothing earlier, whatever round the problems claim.
+    expect(() => prepareReview(input({ earlierProblems: [{ round: 0, item: 'P1', summary: 's', detail: 'd', check: null }] }))).toThrow('Round 1 has no earlier problems');
     expect(() => prepareReview(input({ issue: { number: 413, title: '', body: '', comments: [] } }))).toThrow('issue mismatch');
     expect(() => prepareReview(input({ issue: { number: 412, title: '', body: 'x'.repeat(33 * 1024), comments: [] } }))).toThrow('32 KiB');
     // Each block fits on its own, but the prompt as a whole does not.
@@ -67,42 +68,41 @@ describe('review prompt (#201)', () => {
       approvedLessons: ['y'.repeat(17 * 1024)] }))).toThrow('Review prompt exceeds 32 KiB.');
   });
 
-  it('keeps room in every prompt but the last for the largest list of problems a round may give the next one', () => {
-    // Round 9 at the largest issue body it accepts; the next round is 10, a digit longer, and every item then lists all
-    // its declared paths as changed. The largest answer round 9 accepts, in text that escapes to more bytes (<, >, &)
-    // and is multibyte, must fit round 10's prompt exactly as the earlier problems.
-    const issue = (bytes: number) => ({ number: 412, title: '', body: 'x'.repeat(bytes), comments: [] });
-    const round9 = (bytes: number, final = false) => prepareReview(input({ round: 9, issue: issue(bytes), changes: {},
-      earlierProblems: [], final }));
-    const largest = (ok: (n: number) => boolean, high: number) => {
-      let low = 0;
-      while (low < high) { const mid = Math.ceil((low + high) / 2); if (ok(mid)) low = mid; else high = mid - 1; }
-      return low;
-    };
-    const accepts = (fn: () => unknown) => { try { fn(); return true; } catch { return false; } };
-    const body = largest(bytes => accepts(() => round9(bytes)), 32 * 1024);
-    expect(body).toBeGreaterThan(0);
-    expect(() => round9(body + 1)).toThrow('no room for the next round');
-    // The last round keeps no room: the same body plus more still fits.
-    expect(() => round9(body + 1, true)).not.toThrow();
-    const { validate } = round9(body);
-    const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
-    const reply = (count: number, detail: number) => answer(Array.from({ length: count }, (_, index) =>
-      ({ items: ['P1', 'P2'], summary: text(300), detail: text(index === count - 1 ? detail : 1500), check: null })), 9);
-    const count = Array.from({ length: 20 }, (_, index) => index + 1).find(n => !accepts(() => validate(reply(n, 1500))))!;
-    const detail = largest(length => accepts(() => validate(reply(count, length))), 1500);
-    expect(detail).toBeGreaterThan(0);
-    expect(() => validate(reply(count, detail + 1))).toThrow(`${MAX_ROUND_PROBLEM_BYTES}-byte limit`);
-    const problems = validate(reply(count, detail));
-    const round10 = () => prepareReview(input({ round: 10, issue: issue(body), final: true,
-      changes: { P1: ['src/example.ts'], P2: ['test/example.test.ts'] }, earlierProblems: problems.map(problem => ({ round: 9, ...problem })) }));
-    expect(round10).not.toThrow();
-    // And the room is not overstated: round 10's prompt is within one answer character (two copies of a six-byte
-    // escape) of 32 KiB.
-    const slack = 32 * 1024 - Buffer.byteLength(round10().request.prompt);
-    expect(slack).toBeGreaterThanOrEqual(0);
-    expect(slack).toBeLessThan(12);
-  });
+  // Round 9 at the largest issue body it accepts; the next round is 10, a digit longer. The largest answer round 9 accepts
+  // must fit round 10's prompt as its earlier problems, and the room must not be overstated: round 10's prompt then
+  // comes within one answer character of 32 KiB. With ASCII text that is one byte for each of the two copies of the
+  // problem; with text that escapes to more bytes (<, >, &) or is multibyte, at most six for each.
+  it.each([['ASCII', 'x', 2], ['escaped and multibyte', '<é&', 12]])(
+    'keeps room in every prompt but the last for the largest list of problems a round may give the next one (%s text)', (_name, unit, step) => {
+      const issue = (bytes: number) => ({ number: 412, title: '', body: 'x'.repeat(bytes), comments: [] });
+      const round9 = (bytes: number, final = false) => prepareReview(input({ round: 9, issue: issue(bytes), earlierProblems: [], final }));
+      const largest = (ok: (n: number) => boolean, high: number) => {
+        let low = 0;
+        while (low < high) { const mid = Math.ceil((low + high) / 2); if (ok(mid)) low = mid; else high = mid - 1; }
+        return low;
+      };
+      const accepts = (fn: () => unknown) => { try { fn(); return true; } catch { return false; } };
+      const body = largest(bytes => accepts(() => round9(bytes)), 32 * 1024);
+      expect(body).toBeGreaterThan(0);
+      expect(() => round9(body + 1)).toThrow('no room for the next round');
+      // The last round keeps no room: the same body plus more still fits.
+      expect(() => round9(body + 1, true)).not.toThrow();
+      const { validate } = round9(body);
+      const text = (length: number) => unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
+      const reply = (count: number, detail: number) => answer(Array.from({ length: count }, (_, index) =>
+        ({ items: ['P1', 'P2'], summary: text(300), detail: text(index === count - 1 ? detail : 1500), check: null })), 9);
+      const count = Array.from({ length: 20 }, (_, index) => index + 1).find(n => !accepts(() => validate(reply(n, 1500))))!;
+      const detail = largest(length => accepts(() => validate(reply(count, length))), 1500);
+      expect(detail).toBeGreaterThan(0);
+      expect(() => validate(reply(count, detail + 1))).toThrow(`${MAX_ROUND_PROBLEM_BYTES}-byte limit`);
+      const problems = validate(reply(count, detail));
+      const round10 = () => prepareReview(input({ round: 10, issue: issue(body), final: true,
+        earlierProblems: problems.map(problem => ({ round: 9, ...problem })) }));
+      expect(round10).not.toThrow();
+      const slack = 32 * 1024 - Buffer.byteLength(round10().request.prompt);
+      expect(slack).toBeGreaterThanOrEqual(0);
+      expect(slack).toBeLessThan(step);
+    });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {
     const { validate } = prepareReview(input());
@@ -185,7 +185,8 @@ describe('review agent output (#201)', () => {
     expect(REVIEW_FEATURE.removeRoot).toBe(removeReviewRoot);
     expect(() => removeReviewRoot('/etc')).toThrow('it is not a review root');
     expect(() => removeReviewRoot(join(tmpdir(), 'codeboost-planning-x'))).toThrow('it is not a review root');
-    const root = mkdtempSync(join(tmpdir(), 'codeboost-review-'));
+    expect(() => removeReviewRoot(join(tmpdir(), 'codeboost-review-x'))).toThrow('it is not a review root');
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-review-agent-'));
     removeReviewRoot(root);
     expect(existsSync(root)).toBe(false);
   });

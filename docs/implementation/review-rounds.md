@@ -34,7 +34,6 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `round` | The round number, from 1 to `MAX_REVIEW_ROUNDS` (10). |
 | `plan` | The approved plan revision that ran. |
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
-| `changes` | For each plan item, the paths its commits changed. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
 | `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. Failed `cmd:` checks are not among them: the agent cannot run commands, and the next round runs the checks again. |
 | `final` | The last round the limit allows. Its prompt keeps no room for a next round. |
@@ -42,10 +41,10 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 The template is `prompts/review.md`. Every input goes into an escaped JSON data block, filled in one pass, so inserted
 text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB. Every round's prompt except the
 last one's must also leave room for the next round's earlier problems (`MAX_ROUND_PROBLEM_BYTES`, 12 KiB, plus that
-section's own text). The room is measured on the largest prompt the next round can have from the same issue and lessons:
-the longest round number, and every item listing all its declared paths as changed. So a valid answer never makes the
-next round's prompt too large, unless the issue or the lessons grew in between. A prompt without that room is refused
-at once.
+section's own text). The next round of the same plan revision has the same prompt but for its round number, which is
+counted as long as the largest. So a valid answer never makes the next round's prompt too large, unless the issue or the
+lessons grew in between. A prompt without that room is refused at once. A new plan revision starts again at round 1,
+with no earlier problems.
 
 ### The answer
 

@@ -67,7 +67,6 @@ export const REVIEW_RECORDING_NAMES: readonly ReviewRecordingName[] = ['claude-r
 export function reviewRecordingInput(name: ReviewRecordingName, head: string, attemptId: string): ReviewInput {
   const round = name === 'claude-review-round1' ? 1 : 2;
   return { identity: { ...REVIEW_RECORDING_IDENTITY }, attemptId, round, plan: reviewRecordingPlan(), head,
-    changes: { P1: ['src/example.ts'], P2: ['test/example.test.ts'] },
     issue: { ...REVIEW_RECORDING_ISSUE, comments: [...REVIEW_RECORDING_ISSUE.comments] }, approvedLessons: [],
     earlierProblems: round === 1 ? [] : REVIEW_RECORDING_EARLIER.map(problem => ({ ...problem })) };
 }

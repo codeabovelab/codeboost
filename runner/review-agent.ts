@@ -25,7 +25,7 @@ export function reviewOutput(result: InvocationResult, invocation: InvocationInp
 export const CODEX_REVIEW_REFUSED = 'Codex cannot review plan items yet: it can read the code only by running commands, '
   + 'and the review runs none. Choose Claude Code in Settings, then retry.';
 const text = (error: unknown) => error instanceof Error ? error.message : String(error);
-const ROOT_PREFIX = 'codeboost-review-';
+const ROOT_PREFIX = 'codeboost-review-agent-';
 /** Delete a review root: a direct child of the temporary directory named with the review's prefix, and nothing else. */
 export function removeReviewRoot(root: string): void { removeFeatureRoot(root, ROOT_PREFIX, 'reviewed', 'review'); }
 /**

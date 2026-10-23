@@ -28,8 +28,6 @@ export interface ReviewInput {
   plan: Plan;
   /** The commit the agent reads: the task head after the last item, or after the last round's fixes. */
   head: string;
-  /** For each plan item, the paths its commits changed. Items with no entry changed nothing. */
-  changes: Readonly<Record<string, readonly string[]>>;
   issue: { number: number; title: string; body: string; comments: readonly string[] };
   approvedLessons: readonly string[];
   /** The problems the review agent found in the previous round and a fix ran for; empty in round 1. */
@@ -64,20 +62,17 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   identityKey(input.identity);
   if (!Number.isSafeInteger(input.round) || input.round < 1 || input.round > MAX_REVIEW_ROUNDS)
     throw new Error(`Review round must be an integer from 1 to ${MAX_REVIEW_ROUNDS}.`);
-  if (typeof input.attemptId !== 'string' || !/^[0-9a-f-]{1,64}$/u.test(input.attemptId)) throw new Error('Attempt ID is required.');
+  if (typeof input.attemptId !== 'string' || !/^[0-9a-f-]{1,64}$/u.test(input.attemptId)) throw new Error('Attempt ID must be 1 to 64 lowercase hex digits and hyphens.');
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.head)) throw new Error('Review head must be a full commit ID.');
   if (!Number.isSafeInteger(input.plan.revision) || input.plan.revision < 1) throw new Error('Plan revision must be a positive integer.');
   if (input.issue.number !== input.plan.issue) throw new Error('Selected issue mismatch.');
   const plan = structuredClone(input.plan), ids = new Set(plan.items.map(item => item.id));
-  for (const [id, paths] of Object.entries(input.changes))
-    if (!ids.has(id) || !Array.isArray(paths) || paths.some(path => typeof path !== 'string')) throw new Error(`Changes name ${id}, which is not a plan item with a list of paths.`);
+  if (input.round === 1 && input.earlierProblems.length) throw new Error('Round 1 has no earlier problems.');
   for (const problem of input.earlierProblems)
     if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
-  const items = plan.items.map(item => ({ ...item, changed_files: [...(input.changes[item.id] ?? [])] }));
-  const planData = (entries: typeof items) => dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: entries }, 'Plan data');
   const slots: Record<string, string> = {
     round: String(input.round),
-    plan_data_json: planData(items),
+    plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: plan.items }, 'Plan data'),
     issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: input.issue.body, comments: input.issue.comments }, 'Issue data'),
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     earlier_problems_json: earlierData(input.earlierProblems),
@@ -91,13 +86,11 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     });
   const prompt = fill(slots, input.earlierProblems.length > 0);
   if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('Review prompt exceeds 32 KiB.');
-  // Room for the next round's earlier problems, measured on the largest prompt the next round can have from the same
-  // issue and lessons: its round number as long as the largest, every item listing all its declared paths as changed
-  // (a fix stays in them; an edit outside them pauses the run), the section's own text and the largest problem list.
+  // Room for the next round's earlier problems: the next round of this plan revision has the same prompt but for its
+  // round number (counted as long as the largest) and that section (its own text and the largest problem list). Only a
+  // longer issue or more lessons by then can make it larger.
   if (!input.final) {
-    const bound = items.map(item => ({ ...item, changed_files: [...new Set([...item.changed_files,
-      ...item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])])])] }));
-    const next = fill({ ...slots, round: String(MAX_REVIEW_ROUNDS), plan_data_json: planData(bound) }, false);
+    const next = fill({ ...slots, round: String(MAX_REVIEW_ROUNDS) }, false);
     if (Buffer.byteLength(next, 'utf8') + EARLIER_BLOCK_BYTES + MAX_ROUND_PROBLEM_BYTES > MAX_PROMPT_BYTES)
       throw new Error('The review prompt leaves no room for the next round\'s problems. Shorten the issue or the lessons, or split the plan.');
   }
@@ -121,7 +114,6 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       // Later prompts carry this text in data blocks, which refuse NUL and unpaired surrogates: refuse it here instead.
       if ([problem.summary, problem.detail, problem.check ?? ''].some(text => text.includes('\0') || !text.isWellFormed()))
         throw new Error('The review answer contains text with NUL or an unpaired surrogate.');
-      if (!problem.summary.trim() || !problem.detail.trim()) throw new Error('The review answer has a problem with no summary or no detail.');
       // Split per item (design, "Review rounds" step 3), in plan order; a repeated ID files one copy. An item keeps the
       // check text only when it is one of that item's own `check:` entries.
       for (const item of plan.items) if (problem.items.includes(item.id)) {
