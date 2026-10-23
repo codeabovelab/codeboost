@@ -792,3 +792,81 @@ test('the Plans screen refresh clears a note that asked for Refresh', async ({ p
   await expect(page.locator('#plans-status')).toContainText('is current');
   await expect(note).toHaveText('');
 });
+
+test('a note about ended work survives a failed poll and the good poll after it, and shows with the quiet note', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  let failRead = false;
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    if (failRead) { failRead = false; await route.fulfill({ status: 500, json: { error: 'Storage failed.' } }); return; }
+    // The run stays between steps after P1 (nothing offered), so polling goes on.
+    const view = await serverRunnerView(route);
+    view.resumable = false;
+    await route.fulfill({ status: 200, json: view });
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  const note = page.locator('#runner-note');
+  // One poll at a time: advance a second at a time until the next read settles (a poll waits at most 30 s).
+  const step = async () => {
+    const reads = Number(await note.getAttribute('data-reads'));
+    for (let second = 0; Number(await note.getAttribute('data-reads')) === reads; second++) {
+      expect(second).toBeLessThan(40);
+      await page.clock.runFor(1_000);
+      await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+    }
+    await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  };
+  fail();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const ended = '✕ P1 failed. The task is now running. Refresh to review its latest changes.';
+  while ((await note.textContent()) !== ended) await step();
+  failRead = true;
+  await step();
+  await expect(note).toHaveText(`${ended} ✕ Could not read the runner state. Storage failed.`);
+  await step();
+  await expect(note).toHaveText(ended);
+  const quiet = '! Nothing has changed for a minute. Press Refresh to check again.';
+  for (let polls = 0; (await note.textContent()) !== `${ended} ${quiet}`; polls++) { expect(polls).toBeLessThan(10); await step(); }
+});
+
+test('a stale-review Start while the cancel question is armed keeps the question', async ({ page }) => {
+  await serve();
+  const posts = runnerPosts(page);
+  await viewWith(page, view => { view.reviewVersion += 1; });
+  await openReview(page, app.url);
+  const note = page.locator('#runner-note'), cancel = page.locator('#cancel-task');
+  await cancel.click();
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(note).toHaveText('! The review changed since this page loaded it. Press Refresh, check the review, then try again. '
+    + "! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.");
+  await expect(cancel).toHaveText('Confirm cancel');
+  expect(posts).toHaveLength(0);
+});
+
+test('a runner read after a review action clears the quiet note when it shows a change', async ({ page }) => {
+  await serve({ approve: false });
+  // A task the server reports running with nothing offered, unchanged, until the flag drops.
+  let faked = true;
+  await viewWith(page, view => { if (faked) view.task.status = 'running'; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('● Running');
+  const note = page.locator('#runner-note'), quiet = '! Nothing has changed for a minute. Press Refresh to check again.';
+  for (let polls = 0; (await note.textContent()) !== quiet; polls++) {
+    expect(polls).toBeLessThan(10);
+    const reads = Number(await note.getAttribute('data-reads'));
+    await page.clock.runFor(30_000);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent()) === quiet).toBe(true);
+  }
+  // A review action (approving P1 with its shortcut) reloads the review and reads the runner; that read shows a change.
+  faked = false;
+  const reads = Number(await note.getAttribute('data-reads'));
+  await page.keyboard.press('a');
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  await expect(status(page)).toHaveText('○ In review');
+  await expect(note).toHaveText('');
+});
