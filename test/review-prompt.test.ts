@@ -157,9 +157,27 @@ describe('review prompt (#201)', () => {
     const huge = { ...big, items: Array.from({ length: 10 }, (_, index) => ({ ...big.items[0]!, id: `P${index + 1}`, depends_on: [], intent: 'i'.repeat(600),
       acceptance: Array.from({ length: 10 }, (_, check) => ({ type: 'check' as const, text: `${check}${'a'.repeat(399)}` })),
       files: Array.from({ length: 40 }, (_, file) => ({ path: `${'d'.repeat(300)}/f${file}.ts`, kind: 'edit' as const, renamed_from: null, change: 'x' })) })) };
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: its items, intents, files and checks alone take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
-    // A refusal that is not about size is not hidden as "did not fit".
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: its items, intents, files and checks, with the prompt's own text, take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
+    expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
+    expect(() => build({ round: 2, earlierProblems: [{ round: 1, item: 'P1', summary: '\ud800', detail: 'd', check: null }] })).toThrow('Earlier problems must be valid text');
+  });
+
+  it('builds the next round from the largest plan the first round accepted, dropping its notes only if nothing else fits', () => {
+    // Round 1 at exactly the budget, with nothing left out; round 2 adds one problem, which needs at least a note.
+    const plan = input().plan;
+    const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => prepareReview(input({ round, earlierProblems,
+      issue: { number: 412, title: '', body: '', comments: [] },
+      plan: { ...plan, summary: 'x'.repeat(30_000), items: plan.items.map((item, index) => index ? item : { ...item, intent: 'y'.repeat(pad) }) } })).request;
+    const pad = 1000 + MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(at(1000).prompt);
+    const first = at(pad);
+    expect([Buffer.byteLength(first.prompt), first.leftOut]).toEqual([MAX_REVIEW_PROMPT_BYTES, []]);
+    const second = at(pad, 2, [{ round: 1, item: 'P2', summary: 'Still wrong.', detail: 'd', check: null }]);
+    expect(second.earlierListed).toBe(0);
+    expect(Buffer.byteLength(second.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
+    // There was room for neither the problem nor its note: the rest of the plan's text gave way first (none was left).
+    expect(second.prompt).not.toContain('did not fit here');
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {

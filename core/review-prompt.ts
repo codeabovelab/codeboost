@@ -12,8 +12,8 @@ const template = readFileSync(new URL('../prompts/review.md', import.meta.url), 
 export const REVIEW_SCHEMA_TEXT = readFileSync(new URL('../prompts/review-answer.schema.json', import.meta.url), 'utf8');
 /**
  * The largest review prompt, in UTF-8 bytes: the review's model budget, 64 KiB of prompt and schema (planning's
- * `MAX_PLANNING_INPUT_BYTES`, which lane D's command builder enforces again), less the schema. Each data block in it is
- * also at most 32 KiB (`dataJSON`).
+ * `MAX_PLANNING_INPUT_BYTES`, which lane D's command builder enforces again), less the schema. The plan block may use
+ * all of it; the issue, lessons and earlier-problems blocks are at most 32 KiB each, and every string 32 KiB (`dataJSON`).
  */
 export const MAX_REVIEW_PROMPT_BYTES = 64 * 1024 - Buffer.byteLength(REVIEW_SCHEMA_TEXT, 'utf8');
 const validateAnswer = new Ajv2020({ allErrors: true, strict: true }).compile(JSON.parse(REVIEW_SCHEMA_TEXT) as object);
@@ -77,12 +77,15 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   if (input.round === 1 && input.earlierProblems.length) throw new Error('Round 1 has no earlier problems.');
   for (const problem of input.earlierProblems)
     if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
+  // Text a data block cannot hold (NUL, an unpaired surrogate) is refused wherever it is, before any of it is left out.
+  for (const [label, value] of [['Plan data', plan], ['Issue data', input.issue], ['Lessons', input.approvedLessons], ['Earlier problems', input.earlierProblems]] as const)
+    assertText(value, label);
   // The plan's items, intents, files and checks always go in: without them there is nothing to review. The rest goes in
   // while it fits, in this order: the file change texts, the earlier problems (as many as fit, in order: a hint, as the
   // agent checks every item anyway), the issue's description, the lessons, the issue's comments. What is left out is
   // named in codeboost's own note.
   const total = input.earlierProblems.length;
-  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean };
+  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean; notes: boolean };
   const changeTexts = plan.items.some(item => item.files.some(file => file.change));
   const issueNote = (description: boolean, comments: number) => {
     const what = [description ? 'description' : '', comments ? `${comments} comment${comments === 1 ? '' : 's'}` : ''].filter(Boolean);
@@ -94,15 +97,15 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       round: String(input.round),
       plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
         : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
-      plan_left_out: !parts.changes && changeTexts ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
+      plan_left_out: parts.notes && !parts.changes && changeTexts ? '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.' : '',
       issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: parts.description ? input.issue.body : '',
         comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
-      issue_left_out: issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments),
+      issue_left_out: parts.notes ? issueNote(!parts.description && !!input.issue.body, parts.comments ? 0 : comments) : '',
       lessons_data_json: dataJSON(parts.lessons ? input.approvedLessons : [], 'Lessons'),
-      lessons_left_out: !parts.lessons && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
+      lessons_left_out: parts.notes && !parts.lessons && input.approvedLessons.length ? '\n\nThe approved lessons did not fit here, so they are left out.' : '',
       earlier_problems_json: dataJSON(input.earlierProblems.slice(0, parts.earlier).map(({ round, item, summary, detail, check }) =>
         ({ round, item, summary, detail, check })), 'Earlier problems'),
-      earlier_left_out: left ? `\n\n${parts.earlier ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '',
+      earlier_left_out: parts.notes && left ? `\n\n${parts.earlier ? `${left} more problem${left === 1 ? '' : 's'}` : `The ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '',
     };
     const prompt = template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => parts.earlier ? block : '')
       // One pass over the trusted template only: inserted data is never interpreted again.
@@ -114,10 +117,13 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   };
   // Only a size refusal means "does not fit"; any other refusal (text a data block cannot hold) is the input's fault.
   const sized = (parts: Parts) => { try { return render(parts); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
-  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
+  // The smallest prompt: the plan's items, intents, files and checks and the prompt's own text. Then codeboost's notes
+  // about what is left out, which go in unless the plan alone leaves no room even for them.
+  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false, notes: false };
   if (sized(parts) === null)
-    throw new Error(`The plan is too large to review in one prompt: its items, intents, files and checks alone take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    throw new Error(`The plan is too large to review in one prompt: its items, intents, files and checks, with the prompt's own text, take more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
+  keep({ ...parts, notes: true });
   keep({ ...parts, changes: true });
   if (total) {
     if (sized({ ...parts, earlier: total }) !== null) parts = { ...parts, earlier: total };
@@ -131,7 +137,7 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   keep({ ...parts, description: true });
   keep({ ...parts, lessons: true });
   keep({ ...parts, comments: true });
-  const prompt = sized(parts)!, low = parts.earlier;
+  const prompt = sized(parts)!, listed = parts.earlier;
   const leftOut: ReviewLeftOut[] = [
     ...(!parts.changes && changeTexts ? ['file change texts' as const] : []),
     ...(!parts.description && input.issue.body ? ['issue description' as const] : []),
@@ -141,10 +147,16 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   const { repositoryId, taskId, planId } = input.identity;
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,
-    revision: plan.revision, head: input.head, prompt, schemaText: REVIEW_SCHEMA_TEXT, earlierListed: low, leftOut: Object.freeze([...leftOut]) });
+    revision: plan.revision, head: input.head, prompt, schemaText: REVIEW_SCHEMA_TEXT, earlierListed: listed, leftOut: Object.freeze([...leftOut]) });
   return Object.freeze({ request, validate: (source: string | Uint8Array) => validateReviewAnswer(plan, input.round, source) });
 }
 
+/** Refuse NUL and unpaired surrogates in every string of `value`, as `dataJSON` would where it reached them. */
+function assertText(value: unknown, label: string): void {
+  if (typeof value === 'string') { if (value.includes('\0') || !value.isWellFormed()) throw new Error(`${label} must be valid text without NUL.`); }
+  else if (Array.isArray(value)) for (const child of value) assertText(child, label);
+  else if (value && typeof value === 'object') for (const [key, child] of Object.entries(value)) { assertText(key, label); assertText(child, label); }
+}
 /**
  * Parse and check a review agent's answer for `round` of `plan`, without the rest of the request: an answer that matches
  * the schema, names only the plan's items and holds text a data block accepts is valid, whatever its size (#201).

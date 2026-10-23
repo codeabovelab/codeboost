@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import type { InvocationHandle } from '../contract.ts';
+import type { InvocationHandle, Phase } from '../contract.ts';
 import { readCapturedFile } from '../container/profile.ts';
 import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES, STRUCTURED_PHASES } from '../policy.ts';
 import { launchInvocation } from './supervisor.ts';
@@ -87,7 +87,7 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
  * Read the planning or review schema for `--json-schema` with the profile's bounded no-follow reader. The profile
  * captures the mounted file again and refuses a command whose schema differs.
  */
-export function readAnswerSchema(inputDirectory: string, label = 'Planning schema'): string {
+export function readAnswerSchema(inputDirectory: string, label: string): string {
   const { content } = readCapturedFile(join(inputDirectory, 'schema.json'), label, MAX_COMMAND_SCHEMA_BYTES);
   return new TextDecoder('utf-8', { fatal: true }).decode(content);
 }
@@ -108,5 +108,9 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
     network => ({ ...request, policy, network, command, claudeToken: oauthToken }),
     profile => start(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
       processLifecycle: request.processLifecycle,
-      invocationBudget: remaining, decode: (_profile, raw) => parseClaudeOutput(raw, structured) })));
+      invocationBudget: remaining, decode: (_profile, raw) => decodeClaudeAnswer(policy.phase, raw) })));
+}
+/** How a Claude invocation's output is read in `phase`: a planning or review answer from `structured_output` (#201). */
+export function decodeClaudeAnswer(phase: Phase, raw: Buffer): { text: string; providerFailed: boolean } {
+  return parseClaudeOutput(raw, STRUCTURED_PHASES.has(phase));
 }

@@ -42,8 +42,9 @@ text is never read as a placeholder or as a closing tag. The prompt is at most `
 64 KiB model budget less its schema. The plan block may use all of it; the issue, lessons and earlier-problems blocks are
 at most 32 KiB each.
 
-The plan's items, intents, files and checks always go in: without them there is nothing to review. The rest goes in
-while it fits, in this order:
+The plan's items, intents, files and checks always go in: without them there is nothing to review. Each of the rest
+goes in if it still fits, tried in this order (a part that does not fit is skipped, and the later ones are still
+tried):
 
 1. the text of each file change in the plan;
 2. the previous round's problems, as many as fit, in order (`request.earlierListed`): they are a hint, and the agent
@@ -52,9 +53,11 @@ while it fits, in this order:
 4. the approved lessons;
 5. the issue's comments.
 
-codeboost's own note in the prompt names whatever was left out, and `request.leftOut` lists it. So an answer is never
-refused for its size: any valid answer can be the next round's earlier problems. A new plan revision starts again at
-round 1, with no earlier problems.
+codeboost's own note in the prompt names whatever was left out. `request.leftOut` lists the parts left out, and
+`request.earlierListed` counts the earlier problems listed. Only when the plan alone leaves no room even for those notes
+are they left out too. So an answer is never refused for its size: any valid answer can be the next round's earlier
+problems. Text that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it
+would fit. A new plan revision starts again at round 1, with no earlier problems.
 
 **Known limit.** A plan whose items, intents, files and checks alone take more than the budget cannot be reviewed in one
 prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
