@@ -1155,7 +1155,8 @@ test('names a publish message as the needs-human cause while the budget is unspe
     view.publish = { ...view.publish, last: { outcome: 'opened', draft: true, message: 'Pull request #7 is open as a draft; the task is needs human.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z', number: 7 } };
     // A stopped attempt whose first reason is the time limit (runner/lifecycle.ts FIRST_REASONS); the page reads only
     // these fields of it.
-    if (state === 'time-limit') { view.task.currentAttemptId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
+    // A time-limit stop happens only at or after the deadline, which is never moved later (runner/store.ts).
+    if (state === 'time-limit') { view.task.budgetDeadline = Date.now() - 1_000; view.task.currentAttemptId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
       view.attempts = [{ id: view.task.currentAttemptId, kind: 'execute', item: 'P1', state: 'cancelled', firstReason: 'time-limit', diagnostic: null }]; }
   });
   await openReview(page, app.url);
@@ -1163,4 +1164,17 @@ test('names a publish message as the needs-human cause while the budget is unspe
   state = 'time-limit';
   await refreshReview(page);
   await expect(page.locator('#task-banner-text')).toHaveText("! This task needs a person. The task's time budget ran out.");
+});
+
+test('offers Cancel task during a merge submission and shows the server\'s refusal', async ({ page }) => {
+  await serve();
+  // A real merge attempt being submitted (as review.spec.ts makes one): the server refuses a cancel while it lasts.
+  const view = await app.service.load();
+  app.service.store.beginMergeAttempt(app.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion! }, view.snapshot.head, null, 'direct');
+  await openReview(page, app.url);
+  const cancel = page.locator('#cancel-task');
+  await expect(cancel).toBeVisible();
+  await cancel.click(); await cancel.click();
+  await expect(page.locator('#runner-note')).toContainText('✕ A merge is in progress. Cancel the task after it finishes or fails.');
+  expect(app.service.store.getTask(app.service.config.identity).status).not.toBe('cancelled');
 });
