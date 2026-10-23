@@ -264,6 +264,11 @@ describe('review prompt (#201)', () => {
     expect(() => validate('{"round":1,"problems":[],"round":1}')).toThrow('Duplicate');
     expect(() => validate('{"round":1.0000000000000001,"problems":[]}')).toThrow('not exactly representable');
     expect(() => validate('not json')).toThrow();
+    // A valid answer over 1 MiB is refused for its size, as a string and as bytes; exactly 1 MiB is accepted.
+    const padded = (bytes: number) => answer([]).slice(0, -1) + ' '.repeat(bytes - answer([]).length) + '}';
+    expect(validate(padded(1024 * 1024))).toEqual([]);
+    expect(() => validate(padded(1024 * 1024 + 1))).toThrow('Input size exceeds 1 MiB.');
+    expect(() => validate(Buffer.from(padded(1024 * 1024 + 1)))).toThrow('Input size exceeds 1 MiB.');
     expect(() => validate(answer([problem(['P1'], 'a\u0000b')]))).toThrow('NUL or an unpaired surrogate');
     expect(() => validate(answer([{ ...problem(['P1']), detail: '\ud800' }]))).toThrow('NUL or an unpaired surrogate');
     expect(() => validate(answer([{ ...problem(['P1']), check: 'a\u0000b' }]))).toThrow('NUL or an unpaired surrogate');
