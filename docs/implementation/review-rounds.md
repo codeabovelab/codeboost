@@ -36,12 +36,16 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
 | `changes` | For each plan item, the paths its commits changed. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
-| `earlierProblems` | The problems the previous round filed and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. |
+| `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. Round 1 has none. Failed `cmd:` checks are not among them: the agent cannot run commands, and the next round runs the checks again. |
+| `final` | The last round the limit allows. Its prompt keeps no room for a next round. |
 
 The template is `prompts/review.md`. Every input goes into an escaped JSON data block, filled in one pass, so inserted
-text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB. Every round's prompt must also
-leave room for the next round's earlier problems (`MAX_ROUND_PROBLEM_BYTES`, 12 KiB, plus that section's own text), so a
-valid answer can never make the next round's prompt too large. A prompt without that room is refused at once.
+text is never read as a placeholder or as a closing tag. The prompt is at most 32 KiB. Every round's prompt except the
+last one's must also leave room for the next round's earlier problems (`MAX_ROUND_PROBLEM_BYTES`, 12 KiB, plus that
+section's own text). The room is measured on the largest prompt the next round can have from the same issue and lessons:
+the longest round number, and every item listing all its declared paths as changed. So a valid answer never makes the
+next round's prompt too large, unless the issue or the lessons grew in between. A prompt without that room is refused
+at once.
 
 ### The answer
 
@@ -49,8 +53,9 @@ The answer schema is `prompts/review-answer.schema.json`. Lane D mounts it as th
 text to Claude as `--json-schema` ([agent isolation](agent-isolation.md), "Review answers"). The answer is one object:
 
 - `round`: the round number from the request;
-- `problems`: at most 20, each with `items` (the plan item IDs whose code must change), `summary` (300 characters),
-  `detail` (1,500 characters), and `check` (the exact text of the `check:` entry it fails, or null).
+- `problems`: at most 20, each with `items` (the plan item IDs whose code must change, at most 30, as a plan has),
+  `summary` (300 characters), `detail` (1,500 characters), and `check` (the exact text of the `check:` entry it fails,
+  or null).
 
 `validate` refuses an answer that:
 
@@ -58,22 +63,25 @@ text to Claude as `--json-schema` ([agent isolation](agent-isolation.md), "Revie
 - does not match the schema;
 - is for another round;
 - names an item that is not in the plan;
-- holds text with NUL or an unpaired surrogate (the data blocks of later prompts refuse it);
+- holds text with NUL or an unpaired surrogate (the data blocks of later prompts refuse it), or a summary or detail that
+  is only white space;
 - splits into problems that take more than 12 KiB as the next round's data block.
 
-A valid answer becomes a list of `ReviewProblem`s, one per named item, in plan order. An item named twice in one problem
-gets one copy. A copy keeps the `check` text only when it is exactly one of that item's own `check:` entries; otherwise
+A valid answer becomes a list of `ReviewProblem`s: for each problem in the answer's order, one copy per named item, in
+plan order. An item named twice in one problem gets one copy. A copy keeps the `check` text only when it is exactly one of that item's own `check:` entries; otherwise
 it is null. An empty list means the round found nothing.
 
 ### The invocation
 
-The review agent is Claude in lane D's read-only `review` phase: read, list and search tools, `plan` permission mode, no
-commands, vendor-only egress. It shares planning's model budget: 64 KiB of prompt and schema, and `--max-turns 50`.
+The review agent is Claude in lane D's read-only `review` phase: read, list and search tools, `plan` permission mode, and
+vendor-only egress. It runs no commands: the Claude command disallows Bash, and a review is captured with no approved
+argv, so the phase's command tool has nothing to run. It shares planning's model budget: 64 KiB of prompt and schema, and `--max-turns 50`.
 Codex is refused, as in every phase (#93). `reviewOutput` (`runner/review-agent.ts`) accepts only the invocation's own
 output after a clean exit.
 
 `REVIEW_FEATURE` runs a review as a read-only run outside the runner, for the recording script and the Docker test. In
-part 2 the runner starts review attempts through its coordinator instead, so stops, shutdown and recovery apply.
+part 2 the runner starts review attempts through its coordinator instead, so stops, shutdown and recovery apply. Their
+launcher must mount the review answer schema: the execute launcher's plain-text schema is refused for a review.
 
 ### Recorded output
 

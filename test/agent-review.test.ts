@@ -48,7 +48,8 @@ describe('review in the agent container', () => {
       capture: captureInvocation, startClaude: startClaudeInvocation, env };
     const before = readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-'));
     const { request } = prepareReviewRecording('claude-review-round2', head, randomUUID());
-    const retained = new RetainedStorage();
+    const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, paths: paths => `Delete ${paths.join(', ')}.`,
+      untracked: () => 'Setup or cleanup was not confirmed.', retained: count => `${count} allocation(s) were not removed.` });
     // Only a request that left the container through the vendor proxy can come back with Anthropic's 401. The unit
     // tests (agent-policy, agent-adapter, review-prompt) check that the review command carries the schema.
     await expect(runReadOnlyAgent(REVIEW_FEATURE, { ...reviewRun(request, { vendor: 'claude', repository, snapshotId: 's' },

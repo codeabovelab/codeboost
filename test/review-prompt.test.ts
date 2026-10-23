@@ -67,24 +67,41 @@ describe('review prompt (#201)', () => {
       approvedLessons: ['y'.repeat(17 * 1024)] }))).toThrow('Review prompt exceeds 32 KiB.');
   });
 
-  it('keeps room in every prompt for the largest list of problems a round may give the next one', () => {
-    // A prompt that fits today but would not fit with a full round of earlier problems is refused now, not next round.
-    const body = (bytes: number) => 'x'.repeat(bytes);
-    const base = Buffer.byteLength(prepareReview(input({ issue: { number: 412, title: '', body: '', comments: [] } })).request.prompt);
-    const room = 32 * 1024 - base - MAX_ROUND_PROBLEM_BYTES;
-    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }))).not.toThrow();
-    expect(() => prepareReview(input({ issue: { number: 412, title: '', body: body(room), comments: [] } }))).toThrow('no room for the next round');
-    // The largest valid answer then fits in the next round's prompt.
-    const { validate } = prepareReview(input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }));
-    const detail = 'd'.repeat(1500), summary = 's'.repeat(300);
-    const most: ReturnType<typeof validate> = [];
-    for (let count = 1; count <= 20; count++) {
-      try { most.splice(0, most.length, ...validate(answer(Array.from({ length: count }, () => ({ items: ['P1'], summary, detail, check: null }))))); }
-      catch { break; }
-    }
-    expect(most.length).toBeGreaterThan(0);
-    expect(() => prepareReview({ ...input({ issue: { number: 412, title: '', body: body(room - 600), comments: [] } }), round: 2,
-      earlierProblems: most.map(problem => ({ round: 1, ...problem })) })).not.toThrow();
+  it('keeps room in every prompt but the last for the largest list of problems a round may give the next one', () => {
+    // Round 9 at the largest issue body it accepts; the next round is 10, a digit longer, and every item then lists all
+    // its declared paths as changed. The largest answer round 9 accepts, in text that escapes to more bytes (<, >, &)
+    // and is multibyte, must fit round 10's prompt exactly as the earlier problems.
+    const issue = (bytes: number) => ({ number: 412, title: '', body: 'x'.repeat(bytes), comments: [] });
+    const round9 = (bytes: number, final = false) => prepareReview(input({ round: 9, issue: issue(bytes), changes: {},
+      earlierProblems: [], final }));
+    const largest = (ok: (n: number) => boolean, high: number) => {
+      let low = 0;
+      while (low < high) { const mid = Math.ceil((low + high) / 2); if (ok(mid)) low = mid; else high = mid - 1; }
+      return low;
+    };
+    const accepts = (fn: () => unknown) => { try { fn(); return true; } catch { return false; } };
+    const body = largest(bytes => accepts(() => round9(bytes)), 32 * 1024);
+    expect(body).toBeGreaterThan(0);
+    expect(() => round9(body + 1)).toThrow('no room for the next round');
+    // The last round keeps no room: the same body plus more still fits.
+    expect(() => round9(body + 1, true)).not.toThrow();
+    const { validate } = round9(body);
+    const text = (length: number) => '<é&'.repeat(Math.ceil(length / 3)).slice(0, length);
+    const reply = (count: number, detail: number) => answer(Array.from({ length: count }, (_, index) =>
+      ({ items: ['P1', 'P2'], summary: text(300), detail: text(index === count - 1 ? detail : 1500), check: null })), 9);
+    const count = Array.from({ length: 20 }, (_, index) => index + 1).find(n => !accepts(() => validate(reply(n, 1500))))!;
+    const detail = largest(length => accepts(() => validate(reply(count, length))), 1500);
+    expect(detail).toBeGreaterThan(0);
+    expect(() => validate(reply(count, detail + 1))).toThrow(`${MAX_ROUND_PROBLEM_BYTES}-byte limit`);
+    const problems = validate(reply(count, detail));
+    const round10 = () => prepareReview(input({ round: 10, issue: issue(body), final: true,
+      changes: { P1: ['src/example.ts'], P2: ['test/example.test.ts'] }, earlierProblems: problems.map(problem => ({ round: 9, ...problem })) }));
+    expect(round10).not.toThrow();
+    // And the room is not overstated: round 10's prompt is within one answer character (two copies of a six-byte
+    // escape) of 32 KiB.
+    const slack = 32 * 1024 - Buffer.byteLength(round10().request.prompt);
+    expect(slack).toBeGreaterThanOrEqual(0);
+    expect(slack).toBeLessThan(12);
   });
 
   it('files a problem against every item it names, in plan order, and accepts an empty round', () => {
@@ -120,6 +137,9 @@ describe('review prompt (#201)', () => {
     expect(() => validate(answer([problem([])]))).toThrow('schema');
     expect(() => validate(answer([problem(['p1'])]))).toThrow('schema');
     expect(() => validate(answer([problem(['P1'], '')]))).toThrow('schema');
+    expect(() => validate(answer([problem(['P1'], '   ')]))).toThrow('schema');
+    expect(() => validate(answer([{ ...problem(['P1']), detail: ' \t\n' }]))).toThrow('schema');
+    expect(() => validate(answer([problem(Array.from({ length: 31 }, (_, index) => `P${index + 1}`))]))).toThrow('schema');
     expect(() => validate(answer(Array.from({ length: 21 }, () => problem(['P1']))))).toThrow('schema');
   });
 

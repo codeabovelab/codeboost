@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { parseClaudeOutput, readPlanningSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { parseClaudeOutput, readAnswerSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { capAdapterInvocationBudget, createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
@@ -87,14 +87,14 @@ describe('production agent adapters', () => {
       };
       const text = '{"type":"object"}\n';
       // The reader returns the exact text; the command builder validates it.
-      expect(readPlanningSchema(dir('valid', file => writeFileSync(file, text)))).toBe(text);
+      expect(readAnswerSchema(dir('valid', file => writeFileSync(file, text)))).toBe(text);
       const target = join(root, 'target.json'); writeFileSync(target, text);
-      expect(() => readPlanningSchema(dir('link', file => symlinkSync(target, file)))).toThrow('not a link');
+      expect(() => readAnswerSchema(dir('link', file => symlinkSync(target, file)))).toThrow('not a link');
       // A FIFO with no writer would block a plain open forever.
-      expect(() => readPlanningSchema(dir('fifo', file => execFileSync('mkfifo', [file])))).toThrow('regular file');
-      expect(() => readPlanningSchema(dir('big', file => writeFileSync(file, `{"d":"${'x'.repeat(64 * 1024)}"}`))))
+      expect(() => readAnswerSchema(dir('fifo', file => execFileSync('mkfifo', [file])))).toThrow('regular file');
+      expect(() => readAnswerSchema(dir('big', file => writeFileSync(file, `{"d":"${'x'.repeat(64 * 1024)}"}`))))
         .toThrow('bounded');
-      expect(() => readPlanningSchema(dir('binary', file => writeFileSync(file, Buffer.from([0x7b, 0xff, 0x7d])))))
+      expect(() => readAnswerSchema(dir('binary', file => writeFileSync(file, Buffer.from([0x7b, 0xff, 0x7d])))))
         .toThrow('not valid');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

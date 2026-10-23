@@ -52,19 +52,17 @@ const ROOT_PREFIX = 'codeboost-planning-';
  * Delete a planning root: a direct child of the temporary directory named with planning's prefix, and nothing else.
  * Its input directory is made writable first, since the request left it read-only.
  */
-export function removePlanningRoot(root: string): void { rootRemover(ROOT_PREFIX, 'planned', 'planning')(root); }
+export function removePlanningRoot(root: string): void { removeFeatureRoot(root, ROOT_PREFIX, 'planned', 'planning'); }
 /**
- * The removal of one read-only feature's host roots (planning's, the review's): a direct child of the temporary
- * directory named with `prefix`, and nothing else. `code` and `feature` name them in errors.
+ * Delete one read-only feature's host root (planning's, the review's): a direct child of the temporary directory named
+ * with `prefix`, and nothing else. `code` and `feature` name it in errors.
  */
-export function rootRemover(prefix: string, code: string, feature: string): (root: string) => void {
-  return root => {
-    if (dirname(root) !== tmpdir() || !basename(root).startsWith(prefix))
-      throw new Error(`A copy of the ${code} code could not be deleted (${root}): it is not a ${feature} root.`);
-    try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
-    try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
-    catch (error) { throw new Error(`A copy of the ${code} code could not be deleted (${root}).`, { cause: error }); }
-  };
+export function removeFeatureRoot(root: string, prefix: string, code: string, feature: string): void {
+  if (dirname(root) !== tmpdir() || !basename(root).startsWith(prefix))
+    throw new Error(`A copy of the ${code} code could not be deleted (${root}): it is not a ${feature} root.`);
+  try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+  catch (error) { throw new Error(`A copy of the ${code} code could not be deleted (${root}).`, { cause: error }); }
 }
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.

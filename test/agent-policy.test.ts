@@ -80,9 +80,10 @@ describe('agent phase policy', () => {
       const argv = createClaudeCommand(createPhasePolicy(request(phase)), 'Answer.', SCHEMA).argv;
       expect(argv[argv.indexOf('--json-schema') + 1]).toBe(SCHEMA);
       expect(argv.indexOf('--json-schema')).toBeLessThan(argv.indexOf('--'));
-      // A review reads like planning: read-only tools and plan mode.
+      // A review reads like planning: read-only tools, plan mode, and no shell.
       expect(argv[argv.indexOf('--tools') + 1]).toBe('Read,Glob,Grep');
       expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('plan');
+      expect(argv[argv.indexOf('--disallowedTools') + 1]).toBe('Bash,WebFetch,WebSearch,NotebookEdit');
       expect(() => createClaudeCommand(createPhasePolicy(request(phase)), 'Answer.')).toThrow('must');
     }
     for (const phase of ['questions', 'execute', 'fix'] as const) {

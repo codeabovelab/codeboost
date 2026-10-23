@@ -32,8 +32,10 @@ export interface ReviewInput {
   changes: Readonly<Record<string, readonly string[]>>;
   issue: { number: number; title: string; body: string; comments: readonly string[] };
   approvedLessons: readonly string[];
-  /** The problems the previous round found and a fix ran for; empty in round 1. */
+  /** The problems the review agent found in the previous round and a fix ran for; empty in round 1. */
   earlierProblems: readonly EarlierProblem[];
+  /** The last round the limit allows: no next round reads its problems, so its prompt keeps no room for them. */
+  final?: boolean;
 }
 export interface ReviewRequest {
   readonly phase: 'review';
@@ -72,25 +74,33 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   for (const problem of input.earlierProblems)
     if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
   const items = plan.items.map(item => ({ ...item, changed_files: [...(input.changes[item.id] ?? [])] }));
+  const planData = (entries: typeof items) => dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: entries }, 'Plan data');
   const slots: Record<string, string> = {
     round: String(input.round),
-    plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items }, 'Plan data'),
+    plan_data_json: planData(items),
     issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: input.issue.body, comments: input.issue.comments }, 'Issue data'),
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     earlier_problems_json: earlierData(input.earlierProblems),
   };
-  const fill = (withEarlier: boolean) => template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu,
+  const fill = (values: Record<string, string>, withEarlier: boolean) => template.replace(/\{\{#if earlier_problems\}\}([\s\S]*?)\{\{\/if\}\}/gu,
     (_, block: string) => withEarlier ? block : '')
     // One pass over the trusted template only: inserted data is never interpreted again.
     .replace(/\{\{([a-z_]+)\}\}/gu, (_, key: string) => {
-      if (!(key in slots)) throw new Error(`Unknown template slot ${key}.`);
-      return slots[key]!;
+      if (!(key in values)) throw new Error(`Unknown template slot ${key}.`);
+      return values[key]!;
     });
-  const prompt = fill(input.earlierProblems.length > 0);
+  const prompt = fill(slots, input.earlierProblems.length > 0);
   if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('Review prompt exceeds 32 KiB.');
-  // Room for the next round's earlier problems: the block's own text plus the largest problem list an answer may give.
-  if (Buffer.byteLength(fill(false), 'utf8') + EARLIER_BLOCK_BYTES + MAX_ROUND_PROBLEM_BYTES > MAX_PROMPT_BYTES)
-    throw new Error('Review prompt leaves no room for the next round\'s problems: narrow the issue, the plan or the lessons.');
+  // Room for the next round's earlier problems, measured on the largest prompt the next round can have from the same
+  // issue and lessons: its round number as long as the largest, every item listing all its declared paths as changed
+  // (a fix stays in them; an edit outside them pauses the run), the section's own text and the largest problem list.
+  if (!input.final) {
+    const bound = items.map(item => ({ ...item, changed_files: [...new Set([...item.changed_files,
+      ...item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])])])] }));
+    const next = fill({ ...slots, round: String(MAX_REVIEW_ROUNDS), plan_data_json: planData(bound) }, false);
+    if (Buffer.byteLength(next, 'utf8') + EARLIER_BLOCK_BYTES + MAX_ROUND_PROBLEM_BYTES > MAX_PROMPT_BYTES)
+      throw new Error('The review prompt leaves no room for the next round\'s problems. Shorten the issue or the lessons, or split the plan.');
+  }
   const { repositoryId, taskId, planId } = input.identity;
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,
@@ -111,6 +121,7 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       // Later prompts carry this text in data blocks, which refuse NUL and unpaired surrogates: refuse it here instead.
       if ([problem.summary, problem.detail, problem.check ?? ''].some(text => text.includes('\0') || !text.isWellFormed()))
         throw new Error('The review answer contains text with NUL or an unpaired surrogate.');
+      if (!problem.summary.trim() || !problem.detail.trim()) throw new Error('The review answer has a problem with no summary or no detail.');
       // Split per item (design, "Review rounds" step 3), in plan order; a repeated ID files one copy. An item keeps the
       // check text only when it is one of that item's own `check:` entries.
       for (const item of plan.items) if (problem.items.includes(item.id)) {

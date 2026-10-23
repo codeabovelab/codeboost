@@ -145,7 +145,7 @@ export function assertPlanningInput(prompt: string, schema: string, phase: Phase
   if (promptBytes + schemaBytes > MAX_PLANNING_INPUT_BYTES)
     throw new Error(`${phase === 'review' ? 'Review' : 'Planning'} request is ${promptBytes + schemaBytes} bytes (prompt ${promptBytes}, schema ${schemaBytes}), `
       + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. ${phase === 'review'
-        ? 'Narrow the request (the issue and comments, the plan, the lessons or the earlier problems), then retry.'
+        ? 'Shorten the issue or the lessons, or split the plan, then run the round again.'
         : 'Narrow the request (the issue and comments, the selected paths, the lessons, the feedback or the previous plan), then retry.'}`);
   return schema;
 }
