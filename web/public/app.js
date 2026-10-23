@@ -165,7 +165,7 @@ async function refresh() {
     showNewerMergeObservations(newer);
     setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
     // The review now shows what the ended work changed.
-    if (["work-ended", "needs-refresh", "quiet"].includes(runnerNoteKind)) setRunnerNote("");
+    clearRunnerNotes(["work-ended", "needs-refresh", "quiet"]);
     loadRunner();
   } catch (error) {
     if (generation !== reviewGeneration) return;
@@ -2270,6 +2270,9 @@ let runnerView = null,
   // read), "work-ended" and "needs-refresh" (cleared by Refresh), "quiet" (cleared by Refresh or a read that shows work
   // or a change), "cancel-ask" (replaced by the note before it when the confirmation lapses), or null.
   runnerNoteKind = null,
+  // The note the cancel confirmation's question replaced, put back when the question goes, unless an event cleared its
+  // kind meanwhile.
+  cancelEarlierNote = null,
   cancelConfirmTimer = null;
 const runnerPollMaximumDelay = 30000;
 // Unchanged reads of a task between steps before polling stops: 2 + 4 + 8 + 16 + 30 s, about a minute.
@@ -2377,15 +2380,23 @@ function setRunnerNote(text, kind = null) {
   $("runner-note").textContent = text;
   $("runner-note").className = text ? statusClass(text) : "";
 }
+/** Clears a note of one of `kinds`, also the one the cancel confirmation's question is holding to put back. */
+function clearRunnerNotes(kinds) {
+  if (kinds.includes(runnerNoteKind)) setRunnerNote("");
+  if (kinds.includes(cancelEarlierNote?.kind)) cancelEarlierNote = null;
+}
 function publishNote(record) {
   const mark = record.outcome === "opened" || record.outcome === "closed" ? "✓" : publishNotices.has(record.outcome) ? "!" : "✕";
   return `${mark} ${record.message}`;
 }
+/** Ends the cancel confirmation; its question, if still shown, gives way to the note it replaced. */
 function disarmCancel() {
   if (cancelConfirmTimer) clearTimeout(cancelConfirmTimer);
   cancelConfirmTimer = null;
   $("cancel-task").textContent = "Cancel task";
   $("cancel-task").removeAttribute("data-confirm");
+  if (runnerNoteKind === "cancel-ask") setRunnerNote(cancelEarlierNote?.text ?? "", cancelEarlierNote?.kind ?? null);
+  cancelEarlierNote = null;
 }
 /**
  * Shows the runner controls from the last applied view. Each control's visibility is decided once, and focus on a
@@ -2415,7 +2426,7 @@ function renderRunner() {
     shown["run-action"] = !!run;
     if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
     // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles.
-    shown["cancel-task"] = !closed && (task.cancelRequested === null || !runnerWorking(view));
+    shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
     $("task-banner-text").textContent = text;
@@ -2440,7 +2451,10 @@ function scheduleRunnerPoll() {
   runnerPollTimer = null;
   if (!runnerBusy(runnerView) || runnerPending) return;
   if (!runnerWorking(runnerView) && runnerQuietPolls >= runnerQuietPollLimit) {
-    const quiet = "! Nothing has changed for a minute. Press Refresh to check again.";
+    // A cancel with no work left settles by being sent again; Refresh only reads.
+    const quiet = runnerView.task.cancelRequested !== null
+      ? "! Nothing has changed for a minute. Press Cancel task again to retry the cancel, or Refresh to check again."
+      : "! Nothing has changed for a minute. Press Refresh to check again.";
     // Kept after a note about work that ended, which names what to review.
     setRunnerNote(runnerNoteKind === "work-ended" ? `${$("runner-note").textContent} ${quiet}` : quiet, "quiet");
     return;
@@ -2471,8 +2485,7 @@ function applyRunnerView(view) {
   runnerView = view;
   const ended = view.available ? endedWorkNote(before, view) : "";
   if (ended) setRunnerNote(ended, "work-ended");
-  else if (runnerNoteKind === "read-error") setRunnerNote("");
-  else if (runnerNoteKind === "quiet" && (runnerWorking(view) || JSON.stringify(before) !== JSON.stringify(view))) setRunnerNote("");
+  else clearRunnerNotes(runnerWorking(view) || JSON.stringify(before) !== JSON.stringify(view) ? ["read-error", "quiet"] : ["read-error"]);
   renderRunner();
 }
 async function loadRunner({ poll = false, generation = poll ? runnerGeneration : undefined } = {}) {
@@ -2601,10 +2614,10 @@ $("cancel-task").onclick = () => {
   if ($("cancel-task").dataset.confirm !== "true") {
     $("cancel-task").dataset.confirm = "true";
     $("cancel-task").textContent = "Confirm cancel";
-    const earlier = { text: $("runner-note").textContent, kind: runnerNoteKind };
+    cancelEarlierNote = $("runner-note").textContent ? { text: $("runner-note").textContent, kind: runnerNoteKind } : null;
     setRunnerNote("! Cancelling stops any running work and closes this task's pull requests. It cannot be undone. Press Confirm cancel to go on.", "cancel-ask");
-    // Puts back the note the question replaced; a later note (a poll's run end, an answer) stays.
-    cancelConfirmTimer = setTimeout(() => { disarmCancel(); if (runnerNoteKind === "cancel-ask") setRunnerNote(earlier.text, earlier.kind); }, 5000);
+    // The lapse puts back the note the question replaced; a later note (a poll's run end, an answer) stays.
+    cancelConfirmTimer = setTimeout(disarmCancel, 5000);
     return;
   }
   sendRunnerAction("cancel-task");
