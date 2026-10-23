@@ -2272,6 +2272,9 @@ let runnerView = null,
   runnerNoteKind = null,
   cancelConfirmTimer = null;
 const runnerPollMaximumDelay = 30000;
+// Unchanged reads of a task between steps before polling stops: 2 + 4 + 8 + 16 + 30 s, about a minute.
+const runnerQuietPollLimit = 5;
+let runnerQuietPolls = 0;
 // Icon, word and colour class (DESIGN.md: status never by colour alone). Running uses the merge step list's mark.
 const runnerStatusMarks = {
   queued: ["○", "Queued", "neutral"],
@@ -2308,17 +2311,26 @@ function liveAttempt(view) {
   return attempt && (attempt.state === "pending" || attempt.state === "running") ? attempt : null;
 }
 /**
- * Work that is still moving on its own, so the page polls until it settles. Nothing is while an unresolved marker holds
- * the task: only a restart clears it, so polling for it would never end. A running or queued task the server offers no
- * action for is between steps of a run (an attempt's cleanup, the next item, the publish after the last one), which
- * the view does not name; it is polled too, at the backoff's pace.
+ * Work the view names as still moving on its own, so the page polls until it settles. Nothing is while an unresolved
+ * marker holds the task: only a restart clears it, so polling for it would never end.
  */
-function runnerBusy(view) {
+function runnerWorking(view) {
   if (!view?.available || view.unresolved) return false;
-  const betweenSteps = ["running", "queued"].includes(view.task.status) && !view.startable && !view.resumable
-    && !view.retryable && !approvableContinuation(view);
-  return !!liveAttempt(view) || view.publish.active || view.preMerge.active || betweenSteps
+  return !!liveAttempt(view) || view.publish.active || view.preMerge.active
     || view.stopRequested !== null || view.task.cancelRequested !== null;
+}
+/**
+ * A running or queued task the server offers no action for. It may be between steps of a run (an attempt's cleanup,
+ * the next item, the publish after the last one), which the view does not name; or it may wait on a person in a way the
+ * view does not name either (an expired time budget, unapproved items, an untrusted issue). So the page polls it only
+ * for `runnerQuietPollLimit` unchanged reads, then stops and asks for Refresh.
+ */
+function runnerBetweenSteps(view) {
+  return !!view?.available && !view.unresolved && !runnerWorking(view) && ["running", "queued"].includes(view.task.status)
+    && !view.startable && !view.resumable && !view.retryable && !approvableContinuation(view);
+}
+function runnerBusy(view) {
+  return runnerWorking(view) || runnerBetweenSteps(view);
 }
 /** The header's one run action, in the order a person would take them; null when the server would admit none. */
 function runAction(view) {
@@ -2425,6 +2437,10 @@ function scheduleRunnerPoll() {
   if (runnerPollTimer) clearTimeout(runnerPollTimer);
   runnerPollTimer = null;
   if (!runnerBusy(runnerView) || runnerPending) return;
+  if (!runnerWorking(runnerView) && runnerQuietPolls >= runnerQuietPollLimit) {
+    setRunnerNote("! No work is running and no action is offered yet. Press Refresh to check again.", "needs-refresh");
+    return;
+  }
   const generation = runnerGeneration;
   runnerPollTimer = setTimeout(() => loadRunner({ generation, poll: true }), runnerPollDelay);
 }
@@ -2436,10 +2452,10 @@ function scheduleRunnerPoll() {
 function endedWorkNote(before, after) {
   const notes = [];
   const was = before && liveAttempt(before);
-  if (was && liveAttempt(after)?.id !== was.id) {
-    const settled = after.attempts.find((attempt) => attempt.id === was.id);
-    const state = settled?.state ?? "ended";
-    notes.push(`${state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${state}. The task is now ${after.task.status}. Refresh to review its latest changes.`);
+  // Only an attempt whose row settled: an unresolved marker hides a row that is still pending or running.
+  const settled = was && after.attempts.find((attempt) => attempt.id === was.id);
+  if (settled && ["completed", "failed", "cancelled", "stale"].includes(settled.state)) {
+    notes.push(`${settled.state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`);
   }
   if (before?.publish.active && !after.publish.active && after.publish.last) notes.push(publishNote(after.publish.last));
   if (before && before.task.cancelRequested !== null && after.task.cancelRequested === null && after.task.status === "cancelled") notes.push("✓ Task cancelled.");
@@ -2465,6 +2481,9 @@ async function loadRunner({ poll = false, generation = poll ? runnerGeneration :
     if (generation !== runnerGeneration) return;
     const before = JSON.stringify(runnerView);
     applyRunnerView(view);
+    // Counts unchanged polls of a task between steps; any change, work in progress, or a load that is not a poll (a
+    // Refresh, a review action) starts the count again.
+    runnerQuietPolls = poll && before === JSON.stringify(view) && runnerBetweenSteps(view) ? runnerQuietPolls + 1 : 0;
     // Unchanged work in progress backs off; any change polls quickly again.
     runnerPollDelay = poll && before === JSON.stringify(view) ? Math.min(runnerPollDelay * 2, runnerPollMaximumDelay) : 2000;
   } catch (error) {
@@ -2530,6 +2549,7 @@ async function sendRunnerAction(action, attemptId = null) {
     if (runnerKey === key) runnerKey = null;
     runnerPending = null;
     runnerPollDelay = 2000;
+    runnerQuietPolls = 0;
     if (generation === runnerGeneration) applyRunnerView(answer.runner);
     setRunnerNote(runnerOutcomeText(action, answer.result));
   } catch (error) {

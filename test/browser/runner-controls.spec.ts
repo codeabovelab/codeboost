@@ -563,10 +563,47 @@ test('an unresolved marker hides Stop for its attempt and stops polling', async 
   await page.clock.runFor(2_000);
   await expect(status(page)).toHaveText("● Running · Needs restart: an attempt's result could not be saved");
   await expect(page.locator('#attempt-stop')).toBeHidden();
+  // P1 has not ended: no note says it did.
+  await expect(page.locator('#runner-note')).toHaveText('✓ Running P1.');
   // Nothing is sent in 60 s, past the 30 s backoff cap.
   const sent = gets;
   await page.clock.runFor(60_000);
   await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
   expect(gets).toBe(sent);
   fail();
+});
+
+test('stops polling a running task that is offered nothing after a minute of unchanged reads, and asks for Refresh', async ({ page }) => {
+  await serve();
+  // A running task the server offers nothing for, which does not change: for example its time budget ran out while it
+  // was idle (web/server.ts runChoice refuses it for the view). The real view after P1 failed, with `resumable` false.
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  await viewWith(page, view => { view.resumable = false; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  await expect(status(page)).toHaveText('● Running');
+  // Each poll is scheduled when the read before it settles, and none waits more than 30 s: advance 30 s at a time,
+  // waiting for a read to settle after each step, until polling stops. Short delays can let more than one poll run
+  // within a step. Five unchanged reads stop it; the first read after Start may still change and restart the count.
+  const note = page.locator('#runner-note'), asks = '! No work is running and no action is offered yet. Press Refresh to check again.';
+  const startReads = Number(await note.getAttribute('data-reads'));
+  for (let step = 0; (await note.textContent()) !== asks; step++) {
+    expect(step).toBeLessThan(10);
+    const reads = Number(await note.getAttribute('data-reads'));
+    await page.clock.runFor(30_000);
+    await expect.poll(async () => Number(await note.getAttribute('data-reads')) > reads || (await note.textContent()) === asks).toBe(true);
+  }
+  expect(Number(await note.getAttribute('data-reads')) - startReads).toBeGreaterThanOrEqual(5);
+  // Nothing is sent in the next 120 s.
+  const sent = gets;
+  await page.clock.runFor(120_000);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+  expect(gets).toBe(sent);
+  // Refresh reads again and clears the note.
+  await refreshReview(page);
+  await expect(page.locator('#runner-note')).toHaveText('');
+  expect(gets).toBeGreaterThan(sent);
 });
