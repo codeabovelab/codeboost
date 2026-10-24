@@ -27,8 +27,8 @@ const validateAnswer = new Ajv2020({ allErrors: true, strict: true }).compile(JS
 
 /**
  * One file's change from the commit the plan started at to the commit the agent reads, as `git diff` text; null when
- * it is not text the prompt can carry (not UTF-8, or longer than a data block's 32 KiB string), so the agent reads the
- * file instead.
+ * it is not text the prompt can carry (not UTF-8, or longer than a data block's 32 KiB string), or the diffs before it
+ * already fill a whole prompt, so the agent reads the file instead.
  */
 export interface ReviewDiff { path: string; diff: string | null }
 /** A problem an earlier round filed against one item, shown to the next round so it can say whether the fix worked. */
