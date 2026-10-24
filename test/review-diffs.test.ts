@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { MAX_PROMPT_BYTES } from '../core/planning-author.ts';
 import { reviewDiffs } from '../runner/review-diffs.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -65,6 +65,47 @@ it('gives a file replaced by a directory only its own diff', async () => {
   expect(diffs[0]!.diff).toContain('-old\n');
   expect(diffs[0]!.diff).not.toContain('cfg/inner');
   expect(diffs[1]!.diff).toBeNull();
+});
+
+it('shows both sides of a file whose type changed', async () => {
+  const { dir, commit } = repository();
+  const base = commit({ 'a.ts': 'secret check\n', 'b.ts': 'b\n' });
+  rmSync(join(dir, 'a.ts')); symlinkSync('b.ts', join(dir, 'a.ts'));
+  const head = commit({});
+  const [entry] = await reviewDiffs(dir, base, head, signal());
+  expect(entry!.path).toBe('a.ts');
+  expect(entry!.diff).toContain('deleted file mode 100644');
+  expect(entry!.diff).toContain('new file mode 120000');
+  expect(entry!.diff).toContain('+b.ts');
+});
+
+it('shows a renamed file as its rename and its edits, under its new path', async () => {
+  const { dir, commit } = repository();
+  const lines = Array.from({ length: 3000 }, (_, index) => `line ${index}`);
+  const base = commit({ 'old.ts': `${lines.join('\n')}\n` });
+  rmSync(join(dir, 'old.ts'));
+  const head = commit({ 'new.ts': `${lines.map((line, index) => index === 1500 ? 'changed' : line).join('\n')}\n` });
+  const diffs = await reviewDiffs(dir, base, head, signal());
+  expect(diffs.map(entry => entry.path)).toEqual(['new.ts']);
+  expect(diffs[0]!.diff).toContain('rename from old.ts\nrename to new.ts');
+  expect(diffs[0]!.diff).toContain('-line 1500\n+changed\n');
+  expect(Buffer.byteLength(diffs[0]!.diff!)).toBeLessThan(1000);
+});
+
+it('rejects a stop only after Git has exited', async () => {
+  const { dir, commit } = repository();
+  const base = commit({ 'a.ts': 'a\n' }), head = commit({ 'a.ts': 'b\n' });
+  // A stand-in Git that ignores SIGTERM and writes its PID, so only a kill ends it.
+  const bin = mkdtempSync(join(tmpdir(), 'review-diffs-git-')); dirs.push(bin);
+  const fake = join(bin, 'git'), pidFile = join(bin, 'pid');
+  writeFileSync(fake, `#!/bin/sh\ntrap '' TERM\necho $$ > '${pidFile}'\nwhile :; do sleep 1; done\n`); chmodSync(fake, 0o755);
+  const controller = new AbortController();
+  const running = reviewDiffs(dir, base, head, controller.signal, fake);
+  await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  controller.abort(new Error('stopped'));
+  await expect(running).rejects.toThrow('stopped');
+  expect(() => process.kill(pid, 0)).toThrow();
 });
 
 it('stops reading diffs once they fill a whole prompt, and lists the rest with no diff', async () => {

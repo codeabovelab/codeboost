@@ -9,74 +9,92 @@ const MAX_FILE_DIFF_BYTES = MAX_PROMPT_BYTES;
 const MAX_PATH_LIST_BYTES = 16 * 1024 * 1024;
 /**
  * `--text`: in-tree attributes (`-diff`, `binary`) are the agent's to write, so they never decide what the review
- * sees; real binary content is caught by the UTF-8 and NUL checks below. `--ignore-submodules=all` keeps Git out of
- * submodules, whose config is not the runner's (AGENTS.md); an agent cannot change their contents anyway.
+ * sees; real binary content is caught by the UTF-8 and NUL checks below. `-M`: a renamed file is shown as its rename
+ * and its edits, not as a whole delete and a whole add. `--ignore-submodules=all` keeps Git out of submodules, whose
+ * config is not the runner's (AGENTS.md); an agent cannot change their contents anyway.
  */
-const DIFF_OPTIONS = ['--text', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--ignore-submodules=all'];
-/** Each diff header starts a line, and every other diff line starts with ' ', '+', '-', '@' or '\'. */
-const HEADER = Buffer.from('\ndiff --git ');
+const DIFF_OPTIONS = ['--text', '--no-ext-diff', '--no-textconv', '--no-color', '-M', '--ignore-submodules=all'];
 
 interface GitOutput { status: number | null; stdout: Buffer; over: boolean }
 /**
  * Run hardened Git and keep at most `limit` bytes of its stdout; past that, Git is killed and `over` is set. Its stderr
  * is drained and not read: Git can print hints there (for example about the empty graft file the hardened environment
- * names), and the exit status says whether it failed.
+ * names), and the exit status says whether it failed. When `signal` aborts, Git is killed, and the promise rejects
+ * only once Git has exited, so nothing still reads the repository.
  */
 function git(executable: string, repository: string, args: string[], limit: number, signal: AbortSignal): Promise<GitOutput> {
   return new Promise((resolve, reject) => {
     signal.throwIfAborted();
-    const child = spawn(executable, [...GIT_OPTIONS, '--literal-pathspecs', ...args],
-      { cwd: repository, env: gitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], signal });
+    const child = spawn(executable, [...GIT_OPTIONS, ...args], { cwd: repository, env: gitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = [];
-    let size = 0, over = false;
+    let size = 0, over = false, failure: unknown;
+    const abort = () => { child.kill('SIGKILL'); };
+    signal.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', (chunk: Buffer) => {
       if (over) return;
-      const room = limit - size;
-      if (chunk.length > room) { chunks.push(chunk.subarray(0, room)); size = limit; over = true; child.kill('SIGKILL'); return; }
+      if (chunk.length > limit - size) { chunks.push(chunk.subarray(0, limit - size)); size = limit; over = true; child.kill('SIGKILL'); return; }
       chunks.push(chunk); size += chunk.length;
     });
     child.stderr.resume();
-    child.on('error', reject);
-    child.on('close', status => resolve({ status: over ? null : status, stdout: Buffer.concat(chunks), over }));
+    child.on('error', error => { failure ??= error; });
+    child.on('close', status => {
+      signal.removeEventListener('abort', abort);
+      if (signal.aborted) reject(signal.reason);
+      else if (failure !== undefined) reject(failure);
+      else resolve({ status: over ? null : status, stdout: Buffer.concat(chunks), over });
+    });
   });
 }
 
+/** Pathspecs for exactly `path`: a literal path matches the files under it too, so those are excluded. */
+const exactly = (path: string) => [`:(literal)${path}`, `:(exclude,literal)${path}/`];
+
 /**
  * Every file that differs between `base` and `head` in `repository`, in Git's path order, with its `git diff` text for
- * the review prompt (#201). The diff is null where the prompt cannot carry it: not UTF-8 text without NUL, longer than
- * 32 KiB, or after the diffs before it have already filled a whole prompt (none after that could be listed). The agent
- * reads those files at the head.
+ * the review prompt (#201). A renamed file is listed by its new path, and its diff shows the rename. The diff is null
+ * where the prompt cannot carry it: not UTF-8 text without NUL, longer than 32 KiB, or after the diffs before it have
+ * already filled a whole prompt (none after that could be listed). The agent reads those files at the head.
  *
  * Git runs without system or global config, hooks, replace objects, external diff or text conversion programs, in-tree
- * diff attributes or submodules, with literal pathspecs, one file at a time, and its output is bounded. A literal
- * pathspec still matches a directory's files, so each file's diff keeps only its own section. `signal` stops it.
+ * diff attributes or submodules, one file at a time, with pathspecs that match only that file, and its output is
+ * bounded. `signal` stops it.
  */
 export async function reviewDiffs(repository: string, base: string, head: string, signal: AbortSignal, executable = 'git'): Promise<ReviewDiff[]> {
   for (const commit of [base, head]) if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commit)) throw new Error('Review diffs need full commit IDs.');
-  const listed = await git(executable, repository, ['diff', '--name-only', '-z', ...DIFF_OPTIONS, base, head, '--'], MAX_PATH_LIST_BYTES, signal);
+  const listed = await git(executable, repository, ['diff', '--name-status', '-z', ...DIFF_OPTIONS, base, head, '--'], MAX_PATH_LIST_BYTES, signal);
   if (listed.over) throw new Error('The list of files the plan changed is too long for a review.');
   if (listed.status !== 0) throw new Error('Git could not list the files the plan changed.');
-  const names = listed.stdout;
-  if (names.length && names[names.length - 1] !== 0) throw new Error('Git returned an unterminated path record.');
+  const output = listed.stdout;
+  if (output.length && output[output.length - 1] !== 0) throw new Error('Git returned an unterminated path record.');
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  const paths: string[] = [];
-  for (let start = 0; start < names.length;) {
-    const end = names.indexOf(0, start);
-    try { paths.push(decoder.decode(names.subarray(start, end))); } catch { throw new Error('A changed path is not UTF-8 text.'); }
+  const fields: string[] = [];
+  for (let start = 0; start < output.length;) {
+    const end = output.indexOf(0, start);
+    try { fields.push(decoder.decode(output.subarray(start, end))); } catch { throw new Error('A changed path is not UTF-8 text.'); }
     start = end + 1;
+  }
+  // Each record is a status, then its path, or for a rename (R and a score) its old and new paths.
+  const changes: { path: string; pathspecs: string[] }[] = [];
+  for (let index = 0; index < fields.length;) {
+    const status = fields[index++]!;
+    if (status.startsWith('R')) {
+      const from = fields[index++], to = fields[index++];
+      if (from === undefined || to === undefined) throw new Error('Git returned an incomplete rename record.');
+      changes.push({ path: to, pathspecs: [...exactly(from), ...exactly(to)] });
+    } else {
+      const path = fields[index++];
+      if (path === undefined || !/^[ACDMTUX]$/u.test(status)) throw new Error('Git returned an unexpected change record.');
+      changes.push({ path, pathspecs: exactly(path) });
+    }
   }
   const diffs: ReviewDiff[] = [];
   let shown = 0;
-  for (const path of paths) {
+  for (const { path, pathspecs } of changes) {
     if (shown > MAX_REVIEW_PROMPT_BYTES) { diffs.push({ path, diff: null }); continue; }
-    // One byte past the longest diff, so a complete section of exactly 32 KiB is told apart from a longer one.
-    const result = await git(executable, repository, ['diff', ...DIFF_OPTIONS, base, head, '--', path], MAX_FILE_DIFF_BYTES + HEADER.length, signal);
+    const result = await git(executable, repository, ['diff', ...DIFF_OPTIONS, base, head, '--', ...pathspecs], MAX_FILE_DIFF_BYTES, signal);
     if (!result.over && result.status !== 0) throw new Error(`Git could not show the change to ${path}.`);
-    // This file's own section: a later header belongs to a file under it (a file replaced by a directory, say).
-    const next = result.stdout.indexOf(HEADER);
-    const own = next === -1 ? (result.over ? null : result.stdout) : result.stdout.subarray(0, next + 1);
     let diff: string | null = null;
-    if (own && own.length <= MAX_FILE_DIFF_BYTES) { try { diff = decoder.decode(own); } catch { diff = null; } }
+    if (!result.over) { try { diff = decoder.decode(result.stdout); } catch { diff = null; } }
     if (diff?.includes('\0')) diff = null;
     if (diff !== null) shown += Buffer.byteLength(diff);
     diffs.push({ path, diff });
