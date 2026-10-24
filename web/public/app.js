@@ -1822,6 +1822,8 @@ async function importPlan(event) {
       blockers: [{ code: "plan-import-unknown", message: "The plan import outcome is unknown. Refresh before merging." }] } };
     setPlanStatus(statusOwner, "bad", `✕ Could not import the plan. ${error.message}`);
     renderMerge();
+    // The revision may have been saved all the same; the runner view reflects it.
+    if (ambiguous) loadRunner();
   } finally {
     planImportPending = false;
     endBusy(busyOwner);
@@ -2020,6 +2022,8 @@ async function applyPlanAuthor(index) {
     renderPlanAuthor();
     renderMerge();
     setPlanStatus(statusOwner, ambiguous ? "warn" : "bad", `${ambiguous ? "!" : "✕"} Could not confirm Apply. ${error.message}`);
+    // The revision may have been saved all the same; the runner view reflects it.
+    if (ambiguous) loadRunner();
   } finally {
     endBusy(busyOwner);
   }
@@ -2182,6 +2186,8 @@ async function changeIssueTrust(button) {
     if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, authorLogin: committed.authorLogin,
       trust: committed.trust, trustedAt: committed.trustedAt, trustedBy: committed.trustedBy, trustChangedAt: committed.trustChangedAt });
     renderIssuesWithPending();
+    // Trust decides whether the runner would admit a run or a publish of the review's issue (#200).
+    if (committed && runnerView?.available) loadRunner();
   } catch (error) {
     // A transport failure or 503 proves nothing was returned. Keep the exact request and idempotency key for retry.
     const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
@@ -2212,6 +2218,8 @@ async function loadIssues() {
     issuesView = mergeTrustCommittedDuring(updated, trustGeneration);
     for (const [number, error] of trustErrors) if (error.order <= trustErrorOrder) trustErrors.delete(number);
     renderIssuesWithPending();
+    // A fresh board tells the runner whether the review's issue is trusted; until one loads, it does not know (#200).
+    if (runnerView?.available) loadRunner();
   } catch (error) {
     if (generation !== issuesGeneration) return;
     if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
@@ -2315,7 +2323,8 @@ let runnerView = null,
 // another (#200):
 // - review: what changed since the review on screen loaded: an attempt that ended, a publish or close that ended, a
 //   cancel that settled, or a stale-review refusal; one entry of each kind, the latest. Only a review reload (Refresh,
-//   or the Plans screen's refresh) clears an entry, and only one written before its review request was sent.
+//   the Plans screen's refresh, a plan import or Apply) clears an entry, and only one written before its review request
+//   was sent.
 // - status: the latest action answer, action refusal, read error or quiet note; the next one replaces it. A good read
 //   clears a read error, and a read that shows work or a change clears the quiet note. Work that ended makes it out of
 //   date and clears it; so does a review reload sent after it was written.

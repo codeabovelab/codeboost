@@ -11,6 +11,7 @@ import type { RunnerDeps } from '../../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../../runner/execution.ts';
 import { approveItem } from '../../core/approvals.ts';
 import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
+import type { IssueTrustGateway } from '../../github/issues.ts';
 import { SETTLED_BEFORE_JOB_MERGE, type MergeJobView } from '../../runner/merge-job.ts';
 import { fixtureGit } from '../fixtures/git.ts';
 import { openReview, refreshReview } from './review-page.ts';
@@ -29,13 +30,15 @@ async function approvePlan(service: ReviewService) {
 }
 /** `prepare` decides when the item's preparation fails, so a test can hold an attempt in progress. */
 async function serve(options: { approve?: boolean; prepare?: () => Promise<never>; mergeGateway?: MergeGateway | (MergeGateway & MergeQueueGateway);
-  planning?: PlanningDeps } = {}) {
+  planning?: PlanningDeps; issueGateway?: IssueTrustGateway } = {}) {
   root = mkdtempSync(join(tmpdir(), 'codeboost-runner-ui-'));
   const demo = createDemo(join(root, 'demo'));
-  // A merge needs a review that is not a demo, with the demo's out-of-scope change undone (as review.spec.ts does).
-  const config = options.mergeGateway ? { ...demo, demo: false } : demo;
+  // A merge needs a review that is not a demo, with the demo's out-of-scope change undone (as review.spec.ts does). An
+  // issue gateway needs a github block naming the review's issue (as test/runner-start.test.ts gives it).
+  const config = options.issueGateway ? { ...demo, demo: false, github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1 } }
+    : options.mergeGateway ? { ...demo, demo: false } : demo;
   if (options.mergeGateway) { chmodSync(join(config.repository, 'run.sh'), 0o644); fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope'); }
-  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, undefined, undefined, options.planning, async service => {
+  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, options.issueGateway, undefined, options.planning, async service => {
     if (options.approve !== false) await approvePlan(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: options.prepare ?? (async () => { throw new Error('no agent here'); }),
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
@@ -1369,4 +1372,33 @@ test('reads the runner state after a draft is applied, so Start goes when the ne
   await expect(page.getByRole('status').filter({ hasText: `Revision r${current.revision + 1} is current.` })).toBeVisible();
   await page.locator('#review-link').click();
   await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('reads the runner state when the issue board loads and when the issue\'s trust changes', async ({ page }) => {
+  // GitHub as the issue board and the runner's admission read it: issue #3 by an author outside the repository, so it
+  // needs a person's trust before it can run (github/issues.ts RepositoryIssue, IssueAccess).
+  const gateway: IssueTrustGateway = {
+    repository: 'owner/repo',
+    async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [{ repository: 'owner/repo', number: 3, title: 'Make retries predictable',
+      body: '', url: 'https://github.com/owner/repo/issues/3', createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z', comments: 0, positiveReactions: 0,
+      labels: [], authorLogin: 'outside', authorAssociation: 'NONE', trust: 'requires-approval' }] }; },
+    async issueAccess(number) { return { number, authorLogin: 'outside', collaborator: false }; },
+    async issueText(number) { return { number, title: 'Make retries predictable', body: '', comments: [] }; },
+  };
+  await serve({ issueGateway: gateway });
+  await openReview(page, app.url);
+  // Until the board has loaded, the server does not know the issue is untrusted, and offers Start.
+  const start = page.getByRole('button', { name: 'Start', exact: true });
+  await expect(start).toBeVisible();
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Trust this issue', exact: true })).toBeVisible();
+  // The board loaded: the issue is untrusted, so the runner no longer offers Start, which the header shows without Refresh.
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+  // Trusting the issue offers it again.
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.getByRole('button', { name: 'Trust this issue', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Remove trust', exact: true })).toBeVisible();
+  await page.locator('#review-link').click();
+  await expect(start).toBeVisible();
 });
