@@ -55,7 +55,7 @@ describe('adapter profile-creation cleanup', () => {
   it('retries only the profile cleanup, within the window, and never removes the network separately', async () => {
     const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-      phase: 'review', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
+      phase: 'questions', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
       attemptId: 'adapter-profile-cleanup',
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
     });
@@ -75,7 +75,7 @@ describe('adapter profile-creation cleanup', () => {
     state.profileFails = false;
     const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-      phase: 'review', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
+      phase: 'questions', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
       attemptId: 'adapter-handoff-throws',
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
     });
@@ -95,7 +95,7 @@ describe('adapter profile-creation cleanup', () => {
     try {
       const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
         clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-        phase: 'review', vendor: 'claude', approvedArgv: [], deadline: wall + 5_000,
+        phase: 'questions', vendor: 'claude', approvedArgv: [], deadline: wall + 5_000,
         attemptId: 'adapter-monotonic-handoff',
         context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
       });
@@ -115,7 +115,7 @@ describe('adapter profile-creation cleanup', () => {
     state.networkHangs = true;
     const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-      phase: 'review', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 60_000,
+      phase: 'questions', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 60_000,
       attemptId: 'adapter-configured-cap',
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
     });
@@ -137,7 +137,7 @@ describe('adapter start input', () => {
     for (const networkAllocationId of [randomUUID().toUpperCase(), '6ba7b810-9dad-11d1-80b4-00c04fd430c8', '']) {
       const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
         clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-        phase: 'review', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId: randomUUID(),
+        phase: 'questions', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId: randomUUID(),
         context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
       });
       expect(() => startClaudeInvocation({ invocation, filesystems: {} as never, inputDirectory: '/unused',

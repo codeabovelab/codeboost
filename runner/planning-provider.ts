@@ -52,12 +52,17 @@ const ROOT_PREFIX = 'codeboost-planning-';
  * Delete a planning root: a direct child of the temporary directory named with planning's prefix, and nothing else.
  * Its input directory is made writable first, since the request left it read-only.
  */
-export function removePlanningRoot(root: string): void {
-  if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
-    throw new Error(`A copy of the planned code could not be deleted (${root}): it is not a planning root.`);
+export function removePlanningRoot(root: string): void { removeFeatureRoot(root, ROOT_PREFIX, 'planned', 'planning'); }
+/**
+ * Delete one read-only feature's host root (planning's, the review's): a direct child of the temporary directory named
+ * with `prefix`, and nothing else. `code` and `feature` name it in errors.
+ */
+export function removeFeatureRoot(root: string, prefix: string, code: string, feature: string): void {
+  if (dirname(root) !== tmpdir() || !basename(root).startsWith(prefix))
+    throw new Error(`A copy of the ${code} code could not be deleted (${root}): it is not a ${feature} root.`);
   try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
   try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
-  catch (error) { throw new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }); }
+  catch (error) { throw new Error(`A copy of the ${code} code could not be deleted (${root}).`, { cause: error }); }
 }
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.
@@ -88,9 +93,16 @@ const stopMessages: Record<StopReason, string> = {
 };
 /** Accept only this exact invocation's output, and only after a clean exit. The text is still unvalidated. */
 export function planningOutput(result: InvocationResult, invocation: InvocationInput): string {
+  return structuredOutput(result, invocation, { agent: 'planning agent', stops: stopMessages, failed: 'Claude could not write the plan.',
+    turnLimit: `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.` });
+}
+/** What a structured-answer feature (planning, the review) says about an invocation that gave no answer. */
+export interface OutputWords { agent: string; stops: Record<StopReason, string>; failed: string; turnLimit: string }
+/** Accept only this exact invocation's output, and only after a clean exit, for planning or the review. Still unvalidated. */
+export function structuredOutput(result: InvocationResult, invocation: InvocationInput, words: OutputWords): string {
   if (result.attemptId !== invocation.attemptId || !result.context || !sameContext(result.context, invocation.context))
-    throw new Error('The planning agent returned a result for a different attempt.');
-  if (result.stopReason) throw new Error(stopMessages[result.stopReason]);
+    throw new Error(`The ${words.agent} returned a result for a different attempt.`);
+  if (result.stopReason) throw new Error(words.stops[result.stopReason]);
   if (result.exitCode === null || result.signal !== null)
     throw new Error(`Claude stopped unexpectedly${result.signal ? ` (${result.signal})` : ''}.`);
   if (result.exitCode !== 0) {
@@ -98,10 +110,8 @@ export function planningOutput(result: InvocationResult, invocation: InvocationI
     // Claude Code's own text when `--max-turns` stops the run (#163). The decoder keeps no subtype, so this matches the
     // text: a stop without it gets the general advice, and other output that contains it (Claude's own `result` text
     // can) gets the turn-limit advice. Only the advice can be wrong; the text is still quoted.
-    const advice = detail.includes('Reached maximum number of turns')
-      ? `Planning stopped at its ${PLANNING_MAX_TURNS}-turn limit before Claude answered. Narrow the request, then retry.`
-      : 'Check its sign-in and usage limits.';
-    throw new Error(`Claude could not write the plan. ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
+    const advice = detail.includes('Reached maximum number of turns') ? words.turnLimit : 'Check its sign-in and usage limits.';
+    throw new Error(`${words.failed} ${advice}${detail ? ` Claude said: ${detail}` : ''}`);
   }
   return result.stdout;
 }
@@ -117,10 +127,14 @@ export const PLANNING_FEATURE: ReadOnlyFeature = Object.freeze({
   output: (_vendor: Provider, result: InvocationResult, invocation: InvocationInput) => planningOutput(result, invocation),
   // What cleanup left is retained, and the next request names it. A successful request is refused rather than
   // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
-  cleanupFailed: (failures: readonly unknown[], failure?: { error: unknown }) => failure
-    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
-    : new AggregateError(failures, 'Planning container cleanup did not settle.'),
+  cleanupFailed: cleanupFailure('Planning'),
 });
+/** A read-only feature's `cleanupFailed`: the run's own error first, when it had one, then what cleanup did not settle. */
+export function cleanupFailure(feature: string): ReadOnlyFeature['cleanupFailed'] {
+  return (failures, failure) => failure
+    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
+    : new AggregateError(failures, `${feature} container cleanup did not settle.`);
+}
 
 /** Where a planning request reads the code: the review's repository at the snapshot's head. */
 export interface PlanningSource {

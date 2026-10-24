@@ -80,8 +80,9 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
  * Planning's model budget (#163), checked when the command is built, before the adapter creates a container. The input
  * is counted in UTF-8 bytes of the prompt and schema: Claude's tokenizer is not available offline, and a count of bytes
  * bounds the tokens if every token covers at least one byte (assumed, not verified against Claude's tokenizer). 64 KiB
- * is the 32 KiB prompt plus the 32 KiB of schema text that core/planning-author.ts allows, so this is a backstop for
- * callers that skip it; it does not count Claude Code's own system prompt and tools, or the answer. The run is bounded
+ * is the 32 KiB prompt plus the 32 KiB of schema text that core/planning-author.ts allows, so for planning this is a
+ * backstop for callers that skip it. A review's prompt may use all of it less its schema (`MAX_REVIEW_PROMPT_BYTES`,
+ * #201). It does not count Claude Code's own system prompt and tools, or the answer. The run is bounded
  * by turns: if each turn sends at most one context window (assumed; the CLI's own calls, such as compaction, are not
  * counted), `--max-turns` bounds the tokens a run can use (the CLI may make one call more than the limit). Claude stops
  * at the limit with an `error_max_turns` result and exit status 1 (seen in a run of Claude Code 2.1.281 on macOS,
@@ -91,18 +92,25 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
 export const MAX_PLANNING_INPUT_BYTES = 64 * 1024;
 export const PLANNING_MAX_TURNS = 50;
 
+/** The phases whose Claude answer is a JSON object that must match the request's schema: plans, and review problems (#201). */
+export const STRUCTURED_PHASES: ReadonlySet<Phase> = new Set(['planning', 'review']);
 /**
- * Planning answers must match the request's schema, so the planning command carries it. Claude's `--json-schema` takes
- * the schema text, not a path; the profile checks that text against the mounted file. Questions answer in plain text
- * (their schema is `{"type":"string"}`), and the other phases return no JSON answer, so they carry no schema.
+ * Planning and review answers must match the request's schema, so their commands carry it. Claude's `--json-schema`
+ * takes the schema text, not a path; the profile checks that text against the mounted file. Both have the same model
+ * budget. Questions answer in plain text (their schema is `{"type":"string"}`), and execute and fix return no JSON
+ * answer, so they carry no schema.
  */
 export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Claude prompt must be nonempty and contain no NUL.');
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
-  if ((policy.phase === 'planning') !== (schema !== undefined))
-    throw new Error('Only the Claude planning command carries an answer schema, and it must.');
+  if (STRUCTURED_PHASES.has(policy.phase) !== (schema !== undefined))
+    throw new Error('Only the Claude planning and review commands carry an answer schema, and they must.');
+  // Claude has no tool here that runs approved argv (Bash is disallowed), so a review captured with any is a caller's
+  // mistake, refused rather than left to the tool lists (#201).
+  if (policy.phase === 'review' && assertPhasePolicy(policy).approvedArgv.length)
+    throw new Error('A Claude review runs no commands: capture it with no approved argv.');
   const planningArguments = schema === undefined ? [] : ['--json-schema',
-    assertPlanningInput(prompt, assertPlanningSchema(schema)), '--max-turns', String(PLANNING_MAX_TURNS)];
+    assertPlanningInput(prompt, assertPlanningSchema(schema, policy.phase), policy.phase), '--max-turns', String(PLANNING_MAX_TURNS)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
@@ -133,28 +141,33 @@ export function createRunnerCommand(policy: PhasePolicy, commands: string): Agen
   return command(policy, ['node', '/usr/local/bin/codeboost-command-check', '/run/codeboost-input/schema.json'], commands);
 }
 
-/** Refuse a planning request whose prompt and schema together exceed the model budget. Returns the schema unchanged. */
-export function assertPlanningInput(prompt: string, schema: string): string {
+/**
+ * Refuse a planning or review request whose prompt and schema together exceed the model budget. Returns the schema
+ * unchanged. A review shares planning's budget (#201).
+ */
+export function assertPlanningInput(prompt: string, schema: string, phase: Phase = 'planning'): string {
   const promptBytes = Buffer.byteLength(prompt, 'utf8'), schemaBytes = Buffer.byteLength(schema, 'utf8');
   if (promptBytes + schemaBytes > MAX_PLANNING_INPUT_BYTES)
-    throw new Error(`Planning request is ${promptBytes + schemaBytes} bytes (prompt ${promptBytes}, schema ${schemaBytes}), `
-      + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. Narrow the request (the issue and comments, the selected `
-      + 'paths, the lessons, the feedback or the previous plan), then retry.');
+    throw new Error(`${phase === 'review' ? 'Review' : 'Planning'} request is ${promptBytes + schemaBytes} bytes (prompt ${promptBytes}, schema ${schemaBytes}), `
+      + `over the ${MAX_PLANNING_INPUT_BYTES}-byte model budget. ${phase === 'review'
+        ? 'Build review requests with prepareReview (core/review-prompt.ts), which keeps them within it.'
+        : 'Narrow the request (the issue and comments, the selected paths, the lessons, the feedback or the previous plan), then retry.'}`);
   return schema;
 }
 
 /**
- * A planning schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one command
- * argument. Returns the schema unchanged.
+ * A planning or review schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one
+ * command argument. Returns the schema unchanged.
  */
-export function assertPlanningSchema(schema: string): string {
+export function assertPlanningSchema(schema: string, phase: Phase = 'planning'): string {
+  const name = phase === 'review' ? 'Review schema' : 'Planning schema';
   if (schema.includes('\0') || Buffer.byteLength(schema, 'utf8') > MAX_COMMAND_SCHEMA_BYTES)
-    throw new Error('Planning schema must contain no NUL and fit the command schema limit.');
+    throw new Error(`${name} must contain no NUL and fit the command schema limit.`);
   let parsed: unknown;
-  try { parsed = JSON.parse(schema); } catch { throw new Error('Planning schema must be JSON.'); }
+  try { parsed = JSON.parse(schema); } catch { throw new Error(`${name} must be JSON.`); }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)
     || (parsed as { type?: unknown }).type !== 'object')
-    throw new Error('Planning schema must be a JSON object schema with "type": "object".');
+    throw new Error(`${name} must be a JSON object schema with "type": "object".`);
   return schema;
 }
 

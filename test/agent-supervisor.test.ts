@@ -370,7 +370,7 @@ describe('container invocation supervisor', () => {
   }, 2 * 60_000);
 
   it('returns the adapter handle at once and cancels it during network creation', async () => {
-    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'claude', 'review');
+    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'claude', 'questions');
     const egress = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress',
       '--filter', `label=${RUNNER_LABEL}=${TEST_RUNNER_OWNER}`], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort();
     const before = egress();

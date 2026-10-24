@@ -1,7 +1,7 @@
 import { join } from 'node:path';
-import type { InvocationHandle } from '../contract.ts';
+import type { InvocationHandle, Phase } from '../contract.ts';
 import { readCapturedFile } from '../container/profile.ts';
-import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES } from '../policy.ts';
+import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES, STRUCTURED_PHASES } from '../policy.ts';
 import { launchInvocation } from './supervisor.ts';
 import { setUpProfile } from './setup.ts';
 import { assertAdapterRequest, capAdapterInvocationBudget, createAdapterInvocationBudget,
@@ -48,7 +48,7 @@ function topLevelMembers(json: string): Map<string, string> {
 /**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
  * true, is a provider failure; it can omit `result`, and when `result` is missing or empty its `errors` strings are
- * the text. With `--json-schema` (planning), a successful answer needs `subtype: "success"` and is the
+ * the text. With `--json-schema` (planning and review), a successful answer needs `subtype: "success"` and is the
  * schema-validated `structured_output` object. It is returned as the exact JSON text of that member in the CLI's
  * envelope, never re-encoded here, so the plan parser sees any duplicate key or inexact integer the envelope holds
  * (#166). Whether the API or CLI resolves those before writing the envelope is not verified. With a schema, an
@@ -84,11 +84,11 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
 }
 
 /**
- * Read the planning schema for `--json-schema` with the profile's bounded no-follow reader. The profile captures the
- * mounted file again and refuses a command whose schema differs.
+ * Read the planning or review schema for `--json-schema` with the profile's bounded no-follow reader. The profile
+ * captures the mounted file again and refuses a command whose schema differs.
  */
-export function readPlanningSchema(inputDirectory: string): string {
-  const { content } = readCapturedFile(join(inputDirectory, 'schema.json'), 'Planning schema', MAX_COMMAND_SCHEMA_BYTES);
+export function readAnswerSchema(inputDirectory: string, label: string): string {
+  const { content } = readCapturedFile(join(inputDirectory, 'schema.json'), label, MAX_COMMAND_SCHEMA_BYTES);
   return new TextDecoder('utf-8', { fatal: true }).decode(content);
 }
 
@@ -99,14 +99,18 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   const remaining = options.invocationBudget
     ? capAdapterInvocationBudget(options.invocationBudget, options.timeoutMs)
     : createAdapterInvocationBudget(request.invocation, options.timeoutMs);
-  const structured = policy.phase === 'planning';
+  const structured = STRUCTURED_PHASES.has(policy.phase);
   // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
   const command = createClaudeCommand(policy, request.prompt,
-    structured ? readPlanningSchema(request.inputDirectory) : undefined);
+    structured ? readAnswerSchema(request.inputDirectory, policy.phase === 'review' ? 'Review schema' : 'Planning schema') : undefined);
   assertAdapterRequest(request);
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command, claudeToken: oauthToken }),
     profile => start(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
       processLifecycle: request.processLifecycle,
-      invocationBudget: remaining, decode: (_profile, raw) => parseClaudeOutput(raw, structured) })));
+      invocationBudget: remaining, decode: (_profile, raw) => decodeClaudeAnswer(policy.phase, raw) })));
+}
+/** How a Claude invocation's output is read in `phase`: a planning or review answer from `structured_output` (#201). */
+export function decodeClaudeAnswer(phase: Phase, raw: Buffer): { text: string; providerFailed: boolean } {
+  return parseClaudeOutput(raw, STRUCTURED_PHASES.has(phase));
 }

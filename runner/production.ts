@@ -51,7 +51,7 @@ export const EXECUTE_STORAGE: TaskStorageLimits = Object.freeze({
   workBytes: 2 * 1024 * 1024 * 1024, workInodes: 262_144, metadataBytes: 1024 * 1024 * 1024, metadataInodes: 131_072,
 });
 /** The profile requires exactly one schema.json in the input mount; an execute answer is a plain-text summary. */
-const EXECUTE_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n';
+export const EXECUTE_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n';
 /** How long one read of the issue serves later plan items: the length of a short multi-item run. */
 export const ISSUE_REUSE_MS = 5 * 60_000;
 export const RUNNER_NEEDS_GITHUB = 'The runner reads the plan\'s issue from GitHub: add a github block to the review configuration.';

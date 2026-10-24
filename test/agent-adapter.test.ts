@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { parseClaudeOutput, readPlanningSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { decodeClaudeAnswer, parseClaudeOutput, readAnswerSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { capAdapterInvocationBudget, createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
@@ -32,6 +32,16 @@ describe('production agent adapters', () => {
     expect(() => parseClaudeOutput(Buffer.from('{"result":3,"is_error":false}'))).toThrow('malformed');
     expect(() => parseClaudeOutput(Buffer.from('not json'))).toThrow();
     expect(() => parseClaudeOutput(Buffer.from([0xff]))).toThrow();
+  });
+
+  it('reads planning and review answers from structured_output, and every other phase\'s from its result (#201)', () => {
+    // Claude Code 2.1.281 wrote this shape for the planning recordings in test/fixtures/planning/recorded, which this
+    // decoder read from the real envelope: `subtype` "success", `is_error` false, and the schema-checked answer object in
+    // `structured_output`. Members the decoder does not read, such as usage and session_id, are left out. A run without
+    // `--json-schema` has no `structured_output`; one envelope with both members checks that those phases ignore it.
+    const envelope = Buffer.from('{"type":"result","subtype":"success","is_error":false,"result":"prose","structured_output":{"round":1,"problems":[]}}');
+    for (const phase of ['planning', 'review'] as const) expect(decodeClaudeAnswer(phase, envelope)).toEqual({ text: '{"round":1,"problems":[]}', providerFailed: false });
+    for (const phase of ['questions', 'execute', 'fix'] as const) expect(decodeClaudeAnswer(phase, envelope)).toEqual({ text: 'prose', providerFailed: false });
   });
 
   it('returns schema-constrained Claude answers from structured_output, not the prose result', () => {
@@ -87,19 +97,19 @@ describe('production agent adapters', () => {
       };
       const text = '{"type":"object"}\n';
       // The reader returns the exact text; the command builder validates it.
-      expect(readPlanningSchema(dir('valid', file => writeFileSync(file, text)))).toBe(text);
+      expect(readAnswerSchema(dir('valid', file => writeFileSync(file, text)), 'Planning schema')).toBe(text);
       const target = join(root, 'target.json'); writeFileSync(target, text);
-      expect(() => readPlanningSchema(dir('link', file => symlinkSync(target, file)))).toThrow('not a link');
+      expect(() => readAnswerSchema(dir('link', file => symlinkSync(target, file)), 'Planning schema')).toThrow('not a link');
       // A FIFO with no writer would block a plain open forever.
-      expect(() => readPlanningSchema(dir('fifo', file => execFileSync('mkfifo', [file])))).toThrow('regular file');
-      expect(() => readPlanningSchema(dir('big', file => writeFileSync(file, `{"d":"${'x'.repeat(64 * 1024)}"}`))))
+      expect(() => readAnswerSchema(dir('fifo', file => execFileSync('mkfifo', [file])), 'Planning schema')).toThrow('regular file');
+      expect(() => readAnswerSchema(dir('big', file => writeFileSync(file, `{"d":"${'x'.repeat(64 * 1024)}"}`)), 'Planning schema'))
         .toThrow('bounded');
-      expect(() => readPlanningSchema(dir('binary', file => writeFileSync(file, Buffer.from([0x7b, 0xff, 0x7d])))))
+      expect(() => readAnswerSchema(dir('binary', file => writeFileSync(file, Buffer.from([0x7b, 0xff, 0x7d]))), 'Planning schema'))
         .toThrow('not valid');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('reads the planning schema before allocating anything, and only in planning', () => {
+  it('reads the answer schema before allocating anything, and only in planning and review', () => {
     const missing = { filesystems: {} as never, inputDirectory: '/nonexistent-codeboost-input',
       imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
     const planning = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
@@ -126,6 +136,10 @@ describe('production agent adapters', () => {
       expect(isInvocationActive(overBudget.attemptId)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
     expect(isInvocationActive(planning.attemptId)).toBe(false);
+    // A Claude review returns its problems as JSON, so it reads the schema too (#201).
+    const review = captureInvocation({ ...planning, phase: 'review', attemptId: 'claude-review-schema' });
+    expect(() => startClaudeInvocation({ ...missing, invocation: review }, 'token')).toThrow('ENOENT');
+    expect(isInvocationActive(review.attemptId)).toBe(false);
     // Questions carry no schema, so the same request gets past the schema read to the image check.
     const questions = captureInvocation({ ...planning, phase: 'questions', attemptId: 'claude-no-schema' });
     expect(() => startClaudeInvocation({ ...missing, invocation: questions }, 'token')).toThrow('Agent image');

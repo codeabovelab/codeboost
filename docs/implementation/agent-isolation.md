@@ -34,10 +34,10 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | --- | --- |
 | Isolation holds: non-root, no capabilities, read-only root, no host paths or secrets, vendor-only egress | `agent-container`: read-only isolation, lockdown and mount validation; `agent-network`: egress and DNS |
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
-| Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
+| Planning and questions cannot run a process; a Claude review runs none either | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases; the Claude review command gives Claude only `Read,Glob,Grep`, disallows Bash, and is refused for a review captured with approved argv |
 | Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
-| A planning request over its model budget is refused before the start, and the planning command passes `--max-turns 50` (see [planning model budget](#planning-model-budget) for what is and is not shown about the stop) | `agent-policy`: a prompt and schema of exactly 64 KiB build a command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
-| A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
+| A planning or review request over its model budget is refused before the start, and the planning and review commands pass `--max-turns 50` (see [planning model budget](#planning-model-budget) for what is and is not shown about the stop) | `agent-policy`: a prompt and schema of exactly 64 KiB build a planning or review command with `--max-turns 50`, and one byte more is refused; `agent-adapter`: the start call refuses an over-budget planning request and allocates nothing, and an `error_max_turns` envelope is a provider failure whose text is its `errors`; `planning-provider`: the planning error quotes the turn limit |
+| A planning or review answer is checked against the mounted schema | `agent-policy`: only the Claude planning and review commands pass `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: a review start call reads the mounted schema; `agent-adapter-decode`: the start call reads a planning or review answer from `structured_output`, and every other phase's from `result` |
 | The Docker daemon keeps no log of an agent container (#165): the supervisor's bounded capture through `docker start --attach` is the only copy of its output. This covers the agent container only. The runner's other containers keep the daemon's default log: the task-storage script containers (`docker run --rm`, `agents/container/storage.ts`), whose log is removed with the container while the client bounds what it reads, and the storage keeper and egress proxy, which write no output | `agent-container`: the created container's `LogConfig` is driver `none` with no option but `cache-*` ones; the validator refuses a container with a `json-file` log or a bounded `local` log; every probe that returns output shows the attach still delivers it. `agent-daemon-log`: the rule (`keepsNoDaemonLog`) also refuses driver `none` with a log option, which only the API can set, and accepts the `cache-*` options a daemon copies into every container |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
@@ -91,6 +91,14 @@ Use only these entry points to run an agent:
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
+   - **Review answers (#201).** A Claude invocation in the review phase answers in JSON too, exactly like planning:
+     the start call reads `schema.json` (the review answer schema, `prompts/review-answer.schema.json`), passes it as
+     `--json-schema`, and returns `structured_output` as JSON text. The command refuses a Claude review without a
+     schema or with approved argv (Claude has no tool that runs them), and a questions, execute or fix command with a
+     schema. A review has planning's model budget below: the same 64 KiB input check (its error names the review and
+     says to build the request with `prepareReview`, which keeps it within the budget) and `--max-turns 50`. The review keeps planning's read-only tools
+     (`Read,Glob,Grep`) and `plan` permission mode. Command checks still run in the review phase with the `runner`
+     vendor and no schema flag.
    - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory
      and passes its exact text to Claude as `--json-schema`. The container profile refuses the command if that text
      differs from the file it mounts. The result's `stdout` is Claude's `structured_output` object as JSON text, with
@@ -132,7 +140,8 @@ Use only these entry points to run an agent:
        that limits the tokens of a whole run. 50 turns is about 12 s for each turn in the ten-minute budget; a planning
        run reads files and answers, so most turns are reads. Lower it if runs are seen to loop; raise it only with a
        recorded run that needs more.
-     - *Other phases.* They do not pass `--max-turns` yet; their runs are bounded by time and output bytes only.
+     - *Other phases.* A Claude review passes the same `--max-turns 50` (#201). Questions, execute and fix do not pass
+       `--max-turns` yet; their runs are bounded by time and output bytes only.
    - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
      [Codex is refused in every phase](#codex-is-refused-in-every-phase).
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before

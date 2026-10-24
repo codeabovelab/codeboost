@@ -1,0 +1,54 @@
+{
+  "$id": "https://github.com/codeabovelab/codeboost/prompts/review-answer.schema.json",
+  "title": "codeboost review answer",
+  "description": "The problems one review round found, written by the review agent (prompts/review.md). Strict-mode compatible: every object lists all its properties as required and allows no others; optional values are nullable. There is no $schema line on purpose: Claude Code's --json-schema rejects the draft 2020-12 URL. Validate with a draft 2020-12 validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["round", "problems"],
+  "properties": {
+    "round": {
+      "description": "The review round this answer is for, copied from the task data.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10
+    },
+    "problems": {
+      "description": "Every problem this round found, at most 10: the most important first. An empty list means the round found nothing.",
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "summary", "detail", "check"],
+        "properties": {
+          "items": {
+            "description": "The plan items whose code must change to fix this problem. codeboost files one copy of the problem against each.",
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": { "type": "string", "pattern": "^P[1-9][0-9]{0,2}$" }
+          },
+          "summary": {
+            "description": "One sentence: what is wrong.",
+            "type": "string",
+            "pattern": "\\S",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "detail": {
+            "description": "Where it is (file and line) and why it is wrong, so that a fix needs no other context.",
+            "type": "string",
+            "pattern": "\\S",
+            "minLength": 1,
+            "maxLength": 1500
+          },
+          "check": {
+            "description": "The text of the check entry this problem fails, copied exactly, or null when it fails the item's intent only.",
+            "type": ["string", "null"],
+            "maxLength": 400
+          }
+        }
+      }
+    }
+  }
+}
