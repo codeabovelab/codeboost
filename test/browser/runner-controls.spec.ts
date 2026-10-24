@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Request, type Route } from '@playwright/test';
+import { request as httpRequest } from 'node:http';
 import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -254,12 +255,28 @@ async function viewWith(page: Page, change: (view: Record<string, any>) => void)
   });
 }
 /**
- * The real server's `GET /api/runner` answer for an intercepted read. A plain fetch, not `route.fetch`: Playwright's
- * pooled connection can reach an earlier test's server on a reused port and fail with ECONNRESET (as clickReview in
- * review.spec.ts notes for its reads).
+ * A request from the test to the server on a connection of its own. Neither `route.fetch` nor Node's `fetch` is safe
+ * here: both keep connections alive in a pool, and a pooled connection can reach an earlier test's server on a reused
+ * port, or be closed by the server between tests, and answer with ECONNRESET.
  */
+/** What the test reads of a server answer. */
+type ServerAnswer = { ok: boolean; status: number; json: () => Promise<any> };
+function unpooled(url: string, options: { method?: string; body?: string; headers: Record<string, string> }): Promise<ServerAnswer> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { method: options.method ?? 'GET', headers: options.headers, agent: false }, response => {
+      const chunks: Buffer[] = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => { const status = response.statusCode ?? 0, text = Buffer.concat(chunks).toString('utf8');
+        resolve({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) }); });
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end(options.body);
+  });
+}
+/** The real server's `GET /api/runner` answer for an intercepted read. */
 async function serverRunnerView(route: Route): Promise<Record<string, any>> {
-  const request = route.request(), response = await fetch(request.url(), { headers: { 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+  const request = route.request(), response = await unpooled(request.url(), { headers: { 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
   if (!response.ok) throw new Error(`The runner read answered ${response.status}.`);
   return await response.json() as Record<string, any>;
 }
@@ -420,7 +437,7 @@ test('the review strip keeps every control on one line at the 1280px minimum wid
   }
   // The title gives way (cut, with an ellipsis) and the revision stays whole.
   expect(boxes.title.width).toBeLessThan(boxes.title.scroll);
-  expect(boxes.revision.text).toBe('· r1');
+  expect(boxes.revision.text).toBe('\u00a0· r1');
   expect(Math.round(boxes.revision.width)).toBeGreaterThanOrEqual(boxes.revision.scroll);
 });
 test('a poll that hides the focused Stop moves focus to Refresh', async ({ page }) => {
@@ -915,7 +932,7 @@ test('a Refresh whose review was read before an item ended keeps the note about 
     if (!holdReview) { await route.continue(); return; }
     holdReview = false;
     // Read now, before P1 ends, and answered after.
-    const response = await fetch(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const response = await unpooled(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
     const body = await response.json();
     reviewSent(); await reviewGate;
     await route.fulfill({ status: response.status, json: body });
@@ -1299,7 +1316,7 @@ test('reads the runner state again when a polled merge job ends', async ({ page 
   await page.route('**/api/action', async route => {
     const body = route.request().postDataJSON();
     if (body.action !== 'merge') { await route.continue(); return; }
-    const reviewResponse = await fetch(route.request().url().replace('/api/action', '/api/review'), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const reviewResponse = await unpooled(route.request().url().replace('/api/action', '/api/review'), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
     const review = await reviewResponse.json() as Record<string, any>;
     await route.fulfill({ status: 200, json: { ...review, merge: { ...review.merge, ready: false, action: null, job: running, settledBeforeJobMerge: SETTLED_BEFORE_JOB_MERGE }, job: running } });
   });
@@ -1332,7 +1349,7 @@ test('reads the runner state after a merge whose review reload failed', async ({
   await page.route('**/api/action', async route => {
     const request = route.request(), body = request.postDataJSON();
     if (body.action !== 'merge') { await route.continue(); return; }
-    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
     const answer = await response.json() as Record<string, any>;
     if (!response.ok) throw new Error(`The merge answered ${response.status}: ${JSON.stringify(answer)}`);
     await route.fulfill({ status: 200, json: { mergeResult: answer.mergeResult, mergeQueue: null, mergeRefreshRequired: true } });
@@ -1379,7 +1396,7 @@ test('reads the runner state after a plan import, so Start goes when the new rev
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(next)) });
   await page.getByRole('button', { name: 'Import next revision' }).click();
   await expect(page.getByRole('status').filter({ hasText: `Revision r${next.revision} is current.` })).toBeVisible();
-  expect((await (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as { startable: boolean }).startable).toBe(false);
+  expect((await (await unpooled(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as { startable: boolean }).startable).toBe(false);
   await page.locator('#review-link').click();
   await expect(page.locator('#run-action')).toBeHidden();
 });
@@ -1444,7 +1461,7 @@ async function nextRevision() {
   return { ...plan, revision: plan.revision + 1, summary: `${plan.summary} (revised)` };
 }
 /** Imports `next` through the Plans screen, with `answer` deciding what the page sees of the import's answer. */
-async function importThrough(page: Page, next: Record<string, unknown>, answer: (route: Route, response: Response) => Promise<void>) {
+async function importThrough(page: Page, next: Record<string, unknown>, answer: (route: Route, response: ServerAnswer) => Promise<void>) {
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
   await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(next)) });
   let once = true;
@@ -1453,7 +1470,7 @@ async function importThrough(page: Page, next: Record<string, unknown>, answer: 
     once = false;
     // The real server saves the revision; only the page's view of the answer is changed.
     const request = route.request();
-    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
     await answer(route, response);
   });
   await page.getByRole('button', { name: 'Import next revision' }).click();
@@ -1489,7 +1506,7 @@ test('reads the runner state after an import whose review reload failed', async 
 });
 
 /** Drafts and applies the next revision through the Plans screen, with `answer` deciding what the page sees of Apply's answer. */
-async function applyThrough(page: Page, answer: (route: Route, response: Response) => Promise<void>) {
+async function applyThrough(page: Page, answer: (route: Route, response: ServerAnswer) => Promise<void>) {
   let reply!: (source: string) => void;
   const provider: AuthorProvider = { invoke: () => new Promise(resolve => { reply = resolve; }) };
   await serve({ planning: { provider, describe: () => ({ repo: { name: 'retry-service', baseRef: 'main' },
@@ -1504,7 +1521,7 @@ async function applyThrough(page: Page, answer: (route: Route, response: Respons
     items: current.items.map((item, index) => index === 0 ? { ...item, title: 'Expose the bounded retry ceiling' } : item) }));
   await page.route('**/api/plan/drafts/*/apply', async route => {
     const request = route.request();
-    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
     await answer(route, response);
   });
   await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
@@ -1556,7 +1573,7 @@ test('reads the runner state after a board refresh whose answer was lost, since 
     if (route.request().method() !== 'POST' || lost) { await route.continue(); return; }
     lost = true;
     const request = route.request();
-    await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
     await route.abort('failed');
   });
   await openReview(page, app.url);
@@ -1656,7 +1673,7 @@ test('a cancel under a marker whose attempt row has settled closes the task at o
   await page.route('**/api/runner', async route => {
     if (route.request().method() !== 'POST') { await route.fallback(); return; }
     const request = route.request();
-    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
     const answer = await response.json() as Record<string, any>;
     if (response.ok) answer.runner.unresolved = unresolved;
     await route.fulfill({ status: response.status, json: answer });

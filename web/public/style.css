@@ -630,7 +630,6 @@ footer button {
 }
 #issue {
   display: flex;
-  gap: 0.25em;
   min-width: 0;
 }
 #issue-title,

@@ -700,7 +700,8 @@ function render() {
   // The title gives way to an ellipsis in a crowded strip (its full text is its title); the revision never does.
   $("issue-title").textContent = `#${data.plan.issue} ${data.plan.summary}`;
   $("issue-title").title = `#${data.plan.issue} ${data.plan.summary}`;
-  $("issue-revision").textContent = `· r${data.plan.revision}`;
+  // Its leading space is a non-breaking one, part of the text: copied, read aloud and shown alike.
+  $("issue-revision").textContent = `\u00a0· r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
   renderMerge();
@@ -2376,7 +2377,7 @@ const runnerControlIds = [...runnerActionIds, "task-banner-plans"];
  * rebase marker with no preparation running it (runner/pre-merge.ts: the process died mid-rebase, and recovery at the
  * next start settles it). While either holds, no work is live and polling would never end. A first cancel is admitted:
  * it takes effect at that restart, or closes the task at once when the marker's attempt row has already settled (its
- * preparation files or storage could not be removed); the server refuses a second.
+ * storage, or its preparation files after a saved terminal write, could not be removed); the server refuses a second.
  */
 function restartNeeded(view) {
   if (view.unresolved) return runnerUnresolved[view.unresolved.reason] ?? view.unresolved.reason;
