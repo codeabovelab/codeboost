@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { MAX_PROMPT_BYTES } from '../core/planning-author.ts';
+import { MAX_REVIEW_PROMPT_BYTES } from '../core/review-prompt.ts';
 import { reviewDiffs } from '../runner/review-diffs.ts';
 import { fixtureGit } from './fixtures/git.ts';
 
@@ -95,28 +96,47 @@ it('shows a renamed file as its rename and its edits, under its new path', async
 it('rejects a stop only after Git has exited', async () => {
   const { dir, commit } = repository();
   const base = commit({ 'a.ts': 'a\n' }), head = commit({ 'a.ts': 'b\n' });
-  // A stand-in Git that ignores SIGTERM and writes its PID, so only a kill ends it.
+  // A stand-in for a Git process that is still running: it ignores SIGTERM and writes its PID, so only a kill ends it.
+  // The code reads none of a Git's output before the stop, so the stand-in gives none, and models no Git version.
   const bin = mkdtempSync(join(tmpdir(), 'review-diffs-git-')); dirs.push(bin);
   const fake = join(bin, 'git'), pidFile = join(bin, 'pid');
   writeFileSync(fake, `#!/bin/sh\ntrap '' TERM\necho $$ > '${pidFile}'\nwhile :; do sleep 1; done\n`); chmodSync(fake, 0o755);
   const controller = new AbortController();
   const running = reviewDiffs(dir, base, head, controller.signal, fake);
-  await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+  await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 30_000 });
   const pid = Number(readFileSync(pidFile, 'utf8'));
   controller.abort(new Error('stopped'));
   await expect(running).rejects.toThrow('stopped');
   expect(() => process.kill(pid, 0)).toThrow();
 });
 
-it('stops reading diffs once they fill a whole prompt, and lists the rest with no diff', async () => {
+it('stops reading diffs once the listed paths alone fill a whole prompt, and lists the rest with no diff', async () => {
   const { dir, commit } = repository();
-  const files = Object.fromEntries(Array.from({ length: 5 }, (_, index) => [`f${index}.txt`, 'x\n']));
-  const base = commit(files);
-  const head = commit(Object.fromEntries(Object.keys(files).map(path => [path, `${'w'.repeat(20_000)}\n`])));
-  const diffs = await reviewDiffs(dir, base, head, signal());
-  expect(diffs.map(entry => entry.path)).toEqual(['f0.txt', 'f1.txt', 'f2.txt', 'f3.txt', 'f4.txt']);
-  // About 20 KB each: three are under a whole prompt, the fourth passes it, and no diff after that is read.
-  expect(diffs.map(entry => entry.diff !== null)).toEqual([true, true, true, true, false]);
+  // Long names, so a few hundred files' paths alone pass a prompt.
+  const names = Array.from({ length: 260 }, (_, index) => `${'p'.repeat(240)}${String(index).padStart(3, '0')}.txt`);
+  const base = commit(Object.fromEntries(names.map(name => [name, 'x\n'])));
+  const head = commit(Object.fromEntries(names.map(name => [name, 'y\n'])));
+  const diffs = await reviewDiffs(dir, base, head, AbortSignal.timeout(120_000));
+  expect(diffs.map(entry => entry.path)).toEqual(names);
+  let listable = 0;
+  const readable = names.filter(path => (listable += Buffer.byteLength(JSON.stringify({ path, diff: null }))) <= MAX_REVIEW_PROMPT_BYTES).length;
+  expect(readable).toBeLessThan(names.length);
+  expect(diffs.map(entry => entry.diff !== null)).toEqual(names.map((_, index) => index < readable));
+}, 120_000);
+
+it('shows a file renamed into a directory of its own name, and back', async () => {
+  const { dir, commit } = repository();
+  const text = Array.from({ length: 40 }, (_, index) => `line ${index}`);
+  const base = commit({ a: `${text.join('\n')}\n` });
+  rmSync(join(dir, 'a')); mkdirSync(join(dir, 'a'));
+  const moved = commit({ 'a/b': `${text.map((line, index) => index === 20 ? 'PLANTED' : line).join('\n')}\n` });
+  const [into] = await reviewDiffs(dir, base, moved, signal());
+  expect(into!.path).toBe('a/b');
+  expect(into!.diff).toContain('rename from a\nrename to a/b');
+  expect(into!.diff).toContain('+PLANTED');
+  const [back] = await reviewDiffs(dir, moved, base, signal());
+  expect(back!.path).toBe('a');
+  expect(back!.diff).toContain('rename from a/b\nrename to a');
 });
 
 it('leaves out a submodule (gitlink) change: Git stays out of submodules', async () => {

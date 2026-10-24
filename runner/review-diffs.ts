@@ -46,14 +46,18 @@ function git(executable: string, repository: string, args: string[], limit: numb
   });
 }
 
-/** Pathspecs for exactly `path`: a literal path matches the files under it too, so those are excluded. */
-const exactly = (path: string) => [`:(literal)${path}`, `:(exclude,literal)${path}/`];
+/**
+ * Pathspecs for exactly `paths`: a literal path matches the files under it too, so those are excluded, except where
+ * one of `paths` is under another (a file renamed into a directory of its own name, say), which an exclude would hide.
+ */
+const exactly = (...paths: string[]) => [...paths.map(path => `:(literal)${path}`),
+  ...paths.filter(path => !paths.some(other => other.startsWith(`${path}/`))).map(path => `:(exclude,literal)${path}/`)];
 
 /**
  * Every file that differs between `base` and `head` in `repository`, in Git's path order, with its `git diff` text for
  * the review prompt (#201). A renamed file is listed by its new path, and its diff shows the rename. The diff is null
- * where the prompt cannot carry it: not UTF-8 text without NUL, longer than 32 KiB, or after the diffs before it have
- * already filled a whole prompt (none after that could be listed). The agent reads those files at the head.
+ * where the prompt cannot carry it: not UTF-8 text without NUL, longer than 32 KiB, or after the paths before it alone
+ * already fill a whole prompt (so at most a few thousand diffs are read). The agent reads those files at the head.
  *
  * Git runs without system or global config, hooks, replace objects, external diff or text conversion programs, in-tree
  * diff attributes or submodules, one file at a time, with pathspecs that match only that file, and its output is
@@ -80,7 +84,7 @@ export async function reviewDiffs(repository: string, base: string, head: string
     if (status.startsWith('R')) {
       const from = fields[index++], to = fields[index++];
       if (from === undefined || to === undefined) throw new Error('Git returned an incomplete rename record.');
-      changes.push({ path: to, pathspecs: [...exactly(from), ...exactly(to)] });
+      changes.push({ path: to, pathspecs: exactly(from, to) });
     } else {
       const path = fields[index++];
       if (path === undefined || !/^[ACDMTUX]$/u.test(status)) throw new Error('Git returned an unexpected change record.');
@@ -88,15 +92,17 @@ export async function reviewDiffs(repository: string, base: string, head: string
     }
   }
   const diffs: ReviewDiff[] = [];
-  let shown = 0;
+  // The prompt can list a file with a null diff where its diff does not fit, so a file after the others' paths alone
+  // fill a whole prompt can never be listed: its diff is not read.
+  let listable = 0;
   for (const { path, pathspecs } of changes) {
-    if (shown > MAX_REVIEW_PROMPT_BYTES) { diffs.push({ path, diff: null }); continue; }
+    listable += Buffer.byteLength(JSON.stringify({ path, diff: null }));
+    if (listable > MAX_REVIEW_PROMPT_BYTES) { diffs.push({ path, diff: null }); continue; }
     const result = await git(executable, repository, ['diff', ...DIFF_OPTIONS, base, head, '--', ...pathspecs], MAX_FILE_DIFF_BYTES, signal);
     if (!result.over && result.status !== 0) throw new Error(`Git could not show the change to ${path}.`);
     let diff: string | null = null;
     if (!result.over) { try { diff = decoder.decode(result.stdout); } catch { diff = null; } }
     if (diff?.includes('\0')) diff = null;
-    if (diff !== null) shown += Buffer.byteLength(diff);
     diffs.push({ path, diff });
   }
   return diffs;

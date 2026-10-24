@@ -35,7 +35,7 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `round` | The round number, from 1 to `MAX_REVIEW_ROUNDS` (10). |
 | `plan` | The approved plan revision that ran. |
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
-| `base`, `diffs` | The commit the plan's first item started from, and every file that differs between it and `head`, in path order, with its `git diff` text. `reviewDiffs` (`runner/review-diffs.ts`) makes them with hardened Git: no system or global config, hooks, external diff or text conversion programs, and `--text`, so an in-tree attribute the agent wrote cannot hide a diff. Each file's diff uses pathspecs that match only that file, so a file replaced by a directory, or a file whose type changed, shows exactly its own change. A renamed file is listed by its new path and shown as its rename and its edits. A stop kills Git and returns only once Git has exited. Submodule (gitlink) changes are left out, as Git stays out of submodules. A diff is null where the prompt cannot carry it: binary or not UTF-8, longer than a data block's 32 KiB string, or after the diffs before it already fill a whole prompt (those are not read). The agent reads such a file instead. The agent cannot run Git, so the diffs are how it sees what each item changed. |
+| `base`, `diffs` | The commit the plan's first item started from, and every file that differs between it and `head`, in path order, with its `git diff` text. `reviewDiffs` (`runner/review-diffs.ts`) makes them with hardened Git: no system or global config, hooks, external diff or text conversion programs, and `--text`, so an in-tree attribute the agent wrote cannot hide a diff. Each file's diff uses pathspecs that match only that file, so a file replaced by a directory, or a file whose type changed, shows exactly its own change. A renamed file is listed by its new path and shown as its rename and its edits. A stop kills Git and returns only once Git has exited. Submodule (gitlink) changes are left out, as Git stays out of submodules. A diff is null where the prompt cannot carry it: binary or not UTF-8, longer than a data block's 32 KiB string, or after the paths before it alone already fill a whole prompt (those are not read, so at most a few thousand diffs are). The agent reads such a file instead. The agent cannot run Git, so the diffs are how it sees what each item changed. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
 | `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. `prepareReview` refuses them in round 1, and any from another round. Part 2 passes only the agent's problems: failed `cmd:` checks are left out, because the agent cannot run commands and the next round runs the checks again. |
 
@@ -49,8 +49,9 @@ goes in if it still fits, tried in this order (a part that does not fit is skipp
 tried):
 
 1. the text of each file change in the plan;
-2. the changed files' diffs, as many as fit, in path order (`request.diffsListed`): the agent reads any other changed
-   file at the head;
+2. the changed files' diffs, in path order: the longest run of whole diffs that fits, then each later file whole, or
+   with a null diff, wherever it still fits, so one large diff cannot push every smaller one after it out
+   (`request.diffsListed` counts the files listed); the agent reads any other changed file at the head;
 3. the previous round's problems, as many as fit, in order (`request.earlierListed`): they are a hint, and the agent
    checks every item anyway;
 4. the issue's description;
