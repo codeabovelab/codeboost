@@ -193,7 +193,8 @@ function mergeFocusFallback() {
 }
 // The merge state the runner header last saw (the merge attempt's state and action ID, the merge job's ID and state), so
 // a change read from a poll reads the runner view again: a merge closes or blocks the task, and nothing else would show
-// it (#200). Paths that read the runner view themselves (Refresh, a review action, the Plans refresh, a merge click) set
+// it (#200). Paths that read the runner view themselves (Refresh, a review action, the Plans refresh, a plan import or
+// apply, a merge click) set
 // `runnerReadFollows` around their render so the merge change does not add a second read; loadRunner, and the busy
 // owner's endBusy, clear it. A read that clears it first (a runner poll during a merge click's wait) can still let one
 // extra read through, which the generation check makes harmless.
@@ -1784,6 +1785,8 @@ async function importPlan(event) {
     setPlanStatus(statusOwner, revision === null ? "warn" : "good", revision === null
       ? "! The import returned success without a revision. Reloading the current plan…"
       : `✓ Imported revision r${revision}. Reloading…`);
+    // Runner notes written from here on are newer than the review this reload reads.
+    const notesMark = runnerNoteSeq;
     try {
       rememberDraft();
       const mergeObservationOwner = mergeObservationGeneration;
@@ -1797,14 +1800,20 @@ async function importPlan(event) {
       rememberDraft();
       const newer = newerMergeObservations(updated, mergeObservationOwner);
       data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
+      runnerReadFollows = true;
       render();
       showNewerMergeObservations(newer);
       if ($("plan-file").files[0] === file) $("plan-file").value = "";
       renderPlanFile();
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+      // A new revision changes what the runner admits (approvals, a continuation): read it, as Refresh does.
+      clearRunnerNotesOnReviewLoad(notesMark);
+      loadRunner();
     } catch (error) {
       setPlanStatus(statusOwner, "warn", `! ${revision === null ? "The import returned success" : `Revision r${revision} was imported`}, but the current plan could not reload. ${error.message}`);
       renderMerge();
+      // The revision was saved all the same; the runner view reflects it.
+      loadRunner();
     }
   } catch (error) {
     const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
@@ -1970,6 +1979,8 @@ async function applyPlanAuthor(index) {
       blockers: [{ code: "plan-changed", message: "The plan changed. Refresh before merging." }] } };
     renderMerge();
     setPlanStatus(statusOwner, "good", `✓ Applied revision r${revision}. Reloading…`);
+    // Runner notes written from here on are newer than the review this reload reads.
+    const notesMark = runnerNoteSeq;
     try {
       const updated = await api("/api/review");
       if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration || planAuthorRequest !== request) return;
@@ -1983,14 +1994,20 @@ async function applyPlanAuthor(index) {
       mergePollDelay = 2000;
       const newer = newerMergeObservations(updated, mergeObservationOwner);
       data = preserveSettledQuestionAnswers(withNewerMergeObservations(updated, newer));
+      runnerReadFollows = true;
       render();
       showNewerMergeObservations(newer);
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+      // A new revision changes what the runner admits (approvals, a continuation): read it, as Refresh does.
+      clearRunnerNotesOnReviewLoad(notesMark);
+      loadRunner();
     } catch (error) {
       request.observationError = `Revision r${revision} was applied, but the current plan could not reload. ${error.message}`;
       renderPlanAuthor();
       setPlanStatus(statusOwner, "warn", `! Revision r${revision} was applied, but the current plan could not reload. ${error.message}`);
       renderMerge();
+      // The revision was saved all the same; the runner view reflects it.
+      loadRunner();
     }
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration || planAuthorRequest !== request) return;

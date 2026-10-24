@@ -3,7 +3,9 @@ import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDemo } from '../../scripts/demo.ts';
-import { startServer } from '../../web/server.ts';
+import { startServer, type PlanningDeps } from '../../web/server.ts';
+import type { AuthorProvider } from '../../core/planning-author.ts';
+import type { Plan } from '../../core/plan.ts';
 import type { ReviewService } from '../../runner/review.ts';
 import type { RunnerDeps } from '../../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../../runner/execution.ts';
@@ -26,13 +28,14 @@ async function approvePlan(service: ReviewService) {
     view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
 }
 /** `prepare` decides when the item's preparation fails, so a test can hold an attempt in progress. */
-async function serve(options: { approve?: boolean; prepare?: () => Promise<never>; mergeGateway?: MergeGateway | (MergeGateway & MergeQueueGateway) } = {}) {
+async function serve(options: { approve?: boolean; prepare?: () => Promise<never>; mergeGateway?: MergeGateway | (MergeGateway & MergeQueueGateway);
+  planning?: PlanningDeps } = {}) {
   root = mkdtempSync(join(tmpdir(), 'codeboost-runner-ui-'));
   const demo = createDemo(join(root, 'demo'));
   // A merge needs a review that is not a demo, with the demo's out-of-scope change undone (as review.spec.ts does).
   const config = options.mergeGateway ? { ...demo, demo: false } : demo;
   if (options.mergeGateway) { chmodSync(join(config.repository, 'run.sh'), 0o644); fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope'); }
-  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, undefined, undefined, undefined, async service => {
+  app = await startServer(config, 0, undefined, options.mergeGateway, 2_000, undefined, undefined, options.planning, async service => {
     if (options.approve !== false) await approvePlan(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: options.prepare ?? (async () => { throw new Error('no agent here'); }),
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
@@ -1330,4 +1333,40 @@ test('a Refresh that shows a changed merge state reads the runner once', async (
   // 2 s first poll delay.
   await page.waitForTimeout(3_000);
   expect(gets).toBe(before + 1);
+});
+
+test('reads the runner state after a plan import, so Start goes when the new revision is unapproved', async ({ page }) => {
+  await serve();
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  // The next revision of the current plan with a new summary: its items need approval again before they run.
+  const plan = (await app.service.load()).plan;
+  const next = { ...plan, revision: plan.revision + 1, summary: `${plan.summary} (revised)` };
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(next)) });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await expect(page.getByRole('status').filter({ hasText: `Revision r${next.revision} is current.` })).toBeVisible();
+  expect((await (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as { startable: boolean }).startable).toBe(false);
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('reads the runner state after a draft is applied, so Start goes when the new revision is unapproved', async ({ page }) => {
+  // A planning provider that answers with the next draft when the test says so (as plans-authoring.spec.ts's does).
+  let answer!: (source: string) => void;
+  const provider: AuthorProvider = { invoke: () => new Promise(resolve => { answer = resolve; }) };
+  await serve({ planning: { provider, describe: () => ({ repo: { name: 'retry-service', baseRef: 'main' },
+    issue: { number: 3, title: 'Retries', body: '', comments: [] }, approvedLessons: [], validate: () => undefined }) } });
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  const current: Plan = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => typeof answer).toBe('function');
+  answer(JSON.stringify({ ...structuredClone(current), revision: current.revision + 1,
+    items: current.items.map((item, index) => index === 0 ? { ...item, title: 'Expose the bounded retry ceiling' } : item) }));
+  await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: `Revision r${current.revision + 1} is current.` })).toBeVisible();
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
 });
