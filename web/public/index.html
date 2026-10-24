@@ -109,8 +109,13 @@
       </div>
       <div id="review-view" class="view">
       <div class="review-strip">
-        <div><strong>Review</strong> <span id="issue">Loading…</span></div>
+        <div><strong>Review</strong> <span id="issue"><span id="issue-title">Loading…</span><span id="issue-revision"></span></span></div>
         <div id="progress" aria-live="polite"></div>
+        <span id="task-status" hidden></span>
+        <button id="attempt-stop" hidden>Stop item</button
+        ><button id="attempt-retry" hidden>Retry</button
+        ><button id="run-action" class="primary" hidden>Start</button
+        ><button id="cancel-task" hidden>Cancel task</button>
         <button id="merge-details" hidden>Review blockers</button
         ><button id="merge" hidden>Merge PR</button
         ><button id="reload">Refresh</button><button id="task">Open task</button>
@@ -121,6 +126,12 @@
         <button id="merge-cancel">Cancel merge</button>
       </div>
       <div id="banner" role="status"></div>
+      <div id="task-banner" class="task-banner" hidden>
+        <p id="task-banner-text" role="status"></p>
+        <button id="task-banner-approve" hidden>Approve continuation</button
+        ><button id="task-banner-plans" class="primary" hidden>Review plan change</button>
+      </div>
+      <div id="runner-note" role="status"></div>
       <main class="workspace">
         <aside class="plan-pane" aria-label="Plan items">
           <div class="pane-heading">
