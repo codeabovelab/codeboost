@@ -215,20 +215,21 @@ describe('review prompt (#201)', () => {
     expect(() => build({ issue: { number: 412, title: '', body: undefined as unknown as string, comments: [] } })).toThrow('Issue data is not JSON data.');
   });
 
+  // Issues the loader can give (github/issues.ts): a title, and a title, description and comments within 32 KiB.
   it.each([
     ['a description, a lesson and a comment', { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }, { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }],
     // Round 1 keeps room for a description written and a lesson approved before a later round.
-    ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(40_000), comments: [], lessons: ['l'.repeat(40_000)] }],
+    ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(30_000), comments: [], lessons: ['l'.repeat(40_000)] }],
     // A later round is not refused for the reserve: with nothing else to take its room, the comments' note fits in it.
-    ['none, and later ten comments', { body: '', comments: [], lessons: [] }, { body: '', comments: Array.from({ length: 10 }, () => 'c'.repeat(4000)), lessons: [] }],
+    ['none, and later ten comments', { body: '', comments: [], lessons: [] }, { body: '', comments: Array.from({ length: 10 }, () => 'c'.repeat(3000)), lessons: [] }],
     // Round 1 keeps room for the comments' note at the most comments the loader reads, and for the longest title.
     ['a description and a lesson, and later the most comments and the longest title', { body: 'b'.repeat(500), comments: [], lessons: ['l'] },
-      { body: 'b'.repeat(500), comments: Array.from({ length: MAX_ISSUE_COMMENTS }, () => 'c'.repeat(40)), lessons: ['l'], title: '<'.repeat(MAX_ISSUE_TITLE) }],
+      { body: 'b'.repeat(500), comments: Array.from({ length: MAX_ISSUE_COMMENTS }, () => 'c'.repeat(20)), lessons: ['l'], title: '<'.repeat(MAX_ISSUE_TITLE) }],
   ])('builds every later round of the largest plan the first round accepted, with its notes (round 1 with %s)', (_, first, later) => {
     // Round 1 at the largest plan it accepts; rounds 2 and 10, with the most problems a round can give, still fit.
     const plan = input().plan;
     const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => {
-      const { body, comments, lessons, title = '' }: { body: string; comments: string[]; lessons: string[]; title?: string } = round === 1 ? first : later;
+      const { body, comments, lessons, title = 'Fix label()' }: { body: string; comments: string[]; lessons: string[]; title?: string } = round === 1 ? first : later;
       return prepareReview(input({ round, earlierProblems, issue: { number: 412, title, body, comments }, approvedLessons: lessons,
         plan: checksPadded(plan, pad) })).request;
     };
