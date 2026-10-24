@@ -2470,7 +2470,9 @@ function taskStateText(view) {
 function renderRunnerNote() {
   const review = runnerReviewKinds.map((kind) => runnerNotes.review.get(kind)?.text).filter(Boolean).join(" ");
   const { status, ask } = runnerNotes;
-  $("runner-note").textContent = [review, status, ask].filter(Boolean).join(" ");
+  const text = [review, status, ask].filter(Boolean).join(" ");
+  // A live region: rewritten only when the text changes, so a render does not re-announce it.
+  if ($("runner-note").textContent !== text) $("runner-note").textContent = text;
   // Coloured by the part a person most needs to act on first.
   const lead = ask || status || review;
   $("runner-note").className = lead ? statusClass(lead) : "";
@@ -2525,11 +2527,17 @@ function renderRunner() {
         : view.stopRequested !== null ? (view.stopRequested.saved ? " · Stopping…" : " · Stopping (not saved yet)")
           : view.publish.active ? " · Publishing…"
             : live ? ` · ${live.item ?? live.kind}` : "";
-    $("task-status").textContent = `${mark} ${word}${suffix}`;
+    // As the merge step list: screen readers skip the mark and read the word (DESIGN.md). The text is rewritten only
+    // when it changes, so a render does not re-announce an unchanged status.
+    const statusText = `${mark} ${word}${suffix}`;
+    if ($("task-status").textContent !== statusText) {
+      $("task-status").replaceChildren(Object.assign(document.createElement("span"), { className: "mark", textContent: mark }),
+        document.createTextNode(" "), Object.assign(document.createElement("span"), { className: "word", textContent: `${word}${suffix}` }));
+      $("task-status").firstChild.setAttribute("aria-hidden", "true");
+    }
     // The strip cuts a long status with an ellipsis; the full text stays readable as its title.
     $("task-status").title = `${word}${suffix.replace(" · ", ", ")}`;
     $("task-status").className = restart ? "bad" : tone;
-    $("task-status").setAttribute("aria-label", `Task: ${word}${suffix.replace(" · ", ", ")}`);
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
     // A pre-merge command check runs as its own attempt on the item (kind `check`); stopping it stops the checks, not
     // the item's run, which the merge's own Cancel merge control also does.
@@ -2543,7 +2551,8 @@ function renderRunner() {
     shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !restart));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
-    $("task-banner-text").textContent = text;
+    // A live region: rewritten only when the text changes, so a render does not re-announce it.
+    if ($("task-banner-text").textContent !== text) $("task-banner-text").textContent = text;
     $("task-banner").hidden = !text;
     shown["task-banner-plans"] = task.status === "needs amendment" || !!approvableContinuation(view);
     shown["task-banner-approve"] = !!approvableContinuation(view);

@@ -1699,3 +1699,21 @@ test('a restart the runner needs comes before the waiting state in the banner', 
   await expect(page.locator('#task-banner-text')).toHaveText("! The runner needs a restart: an attempt's result could not be saved. "
     + '! P2 changed files the plan did not declare: src/config.ts. The current plan does not declare src/config.ts for P2.');
 });
+
+test('polls that change nothing do not rewrite the banner, the note or the status, so they are not re-announced', async ({ page }) => {
+  await serve();
+  // A needs-human task whose draft publish is in progress: polled, and nothing in the view changes between polls.
+  await viewWith(page, view => { view.startable = false; view.task.status = 'needs human';
+    view.publish = { ...view.publish, available: true, active: true, last: { outcome: 'publishing', draft: true, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } }; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs a person. A pull request is being published.');
+  await expect(status(page)).toHaveText('! Needs human · Publishing…');
+  // Count child mutations (text node replacements) of the three live texts over the next polls.
+  await page.evaluate(() => { const counts: Record<string, number> = {}; (window as unknown as { __rewrites: Record<string, number> }).__rewrites = counts;
+    for (const id of ['task-banner-text', 'runner-note', 'task-status']) { counts[id] = 0; new MutationObserver(records => { counts[id] = (counts[id] ?? 0) + records.length; })
+      .observe(document.getElementById(id)!, { childList: true, characterData: true, subtree: true }); } });
+  const note = page.locator('#runner-note');
+  for (const step of [2_000, 4_000, 8_000]) { const reads = Number(await note.getAttribute('data-reads')); await page.clock.runFor(step); await expect(note).toHaveAttribute('data-reads', String(reads + 1)); }
+  expect(await page.evaluate(() => (window as unknown as { __rewrites: Record<string, number> }).__rewrites)).toEqual({ 'task-banner-text': 0, 'runner-note': 0, 'task-status': 0 });
+});
