@@ -1767,7 +1767,8 @@ test('the issue title carries its full text as a tooltip only while the strip cu
   // On first load, measured once the runner's controls are placed: both cut, so each tooltip holds its full text.
   await expect(title).toHaveAttribute('title', `#3 ${summary}`);
   await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
-  // Each text changes while still cut to the same width: the tooltips follow the text, with no size change to observe.
+  // Each text changes while still cut: the tooltips follow the text (here the flex row shares its width a little
+  // differently, which the size observers see; the case with no size change has its own test below).
   reason = 'storage-not-removed'; summary = `${summary}, and every caller of its callers`;
   await refreshReview(page);
   await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's task storage could not be removed");
@@ -1784,4 +1785,58 @@ test('the issue title carries its full text as a tooltip only while the strip cu
   await expect(page.locator('#plans-status')).toContainText('is current');
   await page.locator('#review-link').click();
   await expect(title).toHaveAttribute('title', `#3 ${summary}`);
+});
+
+/**
+ * The review strip at 1280 px with the status at its 40% maximum (the longest status and a restart reason). `summary`
+ * is what the review reports as the plan summary; `reason` the fake marker's reason; both can change for the next load.
+ */
+async function cappedStrip(page: Page, texts: { summary: string; reason: 'preparation-not-removed' | 'storage-not-removed' }) {
+  await serve();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.route('**/api/review', async route => {
+    const response = await unpooled(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const review = await response.json() as Record<string, any>;
+    if (response.ok) review.plan = { ...review.plan, summary: texts.summary };
+    await route.fulfill({ status: response.status, json: review });
+  });
+  await viewWith(page, view => { view.startable = false; view.task.status = 'possibly already fixed';
+    view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: texts.reason }; });
+  await openReview(page, app.url);
+  await page.evaluate(() => document.fonts.ready);
+  const widths = () => page.evaluate(() => { const strip = document.querySelector('#review-view .review-strip')!;
+    const inner = strip.clientWidth - parseFloat(getComputedStyle(strip).paddingLeft) - parseFloat(getComputedStyle(strip).paddingRight);
+    return { inner, status: document.getElementById('task-status')!.getBoundingClientRect().width, title: document.getElementById('issue-title')!.getBoundingClientRect().width }; });
+  return widths;
+}
+
+test('a summary change that leaves the cut widths as they are still updates the title tooltip', async ({ page }) => {
+  // The title is cut by less than the status's excess over its cap, so a summary change (a plan import or Apply editing
+  // it) changes no width: no size observer fires, and only the measurement after the render sees the new text.
+  const texts = { summary: 'Make retries predictable across the service', reason: 'preparation-not-removed' as const };
+  const widths = await cappedStrip(page, texts);
+  const title = page.locator('#issue-title');
+  await expect(title).toHaveAttribute('title', `#3 ${texts.summary}`);
+  const before = await widths();
+  expect(before.status).toBeCloseTo(before.inner * 0.4, 0);
+  expect(before.title).toBeLessThan(await title.evaluate(element => element.scrollWidth));
+  texts.summary = `${texts.summary}.`;
+  await refreshReview(page);
+  expect(await widths()).toEqual(before);
+  await expect(title).toHaveAttribute('title', `#3 ${texts.summary}`);
+});
+
+test('a status change that leaves the cut widths as they are still updates the status tooltip', async ({ page }) => {
+  // A short title that is not cut: the status keeps its cap with either restart reason, so the reason changing (a read
+  // after the runner's state moved) changes no width, and only the measurement after the render sees the new text.
+  const texts = { summary: 'Fix retries', reason: 'preparation-not-removed' as const as 'preparation-not-removed' | 'storage-not-removed' };
+  const widths = await cappedStrip(page, texts);
+  await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
+  await expect(page.locator('#issue-title')).not.toHaveAttribute('title');
+  const before = await widths();
+  expect(before.status).toBeCloseTo(before.inner * 0.4, 0);
+  texts.reason = 'storage-not-removed';
+  await refreshReview(page);
+  expect(await widths()).toEqual(before);
+  await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's task storage could not be removed");
 });

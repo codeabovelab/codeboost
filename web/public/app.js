@@ -797,9 +797,11 @@ function render() {
 }
 /**
  * The issue title and the task status give way to an ellipsis in a crowded review strip; while one is cut, its full
- * text is its title, and only then, so a screen reader does not get the text twice. Measured after every render has
- * placed the strip's controls, and whenever either element's size changes, which covers the first layout, a text
- * change, a window resized and a screen shown; never while the review view is hidden, where every width is zero.
+ * text is its title, and only then, so a screen reader does not get the text twice. Measured whenever either element's
+ * size changes (the first layout, a window resized, a screen shown, and most text changes, which shift how the flex
+ * row shares its width) and after every render has placed the strip's controls, for a text change that leaves the
+ * sizes as they are: a status at its 40% maximum, or a title cut beside one. Never while the review view is hidden,
+ * where every width is zero.
  */
 function updateStripTitles() {
   if ($("review-view").hidden) return;
