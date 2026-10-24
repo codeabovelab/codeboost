@@ -150,6 +150,14 @@ it('refuses when Git skips rename detection, rather than hide a renamed file\'s 
     ...Object.fromEntries(Array.from({ length: 4 }, (_, index) => [`e${index}.txt`, `e${index} other ${index}\n`])) });
   // A limit of 2 stands in for Git's 1,000, so a few files are past it.
   await expect(reviewDiffs(dir, base, head, signal(), { renameLimit: 2 })).rejects.toThrow(ReviewDiffsRefused);
+  // Found however many other messages come first, and when it arrives split: a stand-in Git that prints 20,000 hints,
+  // then Git 2.54.0's warning (as Apple Git-157 printed it above) in two writes, and exits 0 with no output, as Git
+  // does; the code reads nothing else of a listing that warns.
+  const bin = mkdtempSync(join(tmpdir(), 'review-diffs-git-')); dirs.push(bin);
+  const fake = join(bin, 'git');
+  writeFileSync(fake, `#!/bin/sh\ni=0\nwhile [ $i -lt 20000 ]; do echo 'hint: harmless' >&2; i=$((i+1)); done\nprintf 'warning: exhaustive rename detec' >&2\nsleep 0.2\nprintf 'tion was skipped due to too many files.\\n' >&2\nexit 0\n`);
+  chmodSync(fake, 0o755);
+  await expect(reviewDiffs(dir, base, head, signal(), { executable: fake })).rejects.toThrow(ReviewDiffsRefused);
   // Within the limit, the rename and its edit are shown.
   const diffs = await reviewDiffs(dir, base, head, signal(), { renameLimit: 100 });
   expect(diffs.find(entry => entry.path === 'big2.ts')!.diff).toContain('+PLANTED');

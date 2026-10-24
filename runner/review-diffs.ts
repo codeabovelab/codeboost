@@ -17,19 +17,19 @@ const DIFF_OPTIONS = ['--text', '--no-ext-diff', '--no-textconv', '--no-color', 
 
 /** Git's default `diff.renameLimit`, given on the command line so the repository's config cannot change it. */
 export const REVIEW_RENAME_LIMIT = 1000;
-/** Git's stderr is kept only this far: enough for its warnings. */
-const MAX_STDERR_BYTES = 8192;
+/** Git 2.54 still exits 0 when it skips rename detection: "warning: exhaustive rename detection was skipped …" ("inexact" in older Gits). */
+const RENAMES_SKIPPED = 'rename detection was skipped';
 /**
  * The review cannot show the plan's change truthfully, so a person must review it: Git skipped rename detection, and a
  * large renamed file would show only as a delete and an add, hiding its edits.
  */
 export class ReviewDiffsRefused extends Error {}
 
-interface GitOutput { status: number | null; stdout: Buffer; stderr: string; over: boolean }
+interface GitOutput { status: number | null; stdout: Buffer; over: boolean; renamesSkipped: boolean }
 /**
- * Run hardened Git and keep at most `limit` bytes of its stdout; past that, Git is killed and `over` is set. The start
- * of its stderr is kept for the warnings the caller checks; hints there (for example about the empty graft file the
- * hardened environment names) are not failures. When `signal` aborts, Git is killed, and the promise rejects
+ * Run hardened Git and keep at most `limit` bytes of its stdout; past that, Git is killed and `over` is set. Its stderr
+ * is searched as it arrives for the rename-skip warning (`renamesSkipped`), so no amount of other messages can hide it,
+ * and is not kept: other messages (for example about the empty graft file the hardened environment names) are hints. When `signal` aborts, Git is killed, and the promise rejects
  * only once Git has exited, so nothing still reads the repository.
  */
 function git(executable: string, repository: string, args: string[], limit: number, signal: AbortSignal): Promise<GitOutput> {
@@ -38,8 +38,8 @@ function git(executable: string, repository: string, args: string[], limit: numb
     // A repository made on macOS sets core.precomposeunicode, which turns a decomposed name in a pathspec into its
     // composed form: the agent's commits keep names exactly as written, so the pathspec must too.
     const child = spawn(executable, [...GIT_OPTIONS, '-c', 'core.precomposeunicode=false', ...args], { cwd: repository, env: gitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
-    const chunks: Buffer[] = [], errors: Buffer[] = [];
-    let size = 0, over = false, failure: unknown, errorSize = 0;
+    const chunks: Buffer[] = [];
+    let size = 0, over = false, failure: unknown, renamesSkipped = false, tail = '';
     const abort = () => { child.kill('SIGKILL'); };
     signal.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', (chunk: Buffer) => {
@@ -47,15 +47,19 @@ function git(executable: string, repository: string, args: string[], limit: numb
       if (chunk.length > limit - size) { chunks.push(chunk.subarray(0, limit - size)); size = limit; over = true; child.kill('SIGKILL'); return; }
       chunks.push(chunk); size += chunk.length;
     });
-    child.stderr.on('data', (chunk: Buffer) => {
-      if (errorSize < MAX_STDERR_BYTES) { errors.push(chunk.subarray(0, MAX_STDERR_BYTES - errorSize)); errorSize += chunk.length; }
+    // The last few characters carry over, so a warning split between two chunks is still found.
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      const text = tail + chunk;
+      if (text.includes(RENAMES_SKIPPED)) renamesSkipped = true;
+      tail = text.slice(-RENAMES_SKIPPED.length);
     });
     child.on('error', error => { failure ??= error; });
     child.on('close', status => {
       signal.removeEventListener('abort', abort);
       if (signal.aborted) reject(signal.reason);
       else if (failure !== undefined) reject(failure);
-      else resolve({ status: over ? null : status, stdout: Buffer.concat(chunks), stderr: Buffer.concat(errors).toString('utf8'), over });
+      else resolve({ status: over ? null : status, stdout: Buffer.concat(chunks), over, renamesSkipped });
     });
   });
 }
@@ -108,9 +112,7 @@ export async function reviewDiffs(repository: string, base: string, head: string
   const listed = await git(executable, repository, ['diff', '--name-status', '-z', ...DIFF_OPTIONS, `-l${renameLimit}`, base, head, '--'], MAX_PATH_LIST_BYTES, signal);
   if (listed.over) throw new Error('The list of files the plan changed is too long for a review.');
   if (listed.status !== 0) throw new Error('Git could not list the files the plan changed.');
-  // Git 2.54 still exits 0 when it skips rename detection, and says so only on stderr ("warning: exhaustive rename
-  // detection was skipped due to too many files."; older Gits say "inexact").
-  if (/rename detection was skipped/u.test(listed.stderr))
+  if (listed.renamesSkipped)
     throw new ReviewDiffsRefused(`The plan adds and deletes more files than Git's rename detection covers (${renameLimit}), so a renamed file's edits cannot be shown to the review.`);
   const output = listed.stdout;
   if (output.length && output[output.length - 1] !== 0) throw new Error('Git returned an unterminated path record.');
