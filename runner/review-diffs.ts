@@ -46,20 +46,34 @@ function git(executable: string, repository: string, args: string[], limit: numb
   });
 }
 
-/** The most other changed paths one file's diff excludes by name (a rename into a directory of its own name). */
-const MAX_NAMED_EXCLUDES = 1000;
 /**
- * Pathspecs for exactly `paths`, or null when they would need more than MAX_NAMED_EXCLUDES excludes. A literal path
- * matches the files under it too, so those are excluded: as a whole directory, or, where one of `paths` is under
- * another (a file renamed into a directory of its own name), as each other changed path under it, by name.
+ * The most bytes of named excludes one file's diff passes (a rename into a directory of its own name): far under the
+ * operating systems' limits on a command's arguments (1 MiB on macOS, about 2 MiB on Linux).
  */
-function exactly(paths: readonly string[], changed: readonly string[]): string[] | null {
+const MAX_NAMED_EXCLUDE_BYTES = 64 * 1024;
+/**
+ * Pathspecs for exactly `paths`, or null when they would need more than MAX_NAMED_EXCLUDE_BYTES of excludes. A literal
+ * path matches the files under it too, so those are excluded: as a whole directory, or, where one of `paths` is under
+ * another (a file renamed into a directory of its own name), as each other changed path under it, by name. `sorted` is
+ * every changed path in code-unit order, so the paths under one directory are found by a binary search.
+ */
+function exactly(paths: readonly string[], sorted: readonly string[]): string[] | null {
   const specs = paths.map(path => `:(literal)${path}`);
+  let bytes = 0;
   for (const path of paths) {
     if (!paths.some(other => other.startsWith(`${path}/`))) { specs.push(`:(exclude,literal)${path}/`); continue; }
-    for (const other of changed) if (!paths.includes(other) && other.startsWith(`${path}/`)) specs.push(`:(exclude,literal)${other}`);
+    const prefix = `${path}/`;
+    let low = 0, high = sorted.length;
+    while (low < high) { const mid = (low + high) >> 1; if (sorted[mid]! < prefix) low = mid + 1; else high = mid; }
+    for (let index = low; index < sorted.length && sorted[index]!.startsWith(prefix); index++) {
+      const other = sorted[index]!;
+      if (paths.includes(other)) continue;
+      const spec = `:(exclude,literal)${other}`;
+      if ((bytes += Buffer.byteLength(spec) + 1) > MAX_NAMED_EXCLUDE_BYTES) return null;
+      specs.push(spec);
+    }
   }
-  return specs.length - paths.length > MAX_NAMED_EXCLUDES ? null : specs;
+  return specs;
 }
 
 /**
@@ -67,7 +81,7 @@ function exactly(paths: readonly string[], changed: readonly string[]): string[]
  * the review prompt (#201). A renamed file is listed by its new path, and its diff shows the rename. The diff is null
  * where the prompt cannot carry it: not UTF-8 text without NUL, longer than 32 KiB, after the paths before it alone
  * already fill a whole prompt (so at most a few thousand diffs are read), or a rename into a directory of its own name
- * among more than a thousand other changes there. The agent reads those files at the head.
+ * among other changes there whose names pass 64 KiB. The agent reads those files at the head.
  *
  * Git runs without system or global config, hooks, replace objects, external diff or text conversion programs, in-tree
  * diff attributes or submodules, one file at a time, with pathspecs that match only that file, and its output is
@@ -80,7 +94,8 @@ export async function reviewDiffs(repository: string, base: string, head: string
   if (listed.status !== 0) throw new Error('Git could not list the files the plan changed.');
   const output = listed.stdout;
   if (output.length && output[output.length - 1] !== 0) throw new Error('Git returned an unterminated path record.');
-  const decoder = new TextDecoder('utf-8', { fatal: true });
+  // `ignoreBOM`: a leading U+FEFF is part of a name (or a diff), not a mark to drop.
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const fields: string[] = [];
   for (let start = 0; start < output.length;) {
     const end = output.indexOf(0, start);
@@ -101,15 +116,16 @@ export async function reviewDiffs(repository: string, base: string, head: string
       records.push({ path, paths: [path] });
     }
   }
-  const changed = records.flatMap(record => record.paths);
-  const changes = records.map(({ path, paths }) => ({ path, pathspecs: exactly(paths, changed) }));
+  const sorted = records.flatMap(record => record.paths).sort();
   const diffs: ReviewDiff[] = [];
   // Once the paths so far alone fill a whole prompt, no later diff is read: the prompt can still list a later file with
   // a short path, but with a null diff.
   let listable = 0;
-  for (const { path, pathspecs } of changes) {
+  for (const { path, paths } of records) {
     listable += Buffer.byteLength(JSON.stringify({ path, diff: null }));
-    if (listable > MAX_REVIEW_PROMPT_BYTES || pathspecs === null) { diffs.push({ path, diff: null }); continue; }
+    // Built only for a diff that is read, so the bound above also bounds this work.
+    const pathspecs = listable > MAX_REVIEW_PROMPT_BYTES ? null : exactly(paths, sorted);
+    if (pathspecs === null) { diffs.push({ path, diff: null }); continue; }
     const result = await git(executable, repository, ['diff', ...DIFF_OPTIONS, base, head, '--', ...pathspecs], MAX_FILE_DIFF_BYTES, signal);
     if (!result.over && result.status !== 0) throw new Error(`Git could not show the change to ${path}.`);
     let diff: string | null = null;

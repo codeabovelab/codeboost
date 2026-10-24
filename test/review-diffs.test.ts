@@ -110,16 +110,28 @@ it('rejects a stop only after Git has exited', async () => {
   expect(() => process.kill(pid, 0)).toThrow();
 });
 
-it('gives no diff for a rename into a directory of its own name among more than a thousand other changes there', async () => {
+it('gives no diff for a rename into a directory of its own name whose other changes\' names pass 64 KiB', async () => {
   const { dir, commit } = repository();
   const text = Array.from({ length: 40 }, (_, index) => `line ${index}`).join('\n');
   const base = commit({ a: `${text}\n` });
   rmSync(join(dir, 'a')); mkdirSync(join(dir, 'a'));
-  const head = commit({ 'a/b': `${text}\nmore\n`, ...Object.fromEntries(Array.from({ length: 1001 }, (_, index) => [`a/x${index}`, 'x\n'])) });
+  // 300 names of 250 characters: about 80 KB of excludes, though fewer than a thousand of them.
+  const others = Array.from({ length: 300 }, (_, index) => `a/${'x'.repeat(245)}${String(index).padStart(3, '0')}`);
+  const head = commit({ 'a/b': `${text}\nmore\n`, ...Object.fromEntries(others.map(path => [path, 'x\n'])) });
   const diffs = await reviewDiffs(dir, base, head, AbortSignal.timeout(120_000));
   expect(diffs.find(entry => entry.path === 'a/b')).toEqual({ path: 'a/b', diff: null });
-  expect(diffs.find(entry => entry.path === 'a/x0')!.diff).toContain('+x');
+  expect(diffs.find(entry => entry.path === others[0])!.diff).toContain('+x');
 }, 120_000);
+
+it('keeps a byte-order mark at the start of a name', async () => {
+  const { dir, commit } = repository();
+  const base = commit({ 'evil.sh': 'x\n' });
+  const head = commit({ '\uFEFFevil.sh': 'secret\n', 'evil.sh': 'y\n' });
+  const by = Object.fromEntries((await reviewDiffs(dir, base, head, signal())).map(entry => [entry.path, entry.diff]));
+  expect(Object.keys(by).sort()).toEqual(['evil.sh', '\uFEFFevil.sh'].sort());
+  expect(by['\uFEFFevil.sh']).toContain('+secret');
+  expect(by['evil.sh']).toContain('+y');
+});
 
 it('stops reading diffs once the listed paths alone fill a whole prompt, and lists the rest with no diff', async () => {
   const { dir, commit } = repository();
