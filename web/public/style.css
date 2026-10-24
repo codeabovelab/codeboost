@@ -617,6 +617,12 @@ footer button {
   font-size: 12px;
   min-height: 24px;
 }
+/* The banner's text names files the plan did not declare: a long path with no space must still shrink and wrap, so
+   the controls after it stay within the 1280px minimum. */
+.task-banner p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 /* The review strip stays one line at the 1280px minimum (DESIGN.md): the issue title and the task status give way with
    an ellipsis (while one is cut, its full text is its title attribute; a restart's reason is also in the task banner),
    the plan revision and the buttons never shrink or wrap. */

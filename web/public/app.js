@@ -2226,6 +2226,8 @@ async function changeIssueTrust(button) {
     trustErrors.set(number, { generation, order: ++issueErrorOrder,
       message: `✕ Could not ${action === "trust" ? "trust" : "remove trust from"} issue #${number}. ${error.message}` });
     renderIssuesWithPending();
+    // A lost answer may still have committed the decision, which decides what the runner admits (#200).
+    if (ambiguous && runnerView?.available !== false) loadRunner();
   }
 }
 async function loadIssues() {
@@ -2349,6 +2351,9 @@ let runnerView = null,
   // Kept until a definite answer, so a resend after a 503, a lost response or an unknown outcome replays the same
   // action instead of running it twice. Reused only for the identical request: the server hashes it under its action ID.
   runnerKey = null,
+  // A read asked for while an action was in flight: done once the action settles, since the action's answer was
+  // computed before whatever asked for the read (a plan revision, a trust change) and would show the state before it.
+  runnerReadOwed = false,
   cancelConfirmTimer = null;
 // The note under the banner, in parts that are set and cleared independently and shown together, so no note replaces
 // another (#200):
@@ -2615,11 +2620,14 @@ function scheduleRunnerPoll() {
  */
 function endedWorkNotes(before, after) {
   const ended = {};
-  const was = before && liveAttempt(before);
-  // Only an attempt whose row settled: an unresolved marker hides a row that is still pending or running.
-  const settled = was && after.attempts.find((attempt) => attempt.id === was.id);
-  if (settled && ["completed", "failed", "cancelled", "stale"].includes(settled.state)) {
-    ended.attempt = `${settled.state === "failed" ? "✕ " : ""}${was.item ?? was.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
+  // The latest attempt whose row settled since the earlier view: one seen live then, or one that started and ended
+  // between two reads (polls wait up to 30 s). Not under an unresolved marker, which hides a row still pending or
+  // running. The view lists the newest attempts oldest first (runner/store.ts recentAttempts), so the last match.
+  const terminal = (attempt) => ["completed", "failed", "cancelled", "stale"].includes(attempt.state);
+  const settled = before && !after.unresolved ? after.attempts.findLast((attempt) => terminal(attempt)
+    && !before.attempts.some((earlier) => earlier.id === attempt.id && terminal(earlier))) : null;
+  if (settled) {
+    ended.attempt = `${settled.state === "failed" ? "✕ " : ""}${settled.item ?? settled.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
   }
   // A publish or close that settled since the earlier view: its record is new, or the earlier view saw it in progress.
   // It may have started and ended between two reads (polls wait up to 30 s).
@@ -2647,8 +2655,10 @@ function applyRunnerView(view) {
 async function loadRunner({ poll = false, generation = poll ? runnerGeneration : undefined } = {}) {
   runnerReadFollows = false;
   // An action in flight answers with the view after it; a read now could be answered before it commits and, being
-  // newer, would drop that answer and leave the page on the state before the action.
-  if (runnerPending || (poll && generation !== runnerGeneration)) return;
+  // newer, would drop that answer and leave the page on the state before the action. The read is owed instead: the
+  // action's answer may itself be older than what asked for the read.
+  if (runnerPending) { if (!poll) runnerReadOwed = true; return; }
+  if (poll && generation !== runnerGeneration) return;
   generation ??= ++runnerGeneration;
   // A read that is not a poll replaces a pending poll: the timer goes too, so it cannot fire into a newer generation.
   if (!poll && runnerPollTimer) clearTimeout(runnerPollTimer);
@@ -2737,6 +2747,7 @@ async function sendRunnerAction(action, attemptId = null) {
     const outcome = runnerOutcomeText(action, answer.result, answer.runner);
     // A replayed publish answers with its settled record, which the review part may already name.
     setRunnerStatus(outcome === runnerNotes.review.get("publish")?.text ? "" : outcome);
+    if (runnerReadOwed) { runnerReadOwed = false; renderRunner(); await loadRunner(); return; }
   } catch (error) {
     // No status (the response was lost), a 503 or an unknown outcome decided nothing the page can see: keep the key.
     const definite = error.status !== undefined && error.status !== 503 && !error.outcomeUnknown;
@@ -2749,7 +2760,8 @@ async function sendRunnerAction(action, attemptId = null) {
     const note = `✕ ${message}${definite ? "" : " Press it again to resend the same request, unless the task has changed meanwhile."}`;
     if (stale) setRunnerReviewNote("stale", note);
     else setRunnerStatus(note);
-    // A refusal often means the view was stale; read the current one.
+    // A refusal often means the view was stale; read the current one (which also pays a read owed meanwhile).
+    runnerReadOwed = false;
     if (generation === runnerGeneration) {
       renderRunner();
       await loadRunner();

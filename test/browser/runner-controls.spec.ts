@@ -385,19 +385,24 @@ test('a Refresh while an action is in flight does not replace its answer with a 
     if (route.request().method() !== 'POST') { reads.push(Date.now()); await route.continue(); return; }
     posted(); await held; await route.continue();
   });
+  // The page's clock is installed here and paused before the answer is released: no poll can fire after that, so a
+  // read then can only be the one the Refresh owed.
+  await page.clock.install();
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await seen;
   // The start has not reached the server yet. A Refresh now reloads the review; any runner read it makes sees no start.
   const before = reads.length;
   await refreshReview(page);
+  await page.clock.pauseAt(Date.now());
   release();
   await expect(page.locator('#runner-note')).toHaveText('✓ Running P1.');
   // The action's answer shows P1 running: Stop P1 is offered and Start is not.
   await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
   await expect(page.locator('#run-action')).toBeHidden();
-  // The Refresh reloaded the review but made no runner read while the start was in flight.
-  expect(reads.length).toBe(before);
+  // The Refresh reloaded the review; the runner read it asked for while the start was in flight was owed, and done
+  // once the start settled: exactly one, with no poll possible under the frozen clock.
+  await expect.poll(() => reads.length).toBe(before + 1);
   fail();
 });
 
@@ -1801,9 +1806,11 @@ async function cappedStrip(page: Page, texts: { summary: string; reason: 'prepar
   return widths;
 }
 
-test('a summary change that leaves the cut widths as they are still updates the title tooltip', async ({ page }) => {
-  // The title is cut by less than the status's excess over its cap, so a summary change (a plan import or Apply editing
-  // it) changes no width: no size observer fires, and only the measurement after the render sees the new text.
+test('a summary change while the title stays cut updates the title tooltip', async ({ page }) => {
+  // The title is cut beside a status at its cap, so a summary change (a plan import or Apply editing it) leaves the
+  // widths where they are to within a pixel: layout rounding differs across platforms (on Linux the status settles a
+  // quarter of a pixel under its cap), so whether a size observer fires here is not fixed. The measurement that must
+  // see the new text whatever happens is the one after the render; the next test pins it with an exactly capped status.
   const texts = { summary: 'Make retries predictable across the service', reason: 'preparation-not-removed' as const };
   const widths = await cappedStrip(page, texts);
   const title = page.locator('#issue-title');
@@ -1813,7 +1820,9 @@ test('a summary change that leaves the cut widths as they are still updates the 
   expect(before.title).toBeLessThan(await title.evaluate(element => element.scrollWidth));
   texts.summary = `${texts.summary}.`;
   await refreshReview(page);
-  expect(await widths()).toEqual(before);
+  const after = await widths();
+  expect(Math.abs(after.status - before.status)).toBeLessThan(1);
+  expect(Math.abs(after.title - before.title)).toBeLessThan(1);
   await expect(title).toHaveAttribute('title', `#3 ${texts.summary}`);
 });
 
@@ -1830,4 +1839,112 @@ test('a status change that leaves the cut widths as they are still updates the s
   await refreshReview(page);
   expect(await widths()).toEqual(before);
   await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's task storage could not be removed");
+});
+
+test('reads the runner state after a trust change whose answer was lost, since the decision may have committed', async ({ page }) => {
+  await serve({ issueGateway: outsideAuthorGateway });
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // The trust request reaches the server and commits (the route runs it), and the page loses the answer.
+  let lost = false;
+  await page.route('**/api/issues', async route => {
+    if (route.request().method() !== 'POST' || lost || route.request().postDataJSON()?.action !== 'trust') { await route.continue(); return; }
+    lost = true;
+    const request = route.request();
+    await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    await route.abort('failed');
+  });
+  await openReview(page, app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Trust this issue', exact: true })).toBeVisible();
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const before = gets;
+  await page.getByRole('button', { name: 'Trust this issue', exact: true }).click();
+  await expect(page.getByText('Could not trust issue #3.')).toBeVisible();
+  // One read followed the lost answer; the decision it committed makes the runner offer Start again.
+  await expect.poll(() => gets).toBe(before + 1);
+  await page.locator('#review-link').click();
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+});
+
+test('names an attempt that started and ended between two reads', async ({ page }) => {
+  await serve();
+  // The real view after P1 failed, kept between steps (nothing offered) so polling goes on; a later read then shows a
+  // new settled attempt the page never saw live, as the real server's list does (the newest attempts, oldest first,
+  // runner/store.ts recentAttempts): the real attempt's record, copied as P2's after it.
+  let later = false;
+  await viewWith(page, view => { view.resumable = false;
+    if (later && view.attempts.length) view.attempts = [...view.attempts, { ...view.attempts[view.attempts.length - 1], id: '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d', item: 'P2', state: 'completed' }]; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const note = page.locator('#runner-note');
+  // One read settles P1 on screen first, so what follows is only P2's.
+  let reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  later = true;
+  reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(4_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  await expect(note).toContainText('P2 completed. The task is now running. Refresh to review its latest changes.');
+});
+
+test('a runner read asked for during a pending action is done once the action settles', async ({ page }) => {
+  await serve();
+  // Start's answer is computed by the server at once, then held on the wire; meanwhile a new revision is imported, which
+  // asks for a runner read. The held answer offers the state before the import; the owed read must follow it.
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.continue(); return; }
+    const request = route.request();
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const answer = await response.json();
+    await held;
+    await route.fulfill({ status: response.status, json: answer });
+  });
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // The page's clock is installed here and paused before the answer is released: no poll can fire after that, so a
+  // read then can only be the owed one.
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.locator('#run-action')).toHaveAttribute('aria-disabled', 'true');
+  // The item fails at once. Then a new revision is imported: its items are unapproved, so the runner offers nothing
+  // until they are approved again; the import asks for a runner read, which the pending start holds.
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const next = await nextRevision();
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(next)) });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await expect(page.getByRole('status').filter({ hasText: `Revision r${next.revision} is current.` })).toBeVisible();
+  await page.locator('#review-link').click();
+  const before = gets;
+  await page.clock.pauseAt(Date.now());
+  release();
+  // The held answer applies, then the owed read follows it: exactly one, showing the revision's state.
+  await expect(page.locator('#runner-note')).toContainText(/Running P1\.|P1 failed/);
+  await expect.poll(() => gets).toBe(before + 1);
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('a long undeclared path in the needs-amendment banner keeps its controls within 1280px', async ({ page }) => {
+  await serve();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const path = `src/${'a'.repeat(180)}/config.ts`;
+  await viewWith(page, view => {
+    view.startable = false; view.task.status = 'needs amendment';
+    view.continuation = { checkpointId: 'c1', item: 'P2', completedItems: ['P1'], outOfScopePaths: [path], next: 'P2', approved: false };
+  });
+  await openReview(page, app.url);
+  for (const id of ['task-banner-plans', 'task-banner-approve']) {
+    const box = await page.locator(`#${id}`).boundingBox();
+    expect(box, id).not.toBeNull();
+    expect(box!.x + box!.width, `${id} right edge`).toBeLessThanOrEqual(1280);
+  }
 });
