@@ -258,7 +258,11 @@ describe('review prompt (#201)', () => {
   });
 
   it('refuses an answer that is not a valid answer to this request', () => {
-    const { validate } = prepareReview(input());
+    const request = input(), { validate } = prepareReview(request);
+    // The request's round binds validation: a later change to the caller's input does not move it.
+    request.round = 2;
+    expect(validate(answer([]))).toEqual([]);
+    expect(() => validate(answer([], 2))).toThrow('round 2, not round 1');
     expect(() => validate(answer([problem(['P3'])]))).toThrow('P3, which is not a plan item');
     expect(() => validate(answer([], 2))).toThrow('round 2, not round 1');
     expect(() => validate('{"round":1,"problems":[],"round":1}')).toThrow('Duplicate');

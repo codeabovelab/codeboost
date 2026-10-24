@@ -163,7 +163,8 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,
     revision: plan.revision, head: input.head, prompt, schemaText: REVIEW_SCHEMA_TEXT, earlierListed: listed, leftOut: Object.freeze([...leftOut]) });
-  return Object.freeze({ request, validate: (source: string | Uint8Array) => validateReviewAnswer(plan, input.round, source) });
+  // Validation is bound to the frozen request's round, not the caller's input, which may change while the agent runs.
+  return Object.freeze({ request, validate: (source: string | Uint8Array) => validateReviewAnswer(plan, request.round, source) });
 }
 
 /** Refuse NUL and unpaired surrogates in every string of `value`, as `dataJSON` would where it reached them. */
