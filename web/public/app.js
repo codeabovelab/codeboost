@@ -57,8 +57,8 @@ function beginBusy(kind) {
   return ++busyGeneration;
 }
 function endBusy(owner) {
-  runnerReadFollows = false;
   if (owner !== busyGeneration) return;
+  runnerReadFollows = false;
   busy = false;
   busyKind = null;
   renderAttachment();
@@ -194,7 +194,9 @@ function mergeFocusFallback() {
 // The merge state the runner header last saw (the merge attempt's state and action ID, the merge job's ID and state), so
 // a change read from a poll reads the runner view again: a merge closes or blocks the task, and nothing else would show
 // it (#200). Paths that read the runner view themselves (Refresh, a review action, the Plans refresh, a merge click) set
-// `runnerReadFollows` around their render so it is read once; loadRunner and endBusy clear it.
+// `runnerReadFollows` around their render so the merge change does not add a second read; loadRunner, and the busy
+// owner's endBusy, clear it. A read that clears it first (a runner poll during a merge click's wait) can still let one
+// extra read through, which the generation check makes harmless.
 let runnerMergeSeen = null,
   runnerReadFollows = false;
 function renderMerge() {

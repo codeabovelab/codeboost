@@ -1250,9 +1250,11 @@ test('reads the runner state again when a polled merge job ends', async ({ page 
   };
   await serve({ mergeGateway: gateway });
   await readyToMerge();
-  // A merge job record with every field the server sends (runner/merge-job.ts mergeJobView), as review.spec.ts's
-  // mergeJobRecord builds it; this harness has no merge jobs (they need pre-merge preparation), so the click's answer
-  // and the job poll are served here as a runner server with jobs answers them.
+  // A merge job record as runner/merge-job.ts mergeJobView sends it, without `steps` and `cancelRequested`: the page draws
+  // the step list from `steps` and the poll reads `cancelRequested`, and neither matters to the runner read this test
+  // checks. This harness has no merge jobs (they need pre-merge preparation), so the click's answer and the job poll are
+  // served here in the server's shapes ({...review, job} and {queue, job}); the click's `merge` is the review's, with
+  // `job` and no job-mapped blockers (it has none).
   const job = (state: MergeJobView['state'], step: MergeJobView['step'], revision: number, reason: string | null = null): MergeJobView => ({
     id: '0f6b0000-0000-4000-8000-0000000000f1', mergeActionId: null, reason, checks: [], url: null, sequence: 1, revision,
     startedAt: '2026-10-11T00:00:00Z', updatedAt: '2026-10-11T00:00:00Z', state, step });
@@ -1279,4 +1281,53 @@ test('reads the runner state again when a polled merge job ends', async ({ page 
   ended = true;
   await expect(page.locator('#merge')).toHaveText(/blocked/i, { timeout: 15_000 });
   await expect.poll(async () => Number(await note.getAttribute('data-reads'))).toBeGreaterThan(reads);
+});
+
+test('reads the runner state after a merge whose review reload failed', async ({ page }) => {
+  const gateway: MergeGateway = {
+    inspect: async () => { const snapshot = (await app.service.load()).snapshot; return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN',
+      mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false }; },
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+  };
+  await serve({ mergeGateway: gateway });
+  await readyToMerge();
+  // The real server merges; its answer is replaced by the one it sends when its review reload fails after the merge
+  // (web/server.ts: mergeResult, mergeQueue null for a direct merge, mergeRefreshRequired).
+  await page.route('**/api/action', async route => {
+    const request = route.request(), body = request.postDataJSON();
+    if (body.action !== 'merge') { await route.continue(); return; }
+    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const answer = await response.json() as Record<string, any>;
+    if (!response.ok) throw new Error(`The merge answered ${response.status}: ${JSON.stringify(answer)}`);
+    await route.fulfill({ status: 200, json: { mergeResult: answer.mergeResult, mergeQueue: null, mergeRefreshRequired: true } });
+  });
+  await openReview(page, app.url);
+  page.on('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
+  await expect(page.locator('#banner')).toContainText('Merge submitted.');
+  // The merge state on screen did not change (no attempt before, none in the answer), yet the header follows the task.
+  await expect(status(page)).toHaveText('✓ Merged');
+  await expect(page.locator('#cancel-task')).toBeHidden();
+});
+
+test('a Refresh that shows a changed merge state reads the runner once', async ({ page }) => {
+  // A merge gateway, so the review carries the merge status (without one it has none, and nothing changes).
+  await serve({ mergeGateway: {
+    inspect: async () => { const snapshot = (await app.service.load()).snapshot; return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN',
+      mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false }; },
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }) } });
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review');
+  // Another tab starts a merge: the next review load shows a merge attempt the page has not seen.
+  const view = await app.service.load();
+  app.service.store.beginMergeAttempt(app.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion! }, view.snapshot.head, null, 'direct');
+  const before = gets;
+  await refreshReview(page);
+  await expect.poll(() => gets).toBe(before + 1);
+  // No second read follows: the task is in review with nothing running, so nothing polls; this waits 3 s, past the
+  // 2 s first poll delay.
+  await page.waitForTimeout(3_000);
+  expect(gets).toBe(before + 1);
 });
