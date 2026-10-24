@@ -1375,8 +1375,10 @@ test('reads the runner state after a draft is applied, so Start goes when the ne
 });
 
 test('reads the runner state when the issue board loads and when the issue\'s trust changes', async ({ page }) => {
-  // GitHub as the issue board and the runner's admission read it: issue #3 by an author outside the repository, so it
-  // needs a person's trust before it can run (github/issues.ts RepositoryIssue, IssueAccess).
+  // GitHub as the issue board reads it: issue #3 by an author outside the repository, so it needs a person's trust before
+  // it can run (github/issues.ts RepositoryIssue, IssueAccess). Left out, as nothing here reads them: `fetch` ignores
+  // `signal` and `timeoutMs` (the real gateway aborts on them), `issueAccess` and `issueText` answer for any number, and
+  // `issueText` is never called (no runner action is sent).
   const gateway: IssueTrustGateway = {
     repository: 'owner/repo',
     async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [{ repository: 'owner/repo', number: 3, title: 'Make retries predictable',
@@ -1401,4 +1403,112 @@ test('reads the runner state when the issue board loads and when the issue\'s tr
   await expect(page.getByRole('button', { name: 'Remove trust', exact: true })).toBeVisible();
   await page.locator('#review-link').click();
   await expect(start).toBeVisible();
+});
+
+/** The next revision of the current plan, which needs approval again before its items run. */
+async function nextRevision() {
+  const plan = (await app.service.load()).plan;
+  return { ...plan, revision: plan.revision + 1, summary: `${plan.summary} (revised)` };
+}
+/** Imports `next` through the Plans screen, with `answer` deciding what the page sees of the import's answer. */
+async function importThrough(page: Page, next: Record<string, unknown>, answer: (route: Route, response: Response) => Promise<void>) {
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(next)) });
+  let once = true;
+  await page.route('**/api/plan/import', async route => {
+    if (!once) { await route.continue(); return; }
+    once = false;
+    // The real server saves the revision; only the page's view of the answer is changed.
+    const request = route.request();
+    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    await answer(route, response);
+  });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+}
+
+test('reads the runner state after an import whose answer was lost, since the revision may have been saved', async ({ page }) => {
+  await serve();
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  const next = await nextRevision();
+  await importThrough(page, next, async route => { await route.abort('failed'); });
+  await expect(page.getByRole('status').filter({ hasText: 'Could not import the plan.' })).toBeVisible();
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(next.revision);
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('reads the runner state after an import whose review reload failed', async ({ page }) => {
+  await serve();
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  const next = await nextRevision();
+  let failReload = false;
+  await page.route('**/api/review', async route => {
+    if (!failReload) { await route.continue(); return; }
+    failReload = false;
+    await route.fulfill({ status: 500, json: { error: 'History failed.' } });
+  });
+  await importThrough(page, next, async (route, response) => { failReload = true; await route.fulfill({ status: response.status, json: await response.json() }); });
+  await expect(page.locator('#plans-status')).toContainText('but the current plan could not reload.');
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+/** Drafts and applies the next revision through the Plans screen, with `answer` deciding what the page sees of Apply's answer. */
+async function applyThrough(page: Page, answer: (route: Route, response: Response) => Promise<void>) {
+  let reply!: (source: string) => void;
+  const provider: AuthorProvider = { invoke: () => new Promise(resolve => { reply = resolve; }) };
+  await serve({ planning: { provider, describe: () => ({ repo: { name: 'retry-service', baseRef: 'main' },
+    issue: { number: 3, title: 'Retries', body: '', comments: [] }, approvedLessons: [], validate: () => undefined }) } });
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  const current: Plan = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => typeof reply).toBe('function');
+  reply(JSON.stringify({ ...structuredClone(current), revision: current.revision + 1,
+    items: current.items.map((item, index) => index === 0 ? { ...item, title: 'Expose the bounded retry ceiling' } : item) }));
+  await page.route('**/api/plan/drafts/*/apply', async route => {
+    const request = route.request();
+    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    await answer(route, response);
+  });
+  await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
+  return current.revision + 1;
+}
+
+test('reads the runner state after an Apply whose answer was lost, since the revision may have been saved', async ({ page }) => {
+  const revision = await applyThrough(page, async route => { await route.abort('failed'); });
+  await expect(page.getByRole('status').filter({ hasText: 'Could not confirm Apply.' })).toBeVisible();
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(revision);
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('reads the runner state after an Apply whose review reload failed', async ({ page }) => {
+  let failReload = false;
+  await page.route('**/api/review', async route => {
+    if (!failReload) { await route.continue(); return; }
+    failReload = false;
+    await route.fulfill({ status: 500, json: { error: 'History failed.' } });
+  });
+  await applyThrough(page, async (route, response) => { failReload = true; await route.fulfill({ status: response.status, json: await response.json() }); });
+  await expect(page.locator('#plans-status')).toContainText('but the current plan could not reload.');
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
+});
+
+test('a review action\'s answer clears the note about ended work, as Refresh does', async ({ page }) => {
+  await serve();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  const note = page.locator('#runner-note');
+  await expect(note).toContainText('P1 failed.');
+  // A change request is a review action; its answer is the review reloaded (web/server.ts), which now shows P1's changes.
+  await page.getByRole('button', { name: 'Request change', exact: true }).click();
+  await page.getByLabel('Change to request').fill('Add a test for the upper bound.');
+  await page.getByRole('button', { name: 'Save change request' }).click();
+  await expect(page.getByText('Add a test for the upper bound.')).toBeVisible();
+  await expect(note).not.toContainText('P1 failed.');
 });

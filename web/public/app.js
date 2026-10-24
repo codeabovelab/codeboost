@@ -628,6 +628,8 @@ function showMergeQueueStatus(queue) {
 }
 async function act(command) {
   if (busy || planImportPending || !data) return false;
+  // Runner notes written from here on are newer than the review this action's answer carries.
+  const notesMark = runnerNoteSeq;
   supersedePlanRefresh();
   const busyOwner = beginBusy("write");
   const generation = ++reviewGeneration;
@@ -654,6 +656,8 @@ async function act(command) {
     runnerReadFollows = true;
     render();
     showNewerMergeObservations(newer);
+    // The answer is the review reloaded (web/server.ts), as current as Refresh: it shows what ended work changed.
+    clearRunnerNotesOnReviewLoad(notesMark);
     loadRunner();
     return true;
   } catch (error) {
@@ -2186,8 +2190,9 @@ async function changeIssueTrust(button) {
     if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, authorLogin: committed.authorLogin,
       trust: committed.trust, trustedAt: committed.trustedAt, trustedBy: committed.trustedBy, trustChangedAt: committed.trustChangedAt });
     renderIssuesWithPending();
-    // Trust decides whether the runner would admit a run or a publish of the review's issue (#200).
-    if (committed && runnerView?.available) loadRunner();
+    // Trust decides whether the runner would admit a run or a publish of the review's issue (#200). Also before the first
+    // runner read has settled; only a view that says no runner is configured skips it.
+    if (committed && runnerView?.available !== false) loadRunner();
   } catch (error) {
     // A transport failure or 503 proves nothing was returned. Keep the exact request and idempotency key for retry.
     const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
@@ -2218,8 +2223,6 @@ async function loadIssues() {
     issuesView = mergeTrustCommittedDuring(updated, trustGeneration);
     for (const [number, error] of trustErrors) if (error.order <= trustErrorOrder) trustErrors.delete(number);
     renderIssuesWithPending();
-    // A fresh board tells the runner whether the review's issue is trusted; until one loads, it does not know (#200).
-    if (runnerView?.available) loadRunner();
   } catch (error) {
     if (generation !== issuesGeneration) return;
     if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
@@ -2230,6 +2233,10 @@ async function loadIssues() {
       issuesLoading = false;
       $("issues-refresh").removeAttribute("aria-disabled");
       $("issues-refresh").textContent = "Refresh issues";
+      // A fresh board tells the runner whether the review's issue is trusted; until one loads, it does not know (#200).
+      // The server's refresh goes on after an answer this page lost, so the runner is read after a failure too, and
+      // before the first runner read has settled; only a view that says no runner is configured skips it.
+      if (runnerView?.available !== false) loadRunner();
     }
   }
 }
@@ -2323,8 +2330,8 @@ let runnerView = null,
 // another (#200):
 // - review: what changed since the review on screen loaded: an attempt that ended, a publish or close that ended, a
 //   cancel that settled, or a stale-review refusal; one entry of each kind, the latest. Only a review reload (Refresh,
-//   the Plans screen's refresh, a plan import or Apply) clears an entry, and only one written before its review request
-//   was sent.
+//   a review action's answer, the Plans screen's refresh, a plan import or Apply) clears an entry, and only one written
+//   before its review request was sent.
 // - status: the latest action answer, action refusal, read error or quiet note; the next one replaces it. A good read
 //   clears a read error, and a read that shows work or a change clears the quiet note. Work that ended makes it out of
 //   date and clears it; so does a review reload sent after it was written.
