@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type InvocationResult } from '../agents/contract.ts';
 import { assertCommandSchema, createClaudeCommand, createPhasePolicy, MAX_PLANNING_INPUT_BYTES } from '../agents/policy.ts';
-import { MAX_REVIEW_PROMPT_BYTES, MAX_REVIEW_ROUNDS, prepareReview, REVIEW_SCHEMA_TEXT, validateReviewAnswer } from '../core/review-prompt.ts';
+import { MAX_ISSUE_COMMENTS, MAX_ISSUE_TITLE, MAX_REVIEW_PROMPT_BYTES, MAX_REVIEW_ROUNDS, prepareReview, REVIEW_SCHEMA_TEXT, validateReviewAnswer } from '../core/review-prompt.ts';
+import { MAX_ISSUES } from '../github/issues.ts';
 import { CODEX_REVIEW_REFUSED, removeReviewRoot, REVIEW_FEATURE, reviewOutput, reviewRun } from '../runner/review-agent.ts';
-import type { Plan } from '../core/plan.ts';
+import { assertPlan, type Plan } from '../core/plan.ts';
 import { reviewRecordingInput } from './fixtures/review/recording-inputs.ts';
 
 const HEAD = 'a'.repeat(40);
@@ -43,8 +44,9 @@ function checksPadded(base: Plan, bytes: number): Plan {
  * exactly one byte to the prompt.
  */
 function changesPadded(base: Plan, bytes: number): Plan {
+  // A change text has at least one character, so each added file starts with one.
   const items = structuredClone(base.items), first = items[0]!;
-  for (let file = first.files.length; file < MAX.files; file++) first.files.push({ path: `src/pad-${file}.ts`, kind: 'edit', renamed_from: null, change: '' });
+  for (let file = first.files.length; file < MAX.files; file++) first.files.push({ path: `src/pad-${file}.ts`, kind: 'edit', renamed_from: null, change: 'y' });
   let left = bytes;
   for (let file = 0; left > 0 && file < MAX.files; file++) {
     const length = Math.min(MAX.change - first.files[file]!.change.length, left);
@@ -56,6 +58,10 @@ function changesPadded(base: Plan, bytes: number): Plan {
 }
 
 describe('review prompt (#201)', () => {
+  it('pads only with plans the plan schema accepts, and reserves for the comments the loader reads', () => {
+    for (const plan of [changesPadded(input().plan, 20_000), checksPadded(input().plan, 20_000)]) expect(() => assertPlan(plan)).not.toThrow();
+    expect(MAX_ISSUE_COMMENTS).toBe(MAX_ISSUES);
+  });
   it('carries the round, the plan and its head, and the earlier problems only when there are some', () => {
     const first = prepareReview(input()).request;
     expect(first).toMatchObject({ phase: 'review', access: 'read-only', round: 1, revision: 1, head: HEAD, schemaText: REVIEW_SCHEMA_TEXT });
@@ -195,7 +201,7 @@ describe('review prompt (#201)', () => {
     expect(Buffer.byteLength(changes.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
     // Only a plan too large without its change texts is refused.
     const huge = checksPadded(big, 70_000);
-    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, and with room kept for the notes a later round may need, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+    expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, and with room kept for what a later round may add, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     expect(() => build({ plan: huge, round: 2 })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // The earlier problems go in before the issue's description: with room for only one of them, the problems win.
     const some = Array.from({ length: 19 }, (_, index) => ({ round: 1, item: 'P1', summary: `p${index}`, detail: 'd'.repeat(1500), check: null }));
@@ -213,20 +219,23 @@ describe('review prompt (#201)', () => {
     ['a description, a lesson and a comment', { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }, { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }],
     // Round 1 keeps room for a description written and a lesson approved before a later round.
     ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(40_000), comments: [], lessons: ['l'.repeat(40_000)] }],
-    // A later round is not refused for the reserve: comments added before it change only the note's count.
+    // A later round is not refused for the reserve: with nothing else to take its room, the comments' note fits in it.
     ['none, and later ten comments', { body: '', comments: [], lessons: [] }, { body: '', comments: Array.from({ length: 10 }, () => 'c'.repeat(4000)), lessons: [] }],
+    // Round 1 keeps room for the comments' note at the most comments the loader reads, and for the longest title.
+    ['a description and a lesson, and later the most comments and the longest title', { body: 'b'.repeat(500), comments: [], lessons: ['l'] },
+      { body: 'b'.repeat(500), comments: Array.from({ length: MAX_ISSUE_COMMENTS }, () => 'c'.repeat(40)), lessons: ['l'], title: '<'.repeat(MAX_ISSUE_TITLE) }],
   ])('builds every later round of the largest plan the first round accepted, with its notes (round 1 with %s)', (_, first, later) => {
     // Round 1 at the largest plan it accepts; rounds 2 and 10, with the most problems a round can give, still fit.
     const plan = input().plan;
     const at = (pad: number, round = 1, earlierProblems: ReturnType<typeof input>['earlierProblems'] = []) => {
-      const { body, comments, lessons } = round === 1 ? first : later;
-      return prepareReview(input({ round, earlierProblems, issue: { number: 412, title: '', body, comments }, approvedLessons: lessons,
+      const { body, comments, lessons, title = '' }: { body: string; comments: string[]; lessons: string[]; title?: string } = round === 1 ? first : later;
+      return prepareReview(input({ round, earlierProblems, issue: { number: 412, title, body, comments }, approvedLessons: lessons,
         plan: checksPadded(plan, pad) })).request;
     };
     let low = 0, high = 70_000;
     const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
     while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
-    expect(() => at(low + 1)).toThrow('and with room kept for the notes a later round may need, the prompt takes more than');
+    expect(() => at(low + 1)).toThrow('and with room kept for what a later round may add, the prompt takes more than');
     const most = Array.from({ length: 100 }, (_, index) => ({ round: 1, item: index % 2 ? 'P2' : 'P1', summary: `s${index}`, detail: 'd', check: null }));
     for (const round of [2, 10]) {
       const next = at(low, round, most.map(problem => ({ ...problem, round: round - 1 })));

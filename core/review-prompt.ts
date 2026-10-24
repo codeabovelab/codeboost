@@ -7,6 +7,10 @@ import { DataTooLarge, dataJSON } from './planning-author.ts';
 
 /** The largest round number a review answer can carry; the round limit (#201) is at most this. */
 export const MAX_REVIEW_ROUNDS = 10;
+/** GitHub's longest issue title, in characters. */
+export const MAX_ISSUE_TITLE = 256;
+/** The most comments the issue loader reads (github/issues.ts, `MAX_ISSUES`); it refuses an issue with more. */
+export const MAX_ISSUE_COMMENTS = 1000;
 /** The most problems the earlier-problems note can count: one round's answer split per item (10 problems × 10 items). */
 const MAX_NOTE_COUNT = 100;
 const template = readFileSync(new URL('../prompts/review.md', import.meta.url), 'utf8').replace(/^<!--[\s\S]*?-->\s*/u, '');
@@ -98,20 +102,24 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     ? `\n\n${listed ? `${left} more problem${left === 1 ? '' : 's'}` : `## Problems the previous round found\n\nThe ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '';
   const changesNote = '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.';
   const lessonsNote = '\n\nThe approved lessons did not fit here, so they are left out.';
+  // The issue's title at its longest: GitHub's 256 characters, each escaped to its longest form (`<` is `\u003c`).
+  const longestTitle = Buffer.byteLength(dataJSON(input.issue.title, 'Issue data')) >= Buffer.byteLength(dataJSON('<'.repeat(MAX_ISSUE_TITLE), 'Issue data'))
+    ? input.issue.title : '<'.repeat(MAX_ISSUE_TITLE);
   /**
    * `reserve`: what can differ from round to round at its longest, for the room the prompt keeps: the round number, the
-   * earlier-problems note for the most problems a round can give, and the description's and lessons' notes even where
-   * there is no description or lesson yet (one written or approved between rounds then still fits). The change texts'
-   * note is the same in every round of one plan.
+   * earlier-problems note for the most problems a round can give, the issue's title, and the notes of the description,
+   * the comments (for the most comments the issue loader reads) and the lessons even where there are none yet (one
+   * written, posted or approved between rounds then still fits). The change texts' note is the same in every round of
+   * one plan.
    */
   const render = (parts: Parts, reserve = false): string | null => {
-    const left = total - parts.earlier, comments = input.issue.comments.length;
+    const left = total - parts.earlier, comments = reserve ? Math.max(input.issue.comments.length, MAX_ISSUE_COMMENTS) : input.issue.comments.length;
     const values: Record<string, string> = {
       round: reserve ? String(MAX_REVIEW_ROUNDS) : String(input.round),
       plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
         : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
       plan_left_out: !parts.changes && changeTexts ? changesNote : '',
-      issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title, body: parts.description ? input.issue.body : '',
+      issue_data_json: dataJSON({ number: input.issue.number, title: reserve ? longestTitle : input.issue.title, body: parts.description ? input.issue.body : '',
         comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
       issue_left_out: issueNote(reserve || (!parts.description && !!input.issue.body), parts.comments ? 0 : comments),
       lessons_data_json: dataJSON(parts.lessons ? input.approvedLessons : [], 'Lessons'),
@@ -131,13 +139,13 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // Only a size refusal means "does not fit"; any other refusal (data that is not JSON text, a template slot) is a bug.
   const sized = (parts: Parts, reserve = false) => { try { return render(parts, reserve); } catch (error) { if (error instanceof DataTooLarge) return null; throw error; } };
   // The smallest prompt: the plan without its change texts, the issue's number and title, the prompt's own text and the
-  // note for each part left out. Round 1 checks it with the reserve, so every later round of the same plan fits unless
-  // the issue's title or its number of comments changed in between. A later round checks only its own smallest prompt:
-  // the reserve is room kept for it, not a reason to refuse it. Every prompt is at most this size until a part goes in.
+  // note for each part left out. Round 1 checks it with the reserve, so every later round of the same plan fits. A
+  // later round checks only its own smallest prompt: the reserve is room kept for it, not a reason to refuse it. Every
+  // prompt is at most this size until a part goes in.
   let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
   if (sized(parts, input.round === 1) === null)
     throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems${
-      input.round === 1 ? ', and with room kept for the notes a later round may need,' : ','} the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
+      input.round === 1 ? ', and with room kept for what a later round may add,' : ','} the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
   keep({ ...parts, changes: true });
   if (total) {

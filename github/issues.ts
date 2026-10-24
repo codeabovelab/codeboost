@@ -5,7 +5,7 @@ import { RemoteTimeout } from './timeout.ts';
 
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
-const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
+export const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
 const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
