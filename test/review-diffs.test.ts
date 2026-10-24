@@ -110,6 +110,17 @@ it('rejects a stop only after Git has exited', async () => {
   expect(() => process.kill(pid, 0)).toThrow();
 });
 
+it('gives no diff for a rename into a directory of its own name among more than a thousand other changes there', async () => {
+  const { dir, commit } = repository();
+  const text = Array.from({ length: 40 }, (_, index) => `line ${index}`).join('\n');
+  const base = commit({ a: `${text}\n` });
+  rmSync(join(dir, 'a')); mkdirSync(join(dir, 'a'));
+  const head = commit({ 'a/b': `${text}\nmore\n`, ...Object.fromEntries(Array.from({ length: 1001 }, (_, index) => [`a/x${index}`, 'x\n'])) });
+  const diffs = await reviewDiffs(dir, base, head, AbortSignal.timeout(120_000));
+  expect(diffs.find(entry => entry.path === 'a/b')).toEqual({ path: 'a/b', diff: null });
+  expect(diffs.find(entry => entry.path === 'a/x0')!.diff).toContain('+x');
+}, 120_000);
+
 it('stops reading diffs once the listed paths alone fill a whole prompt, and lists the rest with no diff', async () => {
   const { dir, commit } = repository();
   // Long names, so a few hundred files' paths alone pass a prompt.
@@ -129,14 +140,18 @@ it('shows a file renamed into a directory of its own name, and back', async () =
   const text = Array.from({ length: 40 }, (_, index) => `line ${index}`);
   const base = commit({ a: `${text.join('\n')}\n` });
   rmSync(join(dir, 'a')); mkdirSync(join(dir, 'a'));
-  const moved = commit({ 'a/b': `${text.map((line, index) => index === 20 ? 'PLANTED' : line).join('\n')}\n` });
-  const [into] = await reviewDiffs(dir, base, moved, signal());
-  expect(into!.path).toBe('a/b');
-  expect(into!.diff).toContain('rename from a\nrename to a/b');
-  expect(into!.diff).toContain('+PLANTED');
-  const [back] = await reviewDiffs(dir, moved, base, signal());
-  expect(back!.path).toBe('a');
-  expect(back!.diff).toContain('rename from a/b\nrename to a');
+  // Another changed file in that directory, too large for a diff, must not join the rename's diff.
+  const moved = commit({ 'a/b': `${text.map((line, index) => index === 20 ? 'PLANTED' : line).join('\n')}\n`, 'a/c': `${'c'.repeat(MAX_PROMPT_BYTES)}\n` });
+  const into = await reviewDiffs(dir, base, moved, signal());
+  expect(into.map(entry => entry.path)).toEqual(['a/b', 'a/c']);
+  expect(into[0]!.diff).toContain('rename from a\nrename to a/b');
+  expect(into[0]!.diff).toContain('+PLANTED');
+  expect(into[0]!.diff).not.toContain('a/c');
+  expect(into[1]!.diff).toBeNull();
+  const back = await reviewDiffs(dir, moved, base, signal());
+  expect(back.map(entry => entry.path)).toEqual(['a', 'a/c']);
+  expect(back[0]!.diff).toContain('rename from a/b\nrename to a');
+  expect(back[0]!.diff).not.toContain('a/c');
 });
 
 it('leaves out a submodule (gitlink) change: Git stays out of submodules', async () => {
