@@ -384,23 +384,26 @@ test('a Refresh while an action is in flight does not replace its answer with a 
 test('the review strip keeps every control on one line at the 1280px minimum width', async ({ page }) => {
   await serve();
   await page.setViewportSize({ width: 1280, height: 800 });
-  // The widest the strip gets: the longest status word and restart reason, Retry, the longest run action and Cancel task.
-  // Shapes only: the page reads the status, the marker's reason, `retryable` and the publish flags to choose what to
-  // show, nothing else from them here.
-  await viewWith(page, view => { view.task.status = 'possibly already fixed'; view.retryable = true;
+  // The widest the strip gets: the longest status word and restart reason, Retry, the longest run action (Publish draft
+  // PR, offered once neither Start nor Resume is) and Cancel task. Shapes only: the page reads the status, the marker's
+  // reason, `startable`, `retryable` and the publish flags to choose what to show, nothing else from them here.
+  await viewWith(page, view => { view.task.status = 'possibly already fixed'; view.startable = false; view.retryable = true;
     view.publish = { ...view.publish, available: true, publishable: true, draft: true };
     view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'preparation-not-removed' }; });
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
+  await expect(page.locator('#run-action')).toHaveText('Publish draft PR');
   await expect(page.locator('#task-status')).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
   // This server has no merge gateway, so the merge controls a production task also shows are unhidden here with their
-  // production labels (renderMergeControls), for this layout check only.
-  await page.evaluate(() => { for (const [id, text] of [['merge', '3 blockers'], ['merge-details', 'Review blockers']] as [string, string][]) { const button = document.getElementById(id)!; button.hidden = false; button.textContent = text; } });
-  // No horizontal overflow, and every visible child sits inside the strip's box: none wraps to more lines, and none is
-  // clipped by an edge. A wrapped title or button is taller than the strip, which is what the person would see.
+  // widest production labels (renderMergeControls), and Cancel task gets its armed label, for this layout check only.
+  await page.evaluate(() => { for (const [id, text] of [['merge', 'Requesting merge…'], ['merge-details', 'Review blockers'], ['cancel-task', 'Confirm cancel']] as [string, string][]) { const button = document.getElementById(id)!; button.hidden = false; button.textContent = text; } });
+  // No horizontal overflow; every visible child sits inside the strip's box and is one line tall (a button is 28 px, text
+  // less), so a wrapped title or button fails here; and the plan revision is never cut.
   const boxes = await page.locator('#review-view .review-strip').evaluate(strip => {
     const rect = strip.getBoundingClientRect();
+    const revision = document.getElementById('issue-revision')!;
     return { scroll: strip.scrollWidth, client: strip.clientWidth, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right,
+      revision: { text: revision.textContent, width: revision.getBoundingClientRect().width, scroll: revision.scrollWidth },
       children: [...strip.children].filter(child => !(child as HTMLElement).hidden).map(child => { const box = child.getBoundingClientRect();
         return { id: child.id || child.tagName, top: box.top, bottom: box.bottom, left: box.left, right: box.right }; }) };
   });
@@ -410,7 +413,10 @@ test('the review strip keeps every control on one line at the 1280px minimum wid
     expect(child.bottom, `${child.id} bottom`).toBeLessThanOrEqual(boxes.bottom);
     expect(child.left, `${child.id} left`).toBeGreaterThanOrEqual(boxes.left);
     expect(child.right, `${child.id} right`).toBeLessThanOrEqual(boxes.right);
+    expect(child.bottom - child.top, `${child.id} one line`).toBeLessThanOrEqual(28);
   }
+  expect(boxes.revision.text).toBe(' · r1');
+  expect(Math.round(boxes.revision.width)).toBeGreaterThanOrEqual(boxes.revision.scroll);
 });
 test('a poll that hides the focused Stop moves focus to Refresh', async ({ page }) => {
   let fail!: () => void;

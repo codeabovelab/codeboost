@@ -697,8 +697,10 @@ function render() {
   }
   $("repository").textContent = data.repository;
   renderPlans();
-  $("issue").textContent =
-    `#${data.plan.issue} ${data.plan.summary} · r${data.plan.revision}`;
+  // The title gives way to an ellipsis in a crowded strip (its full text is its title); the revision never does.
+  $("issue-title").textContent = `#${data.plan.issue} ${data.plan.summary}`;
+  $("issue-title").title = `#${data.plan.issue} ${data.plan.summary}`;
+  $("issue-revision").textContent = ` · r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
   renderMerge();
@@ -2432,6 +2434,12 @@ function approvableContinuation(view) {
     && ["needs amendment", "queued", "running"].includes(view.task.status) ? continuation : null;
 }
 function taskBannerText(view) {
+  // A restart the runner needs comes first: the status line may cut its reason, and a tooltip is not a place to read it.
+  const restart = restartNeeded(view);
+  const prefix = restart ? `! The runner needs a restart: ${restart}. ` : "";
+  return prefix + taskStateText(view);
+}
+function taskStateText(view) {
   const task = view.task, attempt = view.attempts.find((entry) => entry.id === task.currentAttemptId);
   const continuation = view.continuation;
   // Also a queued or running task: a recovered run can leave one with a checkpoint to approve before it can resume.

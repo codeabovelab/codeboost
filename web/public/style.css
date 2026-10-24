@@ -617,20 +617,33 @@ footer button {
   font-size: 12px;
   min-height: 24px;
 }
-/* The review strip stays one line at the 1280px minimum (DESIGN.md): the title and the task status give way with an
-   ellipsis (the status's full text is its title; the banner and note say why), and the buttons never shrink or wrap. */
-.review-strip > div:first-child,
+/* The review strip stays one line at the 1280px minimum (DESIGN.md): the issue title and the task status give way with
+   an ellipsis (each one's full text is its title attribute; a restart's reason is also in the task banner), the plan
+   revision and the buttons never shrink or wrap. */
+.review-strip > div:first-child {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+}
+#issue {
+  display: flex;
+  min-width: 0;
+}
+#issue-title,
 #task-status {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+#issue-revision {
+  flex-shrink: 0;
+}
 #task-status {
   max-width: 40%;
-}
-.review-strip > div:first-child {
-  flex: 1 1 auto;
 }
 .review-strip button,
 #progress {
