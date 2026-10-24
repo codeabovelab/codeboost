@@ -69,7 +69,7 @@ characters). Part 2 then moves the task to needs human, after the plan's items h
 batches of items, or checking that it can be reviewed before its items run, is follow-up #209.
 
 The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB
-limit for one argument.
+limit for one argument. This is an exception to the AGENTS.md rule that input-sized text goes on stdin. It is safe while the budget holds the prompt under that limit, which a test checks, and NUL is refused first. Follow-up #210 moves every Claude prompt to stdin.
 
 ### The answer
 
