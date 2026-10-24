@@ -1539,3 +1539,39 @@ test('reads the runner state after a board refresh whose answer was lost, since 
   await page.locator('#review-link').click();
   await expect(page.locator('#run-action')).toBeHidden();
 });
+
+test('a cancel held by an interrupted rebase needs a restart: no Cancel task, no polling', async ({ page }) => {
+  await serve();
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // After a restart, a cancel requested during a pre-merge preparation that died mid-rebase: the task keeps the cancel and
+  // its rebase marker (runner/store.ts RebaseMarker, as the pre-merge path saves one before Git moves) while no
+  // preparation runs it; the server refuses another cancel until recovery settles it.
+  await viewWith(page, view => {
+    view.startable = false; view.task.cancelRequested = CANCEL_ACTION;
+    view.task.rebaseInProgress = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', oldBase: 'a'.repeat(40), oldHead: 'b'.repeat(40), onto: 'c'.repeat(40),
+      oldHistory: null, startedAt: 1_760_000_000_000, resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null, processGroup: null };
+  });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review · Needs restart: an interrupted rebase waits for recovery');
+  await expect(page.locator('#cancel-task')).toBeHidden();
+  // Nothing is sent in 60 s, past the 30 s backoff cap.
+  const sent = gets;
+  await page.clock.runFor(60_000);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+  expect(gets).toBe(sent);
+});
+
+test('a rebase marker with its preparation running is work in progress, not a restart', async ({ page }) => {
+  await serve();
+  // During a pre-merge preparation the marker and the active flag are set together (runner/pre-merge.ts).
+  await viewWith(page, view => {
+    view.startable = false; view.preMerge = { ...view.preMerge, available: true, active: true };
+    view.task.rebaseInProgress = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', oldBase: 'a'.repeat(40), oldHead: 'b'.repeat(40), onto: 'c'.repeat(40),
+      oldHistory: null, startedAt: 1_760_000_000_000, resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null, processGroup: null };
+  });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review');
+  await expect(page.locator('#cancel-task')).toBeVisible();
+});

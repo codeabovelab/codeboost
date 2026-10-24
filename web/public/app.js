@@ -2370,21 +2370,30 @@ const publishNotices = new Set(["possibly already fixed", "draft skipped", "draf
 const runnerActionIds = ["attempt-stop", "attempt-retry", "run-action", "cancel-task", "task-banner-approve"];
 const runnerControlIds = [...runnerActionIds, "task-banner-plans"];
 /**
- * The attempt the task is on while it has not settled; the only one Stop can name. None while an unresolved marker
- * holds the task: its row can stay pending or running after its job ended (a result or start that was not saved), and
- * only a restart settles it.
+ * Why only a restart can move the task on, or null: the coordinator's unresolved marker (runner-lifecycle.md), or a
+ * rebase marker with no preparation running it (runner/pre-merge.ts: the process died mid-rebase, and recovery at the
+ * next start settles it). While either holds, no work is live, the server refuses a cancel, and polling would never end.
+ */
+function restartNeeded(view) {
+  if (view.unresolved) return runnerUnresolved[view.unresolved.reason] ?? view.unresolved.reason;
+  if (view.task.rebaseInProgress !== null && !view.preMerge.active) return "an interrupted rebase waits for recovery";
+  return null;
+}
+/**
+ * The attempt the task is on while it has not settled; the only one Stop can name. None while a restart is needed: an
+ * unresolved marker's row can stay pending or running after its job ended (a result or start that was not saved).
  */
 function liveAttempt(view) {
-  if (view.unresolved) return null;
+  if (restartNeeded(view)) return null;
   const attempt = view.attempts.find((entry) => entry.id === view.task.currentAttemptId);
   return attempt && (attempt.state === "pending" || attempt.state === "running") ? attempt : null;
 }
 /**
- * Work the view names as still moving on its own, so the page polls until it settles. Nothing is while an unresolved
- * marker holds the task: only a restart clears it, so polling for it would never end.
+ * Work the view names as still moving on its own, so the page polls until it settles. Nothing is while a restart is
+ * needed: only that clears the marker, so polling for it would never end.
  */
 function runnerWorking(view) {
-  if (!view?.available || view.unresolved) return false;
+  if (!view?.available || restartNeeded(view)) return false;
   return !!liveAttempt(view) || view.publish.active || view.preMerge.active || view.stopRequested !== null;
 }
 /**
@@ -2395,7 +2404,7 @@ function runnerWorking(view) {
  * read). The page polls it only for `runnerQuietPollLimit` unchanged reads, then stops and asks for Refresh.
  */
 function runnerBetweenSteps(view) {
-  if (!view?.available || view.unresolved || runnerWorking(view)) return false;
+  if (!view?.available || restartNeeded(view) || runnerWorking(view)) return false;
   if (view.task.cancelRequested !== null) return true;
   return ["running", "queued"].includes(view.task.status) && !runAction(view) && !view.retryable && !approvableContinuation(view);
 }
@@ -2498,13 +2507,14 @@ function renderRunner() {
     const task = view.task, closed = task.status === "merged" || task.status === "cancelled";
     const [mark, word, tone] = runnerStatusMarks[task.status] ?? ["○", task.status, "neutral"];
     const live = liveAttempt(view);
-    const suffix = view.unresolved ? ` · Needs restart: ${runnerUnresolved[view.unresolved.reason] ?? view.unresolved.reason}`
+    const restart = restartNeeded(view);
+    const suffix = restart ? ` · Needs restart: ${restart}`
       : task.cancelRequested !== null ? " · Cancelling…"
         : view.stopRequested !== null ? (view.stopRequested.saved ? " · Stopping…" : " · Stopping (not saved yet)")
           : view.publish.active ? " · Publishing…"
             : live ? ` · ${live.item ?? live.kind}` : "";
     $("task-status").textContent = `${mark} ${word}${suffix}`;
-    $("task-status").className = view.unresolved ? "bad" : tone;
+    $("task-status").className = restart ? "bad" : tone;
     $("task-status").setAttribute("aria-label", `Task: ${word}${suffix.replace(" · ", ", ")}`);
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
     if (live) $("attempt-stop").textContent = live.item ? `Stop ${live.item}` : "Stop attempt";
@@ -2514,7 +2524,7 @@ function renderRunner() {
     if (run && runnerPending?.action !== run.action) $("run-action").textContent = run.label;
     // Offered again for a cancel with no work left: sending it again is how a cancel held by an unread push settles. While
     // a merge is being submitted or sits in GitHub's queue, the server refuses it and the note says why.
-    shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !view.unresolved));
+    shown["cancel-task"] = !closed && (task.cancelRequested === null || (!runnerWorking(view) && !restart));
     if (!shown["cancel-task"]) disarmCancel();
     const text = taskBannerText(view);
     $("task-banner-text").textContent = text;
