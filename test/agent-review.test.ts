@@ -1,8 +1,8 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { captureInvocation } from '../agents/contract.ts';
@@ -12,7 +12,7 @@ import { createTaskClone } from '../git/clone.ts';
 import { measureGitRepository, RetainedStorage, runReadOnlyAgent } from '../runner/question-container.ts';
 import { REVIEW_FEATURE, reviewRun } from '../runner/review-agent.ts';
 import { CLIENT_LIMIT, REAL_DOCKER, removeRunnerObjects } from './fixtures/docker-sweep.ts';
-import { prepareReviewRecording, REVIEW_RECORDING_FILES } from './fixtures/review/recording-inputs.ts';
+import { buildReviewRecordingRepository, prepareReviewRecording } from './fixtures/review/recording-inputs.ts';
 
 // Real Docker (#201): a review round runs Claude in lane D's read-only "review" phase with the review answer schema
 // as --json-schema. Runs with the other Docker suites, one file at a time.
@@ -34,22 +34,15 @@ describe('review in the agent container', () => {
   it('runs a Claude review in the container and reaches the vendor (fake Claude token)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'agent-review-')); roots.push(root);
     const repository = join(root, 'repository');
-    for (const [path, text] of Object.entries(REVIEW_RECORDING_FILES)) {
-      mkdirSync(dirname(join(repository, path)), { recursive: true });
-      writeFileSync(join(repository, path), text);
-    }
-    // The developer's own Git configuration (signing, hooks) is kept out, as the recording script does.
-    const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repository, encoding: 'utf8',
-      env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
-        GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t.invalid' } }).trim();
-    git('init', '--quiet', '--initial-branch=main'); git('add', '.'); git('commit', '--quiet', '-m', 'baseline');
-    const head = git('rev-parse', 'HEAD'), owner = randomBytes(16).toString('hex'); owners.push(owner);
+    // The recording's repository, with its developer-independent Git environment.
+    const commits = buildReviewRecordingRepository(repository);
+    const owner = randomBytes(16).toString('hex'); owners.push(owner);
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'codeboost-invalid-test-token' };
     const deps = { buildImage: buildAgentImage, createClone: createTaskClone, prepareFilesystems: prepareTaskFilesystems,
       removeFilesystems: removeTaskFilesystems, measureRepository: measureGitRepository,
       capture: captureInvocation, startClaude: startClaudeInvocation, env };
     const before = readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-review-agent-'));
-    const { request } = prepareReviewRecording('claude-review-round2', head, randomUUID());
+    const { request } = prepareReviewRecording('claude-review-round2', commits, randomUUID());
     const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, paths: paths => `Delete ${paths.join(', ')}.`,
       untracked: () => 'Setup or cleanup was not confirmed.', retained: count => `${count} allocation(s) were not removed.` });
     // Only a request that left the container through the vendor proxy can come back with Anthropic's 401. The unit

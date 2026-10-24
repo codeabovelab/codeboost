@@ -18,12 +18,19 @@ const template = readFileSync(new URL('../prompts/review.md', import.meta.url), 
 export const REVIEW_SCHEMA_TEXT = readFileSync(new URL('../prompts/review-answer.schema.json', import.meta.url), 'utf8');
 /**
  * The largest review prompt, in UTF-8 bytes: the review's model budget, 64 KiB of prompt and schema (planning's
- * `MAX_PLANNING_INPUT_BYTES`, which lane D's command builder enforces again), less the schema. The plan block may use
- * all of it; the issue, lessons and earlier-problems blocks are at most 32 KiB each, and every string 32 KiB (`dataJSON`).
+ * `MAX_PLANNING_INPUT_BYTES`, which lane D's command builder enforces again), less the schema. The plan and diffs blocks
+ * may use all of it; the issue, lessons and earlier-problems blocks are at most 32 KiB each, and every other string
+ * 32 KiB (`dataJSON`).
  */
 export const MAX_REVIEW_PROMPT_BYTES = 64 * 1024 - Buffer.byteLength(REVIEW_SCHEMA_TEXT, 'utf8');
 const validateAnswer = new Ajv2020({ allErrors: true, strict: true }).compile(JSON.parse(REVIEW_SCHEMA_TEXT) as object);
 
+/**
+ * One file's change from the commit the plan started at to the commit the agent reads, as `git diff` text; null when
+ * it is not text the prompt can carry (not UTF-8, or longer than a data block's 32 KiB string), so the agent reads the
+ * file instead.
+ */
+export interface ReviewDiff { path: string; diff: string | null }
 /** A problem an earlier round filed against one item, shown to the next round so it can say whether the fix worked. */
 export interface EarlierProblem { round: number; item: string; summary: string; detail: string; check: string | null }
 /** Trusted runner inputs for one review round. Every text field is untrusted data. */
@@ -34,6 +41,10 @@ export interface ReviewInput {
   plan: Plan;
   /** The commit the agent reads: the task head after the last item, or after the last round's fixes. */
   head: string;
+  /** The commit the plan's first item started from. */
+  base: string;
+  /** Every file that differs between `base` and `head`, in path order. As many as fit go into the prompt, in order. */
+  diffs: readonly ReviewDiff[];
   issue: { number: number; title: string; body: string; comments: readonly string[] };
   approvedLessons: readonly string[];
   /**
@@ -54,11 +65,13 @@ export interface ReviewRequest {
   readonly schemaText: string;
   /** How many of the earlier problems the prompt lists; the rest did not fit. */
   readonly earlierListed: number;
+  /** How many of the changed files' diffs the prompt carries; the rest did not fit. */
+  readonly diffsListed: number;
   /** What else did not fit and was left out, with a note in the prompt saying so. */
   readonly leftOut: readonly ReviewLeftOut[];
 }
 /** The parts of a review prompt that can be left out when it would not fit its budget (see prepareReview). */
-export type ReviewLeftOut = 'file change texts' | 'issue description' | 'lessons' | 'issue comments';
+export type ReviewLeftOut = 'file change texts' | 'file diffs' | 'issue description' | 'lessons' | 'issue comments';
 /** One problem filed against one plan item. A problem the agent named several items for becomes one per item. */
 export interface ReviewProblem { item: string; summary: string; detail: string; check: string | null }
 export interface PreparedReview {
@@ -68,8 +81,8 @@ export interface PreparedReview {
 }
 
 /**
- * Build the trusted review request for one round (#201). Untrusted text (issue, plan fields, lessons, earlier problems)
- * goes only into escaped JSON data blocks, filled in one pass over the trusted template.
+ * Build the trusted review request for one round (#201). Untrusted text (issue, plan fields, diffs, lessons, earlier
+ * problems) goes only into escaped JSON data blocks, filled in one pass over the trusted template.
  */
 export function prepareReview(input: ReviewInput): PreparedReview {
   identityKey(input.identity);
@@ -77,6 +90,9 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     throw new Error(`Review round must be an integer from 1 to ${MAX_REVIEW_ROUNDS}.`);
   if (typeof input.attemptId !== 'string' || !/^[0-9a-f-]{1,64}$/u.test(input.attemptId)) throw new Error('Attempt ID must be 1 to 64 lowercase hex digits and hyphens.');
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.head)) throw new Error('Review head must be a full commit ID.');
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.base) || input.base.length !== input.head.length) throw new Error('Review base must be a full commit ID like the head.');
+  for (const entry of input.diffs) if (typeof entry.path !== 'string' || !entry.path || (entry.diff !== null && typeof entry.diff !== 'string'))
+    throw new Error('Each review diff needs a path and a diff text or null.');
   if (!Number.isSafeInteger(input.plan.revision) || input.plan.revision < 1) throw new Error('Plan revision must be a positive integer.');
   if (input.issue.number !== input.plan.issue) throw new Error('Selected issue mismatch.');
   const plan = structuredClone(input.plan), ids = new Set(plan.items.map(item => item.id));
@@ -84,14 +100,15 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   for (const problem of input.earlierProblems)
     if (!ids.has(problem.item) || problem.round !== input.round - 1) throw new Error('Earlier problems must name plan items from the previous round.');
   // Text a data block cannot hold (NUL, an unpaired surrogate) is refused wherever it is, before any of it is left out.
-  for (const [label, value] of [['Plan data', plan], ['Issue data', input.issue], ['Lessons', input.approvedLessons], ['Earlier problems', input.earlierProblems]] as const)
+  for (const [label, value] of [['Plan data', plan], ['Issue data', input.issue], ['Lessons', input.approvedLessons], ['Earlier problems', input.earlierProblems], ['Changes', input.diffs]] as const)
     assertText(value, label);
-  // The plan's items, intents, files and checks always go in: without them there is nothing to review. The rest goes in
-  // while it fits, in this order: the file change texts, the earlier problems (as many as fit, in order: a hint, as the
-  // agent checks every item anyway), the issue's description, the lessons, the issue's comments. codeboost's own note
-  // names each part left out; the prompt always keeps room for every note.
-  const total = input.earlierProblems.length;
-  type Parts = { changes: boolean; earlier: number; description: boolean; lessons: boolean; comments: boolean };
+  // The plan's items, intents, files and checks, and the base commit, always go in: without them there is nothing to
+  // review. The rest goes in while it fits, in this order: the file change texts, the changed files' diffs (as many as
+  // fit, in path order: the agent reads any other file at the head), the earlier problems (as many as fit, in order: a
+  // hint, as the agent checks every item anyway), the issue's description, the lessons, the issue's comments.
+  // codeboost's own note names each part left out; the prompt always keeps room for every note.
+  const total = input.earlierProblems.length, diffCount = input.diffs.length;
+  type Parts = { changes: boolean; diffs: number; earlier: number; description: boolean; lessons: boolean; comments: boolean };
   const changeTexts = plan.items.some(item => item.files.some(file => file.change));
   const issueNote = (description: boolean, comments: number) => {
     const what = [description ? 'description' : '', comments ? `${comments} comment${comments === 1 ? '' : 's'}` : ''].filter(Boolean);
@@ -102,15 +119,17 @@ export function prepareReview(input: ReviewInput): PreparedReview {
     ? `\n\n${listed ? `${left} more problem${left === 1 ? '' : 's'}` : `## Problems the previous round found\n\nThe ${left} problem${left === 1 ? '' : 's'}`} the previous round found did not fit here. Check every plan item again.` : '';
   const changesNote = '\n\nThe text of each file change did not fit here, so it is left out. Read each item\'s intent and its files.';
   const lessonsNote = '\n\nThe approved lessons did not fit here, so they are left out.';
+  // Fixed text: the number of changed files can differ between rounds.
+  const diffsNote = '\n\nNot every changed file\'s diff fit here, so only the first files in path order are listed. Read every declared file at the head, and compare it with the plan.';
   // The issue's title at its longest: GitHub's 256 characters, each escaped to its longest form (`<` is `\u003c`).
   const longestTitle = Buffer.byteLength(dataJSON(input.issue.title, 'Issue data')) >= Buffer.byteLength(dataJSON('<'.repeat(MAX_ISSUE_TITLE), 'Issue data'))
     ? input.issue.title : '<'.repeat(MAX_ISSUE_TITLE);
   /**
    * `reserve`: what can differ from round to round at its longest, for the room the prompt keeps: the round number, the
-   * earlier-problems note for the most problems a round can give, the issue's title, and the notes of the description,
-   * the comments (for the most comments the issue loader reads) and the lessons even where there are none yet (one
-   * written, posted or approved between rounds then still fits). The change texts' note is the same in every round of
-   * one plan.
+   * earlier-problems note for the most problems a round can give, the issue's title, and the notes of the diffs, the
+   * description, the comments (for the most comments the issue loader reads) and the lessons even where there are none
+   * yet (one written, posted or approved between rounds, or a file a fix changed, then still fits). The change texts'
+   * note and the base commit are the same in every round of one plan.
    */
   const render = (parts: Parts, reserve = false): string | null => {
     const left = total - parts.earlier, comments = reserve ? Math.max(input.issue.comments.length, MAX_ISSUE_COMMENTS) : input.issue.comments.length;
@@ -119,6 +138,9 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
         : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
       plan_left_out: !parts.changes && changeTexts ? changesNote : '',
+      diffs_data_json: dataJSON({ base: input.base, files: input.diffs.slice(0, parts.diffs).map(({ path, diff }) => ({ path, diff })) },
+        'Changes', MAX_REVIEW_PROMPT_BYTES),
+      diffs_left_out: reserve || parts.diffs < diffCount ? diffsNote : '',
       issue_data_json: dataJSON({ number: input.issue.number, title: reserve ? longestTitle : input.issue.title, body: parts.description ? input.issue.body : '',
         comments: parts.comments ? input.issue.comments : [] }, 'Issue data'),
       issue_left_out: issueNote(reserve || (!parts.description && !!input.issue.body), parts.comments ? 0 : comments),
@@ -142,27 +164,30 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // note for each part left out. Round 1 checks it with the reserve, so every later round of the same plan fits. A
   // later round checks only its own smallest prompt: the reserve is room kept for it, not a reason to refuse it. Every
   // prompt is at most this size until a part goes in.
-  let parts: Parts = { changes: false, earlier: 0, description: false, lessons: false, comments: false };
+  let parts: Parts = { changes: false, diffs: 0, earlier: 0, description: false, lessons: false, comments: false };
   if (sized(parts, input.round === 1) === null)
-    throw new Error(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems${
+    throw new Error(`The plan is too large to review in one prompt: even without its file change texts and diffs, the issue's description and comments, the lessons and the earlier problems${
       input.round === 1 ? ', and with room kept for what a later round may add,' : ','} the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
   const keep = (next: Parts) => { if (sized(next) !== null) parts = next; };
   keep({ ...parts, changes: true });
-  if (total) {
-    if (sized({ ...parts, earlier: total }) !== null) parts = { ...parts, earlier: total };
-    else {
-      // With the note, each more problem listed adds more than the note's count shrinks, so this is monotonic.
-      let low = 0, high = total - 1;
-      while (low < high) { const mid = Math.ceil((low + high) / 2); if (sized({ ...parts, earlier: mid }) !== null) low = mid; else high = mid - 1; }
-      parts = { ...parts, earlier: low };
-    }
-  }
+  // As many of `count` entries as fit: all of them with no note, or else the most that fit with the note. With the note,
+  // each more entry listed adds more than the note shrinks (the diffs' note is fixed; the problems' count only
+  // shrinks), so the search is monotonic.
+  const most = (count: number, at: (listed: number) => Parts): number => {
+    if (!count || sized(at(count)) !== null) return count;
+    let low = 0, high = count - 1;
+    while (low < high) { const mid = Math.ceil((low + high) / 2); if (sized(at(mid)) !== null) low = mid; else high = mid - 1; }
+    return low;
+  };
+  parts = { ...parts, diffs: most(diffCount, diffs => ({ ...parts, diffs })) };
+  parts = { ...parts, earlier: most(total, earlier => ({ ...parts, earlier })) };
   keep({ ...parts, description: true });
   keep({ ...parts, lessons: true });
   keep({ ...parts, comments: true });
   const prompt = sized(parts)!, listed = parts.earlier;
   const leftOut: ReviewLeftOut[] = [
     ...(!parts.changes && changeTexts ? ['file change texts' as const] : []),
+    ...(parts.diffs < diffCount ? ['file diffs' as const] : []),
     ...(!parts.description && input.issue.body ? ['issue description' as const] : []),
     ...(!parts.lessons && input.approvedLessons.length ? ['lessons' as const] : []),
     ...(!parts.comments && input.issue.comments.length ? ['issue comments' as const] : []),
@@ -170,7 +195,7 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   const { repositoryId, taskId, planId } = input.identity;
   const request: ReviewRequest = Object.freeze({ phase: 'review', access: 'read-only',
     identity: Object.freeze({ repositoryId, taskId, planId }), attemptId: input.attemptId, round: input.round,
-    revision: plan.revision, head: input.head, prompt, schemaText: REVIEW_SCHEMA_TEXT, earlierListed: listed, leftOut: Object.freeze([...leftOut]) });
+    revision: plan.revision, head: input.head, prompt, schemaText: REVIEW_SCHEMA_TEXT, earlierListed: listed, diffsListed: parts.diffs, leftOut: Object.freeze([...leftOut]) });
   // Validation is bound to the frozen request's round, not the caller's input, which may change while the agent runs.
   return Object.freeze({ request, validate: (source: string | Uint8Array) => validateReviewAnswer(plan, request.round, source) });
 }

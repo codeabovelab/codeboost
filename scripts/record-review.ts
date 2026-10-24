@@ -6,7 +6,6 @@
 // schema as `--json-schema`. The output is saved exactly as D extracted it (Claude's `structured_output`), before any
 // validation, so a recording shows what the vendor returned. Validation runs afterwards and only prints its result.
 // Codex is refused in every phase (#93), so only Claude is recorded. Needs Docker.
-import { execFileSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,7 +18,7 @@ import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/contain
 import { createTaskClone } from '../git/clone.ts';
 import { credentialEnvironment, measureGitRepository, RetainedStorage, runReadOnlyAgent, type ContainerDependencies } from '../runner/question-container.ts';
 import { REVIEW_FEATURE, reviewRun } from '../runner/review-agent.ts';
-import { prepareReviewRecording, REVIEW_RECORDING_FILES, REVIEW_RECORDING_KIND, REVIEW_RECORDING_NAMES, reviewCommandSha256,
+import { buildReviewRecordingRepository, prepareReviewRecording, REVIEW_RECORDING_KIND, REVIEW_RECORDING_NAMES, reviewCommandSha256,
   reviewRecordingFilesSha256, sha256, type ReviewRecording } from '../test/fixtures/review/recording-inputs.ts';
 
 if (process.env.CODEBOOST_RUN_AUTH_PROBES !== '1') {
@@ -41,12 +40,6 @@ const deps: Omit<ContainerDependencies, 'recover'> = {
 const token = REVIEW_FEATURE.credential('claude', env);
 const scrub = (text: string) => text.replaceAll(token, '[CLAUDE_CODE_OAUTH_TOKEN]');
 
-// A fixed author, committer and date give the same commit, and so the same prompt, on every run.
-const gitEnv = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
-  GIT_AUTHOR_NAME: 'codeboost', GIT_AUTHOR_EMAIL: 'recording@codeboost.invalid', GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
-  GIT_COMMITTER_NAME: 'codeboost', GIT_COMMITTER_EMAIL: 'recording@codeboost.invalid', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z' };
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, env: gitEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 const root = mkdtempSync(join(tmpdir(), 'codeboost-recording-'));
 const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, paths: paths => `Delete ${paths.join(', ')}.`,
@@ -54,20 +47,12 @@ const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, pa
 const runnerOwner = randomBytes(16).toString('hex');
 let failed = false;
 try {
-  const repository = join(root, 'repository');
-  for (const [path, text] of Object.entries(REVIEW_RECORDING_FILES)) {
-    mkdirSync(dirname(join(repository, path)), { recursive: true });
-    writeFileSync(join(repository, path), text);
-  }
-  git(repository, 'init', '--quiet', '--initial-branch=main');
-  git(repository, 'add', '.');
-  git(repository, 'commit', '--quiet', '-m', 'Recording baseline');
-  const head = git(repository, 'rev-parse', 'HEAD');
+  const repository = join(root, 'repository'), commits = buildReviewRecordingRepository(repository), { head } = commits;
   const image = {};
   mkdirSync(outputDirectory, { recursive: true });
 
   for (const name of REVIEW_RECORDING_NAMES) {
-    const attemptId = randomUUID(), prepared = prepareReviewRecording(name, head, attemptId);
+    const attemptId = randomUUID(), prepared = prepareReviewRecording(name, commits, attemptId);
     process.stdout.write(`${name}: invoking Claude (up to ten minutes)... `);
     let output: string;
     try {
@@ -88,15 +73,17 @@ try {
       recordedAt: new Date().toISOString(),
       provenance: { image: AGENT_IMAGE, cliVersion: CLAUDE_VERSION,
         model: 'claude CLI default (the adapter passes no model flag)', phase: 'review' },
-      request: { attemptId, round: prepared.request.round, revision: prepared.request.revision, head,
+      request: { attemptId, round: prepared.request.round, revision: prepared.request.revision, head, base: commits.base,
         promptSha256: sha256(prepared.request.prompt), schemaSha256: sha256(prepared.request.schemaText),
         filesSha256: reviewRecordingFilesSha256(),
         commandSha256: reviewCommandSha256(prepared.request.prompt, prepared.request.schemaText) },
       output };
-    // Write through a temporary file, so an interrupted run never leaves half a recording.
+    // Write through a temporary file, so an interrupted run never leaves half a recording; a failed write deletes it.
     const target = join(outputDirectory, `${name}.json`), temporary = `${target}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(recording, null, 2)}\n`, { flag: 'wx' });
-    renameSync(temporary, target);
+    try {
+      writeFileSync(temporary, `${JSON.stringify(recording, null, 2)}\n`, { flag: 'wx' });
+      renameSync(temporary, target);
+    } catch (error) { rmSync(temporary, { force: true }); throw error; }
     // Validation only reports. The recording above is kept either way: a rejected output is a finding.
     try {
       const problems = prepared.validate(output);

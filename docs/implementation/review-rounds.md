@@ -15,8 +15,9 @@ recorded for tests, and the decisions part 2 builds to.
 
 After every plan item has run, codeboost reviews the finished code in rounds:
 
-1. A separate review agent reads the code and checks each plan item against its intent and its `check:` entries. It can
-   read but not edit.
+1. A separate review agent reads the code and what the plan changed, and checks each plan item against its intent and
+   its `check:` entries. It reports any change no item's intent covers, such as an unrelated edit in a declared file.
+   It can read but not edit.
 2. codeboost runs every `cmd:` entry on the final code.
 3. Each problem is filed against one plan item. A problem that spans several items becomes one problem per item.
 4. One new `fix` invocation fixes each problem for its plan item. The fix commit carries that item's trailers.
@@ -34,6 +35,7 @@ After every plan item has run, codeboost reviews the finished code in rounds:
 | `round` | The round number, from 1 to `MAX_REVIEW_ROUNDS` (10). |
 | `plan` | The approved plan revision that ran. |
 | `head` | The full commit ID the agent reads: the head after the last item, or after the last round's fixes. |
+| `base`, `diffs` | The commit the plan's first item started from, and every file that differs between it and `head`, in path order, with its `git diff` text. `reviewDiffs` (`runner/review-diffs.ts`) makes them with hardened Git. A diff that is not UTF-8 text, or longer than a data block's 32 KiB string, is null, and the agent reads that file instead. The agent cannot run Git, so the diffs are how it sees what each item changed. |
 | `issue`, `approvedLessons` | Untrusted text, as in the execute prompt. |
 | `earlierProblems` | The problems the review agent filed in the previous round and a fix ran for, so the agent can say whether each fix worked. `prepareReview` refuses them in round 1, and any from another round. Part 2 passes only the agent's problems: failed `cmd:` checks are left out, because the agent cannot run commands and the next round runs the checks again. |
 
@@ -42,20 +44,23 @@ text is never read as a placeholder or as a closing tag. The prompt is at most `
 64 KiB model budget less its schema. The plan block may use all of it; the issue, lessons and earlier-problems blocks are
 at most 32 KiB each.
 
-The plan's items, intents, files and checks always go in: without them there is nothing to review. Each of the rest
+The plan's items, intents, files and checks, and the base commit, always go in: without them there is nothing to review. Each of the rest
 goes in if it still fits, tried in this order (a part that does not fit is skipped, and the later ones are still
 tried):
 
 1. the text of each file change in the plan;
-2. the previous round's problems, as many as fit, in order (`request.earlierListed`): they are a hint, and the agent
+2. the changed files' diffs, as many as fit, in path order (`request.diffsListed`): the agent reads any other changed
+   file at the head;
+3. the previous round's problems, as many as fit, in order (`request.earlierListed`): they are a hint, and the agent
    checks every item anyway;
-3. the issue's description;
-4. the approved lessons;
-5. the issue's comments.
+4. the issue's description;
+5. the approved lessons;
+6. the issue's comments.
 
 codeboost's own note in the prompt names whatever was left out: the smallest prompt the budget must hold includes every
 note, with the earlier-problems note for the most problems a round can give. `request.leftOut` lists the parts left out, and `request.earlierListed` counts the earlier problems listed.
-Room is kept from round 1 on for the longest round number, the earlier-problems note, the issue's title at GitHub's
+Room is kept from round 1 on for the longest round number, the earlier-problems note, the diffs' note (its text is
+fixed, as the number of changed files can change between rounds), the issue's title at GitHub's
 256 characters escaped at their longest, and the notes of the issue's description, of its comments (for the 1,000 the
 issue loader reads at most) and of the lessons. So every later round of the same plan fits whenever round 1 did, even
 if the title was changed, a description written, comments posted or lessons approved in between. A later round refuses
@@ -115,8 +120,15 @@ launcher must mount the review answer schema: the execute launcher's plain-text 
 
 `scripts/record-review.ts` records two real Claude answers on a fixed finished task
 (`test/fixtures/review/recording-inputs.ts`): round 1, and round 2 with a hand-written earlier problem
-(`REVIEW_RECORDING_EARLIER`) like the one round 1 should find. The task's second plan item has a planted defect (its
-test calls `label(3)` once). To record, run this with your own token and Docker:
+(`REVIEW_RECORDING_EARLIER`) like the one round 1 should find. `buildReviewRecordingRepository` commits the code before
+the plan and then after it, with a fixed Git identity and dates, so the commits and diffs are the same on every run.
+The task has two planted defects:
+
+- the second plan item's test calls `label(3)` once;
+- the first item's commit also weakens `isLabelled()`, which no item asked for. Only a review that reads the diffs can
+  see that.
+
+To record, run this with your own token and Docker:
 
 ```bash
 CODEBOOST_RUN_AUTH_PROBES=1 CLAUDE_CODE_OAUTH_TOKEN=... node scripts/record-review.ts
@@ -126,7 +138,9 @@ Read each file in `test/fixtures/review/recorded/` before committing it. `test/r
 
 - each recording must match today's files, prompt, schema and exact Claude argv, by hash; a change to any of them means
   recording again;
-- each output must pass `validate`, and must file a problem against P2.
+- the repository made again must give the recorded base and head commits;
+- each output must pass `validate`, must file a problem against P2, and must file one against P1 naming
+  `isLabelled`.
 
 `test/agent-review.test.ts` runs a review in a real container with an invalid token: only a request that reached the
 vendor comes back with its 401. The unit tests (`test/agent-policy.test.ts`, `test/agent-adapter.test.ts`,
