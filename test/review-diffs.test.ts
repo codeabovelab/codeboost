@@ -6,7 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import { MAX_PROMPT_BYTES } from '../core/planning-author.ts';
 import { MAX_REVIEW_PROMPT_BYTES } from '../core/review-prompt.ts';
-import { reviewDiffs } from '../runner/review-diffs.ts';
+import { reviewDiffs, ReviewDiffsRefused } from '../runner/review-diffs.ts';
 import { fixtureGit } from './fixtures/git.ts';
 
 // The review prompt's diffs (#201), from real Git: every changed file in path order, with the text the prompt carries,
@@ -104,7 +104,7 @@ it('rejects a stop only after Git has exited', async () => {
   const fake = join(bin, 'git'), pidFile = join(bin, 'pid');
   writeFileSync(fake, `#!/bin/sh\ntrap '' TERM\necho $$ > '${pidFile}'\nwhile :; do sleep 1; done\n`); chmodSync(fake, 0o755);
   const controller = new AbortController();
-  const running = reviewDiffs(dir, base, head, controller.signal, fake);
+  const running = reviewDiffs(dir, base, head, controller.signal, { executable: fake });
   await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 30_000 });
   const pid = Number(readFileSync(pidFile, 'utf8'));
   controller.abort(new Error('stopped'));
@@ -138,6 +138,21 @@ it('shows a decomposed (NFD) name\'s own diff, next to its composed twin', async
   const by = Object.fromEntries((await reviewDiffs(dir, base, head, signal())).map(entry => [entry.path, entry.diff]));
   expect(by['cafe\u0301.ts']).toContain('-1\n+1x\n');
   expect(by['caf\u00e9.ts']).toContain('-2\n+2x\n');
+});
+
+it('refuses when Git skips rename detection, rather than hide a renamed file\'s edits', async () => {
+  const { dir, commit } = repository();
+  const big = Array.from({ length: 200 }, (_, index) => `line ${index}`);
+  const base = commit({ 'big.ts': `${big.join('\n')}\n`, ...Object.fromEntries(Array.from({ length: 4 }, (_, index) => [`d${index}.txt`, `d${index} content here\n`])) });
+  for (let index = 0; index < 4; index++) rmSync(join(dir, `d${index}.txt`));
+  rmSync(join(dir, 'big.ts'));
+  const head = commit({ 'big2.ts': `${big.map((line, index) => index === 100 ? 'PLANTED' : line).join('\n')}\n`,
+    ...Object.fromEntries(Array.from({ length: 4 }, (_, index) => [`e${index}.txt`, `e${index} other ${index}\n`])) });
+  // A limit of 2 stands in for Git's 1,000, so a few files are past it.
+  await expect(reviewDiffs(dir, base, head, signal(), { renameLimit: 2 })).rejects.toThrow(ReviewDiffsRefused);
+  // Within the limit, the rename and its edit are shown.
+  const diffs = await reviewDiffs(dir, base, head, signal(), { renameLimit: 100 });
+  expect(diffs.find(entry => entry.path === 'big2.ts')!.diff).toContain('+PLANTED');
 });
 
 it('keeps a byte-order mark at the start of a name', async () => {
