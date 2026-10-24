@@ -697,10 +697,10 @@ function render() {
   }
   $("repository").textContent = data.repository;
   renderPlans();
-  // The title gives way to an ellipsis in a crowded strip, and only then is its full text its title; the revision never
-  // gives way.
+  // The title gives way to an ellipsis in a crowded strip, and only then is its full text its title (updateStripTitles,
+  // once every control of the strip is placed); the revision never gives way.
   $("issue-title").textContent = `#${data.plan.issue} ${data.plan.summary}`;
-  $("issue-title").title = $("issue-title").scrollWidth > $("issue-title").clientWidth ? `#${data.plan.issue} ${data.plan.summary}` : "";
+  $("issue-title").dataset.full = `#${data.plan.issue} ${data.plan.summary}`;
   // Its leading space is a non-breaking one, part of the text: copied, read aloud and shown alike.
   $("issue-revision").textContent = `\u00a0· r${data.plan.revision}`;
   $("progress").textContent =
@@ -793,8 +793,26 @@ function render() {
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderCode();
   renderAttachment();
-
+  updateStripTitles();
 }
+/**
+ * The issue title and the task status give way to an ellipsis in a crowded review strip; while one is cut, its full
+ * text is its title, and only then, so a screen reader does not get the text twice. Measured after every render has
+ * placed the strip's controls, and whenever either element's size changes, which covers the first layout, a text
+ * change, a window resized and a screen shown; never while the review view is hidden, where every width is zero.
+ */
+function updateStripTitles() {
+  if ($("review-view").hidden) return;
+  for (const id of ["issue-title", "task-status"]) {
+    const element = $(id);
+    const title = !element.hidden && element.scrollWidth > element.clientWidth ? element.dataset.full ?? "" : "";
+    // Set or absent, never an empty attribute; unchanged, it is left alone.
+    if (!title) element.removeAttribute("title");
+    else if (element.getAttribute("title") !== title) element.setAttribute("title", title);
+  }
+}
+new ResizeObserver(() => updateStripTitles()).observe($("issue-title"));
+new ResizeObserver(() => updateStripTitles()).observe($("task-status"));
 function renderCode() {
   const item = data.items.find((item) => item.id === selected),
     segments = data.segments.filter((s) => s.row === selected);
@@ -2519,7 +2537,6 @@ function renderRunner() {
   const view = runnerView?.available && data ? runnerView : null;
   const shown = {};
   for (const id of runnerControlIds) shown[id] = false;
-  let statusTitle = "";
   if (view) {
     const task = view.task, closed = task.status === "merged" || task.status === "cancelled";
     const [mark, word, tone] = runnerStatusMarks[task.status] ?? ["○", task.status, "neutral"];
@@ -2538,7 +2555,7 @@ function renderRunner() {
         document.createTextNode(" "), Object.assign(document.createElement("span"), { className: "word", textContent: `${word}${suffix}` }));
       $("task-status").firstChild.setAttribute("aria-hidden", "true");
     }
-    statusTitle = `${word}${suffix.replace(" · ", ", ")}`;
+    $("task-status").dataset.full = `${word}${suffix.replace(" · ", ", ")}`;
     $("task-status").className = restart ? "bad" : tone;
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
     // A pre-merge command check runs as its own attempt on the item (kind `check`); stopping it stops the checks, not
@@ -2563,9 +2580,6 @@ function renderRunner() {
     disarmCancel();
   }
   $("task-status").hidden = !view;
-  // The strip cuts a long status with an ellipsis; only then is the full text its title, so a screen reader does not get
-  // the text twice when nothing is cut. Measured once the element shows.
-  $("task-status").title = view && $("task-status").scrollWidth > $("task-status").clientWidth ? statusTitle : "";
   for (const id of runnerControlIds) $(id).hidden = !shown[id];
   // Marked, never disabled, while an action is in flight, so the focused control keeps focus (AGENTS.md).
   for (const id of runnerActionIds) {
@@ -2573,6 +2587,7 @@ function renderRunner() {
     else $(id).removeAttribute("aria-disabled");
   }
   if (runnerControlIds.includes(focused?.id) && focused.hidden) $("reload").focus();
+  updateStripTitles();
 }
 function scheduleRunnerPoll() {
   if (runnerPollTimer) clearTimeout(runnerPollTimer);

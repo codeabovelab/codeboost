@@ -73,8 +73,8 @@ test('starts an approved task with the versions on screen, then offers Resume on
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('○ In review');
   // Nothing is cut at this width, so neither the status nor the issue title carries a tooltip to be read twice.
-  await expect(status(page)).toHaveAttribute('title', '');
-  await expect(page.locator('#issue-title')).toHaveAttribute('title', '');
+  await expect(status(page)).not.toHaveAttribute('title');
+  await expect(page.locator('#issue-title')).not.toHaveAttribute('title');
   const start = page.getByRole('button', { name: 'Start', exact: true });
   await expect(start).toBeVisible();
   const review = await app.service.load(), before = app.service.store.getTask(app.service.config.identity).stateVersion;
@@ -1744,4 +1744,44 @@ test('polls that change nothing do not rewrite the banner, the note or the statu
       .observe(document.getElementById(id)!, { childList: true, characterData: true, subtree: true }); } });
   for (const step of [2_000, 4_000, 8_000]) { reads = Number(await note.getAttribute('data-reads')); await page.clock.runFor(step); await expect(note).toHaveAttribute('data-reads', String(reads + 1)); }
   expect(await page.evaluate(() => (window as unknown as { __rewrites: Record<string, number> }).__rewrites)).toEqual({ 'task-banner-text': 0, 'runner-note': 0, 'task-status': 0 });
+});
+
+test('the issue title carries its full text as a tooltip only while the strip cuts it', async ({ page }) => {
+  await serve();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  // A long plan summary, as the review reports it: only `plan.summary` is changed in the real answer.
+  let summary = 'Make retries predictable and document the behavior of every client of the retry policy in the service and its tests';
+  await page.route('**/api/review', async route => {
+    const response = await unpooled(route.request().url(), { headers: { 'x-codeboost-token': route.request().headers()['x-codeboost-token'] ?? '' } });
+    const review = await response.json() as Record<string, any>;
+    if (response.ok) review.plan = { ...review.plan, summary };
+    await route.fulfill({ status: response.status, json: review });
+  });
+  // The status is cut too (the longest status and restart reason), and its reason can change without a width change.
+  let reason: 'preparation-not-removed' | 'storage-not-removed' = 'preparation-not-removed';
+  await viewWith(page, view => { view.startable = false; view.task.status = 'possibly already fixed';
+    view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason }; });
+  await openReview(page, app.url);
+  await page.evaluate(() => document.fonts.ready);
+  const title = page.locator('#issue-title');
+  // On first load, measured once the runner's controls are placed: both cut, so each tooltip holds its full text.
+  await expect(title).toHaveAttribute('title', `#3 ${summary}`);
+  await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
+  // Each text changes while still cut to the same width: the tooltips follow the text, with no size change to observe.
+  reason = 'storage-not-removed'; summary = `${summary}, and every caller of its callers`;
+  await refreshReview(page);
+  await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's task storage could not be removed");
+  await expect(title).toHaveAttribute('title', `#3 ${summary}`);
+  // A wider window cuts nothing: the tooltips go, with no render in between.
+  await page.setViewportSize({ width: 2400, height: 800 });
+  await expect(title).not.toHaveAttribute('title');
+  await expect(status(page)).not.toHaveAttribute('title');
+  // Back at the minimum, and after a Refresh made while the review view was hidden (the Plans screen), it is cut again.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect(title).toHaveAttribute('title', `#3 ${summary}`);
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.evaluate(() => (document.getElementById('plans-refresh') as HTMLButtonElement).click());
+  await expect(page.locator('#plans-status')).toContainText('is current');
+  await page.locator('#review-link').click();
+  await expect(title).toHaveAttribute('title', `#3 ${summary}`);
 });

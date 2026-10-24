@@ -618,8 +618,8 @@ footer button {
   min-height: 24px;
 }
 /* The review strip stays one line at the 1280px minimum (DESIGN.md): the issue title and the task status give way with
-   an ellipsis (each one's full text is its title attribute; a restart's reason is also in the task banner), the plan
-   revision and the buttons never shrink or wrap. */
+   an ellipsis (while one is cut, its full text is its title attribute; a restart's reason is also in the task banner),
+   the plan revision and the buttons never shrink or wrap. */
 .review-strip > div:first-child {
   flex: 1 1 auto;
   display: flex;
