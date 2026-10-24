@@ -47,7 +47,7 @@ const retained = new RetainedStorage({ removePath: REVIEW_FEATURE.removeRoot, pa
 const runnerOwner = randomBytes(16).toString('hex');
 let failed = false;
 try {
-  const repository = join(root, 'repository'), commits = buildReviewRecordingRepository(repository), { head } = commits;
+  const repository = join(root, 'repository'), commits = await buildReviewRecordingRepository(repository), { head } = commits;
   const image = {};
   mkdirSync(outputDirectory, { recursive: true });
 

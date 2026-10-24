@@ -116,7 +116,7 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core
  * final files as the second. scripts/record-review.ts reviews it; test/review-recorded.test.ts makes it again to rebuild
  * the same request.
  */
-export function buildReviewRecordingRepository(repository: string): ReviewRecordingCommits {
+export async function buildReviewRecordingRepository(repository: string): Promise<ReviewRecordingCommits> {
   const write = (files: Readonly<Record<string, string>>) => {
     for (const path of Object.keys(REVIEW_RECORDING_BASE_FILES)) rmSync(join(repository, path), { force: true });
     for (const [path, text] of Object.entries(files)) {
@@ -133,7 +133,7 @@ export function buildReviewRecordingRepository(repository: string): ReviewRecord
   write(REVIEW_RECORDING_FILES);
   git(repository, 'commit', '--quiet', '-m', 'After the plan');
   const head = git(repository, 'rev-parse', 'HEAD');
-  return { base, head, diffs: reviewDiffs(repository, base, head) };
+  return { base, head, diffs: await reviewDiffs(repository, base, head, AbortSignal.timeout(60_000)) };
 }
 export function reviewRecordingInput(name: ReviewRecordingName, commits: ReviewRecordingCommits, attemptId: string): ReviewInput {
   const round = name === 'claude-review-round1' ? 1 : 2;

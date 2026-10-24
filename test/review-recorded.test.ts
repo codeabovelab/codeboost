@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AGENT_IMAGE, CLAUDE_VERSION } from '../agents/container/image.ts';
 import { buildReviewRecordingRepository, prepareReviewRecording, type ReviewRecordingCommits, REVIEW_RECORDING_KIND, REVIEW_RECORDING_NAMES, reviewCommandSha256, reviewRecordingFilesSha256,
   reviewRecordingPlan, sha256, type ReviewRecording } from './fixtures/review/recording-inputs.ts';
@@ -14,10 +14,12 @@ const names = existsSync(directory) ? readdirSync(directory).filter(name => name
 const load = (name: string): ReviewRecording => JSON.parse(readFileSync(join(directory, `${name}.json`), 'utf8'));
 // The recording repository made again: its fixed Git identity and dates give the same commits and diffs as recorded.
 let made: { root: string; commits: ReviewRecordingCommits } | undefined;
-const commits = () => {
-  if (!made) { const root = mkdtempSync(join(tmpdir(), 'review-recorded-repo-')); made = { root, commits: buildReviewRecordingRepository(join(root, 'repository')) }; }
-  return made.commits;
-};
+beforeAll(async () => {
+  if (!names.length) return;
+  const root = mkdtempSync(join(tmpdir(), 'review-recorded-repo-'));
+  made = { root, commits: await buildReviewRecordingRepository(join(root, 'repository')) };
+});
+const commits = () => made!.commits;
 afterAll(() => { if (made) rmSync(made.root, { recursive: true, force: true }); });
 
 it('has a Claude recording for each round', () => {

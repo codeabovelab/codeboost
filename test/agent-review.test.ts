@@ -35,7 +35,7 @@ describe('review in the agent container', () => {
     const root = mkdtempSync(join(tmpdir(), 'agent-review-')); roots.push(root);
     const repository = join(root, 'repository');
     // The recording's repository, with its developer-independent Git environment.
-    const commits = buildReviewRecordingRepository(repository);
+    const commits = await buildReviewRecordingRepository(repository);
     const owner = randomBytes(16).toString('hex'); owners.push(owner);
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'codeboost-invalid-test-token' };
     const deps = { buildImage: buildAgentImage, createClone: createTaskClone, prepareFilesystems: prepareTaskFilesystems,
