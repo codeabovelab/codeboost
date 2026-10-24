@@ -1,7 +1,9 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import { MAX_PROMPT_BYTES } from '../core/planning-author.ts';
 import { MAX_REVIEW_PROMPT_BYTES } from '../core/review-prompt.ts';
 import { reviewDiffs } from '../runner/review-diffs.ts';
@@ -122,6 +124,21 @@ it('gives no diff for a rename into a directory of its own name whose other chan
   expect(diffs.find(entry => entry.path === 'a/b')).toEqual({ path: 'a/b', diff: null });
   expect(diffs.find(entry => entry.path === others[0])!.diff).toContain('+x');
 }, 120_000);
+
+it('shows a decomposed (NFD) name\'s own diff, next to its composed twin', async () => {
+  const { dir, commit } = repository();
+  // Built with mktree, so the names stay exactly as written whatever the host's file system does with them. On macOS,
+  // `git init` sets core.precomposeunicode, which this checks is turned off; elsewhere it is off anyway.
+  const blob = (text: string) => execFileSync('git', [...HARDENED_GIT_OPTIONS, 'hash-object', '-w', '--stdin'], { cwd: dir, input: text, env: hardenedGitEnvironment() }).toString().trim();
+  const tree = (nfd: string, nfc: string) => execFileSync('git', [...HARDENED_GIT_OPTIONS, 'mktree'], { cwd: dir, env: hardenedGitEnvironment(),
+    input: `100644 blob ${blob(nfd)}\tcafe\u0301.ts\n100644 blob ${blob(nfc)}\tcaf\u00e9.ts\n` }).toString().trim();
+  const first = commit({ 'seed.ts': 's\n' });
+  const base = fixtureGit(dir, 'commit-tree', tree('1\n', '2\n'), '-p', first, '-m', 'base');
+  const head = fixtureGit(dir, 'commit-tree', tree('1x\n', '2x\n'), '-p', base, '-m', 'head');
+  const by = Object.fromEntries((await reviewDiffs(dir, base, head, signal())).map(entry => [entry.path, entry.diff]));
+  expect(by['cafe\u0301.ts']).toContain('-1\n+1x\n');
+  expect(by['caf\u00e9.ts']).toContain('-2\n+2x\n');
+});
 
 it('keeps a byte-order mark at the start of a name', async () => {
   const { dir, commit } = repository();

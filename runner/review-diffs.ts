@@ -25,7 +25,9 @@ interface GitOutput { status: number | null; stdout: Buffer; over: boolean }
 function git(executable: string, repository: string, args: string[], limit: number, signal: AbortSignal): Promise<GitOutput> {
   return new Promise((resolve, reject) => {
     signal.throwIfAborted();
-    const child = spawn(executable, [...GIT_OPTIONS, ...args], { cwd: repository, env: gitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    // A repository made on macOS sets core.precomposeunicode, which turns a decomposed name in a pathspec into its
+    // composed form: the agent's commits keep names exactly as written, so the pathspec must too.
+    const child = spawn(executable, [...GIT_OPTIONS, '-c', 'core.precomposeunicode=false', ...args], { cwd: repository, env: gitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = [];
     let size = 0, over = false, failure: unknown;
     const abort = () => { child.kill('SIGKILL'); };
@@ -130,7 +132,8 @@ export async function reviewDiffs(repository: string, base: string, head: string
     if (!result.over && result.status !== 0) throw new Error(`Git could not show the change to ${path}.`);
     let diff: string | null = null;
     if (!result.over) { try { diff = decoder.decode(result.stdout); } catch { diff = null; } }
-    if (diff?.includes('\0')) diff = null;
+    // A listed change always prints at least its header: empty output means the pathspec missed it, so it is not shown.
+    if (diff === '' || diff?.includes('\0')) diff = null;
     diffs.push({ path, diff });
   }
   return diffs;
