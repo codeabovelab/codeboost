@@ -59,14 +59,14 @@ Room is kept from round 1 on for the longest round number, the earlier-problems 
 256 characters escaped at their longest, and the notes of the issue's description, of its comments (for the 1,000 the
 issue loader reads at most) and of the lessons. So every later round of the same plan fits whenever round 1 did, even
 if the title was changed, a description written, comments posted or lessons approved in between. A later round refuses
-only a prompt that does not fit without the reserve, which this room makes impossible for an issue GitHub can hold. So an answer is never refused for its size: any valid answer can be the next round's earlier problems. Text
+only a prompt that does not fit without the reserve, which this room makes impossible for an issue GitHub can hold. The title's room relies on GitHub's 256-character limit: the issue loader itself accepts titles up to 4,096 characters, so a longer title from another source could still make a later round refuse. So an answer is never refused for its size: any valid answer can be the next round's earlier problems. Text
 that no data block can hold (NUL, an unpaired surrogate) is refused wherever it is, whether or not it would fit. Part 2
 starts a new plan revision again at round 1, with no earlier problems.
 
 **Known limit.** A plan too large to fit even without its change texts (with the issue's number and title, the
 prompt's own text and the room for the notes) cannot be reviewed in one prompt, and `prepareReview` refuses it. The plan schema allows such a plan (30 items, each with 10 checks of up to 400
 characters). Part 2 then moves the task to needs human, after the plan's items have run. Reviewing such a plan in
-batches of items, or checking that it can be reviewed before its items run, is a follow-up.
+batches of items, or checking that it can be reviewed before its items run, is follow-up #209.
 
 The prompt goes to Claude as one command argument, as planning's does. At most about 62 KiB, it is under Linux's 128 KiB
 limit for one argument.

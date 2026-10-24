@@ -7,7 +7,7 @@ import { DataTooLarge, dataJSON } from './planning-author.ts';
 
 /** The largest round number a review answer can carry; the round limit (#201) is at most this. */
 export const MAX_REVIEW_ROUNDS = 10;
-/** GitHub's longest issue title, in characters. */
+/** GitHub's longest issue title, in characters. The issue loader accepts up to 4,096; the reserve relies on GitHub's limit. */
 export const MAX_ISSUE_TITLE = 256;
 /** The most comments the issue loader reads (github/issues.ts, `MAX_ISSUES`); it refuses an issue with more. */
 export const MAX_ISSUE_COMMENTS = 1000;

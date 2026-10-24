@@ -57,6 +57,10 @@ function changesPadded(base: Plan, bytes: number): Plan {
   return { ...base, items };
 }
 
+/** The problems a round-1 answer of `problems` files for `plan`, as the next round's earlier problems. */
+const earlierFrom = (plan: Plan, problems: { items: string[]; summary: string; detail: string; check: string | null }[]) =>
+  validateReviewAnswer(plan, 1, answer(problems)).map(problem => ({ round: 1, ...problem }));
+
 describe('review prompt (#201)', () => {
   it('pads only with plans the plan schema accepts, and reserves for the comments the loader reads', () => {
     for (const plan of [changesPadded(input().plan, 20_000), checksPadded(input().plan, 20_000)]) expect(() => assertPlan(plan)).not.toThrow();
@@ -111,8 +115,11 @@ describe('review prompt (#201)', () => {
   });
 
   it('lists as many earlier problems as fit, in order, and says how many it left out', () => {
-    const big = (index: number) => ({ round: 1, item: index % 2 ? 'P2' : 'P1', summary: `Problem ${index}.`, detail: '<é&'.repeat(500), check: null });
-    const all = Array.from({ length: 40 }, (_, index) => big(index));
+    // The most one answer can file against the two-item plan: 10 problems, each naming both items. Each copy is then
+    // numbered, as any summary text may be.
+    const all = earlierFrom(input().plan, Array.from({ length: 10 }, (_, index) => ({ items: ['P1', 'P2'], summary: `Problem ${index}`, detail: '<é&'.repeat(500), check: null })))
+      .map((problem, index) => ({ ...problem, summary: `Problem ${index}.` }));
+    expect(all).toHaveLength(20);
     const { request } = prepareReview(input({ round: 2, earlierProblems: all }));
     expect(request.earlierListed).toBeGreaterThan(0);
     expect(request.earlierListed).toBeLessThan(all.length);
@@ -206,7 +213,8 @@ describe('review prompt (#201)', () => {
     expect(() => build({ plan: huge })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, and with room kept for what a later round may add, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     expect(() => build({ plan: huge, round: 2 })).toThrow(`The plan is too large to review in one prompt: even without its file change texts, the issue's description and comments, the lessons and the earlier problems, the prompt takes more than ${MAX_REVIEW_PROMPT_BYTES} bytes.`);
     // The earlier problems go in before the issue's description: with room for only one of them, the problems win.
-    const some = Array.from({ length: 19 }, (_, index) => ({ round: 1, item: 'P1', summary: `p${index}`, detail: 'd'.repeat(1500), check: null }));
+    // 19 of the 20 copies one answer can file: the problems whose fixes ran are a part of what the round found.
+    const some = earlierFrom(input().plan, Array.from({ length: 10 }, (_, index) => ({ items: ['P1', 'P2'], summary: `p${index}`, detail: 'd'.repeat(1500), check: null }))).slice(0, 19);
     const first = build({ round: 2, earlierProblems: some, issue: issue(31 * 1024, 0) });
     expect([first.earlierListed, first.leftOut]).toEqual([19, ['issue description']]);
     // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
@@ -221,7 +229,7 @@ describe('review prompt (#201)', () => {
   it.each([
     ['a description, a lesson and a comment', { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }, { body: 'b'.repeat(500), comments: ['c'], lessons: ['l'] }],
     // Round 1 keeps room for a description written and a lesson approved before a later round.
-    ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(30_000), comments: [], lessons: ['l'.repeat(40_000)] }],
+    ['none, and later a long description and lesson', { body: '', comments: [], lessons: [] }, { body: 'b'.repeat(30_000), comments: [], lessons: ['l'.repeat(30_000)] }],
     // A later round is not refused for the reserve: with nothing else to take its room, the comments' note fits in it.
     ['none, and later ten comments', { body: '', comments: [], lessons: [] }, { body: '', comments: Array.from({ length: 10 }, () => 'c'.repeat(3000)), lessons: [] }],
     // Round 1 keeps room for the comments' note at the most comments the loader reads, and for the longest title.
@@ -239,7 +247,11 @@ describe('review prompt (#201)', () => {
     const accepted = (pad: number) => { try { at(pad); return true; } catch { return false; } };
     while (low < high) { const mid = Math.ceil((low + high) / 2); if (accepted(mid)) low = mid; else high = mid - 1; }
     expect(() => at(low + 1)).toThrow('and with room kept for what a later round may add, the prompt takes more than');
-    const most = Array.from({ length: 100 }, (_, index) => ({ round: 1, item: index % 2 ? 'P2' : 'P1', summary: `s${index}`, detail: 'd', check: null }));
+    // The most problems one answer can give: 10, each naming 10 items.
+    const padded = checksPadded(plan, low), ids = padded.items.slice(0, 10).map(item => item.id);
+    expect(ids).toHaveLength(10);
+    const most = earlierFrom(padded, Array.from({ length: 10 }, (_, index) => ({ items: ids, summary: `s${index}`, detail: 'd', check: null })));
+    expect(most).toHaveLength(100);
     for (const round of [2, 10]) {
       const next = at(low, round, most.map(problem => ({ ...problem, round: round - 1 })));
       expect(Buffer.byteLength(next.prompt)).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_BYTES);
