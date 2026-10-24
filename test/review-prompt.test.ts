@@ -7,6 +7,7 @@ import { captureInvocation, type InvocationInput, type InvocationResult } from '
 import { assertCommandSchema, createClaudeCommand, createPhasePolicy, MAX_PLANNING_INPUT_BYTES } from '../agents/policy.ts';
 import { MAX_ISSUE_COMMENTS, MAX_ISSUE_TITLE, MAX_REVIEW_PROMPT_BYTES, MAX_REVIEW_ROUNDS, prepareReview, REVIEW_SCHEMA_TEXT, validateReviewAnswer } from '../core/review-prompt.ts';
 import { MAX_ISSUES } from '../github/issues.ts';
+import { parseClaudeOutput } from '../agents/adapters/claude.ts';
 import { CODEX_REVIEW_REFUSED, removeReviewRoot, REVIEW_FEATURE, reviewOutput, reviewRun } from '../runner/review-agent.ts';
 import { assertPlan, type Plan } from '../core/plan.ts';
 import { reviewRecordingInput } from './fixtures/review/recording-inputs.ts';
@@ -342,10 +343,15 @@ describe('review agent output (#201)', () => {
     expect(() => reviewOutput(result({ attemptId: 'a2' }), invocation)).toThrow('different attempt');
     expect(() => reviewOutput(result({ stopReason: 'timeout' }), invocation)).toThrow('timed out');
     expect(() => reviewOutput(result({ exitCode: null, signal: 'SIGKILL' }), invocation)).toThrow('SIGKILL');
-    expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Reached maximum number of turns (50)' }), invocation))
+    // The supervisor passes on the decoded text, and a nonzero exit, for a provider failure. The envelope is what Claude
+    // Code 2.1.281 (macOS arm64 build) wrote when `--max-turns 1` stopped a real run (#163), less members nothing reads.
+    const { text: turnLimit } = parseClaudeOutput(Buffer.from('{"type":"result","subtype":"error_max_turns","is_error":true,'
+      + '"num_turns":2,"errors":["Reached maximum number of turns (1)"]}'), true);
+    expect(() => reviewOutput(result({ exitCode: 1, stdout: turnLimit }), invocation))
       .toThrow('Claude could not review the plan items. The review stopped at its 50-turn limit before Claude answered.');
     expect(() => reviewOutput(result({ stopReason: 'output-limit' }), invocation)).toThrow('Review agent output exceeded its limit.');
-    expect(() => reviewOutput(result({ exitCode: 1, stdout: 'Invalid API key' }), invocation)).toThrow('Claude could not review the plan items. Check its sign-in');
+    // Any other failure text keeps the sign-in advice; the code reads nothing in it but the turn limit's words.
+    expect(() => reviewOutput(result({ exitCode: 1, stdout: 'login required' }), invocation)).toThrow('Claude could not review the plan items. Check its sign-in');
   });
 
   it('refuses Codex and a missing token for credentials, and runs the request\'s head read-only', () => {
