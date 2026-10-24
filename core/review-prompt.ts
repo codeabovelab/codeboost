@@ -30,7 +30,17 @@ const validateAnswer = new Ajv2020({ allErrors: true, strict: true }).compile(JS
  * it is not text the prompt can carry (not UTF-8, or longer than a data block's 32 KiB string), or `reviewDiffs` did
  * not read it (see there), or the prompt had no room for it, so the agent reads the file instead.
  */
-export interface ReviewDiff { path: string; diff: string | null }
+export interface ReviewDiff {
+  /** The file's path at the head; for a deleted file, its path at the base. */
+  path: string;
+  diff: string | null;
+  change: ReviewChange;
+  /** A renamed file's path at the base; null for every other change. */
+  from: string | null;
+}
+/** How a file changed between the base and the head (Git's A, D, M, R and T). */
+export type ReviewChange = 'added' | 'deleted' | 'modified' | 'renamed' | 'type changed';
+const CHANGES: ReadonlySet<string> = new Set(['added', 'deleted', 'modified', 'renamed', 'type changed']);
 /** A problem an earlier round filed against one item, shown to the next round so it can say whether the fix worked. */
 export interface EarlierProblem { round: number; item: string; summary: string; detail: string; check: string | null }
 /** Trusted runner inputs for one review round. Every text field is untrusted data. */
@@ -91,8 +101,12 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   if (typeof input.attemptId !== 'string' || !/^[0-9a-f-]{1,64}$/u.test(input.attemptId)) throw new Error('Attempt ID must be 1 to 64 lowercase hex digits and hyphens.');
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.head)) throw new Error('Review head must be a full commit ID.');
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.base) || input.base.length !== input.head.length) throw new Error('Review base must be a full commit ID like the head.');
-  for (const entry of input.diffs) if (typeof entry.path !== 'string' || !entry.path || (entry.diff !== null && typeof entry.diff !== 'string'))
-    throw new Error('Each review diff needs a path and a diff text or null.');
+  for (const entry of input.diffs) {
+    if (typeof entry.path !== 'string' || !entry.path || (entry.diff !== null && typeof entry.diff !== 'string'))
+      throw new Error('Each review diff needs a path and a diff text or null.');
+    if (!CHANGES.has(entry.change) || (entry.change === 'renamed' ? typeof entry.from !== 'string' || !entry.from : entry.from !== null))
+      throw new Error('Each review diff needs its kind of change, and an old path exactly when it is a rename.');
+  }
   if (!Number.isSafeInteger(input.plan.revision) || input.plan.revision < 1) throw new Error('Plan revision must be a positive integer.');
   if (input.issue.number !== input.plan.issue) throw new Error('Selected issue mismatch.');
   const plan = structuredClone(input.plan), ids = new Set(plan.items.map(item => item.id));
@@ -140,7 +154,7 @@ export function prepareReview(input: ReviewInput): PreparedReview {
       plan_data_json: dataJSON({ summary: plan.summary, revision: plan.revision, head: input.head, items: parts.changes ? plan.items
         : plan.items.map(item => ({ ...item, files: item.files.map(file => ({ ...file, change: '' })) })) }, 'Plan data', MAX_REVIEW_PROMPT_BYTES),
       plan_left_out: !parts.changes && changeTexts ? changesNote : '',
-      diffs_data_json: dataJSON({ base: input.base, files: parts.diffs.map(({ path, diff }) => ({ path, diff })) },
+      diffs_data_json: dataJSON({ base: input.base, files: parts.diffs.map(({ path, diff, change, from }) => ({ path, diff, change, from })) },
         'Changes', MAX_REVIEW_PROMPT_BYTES),
       diffs_left_out: reserve || !allDiffs(parts.diffs) ? diffsNote : '',
       issue_data_json: dataJSON({ number: input.issue.number, title: reserve ? longestTitle : input.issue.title, body: parts.description ? input.issue.body : '',
@@ -185,13 +199,13 @@ export function prepareReview(input: ReviewInput): PreparedReview {
   // fits, so one large diff cannot push every smaller one after it out. Each entry's cost in the block is exact (the
   // block is one JSON array of them, escaped per character), and the final prompt is measured again.
   const prefix = most(diffCount, count => ({ ...parts, diffs: input.diffs.slice(0, count) }));
-  let listedDiffs: ReviewDiff[] = input.diffs.slice(0, prefix).map(({ path, diff }) => ({ path, diff }));
+  let listedDiffs: ReviewDiff[] = input.diffs.slice(0, prefix).map(({ path, diff, change, from }) => ({ path, diff, change, from }));
   if (prefix < diffCount) {
     let room = MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(sized({ ...parts, diffs: listedDiffs })!, 'utf8');
     const greedy = [...listedDiffs];
-    for (const { path, diff } of input.diffs.slice(prefix)) {
+    for (const { path, diff, change, from } of input.diffs.slice(prefix)) {
       const cost = (entry: ReviewDiff) => Buffer.byteLength(dataJSON(entry, 'Changes', MAX_REVIEW_PROMPT_BYTES)) + (greedy.length ? 1 : 0);
-      const whole = { path, diff }, bare = { path, diff: null };
+      const whole = { path, diff, change, from }, bare = { path, diff: null, change, from };
       for (const entry of diff === null ? [bare] : [whole, bare]) {
         let bytes: number;
         try { bytes = cost(entry); } catch (error) { if (error instanceof DataTooLarge) continue; throw error; }

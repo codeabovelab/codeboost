@@ -83,7 +83,11 @@ try {
     try {
       writeFileSync(temporary, `${JSON.stringify(recording, null, 2)}\n`, { flag: 'wx' });
       renameSync(temporary, target);
-    } catch (error) { rmSync(temporary, { force: true }); throw error; }
+    } catch (error) {
+      // An existing temporary file is not this run's: only one this run opened is removed.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') rmSync(temporary, { force: true });
+      throw error;
+    }
     // Validation only reports. The recording above is kept either way: a rejected output is a finding.
     try {
       const problems = prepared.validate(output);

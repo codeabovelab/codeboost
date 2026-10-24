@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { MAX_PROMPT_BYTES } from '../core/planning-author.ts';
-import { MAX_REVIEW_PROMPT_BYTES, type ReviewDiff } from '../core/review-prompt.ts';
+import { MAX_REVIEW_PROMPT_BYTES, type ReviewChange, type ReviewDiff } from '../core/review-prompt.ts';
 import { GIT_OPTIONS, gitEnvironment } from '../git/clone.ts';
 
 /** The longest diff shown: a data block's 32 KiB string (`dataJSON`). */
@@ -127,17 +127,19 @@ export async function reviewDiffs(repository: string, base: string, head: string
     start = end + 1;
   }
   // Each record is a status, then its path, or for a rename (R and a score) its old and new paths.
-  const records: { path: string; paths: string[] }[] = [];
+  const records: { path: string; paths: string[]; change: ReviewChange; from: string | null }[] = [];
+  const kinds: Record<string, ReviewChange> = { A: 'added', D: 'deleted', M: 'modified', T: 'type changed' };
   for (let index = 0; index < fields.length;) {
     const status = fields[index++]!;
     if (status.startsWith('R')) {
       const from = fields[index++], to = fields[index++];
       if (from === undefined || to === undefined) throw new Error('Git returned an incomplete rename record.');
-      records.push({ path: to, paths: [from, to] });
+      records.push({ path: to, paths: [from, to], change: 'renamed', from });
     } else {
       const path = fields[index++];
-      if (path === undefined || !/^[ACDMTUX]$/u.test(status)) throw new Error('Git returned an unexpected change record.');
-      records.push({ path, paths: [path] });
+      const change = kinds[status];
+      if (path === undefined || change === undefined) throw new Error('Git returned an unexpected change record.');
+      records.push({ path, paths: [path], change, from: null });
     }
   }
   const sorted = records.flatMap(record => record.paths).sort();
@@ -145,18 +147,18 @@ export async function reviewDiffs(repository: string, base: string, head: string
   // Once the paths so far alone fill a whole prompt, no later diff is read: the prompt can still list a later file with
   // a short path, but with a null diff.
   let listable = 0;
-  for (const { path, paths } of records) {
-    listable += Buffer.byteLength(JSON.stringify({ path, diff: null }));
+  for (const { path, paths, change, from } of records) {
+    listable += Buffer.byteLength(JSON.stringify({ path, diff: null, change, from }));
     // Built only for a diff that is read, so the bound above also bounds this work.
     const pathspecs = listable > MAX_REVIEW_PROMPT_BYTES ? null : exactly(paths, sorted);
-    if (pathspecs === null) { diffs.push({ path, diff: null }); continue; }
+    if (pathspecs === null) { diffs.push({ path, diff: null, change, from }); continue; }
     const result = await git(executable, repository, ['diff', ...DIFF_OPTIONS, `-l${renameLimit}`, base, head, '--', ...pathspecs], MAX_FILE_DIFF_BYTES, signal);
     if (!result.over && result.status !== 0) throw new Error(`Git could not show the change to ${path}.`);
     let diff: string | null = null;
     if (!result.over) { try { diff = decoder.decode(result.stdout); } catch { diff = null; } }
     // A listed change always prints at least its header: empty output means the pathspec missed it, so it is not shown.
     if (diff === '' || diff?.includes('\0')) diff = null;
-    diffs.push({ path, diff });
+    diffs.push({ path, diff, change, from });
   }
   return diffs;
 }

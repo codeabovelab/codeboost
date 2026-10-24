@@ -70,13 +70,28 @@ it('gives a file replaced by a directory only its own diff', async () => {
   expect(diffs[1]!.diff).toBeNull();
 });
 
+it('says how each file changed, and a rename\'s old path, even where the diff is null', async () => {
+  const { dir, commit } = repository();
+  const lines = Array.from({ length: 4000 }, (_, index) => `line ${index}`);
+  const base = commit({ 'secure.ts': `${lines.join('\n')}\n`, 'big.bin': `${'b'.repeat(40_000)}\n`, 'kept.ts': 'k\n' });
+  rmSync(join(dir, 'secure.ts')); rmSync(join(dir, 'big.bin'));
+  const head = commit({ 'declared.ts': `${lines.map((line, index) => index % 3 ? line : `${line} edited`).join('\n')}\n`, 'kept.ts': 'k2\n', 'new.ts': 'n\n' });
+  const diffs = await reviewDiffs(dir, base, head, signal());
+  expect(diffs.map(({ path, change, from, diff }) => ({ path, change, from, shown: diff !== null }))).toEqual([
+    { path: 'big.bin', change: 'deleted', from: null, shown: false },
+    { path: 'declared.ts', change: 'renamed', from: 'secure.ts', shown: false },
+    { path: 'kept.ts', change: 'modified', from: null, shown: true },
+    { path: 'new.ts', change: 'added', from: null, shown: true },
+  ]);
+});
+
 it('shows both sides of a file whose type changed', async () => {
   const { dir, commit } = repository();
   const base = commit({ 'a.ts': 'secret check\n', 'b.ts': 'b\n' });
   rmSync(join(dir, 'a.ts')); symlinkSync('b.ts', join(dir, 'a.ts'));
   const head = commit({});
   const [entry] = await reviewDiffs(dir, base, head, signal());
-  expect(entry!.path).toBe('a.ts');
+  expect([entry!.path, entry!.change]).toEqual(['a.ts', 'type changed']);
   expect(entry!.diff).toContain('deleted file mode 100644');
   expect(entry!.diff).toContain('new file mode 120000');
   expect(entry!.diff).toContain('+b.ts');
@@ -121,7 +136,7 @@ it('gives no diff for a rename into a directory of its own name whose other chan
   const others = Array.from({ length: 300 }, (_, index) => `a/${'x'.repeat(245)}${String(index).padStart(3, '0')}`);
   const head = commit({ 'a/b': `${text}\nmore\n`, ...Object.fromEntries(others.map(path => [path, 'x\n'])) });
   const diffs = await reviewDiffs(dir, base, head, AbortSignal.timeout(120_000));
-  expect(diffs.find(entry => entry.path === 'a/b')).toEqual({ path: 'a/b', diff: null });
+  expect(diffs.find(entry => entry.path === 'a/b')).toEqual({ path: 'a/b', diff: null, change: 'renamed', from: 'a' });
   expect(diffs.find(entry => entry.path === others[0])!.diff).toContain('+x');
 }, 120_000);
 
@@ -182,7 +197,7 @@ it('stops reading diffs once the listed paths alone fill a whole prompt, and lis
   const diffs = await reviewDiffs(dir, base, head, AbortSignal.timeout(120_000));
   expect(diffs.map(entry => entry.path)).toEqual(names);
   let listable = 0;
-  const readable = names.filter(path => (listable += Buffer.byteLength(JSON.stringify({ path, diff: null }))) <= MAX_REVIEW_PROMPT_BYTES).length;
+  const readable = names.filter(path => (listable += Buffer.byteLength(JSON.stringify({ path, diff: null, change: 'modified', from: null }))) <= MAX_REVIEW_PROMPT_BYTES).length;
   expect(readable).toBeLessThan(names.length);
   expect(diffs.map(entry => entry.diff !== null)).toEqual(names.map((_, index) => index < readable));
 }, 120_000);
@@ -228,7 +243,7 @@ it('shows a diff of exactly 32 KiB, and not one byte longer', async () => {
   const head = commit({ 'at.txt': line(MAX_PROMPT_BYTES), 'ov.txt': line(MAX_PROMPT_BYTES + 1) });
   const [at, over] = await reviewDiffs(dir, base, head, signal());
   expect(Buffer.byteLength(at!.diff!)).toBe(MAX_PROMPT_BYTES);
-  expect(over).toEqual({ path: 'ov.txt', diff: null });
+  expect(over).toEqual({ path: 'ov.txt', diff: null, change: 'modified', from: null });
 });
 
 it('refuses a commit that is not a full commit ID and a Git failure, and stops when its signal does', async () => {
