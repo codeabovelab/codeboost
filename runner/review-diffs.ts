@@ -101,8 +101,10 @@ function exactly(paths: readonly string[], sorted: readonly string[]): string[] 
  * already fill a whole prompt (so at most a few thousand diffs are read), or a rename into a directory of its own name
  * among other changes there whose names pass 64 KiB. The agent reads those files at the head.
  *
- * Git runs without system or global config, hooks, replace objects, external diff or text conversion programs, in-tree
- * diff attributes or submodules, one file at a time, with pathspecs that match only that file, and its output is
+ * Git runs without system or global config, hooks, replace objects, external diff or text conversion programs or
+ * submodules, and with `--text`, so no in-tree attribute can hide or replace a diff's lines (a built-in diff driver
+ * named there can still change a hunk header's function context). It runs one file at a time, with pathspecs that match
+ * only that file, and its output is
  * bounded. `signal` stops it.
  */
 export async function reviewDiffs(repository: string, base: string, head: string, signal: AbortSignal,
