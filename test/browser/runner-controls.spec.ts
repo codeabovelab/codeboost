@@ -381,25 +381,37 @@ test('a Refresh while an action is in flight does not replace its answer with a 
   fail();
 });
 
-test('the review strip fits its runner controls at the 1280px minimum width', async ({ page }) => {
+test('the review strip keeps every control on one line at the 1280px minimum width', async ({ page }) => {
   await serve();
   await page.setViewportSize({ width: 1280, height: 800 });
-  // The most controls the strip shows at once: status, Retry, a run action and Cancel task (Stop and Retry are never
-  // offered together: the server offers a retry only when no attempt is active).
-  // Shapes only: the page reads `retryable`, the publish flags and the marker's reason to choose what to show, nothing
-  // else from them here. The marker gives the widest status text the strip can show.
-  await viewWith(page, view => { view.task.status = 'running'; view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true };
+  // The widest the strip gets: the longest status word and restart reason, Retry, the longest run action and Cancel task.
+  // Shapes only: the page reads the status, the marker's reason, `retryable` and the publish flags to choose what to
+  // show, nothing else from them here.
+  await viewWith(page, view => { view.task.status = 'possibly already fixed'; view.retryable = true;
+    view.publish = { ...view.publish, available: true, publishable: true, draft: true };
     view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'preparation-not-removed' }; });
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
-  await expect(page.locator('#task-status')).toHaveText("● Running · Needs restart: an attempt's preparation files could not be removed");
+  await expect(page.locator('#task-status')).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
   // This server has no merge gateway, so the merge controls a production task also shows are unhidden here with their
   // production labels (renderMergeControls), for this layout check only.
   await page.evaluate(() => { for (const [id, text] of [['merge', '3 blockers'], ['merge-details', 'Review blockers']] as [string, string][]) { const button = document.getElementById(id)!; button.hidden = false; button.textContent = text; } });
-  const strip = await page.locator('#review-view .review-strip').evaluate(element => ({ scroll: element.scrollWidth, client: element.clientWidth }));
-  expect(strip.scroll).toBeLessThanOrEqual(strip.client);
+  // No horizontal overflow, and every visible child sits inside the strip's box: none wraps to more lines, and none is
+  // clipped by an edge. A wrapped title or button is taller than the strip, which is what the person would see.
+  const boxes = await page.locator('#review-view .review-strip').evaluate(strip => {
+    const rect = strip.getBoundingClientRect();
+    return { scroll: strip.scrollWidth, client: strip.clientWidth, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right,
+      children: [...strip.children].filter(child => !(child as HTMLElement).hidden).map(child => { const box = child.getBoundingClientRect();
+        return { id: child.id || child.tagName, top: box.top, bottom: box.bottom, left: box.left, right: box.right }; }) };
+  });
+  expect(boxes.scroll).toBeLessThanOrEqual(boxes.client);
+  for (const child of boxes.children) {
+    expect(child.top, `${child.id} top`).toBeGreaterThanOrEqual(boxes.top);
+    expect(child.bottom, `${child.id} bottom`).toBeLessThanOrEqual(boxes.bottom);
+    expect(child.left, `${child.id} left`).toBeGreaterThanOrEqual(boxes.left);
+    expect(child.right, `${child.id} right`).toBeLessThanOrEqual(boxes.right);
+  }
 });
-
 test('a poll that hides the focused Stop moves focus to Refresh', async ({ page }) => {
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });

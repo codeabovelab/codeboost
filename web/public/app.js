@@ -2516,6 +2516,8 @@ function renderRunner() {
           : view.publish.active ? " · Publishing…"
             : live ? ` · ${live.item ?? live.kind}` : "";
     $("task-status").textContent = `${mark} ${word}${suffix}`;
+    // The strip cuts a long status with an ellipsis; the full text stays readable as its title.
+    $("task-status").title = `${word}${suffix.replace(" · ", ", ")}`;
     $("task-status").className = restart ? "bad" : tone;
     $("task-status").setAttribute("aria-label", `Task: ${word}${suffix.replace(" · ", ", ")}`);
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
