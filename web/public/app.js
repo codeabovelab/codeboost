@@ -2470,7 +2470,9 @@ function taskStateText(view) {
     const paths = continuation.outOfScopePaths.join(", ");
     const head = `${continuation.item} changed ${paths ? `files the plan did not declare: ${paths}` : "files the plan did not declare"}.`;
     if (continuation.reason) return `! ${head} ${continuation.reason}`;
-    return continuation.approved ? `! ${head} The continuation is approved; resume the task.` : `! ${head} Revise the plan to declare them, then approve the continuation.`;
+    // An approved continuation never stays in needs amendment: its approval moves the task to queued or running in the
+    // same transaction (runner/store.ts approveContinuation), where the header offers Resume.
+    return `! ${head} Revise the plan to declare them, then approve the continuation.`;
   }
   if (task.status === "needs amendment") return "! This task needs a plan change before it can continue.";
   if (task.status === "needs human") {

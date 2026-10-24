@@ -1181,20 +1181,11 @@ test('names a failed attempt\'s diagnostic in the needs-human banner', async ({ 
   await expect(page.locator('#task-banner-text')).toHaveText(`! This task needs a person. ${diagnostic!.slice(0, 300)}`);
 });
 
-test('shows the needs-approval banner and an approved continuation\'s text', async ({ page }) => {
+test('shows the needs-approval banner', async ({ page }) => {
   await serve();
-  let state: 'needs approval' | 'approved' = 'needs approval';
-  await viewWith(page, view => {
-    view.startable = false;
-    if (state === 'needs approval') view.task.status = 'needs approval';
-    else { view.task.status = 'needs amendment';
-      view.continuation = { checkpointId: 'c1', item: 'P2', completedItems: ['P1'], outOfScopePaths: ['src/config.ts'], next: 'P2', approved: true }; }
-  });
+  await viewWith(page, view => { view.startable = false; view.task.status = 'needs approval'; });
   await openReview(page, app.url);
   await expect(page.locator('#task-banner-text')).toHaveText('! This task needs your approval before it continues.');
-  state = 'approved';
-  await refreshReview(page);
-  await expect(page.locator('#task-banner-text')).toHaveText('! P2 changed files the plan did not declare: src/config.ts. The continuation is approved; resume the task.');
   await expect(page.locator('#task-banner-approve')).toBeHidden();
 });
 
@@ -1829,7 +1820,7 @@ test('a summary change that leaves the cut widths as they are still updates the 
 test('a status change that leaves the cut widths as they are still updates the status tooltip', async ({ page }) => {
   // A short title that is not cut: the status keeps its cap with either restart reason, so the reason changing (a read
   // after the runner's state moved) changes no width, and only the measurement after the render sees the new text.
-  const texts = { summary: 'Fix retries', reason: 'preparation-not-removed' as const as 'preparation-not-removed' | 'storage-not-removed' };
+  const texts: { summary: string; reason: 'preparation-not-removed' | 'storage-not-removed' } = { summary: 'Fix retries', reason: 'preparation-not-removed' };
   const widths = await cappedStrip(page, texts);
   await expect(status(page)).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
   await expect(page.locator('#issue-title')).not.toHaveAttribute('title');
