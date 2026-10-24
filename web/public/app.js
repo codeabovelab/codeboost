@@ -2372,7 +2372,8 @@ const runnerControlIds = [...runnerActionIds, "task-banner-plans"];
 /**
  * Why only a restart can move the task on, or null: the coordinator's unresolved marker (runner-lifecycle.md), or a
  * rebase marker with no preparation running it (runner/pre-merge.ts: the process died mid-rebase, and recovery at the
- * next start settles it). While either holds, no work is live, the server refuses a cancel, and polling would never end.
+ * next start settles it). While either holds, no work is live and polling would never end; a first cancel is admitted
+ * and takes effect at that restart, and the server refuses a second.
  */
 function restartNeeded(view) {
   if (view.unresolved) return runnerUnresolved[view.unresolved.reason] ?? view.unresolved.reason;
@@ -2517,7 +2518,9 @@ function renderRunner() {
     $("task-status").className = restart ? "bad" : tone;
     $("task-status").setAttribute("aria-label", `Task: ${word}${suffix.replace(" · ", ", ")}`);
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
-    if (live) $("attempt-stop").textContent = live.item ? `Stop ${live.item}` : "Stop attempt";
+    // A pre-merge command check runs as its own attempt on the item (kind `check`); stopping it stops the checks, not
+    // the item's run, which the merge's own Cancel merge control also does.
+    if (live) $("attempt-stop").textContent = live.item ? `Stop ${live.item}${live.kind === "check" ? " checks" : ""}` : "Stop attempt";
     shown["attempt-retry"] = view.retryable;
     const run = runAction(view);
     shown["run-action"] = !!run;
@@ -2633,6 +2636,8 @@ function runnerOutcomeText(action, result, view) {
       return `✓ Continuation approved.${result.next ? ` Resume the task to run ${result.next}.` : ""}`;
     case "cancel-task":
       if (result.outcome !== "stopping") return "✓ Task cancelled.";
+      // A task that needs a restart has no work to stop: recovery at the next start closes it (runner/store.ts).
+      if (view && restartNeeded(view)) return "Cancelling: the task closes when the runner restarts and recovers.";
       // A cancel held by a push whose outcome is unknown: the server reads the branch again (web/server.ts cancel-task).
       return view?.task.pushInProgress ? "Cancelling: checking the outcome of the task's last push." : "Cancelling: the running work is stopping.";
     case "publish":

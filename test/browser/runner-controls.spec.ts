@@ -1575,3 +1575,42 @@ test('a rebase marker with its preparation running is work in progress, not a re
   await expect(status(page)).toHaveText('○ In review');
   await expect(page.locator('#cancel-task')).toBeVisible();
 });
+
+/** A rebase marker as runner/store.ts RebaseMarker shapes it, for a preparation that died before Git moved. */
+const deadRebaseMarker = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', oldBase: 'a'.repeat(40), oldHead: 'b'.repeat(40), onto: 'c'.repeat(40),
+  oldHistory: null, startedAt: 1_760_000_000_000, resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null, processGroup: null };
+
+test('a first cancel on a task that needs a restart says the task closes at the restart', async ({ page }) => {
+  await serve();
+  // No cancel yet, so Cancel task is offered; the server admits the first cancel and answers `stopping` with the marker
+  // still set (runner/store.ts cancelTask; web/server.ts cancel-task), and nothing can run until the restart.
+  await viewWith(page, view => { view.startable = false; view.task.rebaseInProgress = deadRebaseMarker; });
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.fallback(); return; }
+    const view = await serverRunnerView(route);
+    view.startable = false; view.task.rebaseInProgress = deadRebaseMarker; view.task.cancelRequested = CANCEL_ACTION;
+    await route.fulfill({ status: 200, json: { result: { outcome: 'stopping' }, runner: view } });
+  });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText('○ In review · Needs restart: an interrupted rebase waits for recovery');
+  const cancel = page.locator('#cancel-task');
+  await cancel.click(); await cancel.click();
+  await expect(page.locator('#runner-note')).toHaveText('Cancelling: the task closes when the runner restarts and recovers.');
+  await expect(cancel).toBeHidden();
+});
+
+test('names a pre-merge command check\'s Stop as stopping the checks', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  // The real live attempt, read as a pre-merge command check (kind `check`, runner/store.ts startAttempt): the page
+  // reads only its kind, item, state and id.
+  let asCheck = false;
+  await viewWith(page, view => { if (asCheck) for (const attempt of view.attempts) if (attempt.id === view.task.currentAttemptId) attempt.kind = 'check'; });
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
+  asCheck = true;
+  await refreshReview(page);
+  await expect(page.getByRole('button', { name: 'Stop P1 checks', exact: true })).toBeVisible();
+  fail();
+});
