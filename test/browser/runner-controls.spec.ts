@@ -401,8 +401,11 @@ test('a Refresh while an action is in flight does not replace its answer with a 
   await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
   await expect(page.locator('#run-action')).toBeHidden();
   // The Refresh reloaded the review; the runner read it asked for while the start was in flight was owed, and done
-  // once the start settled: exactly one, with no poll possible under the frozen clock.
+  // once the start settled: exactly one. With the clock paused no poll can add to it, so a second read in the next
+  // second could only be the owed read paid twice.
   await expect.poll(() => reads.length).toBe(before + 1);
+  await page.waitForTimeout(1_000);
+  expect(reads.length).toBe(before + 1);
   fail();
 });
 
@@ -1871,12 +1874,15 @@ test('reads the runner state after a trust change whose answer was lost, since t
 
 test('names an attempt that started and ended between two reads', async ({ page }) => {
   await serve();
-  // The real view after P1 failed, kept between steps (nothing offered) so polling goes on; a later read then shows a
-  // new settled attempt the page never saw live, as the real server's list does (the newest attempts, oldest first,
-  // runner/store.ts recentAttempts): the real attempt's record, copied as P2's after it.
+  // The real view after P1 failed, kept between steps (nothing offered) so polling goes on; a later read then shows two
+  // settled attempts the page never saw live, as the real server's list does (the newest attempts, oldest first,
+  // runner/store.ts recentAttempts): the real attempt's record, copied as P2's and then P3's after it. The note names
+  // the latest, P3.
   let later = false;
   await viewWith(page, view => { view.resumable = false;
-    if (later && view.attempts.length) view.attempts = [...view.attempts, { ...view.attempts[view.attempts.length - 1], id: '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d', item: 'P2', state: 'completed' }]; });
+    if (later && view.attempts.length) { const last = view.attempts[view.attempts.length - 1];
+      view.attempts = [...view.attempts, { ...last, id: '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d', item: 'P2', state: 'completed' },
+        { ...last, id: '0c1d2e3f-4a5b-4c6d-8e7f-9a8b7c6d5e4f', item: 'P3', state: 'failed' }]; } });
   await page.clock.install();
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Start', exact: true }).click();
@@ -1890,7 +1896,7 @@ test('names an attempt that started and ended between two reads', async ({ page 
   reads = Number(await note.getAttribute('data-reads'));
   await page.clock.runFor(4_000);
   await expect(note).toHaveAttribute('data-reads', String(reads + 1));
-  await expect(note).toContainText('P2 completed. The task is now running. Refresh to review its latest changes.');
+  await expect(note).toHaveText('✕ P3 failed. The task is now running. Refresh to review its latest changes.');
 });
 
 test('a runner read asked for during a pending action is done once the action settles', async ({ page }) => {
@@ -1927,10 +1933,13 @@ test('a runner read asked for during a pending action is done once the action se
   const before = gets;
   await page.clock.pauseAt(Date.now());
   release();
-  // The held answer applies, then the owed read follows it: exactly one, showing the revision's state.
+  // The held answer applies, then the owed read follows it: exactly one, showing the revision's state. With the clock
+  // paused no poll can add to it, so a second read in the next second could only be the owed read paid twice.
   await expect(page.locator('#runner-note')).toContainText(/Running P1\.|P1 failed/);
   await expect.poll(() => gets).toBe(before + 1);
   await expect(page.locator('#run-action')).toBeHidden();
+  await page.waitForTimeout(1_000);
+  expect(gets).toBe(before + 1);
 });
 
 test('a long undeclared path in the needs-amendment banner keeps its controls within 1280px', async ({ page }) => {
