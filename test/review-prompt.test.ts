@@ -107,7 +107,7 @@ describe('review prompt (#201)', () => {
     expect(() => prepareReview(input({ attemptId: 'ABC' }))).toThrow('lowercase hex');
     // Round 1 is told nothing earlier, whatever round the problems claim.
     expect(() => prepareReview(input({ earlierProblems: [{ round: 0, item: 'P1', summary: 's', detail: 'd', check: null }] }))).toThrow('Round 1 has no earlier problems');
-    expect(() => prepareReview(input({ issue: { number: 413, title: '', body: '', comments: [] } }))).toThrow('issue mismatch');
+    expect(() => prepareReview(input({ issue: { number: 413, title: 'T', body: '', comments: [] } }))).toThrow('issue mismatch');
   });
 
   it('lists as many earlier problems as fit, in order, and says how many it left out', () => {
@@ -135,7 +135,7 @@ describe('review prompt (#201)', () => {
     // Each problem takes more than the note does, so leaving one out makes room for the note.
     const tiny = [1, 2, 3].map(index => ({ round: 1, item: 'P1', summary: `s${index}`, detail: 'd'.repeat(200), check: null }));
     const plan = input().plan;
-    const at = (pad: number) => prepareReview(input({ round: 2, earlierProblems: tiny, issue: { number: 412, title: '', body: '', comments: [] },
+    const at = (pad: number) => prepareReview(input({ round: 2, earlierProblems: tiny, issue: { number: 412, title: 'T', body: '', comments: [] },
       plan: changesPadded(checksPadded(plan, 20_000), pad) })).request;
     const base = at(1000), room = MAX_REVIEW_PROMPT_BYTES - Buffer.byteLength(base.prompt);
     expect(base.earlierListed).toBe(3);
@@ -168,11 +168,12 @@ describe('review prompt (#201)', () => {
 
   it('keeps the prompt within the model budget lane D enforces, giving way in order and saying what it left out', () => {
     expect(MAX_REVIEW_PROMPT_BYTES + Buffer.byteLength(REVIEW_SCHEMA_TEXT)).toBe(MAX_PLANNING_INPUT_BYTES);
+    // Issues as the loader gives them (github/issues.ts): a title, and a title, description and comments within 32 KiB.
     const issue = (body: number, comments: number) => ({ number: 412, title: 'T', body: 'b'.repeat(body), comments: comments ? ['c'.repeat(comments)] : [] });
     const build = (over: Partial<ReturnType<typeof input>>) => prepareReview(input(over)).request;
     expect(build({}).leftOut).toEqual([]);
     // Last in: the issue's comments, then the lessons, then its description.
-    const comments = build({ issue: issue(1000, 31 * 1024), approvedLessons: ['l'.repeat(31 * 1024)] });
+    const comments = build({ issue: issue(1000, 30_000), approvedLessons: ['l'.repeat(31 * 1024)] });
     expect(comments.leftOut).toEqual(['issue comments']);
     expect(comments.prompt).toContain('The issue\'s 1 comment did not fit here, so it is left out.');
     expect(comments.prompt).not.toContain('c'.repeat(100));
@@ -181,14 +182,15 @@ describe('review prompt (#201)', () => {
     expect(lessons.leftOut).toEqual(['lessons']);
     expect(lessons.prompt).toContain('The approved lessons did not fit here, so they are left out.');
     expect(lessons.prompt).toContain('c'.repeat(100));
-    // A single block over its own 32 KiB limit gives way the same way, with what is left out named exactly.
+    // A single block over its own 32 KiB limit gives way the same way, with what is left out named exactly. The loader
+    // refuses such an issue; prepareReview does not rely on that.
     expect(build({ issue: issue(33 * 1024, 0) }).leftOut).toEqual(['issue description']);
     expect(build({ issue: issue(33 * 1024, 0) }).prompt).toContain('The issue\'s description did not fit here, so it is left out.');
     expect(build({ issue: issue(20 * 1024, 0), approvedLessons: [] }).leftOut).toEqual([]);
-    expect(build({ issue: { number: 412, title: '', body: 'b'.repeat(20 * 1024), comments: ['c'.repeat(13 * 1024), 'd'] } }).prompt)
-      .toContain('The issue\'s 2 comments did not fit here, so they are left out.');
+    const two = build({ issue: { number: 412, title: 'T', body: 'b'.repeat(16 * 1024), comments: ['c'.repeat(15 * 1024), 'd'] }, approvedLessons: ['l'.repeat(31 * 1024)] });
+    expect([two.leftOut, two.prompt.includes('The issue\'s 2 comments did not fit here, so they are left out.')]).toEqual([['issue comments'], true]);
     // An empty description is not reported as left out.
-    expect(build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024)] } }).leftOut).toEqual(['issue comments']);
+    expect(build({ issue: { number: 412, title: 'T', body: '', comments: ['c'.repeat(31 * 1024)] }, approvedLessons: ['l'.repeat(31 * 1024)] }).leftOut).toEqual(['issue comments']);
     // A plan whose change texts are too large is reviewed without them; the issue and lessons still go in after it.
     const big = input().plan;
     const wide = { ...big, items: big.items.map(item => ({ ...item, files: Array.from({ length: 40 }, (_, index) =>
@@ -209,10 +211,10 @@ describe('review prompt (#201)', () => {
     expect([first.earlierListed, first.leftOut]).toEqual([19, ['issue description']]);
     // A refusal that is not about size is not hidden as "did not fit", wherever the text is.
     expect(() => build({ approvedLessons: ['a\0b'] })).toThrow('Lessons must be valid text without NUL.');
-    expect(() => build({ issue: { number: 412, title: '', body: '', comments: ['c'.repeat(33 * 1024), 'a\0b'] } })).toThrow('Issue data must be valid text without NUL.');
+    expect(() => build({ issue: { number: 412, title: 'T', body: '', comments: ['c'.repeat(30_000), 'a\0b'] }, approvedLessons: ['l'.repeat(31 * 1024)] })).toThrow('Issue data must be valid text without NUL.');
     expect(() => build({ round: 2, earlierProblems: [{ round: 1, item: 'P1', summary: '\ud800', detail: 'd', check: null }] })).toThrow('Earlier problems must be valid text');
     // Nor is a runner bug: data that is not JSON text is refused, not left out.
-    expect(() => build({ issue: { number: 412, title: '', body: undefined as unknown as string, comments: [] } })).toThrow('Issue data is not JSON data.');
+    expect(() => build({ issue: { number: 412, title: 'T', body: undefined as unknown as string, comments: [] } })).toThrow('Issue data is not JSON data.');
   });
 
   // Issues the loader can give (github/issues.ts): a title, and a title, description and comments within 32 KiB.
