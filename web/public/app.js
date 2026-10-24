@@ -697,9 +697,10 @@ function render() {
   }
   $("repository").textContent = data.repository;
   renderPlans();
-  // The title gives way to an ellipsis in a crowded strip (its full text is its title); the revision never does.
+  // The title gives way to an ellipsis in a crowded strip, and only then is its full text its title; the revision never
+  // gives way.
   $("issue-title").textContent = `#${data.plan.issue} ${data.plan.summary}`;
-  $("issue-title").title = `#${data.plan.issue} ${data.plan.summary}`;
+  $("issue-title").title = $("issue-title").scrollWidth > $("issue-title").clientWidth ? `#${data.plan.issue} ${data.plan.summary}` : "";
   // Its leading space is a non-breaking one, part of the text: copied, read aloud and shown alike.
   $("issue-revision").textContent = `\u00a0· r${data.plan.revision}`;
   $("progress").textContent =
@@ -2471,7 +2472,8 @@ function renderRunnerNote() {
   const review = runnerReviewKinds.map((kind) => runnerNotes.review.get(kind)?.text).filter(Boolean).join(" ");
   const { status, ask } = runnerNotes;
   const text = [review, status, ask].filter(Boolean).join(" ");
-  // A live region: rewritten only when the text changes, so a render does not re-announce it.
+  // A live region: rewritten only when the text changes, so a render that leaves it as it is (a review reload that keeps
+  // a note written after its request went out) does not re-announce it.
   if ($("runner-note").textContent !== text) $("runner-note").textContent = text;
   // Coloured by the part a person most needs to act on first.
   const lead = ask || status || review;
@@ -2517,6 +2519,7 @@ function renderRunner() {
   const view = runnerView?.available && data ? runnerView : null;
   const shown = {};
   for (const id of runnerControlIds) shown[id] = false;
+  let statusTitle = "";
   if (view) {
     const task = view.task, closed = task.status === "merged" || task.status === "cancelled";
     const [mark, word, tone] = runnerStatusMarks[task.status] ?? ["○", task.status, "neutral"];
@@ -2535,8 +2538,7 @@ function renderRunner() {
         document.createTextNode(" "), Object.assign(document.createElement("span"), { className: "word", textContent: `${word}${suffix}` }));
       $("task-status").firstChild.setAttribute("aria-hidden", "true");
     }
-    // The strip cuts a long status with an ellipsis; the full text stays readable as its title.
-    $("task-status").title = `${word}${suffix.replace(" · ", ", ")}`;
+    statusTitle = `${word}${suffix.replace(" · ", ", ")}`;
     $("task-status").className = restart ? "bad" : tone;
     shown["attempt-stop"] = !!live && view.stopRequested === null && task.cancelRequested === null;
     // A pre-merge command check runs as its own attempt on the item (kind `check`); stopping it stops the checks, not
@@ -2561,6 +2563,9 @@ function renderRunner() {
     disarmCancel();
   }
   $("task-status").hidden = !view;
+  // The strip cuts a long status with an ellipsis; only then is the full text its title, so a screen reader does not get
+  // the text twice when nothing is cut. Measured once the element shows.
+  $("task-status").title = view && $("task-status").scrollWidth > $("task-status").clientWidth ? statusTitle : "";
   for (const id of runnerControlIds) $(id).hidden = !shown[id];
   // Marked, never disabled, while an action is in flight, so the focused control keeps focus (AGENTS.md).
   for (const id of runnerActionIds) {
@@ -2626,6 +2631,8 @@ async function loadRunner({ poll = false, generation = poll ? runnerGeneration :
   // newer, would drop that answer and leave the page on the state before the action.
   if (runnerPending || (poll && generation !== runnerGeneration)) return;
   generation ??= ++runnerGeneration;
+  // A read that is not a poll replaces a pending poll: the timer goes too, so it cannot fire into a newer generation.
+  if (!poll && runnerPollTimer) clearTimeout(runnerPollTimer);
   // A read a person or a review load asked for starts the quiet count again, whatever it answers.
   if (!poll) runnerQuietPolls = 0;
   runnerPollTimer = null;

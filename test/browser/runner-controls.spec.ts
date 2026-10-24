@@ -72,6 +72,9 @@ test('starts an approved task with the versions on screen, then offers Resume on
   const posts = runnerPosts(page);
   await openReview(page, app.url);
   await expect(status(page)).toHaveText('○ In review');
+  // Nothing is cut at this width, so neither the status nor the issue title carries a tooltip to be read twice.
+  await expect(status(page)).toHaveAttribute('title', '');
+  await expect(page.locator('#issue-title')).toHaveAttribute('title', '');
   const start = page.getByRole('button', { name: 'Start', exact: true });
   await expect(start).toBeVisible();
   const review = await app.service.load(), before = app.service.store.getTask(app.service.config.identity).stateVersion;
@@ -947,10 +950,14 @@ test('a Refresh whose review was read before an item ended keeps the note about 
   const note = page.locator('#runner-note'), ended = '✕ P1 failed. The task is now running. Refresh to review its latest changes.';
   await expect(note).toHaveText(ended);
   const reads = Number(await note.getAttribute('data-reads'));
+  // The reload keeps the note and re-renders it as it is; count its child mutations, which a rewrite would add to.
+  await page.evaluate(() => { const counts = { note: 0 }; (window as unknown as { __rewrites: { note: number } }).__rewrites = counts;
+    new MutationObserver(records => { counts.note += records.length; }).observe(document.getElementById('runner-note')!, { childList: true, characterData: true, subtree: true }); });
   releaseReview();
-  // The reload applies (and reads the runner again); the note it could not have shown stays.
+  // The reload applies (and reads the runner again); the note it could not have shown stays, and is not rewritten.
   await expect(note).toHaveAttribute('data-reads', String(reads + 1));
   await expect(note).toHaveText(ended);
+  expect(await page.evaluate(() => (window as unknown as { __rewrites: { note: number } }).__rewrites.note)).toBe(0);
 });
 
 test('a later success replaces a stale task-state refusal', async ({ page }) => {
@@ -1702,18 +1709,39 @@ test('a restart the runner needs comes before the waiting state in the banner', 
 
 test('polls that change nothing do not rewrite the banner, the note or the status, so they are not re-announced', async ({ page }) => {
   await serve();
-  // A needs-human task whose draft publish is in progress: polled, and nothing in the view changes between polls.
-  await viewWith(page, view => { view.startable = false; view.task.status = 'needs human';
-    view.publish = { ...view.publish, available: true, active: true, last: { outcome: 'publishing', draft: true, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } }; });
+  // A needs-human task whose draft publish is in progress: polled, and nothing in the view changes between polls. The
+  // real server has no publish, so a cancel closes the task at once, which puts a note on screen; the fake keeps the
+  // task needs human and publishing on every later read, so the banner, the note and the status all show and stay.
+  const fake = (view: Record<string, any>) => { view.startable = false; view.task.status = 'needs human';
+    view.publish = { ...view.publish, available: true, active: true, last: { outcome: 'publishing', draft: true, message: 'A pull request is being published.', stateVersion: 1, at: '2026-10-23T12:00:00.000Z' } }; };
+  await viewWith(page, fake);
+  // The cancel's answer, forwarded to the real server, gets the same fake fields, so the view it applies stays busy.
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.fallback(); return; }
+    const request = route.request();
+    const response = await unpooled(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const answer = await response.json() as Record<string, any>;
+    if (response.ok) fake(answer.runner);
+    await route.fulfill({ status: response.status, json: answer });
+  });
   await page.clock.install();
   await openReview(page, app.url);
-  await expect(page.locator('#task-banner-text')).toHaveText('! This task needs a person. A pull request is being published.');
+  const banner = page.locator('#task-banner-text'), note = page.locator('#runner-note');
+  await expect(banner).toHaveText('! This task needs a person. A pull request is being published.');
+  const cancel = page.locator('#cancel-task');
+  await cancel.click(); await cancel.click();
+  await expect(note).toHaveText('✓ Task cancelled.');
+  // One poll after the answer, so the view on screen is a read's; all three texts are set.
+  let reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
   await expect(status(page)).toHaveText('! Needs human · Publishing…');
-  // Count child mutations (text node replacements) of the three live texts over the next polls.
+  await expect(banner).toHaveText('! This task needs a person. A pull request is being published.');
+  await expect(note).toHaveText('✓ Task cancelled.');
+  // Count child mutations (text node replacements) of the three live texts over the next polls, which change nothing.
   await page.evaluate(() => { const counts: Record<string, number> = {}; (window as unknown as { __rewrites: Record<string, number> }).__rewrites = counts;
     for (const id of ['task-banner-text', 'runner-note', 'task-status']) { counts[id] = 0; new MutationObserver(records => { counts[id] = (counts[id] ?? 0) + records.length; })
       .observe(document.getElementById(id)!, { childList: true, characterData: true, subtree: true }); } });
-  const note = page.locator('#runner-note');
-  for (const step of [2_000, 4_000, 8_000]) { const reads = Number(await note.getAttribute('data-reads')); await page.clock.runFor(step); await expect(note).toHaveAttribute('data-reads', String(reads + 1)); }
+  for (const step of [2_000, 4_000, 8_000]) { reads = Number(await note.getAttribute('data-reads')); await page.clock.runFor(step); await expect(note).toHaveAttribute('data-reads', String(reads + 1)); }
   expect(await page.evaluate(() => (window as unknown as { __rewrites: Record<string, number> }).__rewrites)).toEqual({ 'task-banner-text': 0, 'runner-note': 0, 'task-status': 0 });
 });
