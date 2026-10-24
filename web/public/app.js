@@ -2372,8 +2372,9 @@ const runnerControlIds = [...runnerActionIds, "task-banner-plans"];
 /**
  * Why only a restart can move the task on, or null: the coordinator's unresolved marker (runner-lifecycle.md), or a
  * rebase marker with no preparation running it (runner/pre-merge.ts: the process died mid-rebase, and recovery at the
- * next start settles it). While either holds, no work is live and polling would never end; a first cancel is admitted
- * and takes effect at that restart, and the server refuses a second.
+ * next start settles it). While either holds, no work is live and polling would never end. A first cancel is admitted:
+ * it takes effect at that restart, or closes the task at once when the marker's attempt row has already settled (its
+ * preparation files or storage could not be removed); the server refuses a second.
  */
 function restartNeeded(view) {
   if (view.unresolved) return runnerUnresolved[view.unresolved.reason] ?? view.unresolved.reason;

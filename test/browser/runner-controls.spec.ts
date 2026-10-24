@@ -386,10 +386,13 @@ test('the review strip fits its runner controls at the 1280px minimum width', as
   await page.setViewportSize({ width: 1280, height: 800 });
   // The most controls the strip shows at once: status, Retry, a run action and Cancel task (Stop and Retry are never
   // offered together: the server offers a retry only when no attempt is active).
-  // Shapes only: the page reads `retryable` and the publish flags to choose what to show, nothing else from them here.
-  await viewWith(page, view => { view.task.status = 'running'; view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true }; });
+  // Shapes only: the page reads `retryable`, the publish flags and the marker's reason to choose what to show, nothing
+  // else from them here. The marker gives the widest status text the strip can show.
+  await viewWith(page, view => { view.task.status = 'running'; view.retryable = true; view.publish = { ...view.publish, available: true, publishable: true, draft: true };
+    view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'preparation-not-removed' }; });
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
+  await expect(page.locator('#task-status')).toHaveText("● Running · Needs restart: an attempt's preparation files could not be removed");
   // This server has no merge gateway, so the merge controls a production task also shows are unhidden here with their
   // production labels (renderMergeControls), for this layout check only.
   await page.evaluate(() => { for (const [id, text] of [['merge', '3 blockers'], ['merge-details', 'Review blockers']] as [string, string][]) { const button = document.getElementById(id)!; button.hidden = false; button.textContent = text; } });
@@ -1014,7 +1017,8 @@ test('a resent cancel held by a push says the push is being checked', async ({ p
     to: 'b'.repeat(40), snapshotId: 's1', startedAt: 1_760_000_000_000 };
   await viewWith(page, view => { view.startable = false; view.task.cancelRequested = CANCEL_ACTION; view.task.pushInProgress = marker; });
   // The server's answer to that cancel (web/server.ts cancel-task with a push marker): `stopping`, and its runner view
-  // with the marker still set while the branch is read again.
+  // with the marker still set while the branch is read again. Left out: the bumped `stateVersion` the real cancel
+  // writes (runner/store.ts cancelTask), which only a later action would read, and none is sent here.
   await page.route('**/api/runner', async route => {
     if (route.request().method() !== 'POST') { await route.fallback(); return; }
     const view = await serverRunnerView(route);
@@ -1583,7 +1587,8 @@ const deadRebaseMarker = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', ol
 test('a first cancel on a task that needs a restart says the task closes at the restart', async ({ page }) => {
   await serve();
   // No cancel yet, so Cancel task is offered; the server admits the first cancel and answers `stopping` with the marker
-  // still set (runner/store.ts cancelTask; web/server.ts cancel-task), and nothing can run until the restart.
+  // still set (runner/store.ts cancelTask; web/server.ts cancel-task), and nothing can run until the restart. Left out:
+  // the bumped `stateVersion` the real cancel writes, which only a later action would read, and none is sent here.
   await viewWith(page, view => { view.startable = false; view.task.rebaseInProgress = deadRebaseMarker; });
   await page.route('**/api/runner', async route => {
     if (route.request().method() !== 'POST') { await route.fallback(); return; }
@@ -1613,4 +1618,28 @@ test('names a pre-merge command check\'s Stop as stopping the checks', async ({ 
   await refreshReview(page);
   await expect(page.getByRole('button', { name: 'Stop P1 checks', exact: true })).toBeVisible();
   fail();
+});
+
+test('a cancel under a marker whose attempt row has settled closes the task at once', async ({ page }) => {
+  await serve();
+  // Task storage that could not be removed after a saved terminal write (runner-lifecycle.md): the row has settled, so
+  // the real server's cancel closes the task at once. The marker is this fake's (the coordinator keeps a real one in
+  // memory until a restart), so the cancel's answer, forwarded to the real server, gets it added too.
+  const unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'storage-not-removed' };
+  await viewWith(page, view => { view.startable = false; view.unresolved = unresolved; });
+  await page.route('**/api/runner', async route => {
+    if (route.request().method() !== 'POST') { await route.fallback(); return; }
+    const request = route.request();
+    const response = await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    const answer = await response.json() as Record<string, any>;
+    if (response.ok) answer.runner.unresolved = unresolved;
+    await route.fulfill({ status: response.status, json: answer });
+  });
+  await openReview(page, app.url);
+  await expect(status(page)).toHaveText("○ In review · Needs restart: an attempt's task storage could not be removed");
+  const cancel = page.locator('#cancel-task');
+  await cancel.click(); await cancel.click();
+  await expect(page.locator('#runner-note')).toHaveText('✓ Task cancelled.');
+  await expect(status(page)).toHaveText("– Cancelled · Needs restart: an attempt's task storage could not be removed");
+  expect(app.service.store.getTask(app.service.config.identity).status).toBe('cancelled');
 });
