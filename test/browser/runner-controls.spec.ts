@@ -393,6 +393,8 @@ test('the review strip keeps every control on one line at the 1280px minimum wid
   await openReview(page, app.url);
   for (const id of ['task-status', 'attempt-retry', 'run-action', 'cancel-task']) await expect(page.locator(`#${id}`)).toBeVisible();
   await expect(page.locator('#run-action')).toHaveText('Publish draft PR');
+  // The web font decides the widths: measure only once it has loaded. The issue title is made long enough to need cutting.
+  await page.evaluate(async () => { await document.fonts.ready; document.getElementById('issue-title')!.textContent = '#3 Make retries predictable and document the behavior of every client of the retry policy in the service'; });
   await expect(page.locator('#task-status')).toHaveAttribute('title', "Possibly already fixed, Needs restart: an attempt's preparation files could not be removed");
   // This server has no merge gateway, so the merge controls a production task also shows are unhidden here with their
   // widest production labels (renderMergeControls), and Cancel task gets its armed label, for this layout check only.
@@ -401,9 +403,10 @@ test('the review strip keeps every control on one line at the 1280px minimum wid
   // less), so a wrapped title or button fails here; and the plan revision is never cut.
   const boxes = await page.locator('#review-view .review-strip').evaluate(strip => {
     const rect = strip.getBoundingClientRect();
-    const revision = document.getElementById('issue-revision')!;
+    const revision = document.getElementById('issue-revision')!, title = document.getElementById('issue-title')!;
     return { scroll: strip.scrollWidth, client: strip.clientWidth, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right,
       revision: { text: revision.textContent, width: revision.getBoundingClientRect().width, scroll: revision.scrollWidth },
+      title: { width: title.getBoundingClientRect().width, scroll: title.scrollWidth },
       children: [...strip.children].filter(child => !(child as HTMLElement).hidden).map(child => { const box = child.getBoundingClientRect();
         return { id: child.id || child.tagName, top: box.top, bottom: box.bottom, left: box.left, right: box.right }; }) };
   });
@@ -415,7 +418,9 @@ test('the review strip keeps every control on one line at the 1280px minimum wid
     expect(child.right, `${child.id} right`).toBeLessThanOrEqual(boxes.right);
     expect(child.bottom - child.top, `${child.id} one line`).toBeLessThanOrEqual(28);
   }
-  expect(boxes.revision.text).toBe(' · r1');
+  // The title gives way (cut, with an ellipsis) and the revision stays whole.
+  expect(boxes.title.width).toBeLessThan(boxes.title.scroll);
+  expect(boxes.revision.text).toBe('· r1');
   expect(Math.round(boxes.revision.width)).toBeGreaterThanOrEqual(boxes.revision.scroll);
 });
 test('a poll that hides the focused Stop moves focus to Refresh', async ({ page }) => {
@@ -558,6 +563,9 @@ test('shows a runner that needs a restart, and does not poll for it', async ({ p
   await openReview(page, app.url);
   await expect(status(page)).toHaveText("○ In review · Needs restart: an attempt's task storage could not be removed");
   await expect(status(page)).toHaveClass('bad');
+  // The reason is readable in the banner, not only in the status's tooltip.
+  await expect(page.locator('#task-banner')).toBeVisible();
+  await expect(page.locator('#task-banner-text')).toHaveText("! The runner needs a restart: an attempt's task storage could not be removed.");
   const seen = gets;
   // No poll in 60 s, past the 30 s backoff cap.
   await page.clock.runFor(60_000);
@@ -1660,4 +1668,17 @@ test('a cancel under a marker whose attempt row has settled closes the task at o
   await expect(page.locator('#runner-note')).toHaveText('✓ Task cancelled.');
   await expect(status(page)).toHaveText("– Cancelled · Needs restart: an attempt's task storage could not be removed");
   expect(app.service.store.getTask(app.service.config.identity).status).toBe('cancelled');
+});
+
+test('a restart the runner needs comes before the waiting state in the banner', async ({ page }) => {
+  await serve();
+  await viewWith(page, view => {
+    view.startable = false; view.task.status = 'needs amendment';
+    view.continuation = { checkpointId: 'c1', item: 'P2', completedItems: ['P1'], outOfScopePaths: ['src/config.ts'], next: null, approved: false,
+      reason: 'The current plan does not declare src/config.ts for P2.' };
+    view.unresolved = { attemptId: '7d0c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f', reason: 'result-not-saved' };
+  });
+  await openReview(page, app.url);
+  await expect(page.locator('#task-banner-text')).toHaveText("! The runner needs a restart: an attempt's result could not be saved. "
+    + '! P2 changed files the plan did not declare: src/config.ts. The current plan does not declare src/config.ts for P2.');
 });

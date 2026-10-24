@@ -630,6 +630,7 @@ footer button {
 }
 #issue {
   display: flex;
+  gap: 0.25em;
   min-width: 0;
 }
 #issue-title,
@@ -639,6 +640,7 @@ footer button {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* The revision is one word in a nowrap row, so it keeps its width; this says so where the title's rule is. */
 #issue-revision {
   flex-shrink: 0;
 }

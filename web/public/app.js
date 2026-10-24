@@ -700,7 +700,7 @@ function render() {
   // The title gives way to an ellipsis in a crowded strip (its full text is its title); the revision never does.
   $("issue-title").textContent = `#${data.plan.issue} ${data.plan.summary}`;
   $("issue-title").title = `#${data.plan.issue} ${data.plan.summary}`;
-  $("issue-revision").textContent = ` · r${data.plan.revision}`;
+  $("issue-revision").textContent = `· r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
   renderMerge();
@@ -2436,8 +2436,9 @@ function approvableContinuation(view) {
 function taskBannerText(view) {
   // A restart the runner needs comes first: the status line may cut its reason, and a tooltip is not a place to read it.
   const restart = restartNeeded(view);
-  const prefix = restart ? `! The runner needs a restart: ${restart}. ` : "";
-  return prefix + taskStateText(view);
+  const state = taskStateText(view);
+  if (!restart) return state;
+  return `! The runner needs a restart: ${restart}.${state ? ` ${state}` : ""}`;
 }
 function taskStateText(view) {
   const task = view.task, attempt = view.attempts.find((entry) => entry.id === task.currentAttemptId);
