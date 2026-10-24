@@ -11,7 +11,8 @@ const MAX_PATH_LIST_BYTES = 16 * 1024 * 1024;
  * `--text`: in-tree attributes (`-diff`, `binary`) are the agent's to write, so they never decide what the review
  * sees; real binary content is caught by the UTF-8 and NUL checks below. `-M`: a renamed file is shown as its rename
  * and its edits, not as a whole delete and a whole add. `--ignore-submodules=all` keeps Git out of submodules, whose
- * config is not the runner's (AGENTS.md); an agent cannot change their contents anyway.
+ * config is not the runner's (AGENTS.md); an agent cannot change their contents anyway. A file turned into a submodule
+ * entry, or back, is listed as a type change whose diff shows only the file's side.
  */
 const DIFF_OPTIONS = ['--text', '--no-ext-diff', '--no-textconv', '--no-color', '-M', '--ignore-submodules=all'];
 
@@ -115,7 +116,7 @@ export async function reviewDiffs(repository: string, base: string, head: string
   if (listed.over) throw new Error('The list of files the plan changed is too long for a review.');
   if (listed.status !== 0) throw new Error('Git could not list the files the plan changed.');
   if (listed.renamesSkipped)
-    throw new ReviewDiffsRefused(`The plan adds and deletes more files than Git's rename detection covers (${renameLimit}), so a renamed file's edits cannot be shown to the review.`);
+    throw new ReviewDiffsRefused(`Git skipped rename detection: the plan adds and deletes too many files for it (Git's rename limit is ${renameLimit}), so a renamed file's edits cannot be shown to the review.`);
   const output = listed.stdout;
   if (output.length && output[output.length - 1] !== 0) throw new Error('Git returned an unterminated path record.');
   // `ignoreBOM`: a leading U+FEFF is part of a name (or a diff), not a mark to drop.

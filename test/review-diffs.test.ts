@@ -178,6 +178,19 @@ it('refuses when Git skips rename detection, rather than hide a renamed file\'s 
   expect(diffs.find(entry => entry.path === 'big2.ts')!.diff).toContain('+PLANTED');
 });
 
+it('lists a file turned into a submodule entry as a type change, showing only the file\'s side', async () => {
+  const { dir, commit } = repository();
+  const base = commit({ sub: 'x\n', 'a.ts': 'a\n' });
+  fixtureGit(dir, 'rm', '--quiet', '--cached', 'sub'); rmSync(join(dir, 'sub'));
+  fixtureGit(dir, 'update-index', '--add', '--cacheinfo', `160000,${base},sub`);
+  fixtureGit(dir, 'commit', '--quiet', '-m', 'gitlink');
+  const head = fixtureGit(dir, 'rev-parse', 'HEAD');
+  const [entry] = await reviewDiffs(dir, base, head, signal());
+  expect([entry!.path, entry!.change]).toEqual(['sub', 'type changed']);
+  expect(entry!.diff).toContain('deleted file mode 100644');
+  expect(entry!.diff).not.toContain('160000');
+});
+
 it('keeps a byte-order mark at the start of a name', async () => {
   const { dir, commit } = repository();
   const base = commit({ 'evil.sh': 'x\n' });
