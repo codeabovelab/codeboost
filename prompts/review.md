@@ -54,7 +54,7 @@ The block below lists the problems the previous round found in the code. codeboo
 
 ## How to review
 
-1. **Check every plan item.** Read the files it declares and what changed in them. Does the code do what its intent says? Does it pass each of its `check` entries? Its `cmd` entries are run by codeboost separately; do not report them as unverified.
+1. **Check every plan item.** Read the files it declares and what changed in them. Does the code do what its intent says? Then go through its `check` entries one at a time, and report each one the code does not meet exactly as it is written, even where the code otherwise works. Its `cmd` entries are run by codeboost separately; do not report them as unverified.
 2. **Report real problems only.** A problem is code that is wrong, missing, or contradicts the item's intent or a check. Do not report style preferences, naming, or improvements you would like that the plan did not ask for.
 3. **Report changes the plan did not ask for.** A change that no item's intent covers is a problem, even when it looks harmless: for example, an edit unrelated to the item in a file it declares, a weakened check, or removed code. Name the item that declares the file.
 4. **Give evidence.** In `detail`, name the file and line, and say why it is wrong, so that someone can fix it without asking you.

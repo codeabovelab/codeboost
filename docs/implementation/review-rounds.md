@@ -125,7 +125,7 @@ launcher must mount the review answer schema: the execute launcher's plain-text 
 the plan and then after it, with a fixed Git identity and dates, so the commits and diffs are the same on every run.
 The task has two planted defects:
 
-- the second plan item's test calls `label(3)` once;
+- the second plan item's new test calls `label(3)` once, not twice as its check asks;
 - the first item's commit also weakens `isLabelled()`, which no item asked for. Only a review that reads the diffs can
   see that.
 

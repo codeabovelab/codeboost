@@ -14,9 +14,10 @@ import { prepareReview, type EarlierProblem, type PreparedReview, type ReviewDif
 //
 // REVIEW_RECORDING_BASE_FILES are the code before the plan; REVIEW_RECORDING_FILES the code after both plan items
 // below ran. P1 removes the call counter as planned, but its commit also weakens isLabelled(), which no item asked for:
-// an unrelated edit inside a declared file, which only the review sees. P2 is not done as planned: its test calls
-// label(3) once, so it cannot catch the bug its intent and its check describe. A review that reads the code and what
-// changed finds both.
+// an unrelated edit inside a declared file, which only the review sees. P2 is not done as planned: its check asks for a
+// test that calls label(3) twice and compares the results, but the new test calls it once and compares it with a
+// literal. (Run with the file's first test, it would still notice the counter coming back; run alone, it would not.) A
+// review that reads the code and what changed finds both.
 const PACKAGE_JSON = '{\n  "name": "example",\n  "private": true,\n  "type": "module",\n  "scripts": { "test": "node --test" }\n}\n';
 export const REVIEW_RECORDING_BASE_FILES: Readonly<Record<string, string>> = Object.freeze({
   'package.json': PACKAGE_JSON,
@@ -97,8 +98,8 @@ export function reviewRecordingPlan(): Plan {
 }
 /** The problem round 2 is told round 1 found and fixed. The files are unchanged, so it is still there. */
 export const REVIEW_RECORDING_EARLIER: readonly EarlierProblem[] = Object.freeze([Object.freeze({
-  round: 1, item: 'P2', summary: 'The new test calls label(3) only once, so it cannot show that label() is stable.',
-  detail: 'test/example.test.ts, test "labels a value the same way every time": it calls label(3) once and compares it with a literal. Call it twice and compare the two results.',
+  round: 1, item: 'P2', summary: 'The new test calls label(3) once, not twice as the check asks, so on its own it cannot show that label() is stable.',
+  detail: 'test/example.test.ts, test "labels a value the same way every time": it calls label(3) once and compares it with a literal, so it relies on the earlier test having called label() first. Call it twice and compare the two results.',
   check: 'The new test calls label(3) twice and asserts both results are equal.' })]);
 
 export type ReviewRecordingName = 'claude-review-round1' | 'claude-review-round2';
