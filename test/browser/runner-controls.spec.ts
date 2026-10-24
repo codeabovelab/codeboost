@@ -1374,20 +1374,23 @@ test('reads the runner state after a draft is applied, so Start goes when the ne
   await expect(page.locator('#run-action')).toBeHidden();
 });
 
+/**
+ * GitHub as the issue board reads it: issue #3 by an author outside the repository, so it needs a person's trust before it
+ * can run (github/issues.ts RepositoryIssue, IssueAccess). Left out, as nothing here reads them: `fetch` ignores `signal`
+ * and `timeoutMs` (the real gateway aborts on them), `issueAccess` and `issueText` answer for any number, and `issueText`
+ * is never called (no runner action is sent).
+ */
+const outsideAuthorGateway: IssueTrustGateway = {
+  repository: 'owner/repo',
+  async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [{ repository: 'owner/repo', number: 3, title: 'Make retries predictable',
+    body: '', url: 'https://github.com/owner/repo/issues/3', createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z', comments: 0, positiveReactions: 0,
+    labels: [], authorLogin: 'outside', authorAssociation: 'NONE', trust: 'requires-approval' }] }; },
+  async issueAccess(number) { return { number, authorLogin: 'outside', collaborator: false }; },
+  async issueText(number) { return { number, title: 'Make retries predictable', body: '', comments: [] }; },
+};
+
 test('reads the runner state when the issue board loads and when the issue\'s trust changes', async ({ page }) => {
-  // GitHub as the issue board reads it: issue #3 by an author outside the repository, so it needs a person's trust before
-  // it can run (github/issues.ts RepositoryIssue, IssueAccess). Left out, as nothing here reads them: `fetch` ignores
-  // `signal` and `timeoutMs` (the real gateway aborts on them), `issueAccess` and `issueText` answer for any number, and
-  // `issueText` is never called (no runner action is sent).
-  const gateway: IssueTrustGateway = {
-    repository: 'owner/repo',
-    async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [{ repository: 'owner/repo', number: 3, title: 'Make retries predictable',
-      body: '', url: 'https://github.com/owner/repo/issues/3', createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z', comments: 0, positiveReactions: 0,
-      labels: [], authorLogin: 'outside', authorAssociation: 'NONE', trust: 'requires-approval' }] }; },
-    async issueAccess(number) { return { number, authorLogin: 'outside', collaborator: false }; },
-    async issueText(number) { return { number, title: 'Make retries predictable', body: '', comments: [] }; },
-  };
-  await serve({ issueGateway: gateway });
+  await serve({ issueGateway: outsideAuthorGateway });
   await openReview(page, app.url);
   // Until the board has loaded, the server does not know the issue is untrusted, and offers Start.
   const start = page.getByRole('button', { name: 'Start', exact: true });
@@ -1511,4 +1514,28 @@ test('a review action\'s answer clears the note about ended work, as Refresh doe
   await page.getByRole('button', { name: 'Save change request' }).click();
   await expect(page.getByText('Add a test for the upper bound.')).toBeVisible();
   await expect(note).not.toContainText('P1 failed.');
+});
+
+test('reads the runner state after a board refresh whose answer was lost, since the server\'s refresh went on', async ({ page }) => {
+  await serve({ issueGateway: outsideAuthorGateway });
+  let gets = 0;
+  page.on('request', request => { if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/runner') gets++; });
+  // The board's refresh reaches the server and completes (the route runs it), and the page loses the answer.
+  let lost = false;
+  await page.route('**/api/issues', async route => {
+    if (route.request().method() !== 'POST' || lost) { await route.continue(); return; }
+    lost = true;
+    const request = route.request();
+    await fetch(request.url(), { method: 'POST', body: request.postData() ?? '', headers: { 'content-type': 'application/json', 'x-codeboost-token': request.headers()['x-codeboost-token'] ?? '' } });
+    await route.abort('failed');
+  });
+  await openReview(page, app.url);
+  await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
+  const before = gets;
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect(page.locator('#issues-status')).toContainText('Could not refresh issues.');
+  // One read followed the failed load; the board the server has says the issue is untrusted, so Start goes.
+  await expect.poll(() => gets).toBe(before + 1);
+  await page.locator('#review-link').click();
+  await expect(page.locator('#run-action')).toBeHidden();
 });
