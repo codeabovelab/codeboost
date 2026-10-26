@@ -1656,16 +1656,18 @@ test('a first cancel on a task that needs a restart says the task closes at the 
 test('names a pre-merge command check\'s Stop as stopping the checks', async ({ page }) => {
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
-  // The real live attempt, read as a pre-merge command check (kind `check`, runner/store.ts startAttempt): the page
-  // reads only its kind, item, state and id.
+  // The real live attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts). During a merge's
+  // preparation the task stays in review (runner/pre-merge.ts refuses any other status), so the fake says so too.
   let asCheck = false;
-  await viewWith(page, view => { if (asCheck) for (const attempt of view.attempts) if (attempt.id === view.task.currentAttemptId) attempt.kind = 'check'; });
+  await viewWith(page, view => { if (asCheck) { view.task.status = 'in review';
+    for (const attempt of view.attempts) if (attempt.id === view.task.currentAttemptId) attempt.kind = 'check'; } });
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Start', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Stop P1', exact: true })).toBeVisible();
   asCheck = true;
   await refreshReview(page);
   await expect(page.getByRole('button', { name: 'Stop P1 checks', exact: true })).toBeVisible();
+  await expect(status(page)).toHaveText('○ In review · P1 checks');
   fail();
 });
 
@@ -1961,9 +1963,10 @@ test('a long undeclared path in the needs-amendment banner keeps its controls wi
 test('names an ended pre-merge command check as its checks, with no call to review new changes', async ({ page }) => {
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
-  // The real attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts): the page reads only its
-  // kind, item, state and id.
-  await viewWith(page, view => { for (const attempt of view.attempts) attempt.kind = 'check'; });
+  // The real attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts). During a merge's
+  // preparation the task stays in review (runner/pre-merge.ts refuses any other status), so once the attempt exists the
+  // fake says so too.
+  await viewWith(page, view => { if (view.attempts.length) view.task.status = 'in review'; for (const attempt of view.attempts) attempt.kind = 'check'; });
   await page.clock.install();
   await openReview(page, app.url);
   await page.getByRole('button', { name: 'Start', exact: true }).click();
@@ -1974,5 +1977,5 @@ test('names an ended pre-merge command check as its checks, with no call to revi
   const note = page.locator('#runner-note'), reads = Number(await note.getAttribute('data-reads'));
   await page.clock.runFor(2_000);
   await expect(note).toHaveAttribute('data-reads', String(reads + 1));
-  await expect(note).toHaveText('✕ P1 command checks failed. The task is now running.');
+  await expect(note).toHaveText('✕ P1 command checks failed. The task is now in review.');
 });

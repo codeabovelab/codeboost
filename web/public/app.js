@@ -2555,7 +2555,7 @@ function renderRunner() {
       : task.cancelRequested !== null ? " · Cancelling…"
         : view.stopRequested !== null ? (view.stopRequested.saved ? " · Stopping…" : " · Stopping (not saved yet)")
           : view.publish.active ? " · Publishing…"
-            : live ? ` · ${live.item ?? live.kind}` : "";
+            : live ? ` · ${live.item ?? live.kind}${live.kind === "check" && live.item ? " checks" : ""}` : "";
     // As the merge step list: screen readers skip the mark and read the word (DESIGN.md). The text is rewritten only
     // when it changes, so a render does not re-announce an unchanged status.
     const statusText = `${mark} ${word}${suffix}`;
