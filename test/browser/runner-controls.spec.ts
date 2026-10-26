@@ -1657,7 +1657,8 @@ test('names a pre-merge command check\'s Stop as stopping the checks', async ({ 
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
   // The real live attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts). During a merge's
-  // preparation the task stays in review (runner/pre-merge.ts refuses any other status), so the fake says so too.
+  // preparation the task keeps a mergeable status (in review or approved but merge blocked, MERGEABLE_STATUSES in
+  // runner/lifecycle.ts); the fake uses in review.
   let asCheck = false;
   await viewWith(page, view => { if (asCheck) { view.task.status = 'in review';
     for (const attempt of view.attempts) if (attempt.id === view.task.currentAttemptId) attempt.kind = 'check'; } });
@@ -1964,8 +1965,8 @@ test('names an ended pre-merge command check as its checks, with no call to revi
   let fail!: () => void;
   await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
   // The real attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts). During a merge's
-  // preparation the task stays in review (runner/pre-merge.ts refuses any other status), so once the attempt exists the
-  // fake says so too.
+  // preparation the task keeps a mergeable status (in review or approved but merge blocked, MERGEABLE_STATUSES in
+  // runner/lifecycle.ts); once the attempt exists the fake uses in review.
   await viewWith(page, view => { if (view.attempts.length) view.task.status = 'in review'; for (const attempt of view.attempts) attempt.kind = 'check'; });
   await page.clock.install();
   await openReview(page, app.url);
