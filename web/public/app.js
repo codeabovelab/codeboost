@@ -2627,7 +2627,12 @@ function endedWorkNotes(before, after) {
   const settled = before && !after.unresolved ? after.attempts.findLast((attempt) => terminal(attempt)
     && !before.attempts.some((earlier) => earlier.id === attempt.id && terminal(earlier))) : null;
   if (settled) {
-    ended.attempt = `${settled.state === "failed" ? "✕ " : ""}${settled.item ?? settled.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
+    const mark = settled.state === "failed" ? "✕ " : "";
+    // A pre-merge command check (kind `check`) runs an item's `cmd:` entries and changes no code, so there is nothing
+    // new to review; anything else (an item's run, a fix) may have changed the code.
+    ended.attempt = settled.kind === "check"
+      ? `${mark}${settled.item ? `${settled.item} command checks` : "Command checks"} ${settled.state}. The task is now ${after.task.status}.`
+      : `${mark}${settled.item ?? settled.kind} ${settled.state}. The task is now ${after.task.status}. Refresh to review its latest changes.`;
   }
   // A publish or close that settled since the earlier view: its record is new, or the earlier view saw it in progress.
   // It may have started and ended between two reads (polls wait up to 30 s).

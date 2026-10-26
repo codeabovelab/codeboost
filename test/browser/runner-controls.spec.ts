@@ -1957,3 +1957,22 @@ test('a long undeclared path in the needs-amendment banner keeps its controls wi
     expect(box!.x + box!.width, `${id} right edge`).toBeLessThanOrEqual(1280);
   }
 });
+
+test('names an ended pre-merge command check as its checks, with no call to review new changes', async ({ page }) => {
+  let fail!: () => void;
+  await serve({ prepare: () => new Promise<never>((_, reject) => { fail = () => reject(new Error('no agent here')); }) });
+  // The real attempt, read as a pre-merge command check (kind `check`, runner/pre-merge.ts): the page reads only its
+  // kind, item, state and id.
+  await viewWith(page, view => { for (const attempt of view.attempts) attempt.kind = 'check'; });
+  await page.clock.install();
+  await openReview(page, app.url);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop P1 checks', exact: true })).toBeVisible();
+  // The check fails; the next poll sees its row settled.
+  fail();
+  await expect.poll(() => app.service.store.recentAttempts(app.service.config.identity, 1)[0]?.state).toBe('failed');
+  const note = page.locator('#runner-note'), reads = Number(await note.getAttribute('data-reads'));
+  await page.clock.runFor(2_000);
+  await expect(note).toHaveAttribute('data-reads', String(reads + 1));
+  await expect(note).toHaveText('✕ P1 command checks failed. The task is now running.');
+});
